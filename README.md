@@ -1,5 +1,7 @@
 # Groundwork
 
+![Groundwork banner](docs/assets/groundwork-banner.png)
+
 Groundwork is a provider-neutral persistence foundation for .NET applications. Modules describe storage intent through manifests, and providers translate those manifests into concrete relational or document database structures.
 
 This repository contains the standalone Groundwork library extracted from the Elsa foundation workspace.
