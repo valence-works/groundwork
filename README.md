@@ -34,6 +34,200 @@ dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.c
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 ```
 
+## Use Groundwork
+
+Groundwork starts with a provider-neutral `StorageManifest`. The manifest below declares a support-ticket document/table shape with string IDs, JSON content, optimistic concurrency, a unique ticket-number index, and queryable customer/status/assignee/priority indexes.
+
+```csharp
+using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.Queries;
+using Groundwork.Core.Workloads;
+
+const string DocumentKind = "supportTicket";
+const string SchemaVersion = "1.0.0";
+
+var manifest = new StorageManifest(
+    new StorageManifestIdentity("support-tickets"),
+    new StorageManifestOwner("sample.support"),
+    new StorageManifestVersion(SchemaVersion),
+    [
+        new StorageUnit(
+            new StorageUnitIdentity(DocumentKind),
+            "Support ticket",
+            new WorkloadClassification(
+                WorkloadFamily.RuntimeDefinedBusinessData,
+                WorkloadCandidateCategory.GroundworkDefault),
+            LifecyclePolicy.Mutable,
+            IdentityPolicy.StringId(),
+            TenancyPolicy.None,
+            ConcurrencyPolicy.Optimistic(),
+            SerializationPolicy.Json(),
+            [
+                Keyword("by-ticket-number", "ticketNumber", isUnique: true),
+                Keyword("by-customer", "customerId"),
+                Keyword("by-status", "status"),
+                Keyword("by-assignee", "assigneeId"),
+                Keyword("by-priority", "priority")
+            ],
+            [
+                Query("find-by-ticket-number", "by-ticket-number"),
+                Query("list-by-customer", "by-customer", QuerySortSupport.Both, QueryPagingSupport.Offset),
+                Query("list-by-status", "by-status", QuerySortSupport.Both, QueryPagingSupport.Offset),
+                Query("list-by-assignee", "by-assignee", QuerySortSupport.Both, QueryPagingSupport.Offset),
+                Query("list-by-priority", "by-priority", QuerySortSupport.Both, QueryPagingSupport.Offset)
+            ],
+            PhysicalizationPolicy.Portable)
+    ],
+    new HashSet<string> { "schema-history", "optimistic-concurrency" },
+    []);
+
+static IndexDeclaration Keyword(string identity, string field, bool isUnique = false) =>
+    new(
+        identity,
+        [new IndexField(field)],
+        IndexValueKind.Keyword,
+        isUnique,
+        true,
+        MissingValueBehavior.Excluded,
+        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+
+static PortableQueryDeclaration Query(
+    string identity,
+    string indexName,
+    QuerySortSupport sort = QuerySortSupport.None,
+    QueryPagingSupport paging = QueryPagingSupport.None) =>
+    new(
+        identity,
+        indexName,
+        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+        sort,
+        paging);
+```
+
+Configure SQLite by materializing the manifest, then create an `IDocumentStore` over the same connection:
+
+```csharp
+using Groundwork.Core.Capabilities;
+using Groundwork.Documents.Store;
+using Groundwork.Sqlite.Documents;
+using Groundwork.Sqlite.Materialization;
+using Microsoft.Data.Sqlite;
+
+var connection = new SqliteConnection("Data Source=support-tickets.db");
+var provider = new ProviderIdentity("groundwork-sqlite", "1.0.0");
+
+await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, provider);
+
+IDocumentStore store = new SqliteDocumentStore(connection, manifest);
+```
+
+Configure MongoDB with the same manifest:
+
+```csharp
+using Groundwork.Core.Capabilities;
+using Groundwork.Documents.Store;
+using Groundwork.MongoDb.Documents;
+using Groundwork.MongoDb.Materialization;
+using MongoDB.Driver;
+
+var client = new MongoClient("mongodb://localhost:27017");
+var database = client.GetDatabase("support");
+var provider = new ProviderIdentity("groundwork-mongodb", "1.0.0");
+
+await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, provider);
+
+IDocumentStore store = new MongoDbDocumentStore(database, manifest);
+```
+
+Create, load, query, update, and delete support-ticket documents through the portable document-store contract:
+
+```csharp
+using System.Text.Json;
+using Groundwork.Documents.Store;
+
+var ticket = new
+{
+    ticketNumber = "TCK-1001",
+    customerId = "acme",
+    subject = "Invoice export fails",
+    description = "The monthly invoice export returns an empty file.",
+    status = "open",
+    priority = "high",
+    assigneeId = "triage",
+    openedAt = DateTimeOffset.UtcNow
+};
+
+var created = await store.SaveAsync(new SaveDocumentRequest(
+    DocumentKind,
+    ticket.ticketNumber,
+    SchemaVersion,
+    JsonSerializer.Serialize(ticket)));
+
+if (created.Status != DocumentStoreWriteStatus.Saved)
+    throw new InvalidOperationException($"Ticket was not saved: {created.Status}");
+
+var loaded = await store.LoadAsync(DocumentKind, ticket.ticketNumber);
+
+var openTickets = await store.QueryAsync(
+    new DocumentStoreQuery(DocumentKind, "by-status", "open", skip: 0, take: 25));
+
+var assignedTicketJson = """
+    {
+      "ticketNumber": "TCK-1001",
+      "customerId": "acme",
+      "subject": "Invoice export fails",
+      "description": "The monthly invoice export returns an empty file.",
+      "status": "assigned",
+      "priority": "high",
+      "assigneeId": "agent-alex",
+      "openedAt": "2026-06-12T08:00:00Z"
+    }
+    """;
+
+var updated = await store.SaveAsync(new SaveDocumentRequest(
+    DocumentKind,
+    "TCK-1001",
+    SchemaVersion,
+    assignedTicketJson,
+    ExpectedVersion: created.Document!.Version));
+
+if (updated.Status == DocumentStoreWriteStatus.ConcurrencyConflict)
+    throw new InvalidOperationException("Ticket changed before the assignment was saved.");
+if (updated.Status != DocumentStoreWriteStatus.Saved)
+    throw new InvalidOperationException($"Ticket was not updated: {updated.Status}");
+
+var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
+    DocumentKind,
+    "TCK-1001",
+    ExpectedVersion: updated.Document!.Version));
+```
+
+The same manifest also supports planning, validation, and provider capability checks before materialization:
+
+```csharp
+using Groundwork.Core.Capabilities;
+using Groundwork.Core.Validation;
+using Groundwork.Documents.Planning;
+
+var manifestValidation = new StorageManifestValidator().Validate(manifest);
+if (!manifestValidation.IsValid)
+    throw new InvalidOperationException(string.Join(Environment.NewLine, manifestValidation.Errors));
+
+var capabilityReport = ProviderCapabilityReport.FullyPortable(
+    new ProviderIdentity("groundwork-sqlite", "1.0.0"));
+
+var compatibility = new ProviderCapabilityValidator().Validate(manifest, capabilityReport);
+if (!compatibility.IsCompatible)
+    throw new InvalidOperationException(string.Join(Environment.NewLine, compatibility.Errors));
+
+var documentPlan = new DocumentManifestPlanner(
+    new StorageManifestValidator(),
+    new ProviderCapabilityValidator()).Plan(manifest, capabilityReport);
+```
+
+Set `PhysicalizationPolicy.Optimized` on a storage unit when a provider should maintain native query projections for eligible declared indexes. SQLite creates provider tables for those projections, while MongoDB stores physicalized fields and indexes them natively.
+
 ## Sample
 
 `samples/Groundwork.SupportTickets` demonstrates a small support ticket domain on top of `Groundwork.Sqlite`.
