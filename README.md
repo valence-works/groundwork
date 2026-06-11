@@ -1,6 +1,6 @@
 # Groundwork
 
-![Groundwork banner](docs/assets/groundwork-banner.png)
+![Groundwork banner](docs/assets/groundwork-banner.svg)
 
 Groundwork is a provider-neutral persistence foundation for .NET applications. Modules describe storage intent through manifests, and providers translate those manifests into concrete relational or document database structures.
 
