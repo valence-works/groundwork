@@ -142,7 +142,7 @@ await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, pro
 IDocumentStore store = new MongoDbDocumentStore(database, manifest);
 ```
 
-Create, load, query, update, and delete support-ticket documents through the portable document-store contract:
+Create, load, query, update, and delete support-ticket documents through the portable document-store contract. For quick scripts or tests, an anonymous object is enough because `IDocumentStore` stores JSON envelopes:
 
 ```csharp
 using System.Text.Json;
@@ -203,6 +203,61 @@ var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
     DocumentKind,
     "TCK-1001",
     ExpectedVersion: updated.Document!.Version));
+```
+
+For application code, use a regular CLR type and serialize it with the same JSON field names declared by the manifest indexes:
+
+```csharp
+public sealed class SupportTicket
+{
+    public required string TicketNumber { get; set; }
+    public required string CustomerId { get; set; }
+    public required string Subject { get; set; }
+    public required string Description { get; set; }
+    public required string Status { get; set; }
+    public required string Priority { get; set; }
+    public required string AssigneeId { get; set; }
+    public DateTimeOffset OpenedAt { get; set; }
+    public DateTimeOffset? ResolvedAt { get; set; }
+}
+```
+
+```csharp
+using System.Text.Json;
+using Groundwork.Documents.Store;
+
+var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+var ticket = new SupportTicket
+{
+    TicketNumber = "TCK-1002",
+    CustomerId = "acme",
+    Subject = "Workflow run is stuck",
+    Description = "The workflow run remains in Running after all activities complete.",
+    Status = "open",
+    Priority = "normal",
+    AssigneeId = "triage",
+    OpenedAt = DateTimeOffset.UtcNow
+};
+
+var saved = await store.SaveAsync(new SaveDocumentRequest(
+    DocumentKind,
+    ticket.TicketNumber,
+    SchemaVersion,
+    JsonSerializer.Serialize(ticket, json)));
+
+var envelope = await store.LoadAsync(DocumentKind, ticket.TicketNumber);
+var loadedTicket = JsonSerializer.Deserialize<SupportTicket>(envelope!.ContentJson, json)!;
+
+loadedTicket.Status = "assigned";
+loadedTicket.AssigneeId = "agent-sam";
+
+await store.SaveAsync(new SaveDocumentRequest(
+    DocumentKind,
+    loadedTicket.TicketNumber,
+    SchemaVersion,
+    JsonSerializer.Serialize(loadedTicket, json),
+    ExpectedVersion: envelope.Version));
 ```
 
 The same manifest also supports planning, validation, and provider capability checks before materialization:
