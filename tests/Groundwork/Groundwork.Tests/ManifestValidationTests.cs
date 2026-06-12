@@ -164,6 +164,35 @@ public sealed class ManifestValidationTests
         Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-012");
     }
 
+    [Fact]
+    public void StorageIntentFactoriesNormalizeNullRequirements()
+    {
+        var intent = StorageIntent.SpecializedProvider("Requires external coordination.", (StorageRequirement[]?)null!);
+
+        Assert.Empty(intent.Requirements);
+    }
+
+    [Fact]
+    public void StorageIntentUsesRequirementSetValueEquality()
+    {
+        var first = StorageIntent.SpecializedProvider(
+            "Requires task claiming.",
+            StorageRequirement.AtomicClaim,
+            StorageRequirement.LeaseRecovery);
+        var second = new StorageIntent(
+            StorageIntentKind.SpecializedProvider,
+            new HashSet<StorageRequirement>
+            {
+                StorageRequirement.LeaseRecovery,
+                StorageRequirement.AtomicClaim
+            },
+            "Requires task claiming.");
+
+        Assert.Equal(first, second);
+        Assert.Equal(first.GetHashCode(), second.GetHashCode());
+        Assert.Equal(StorageIntent.PortableDocument(), StorageIntent.PortableDocument());
+    }
+
     private static StorageManifest WithSingleUnit(Func<StorageUnit, StorageUnit> configure)
     {
         var manifest = SampleManifests.MetadataManifest();

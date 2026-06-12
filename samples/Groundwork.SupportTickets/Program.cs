@@ -2,13 +2,12 @@ using Groundwork.SupportTickets;
 
 var builder = WebApplication.CreateBuilder(args);
 var storageOptions = SupportTicketStorageOptions.FromConfiguration(builder.Configuration);
-var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
+await using var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
 
 builder.Services.AddSingleton(supportTickets);
 builder.Services.AddSingleton(supportTickets.Tickets);
 
 var app = builder.Build();
-app.Lifetime.ApplicationStopped.Register(() => supportTickets.DisposeAsync().AsTask().GetAwaiter().GetResult());
 
 app.UseDefaultFiles();
 app.UseStaticFiles();

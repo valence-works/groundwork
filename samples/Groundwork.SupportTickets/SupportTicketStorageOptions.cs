@@ -20,7 +20,9 @@ public sealed record SupportTicketStorageOptions(
         var physicalization = Enum.TryParse<PhysicalizationKind>(section["Physicalization"], ignoreCase: true, out var parsedPhysicalization)
             ? new PhysicalizationPolicy(parsedPhysicalization)
             : PhysicalizationPolicy.Portable;
-        var connectionString = section["ConnectionString"] ?? configuration.GetConnectionString("Groundwork") ?? "Data Source=support-tickets.db";
+        var connectionString = section["ConnectionString"] ?? configuration.GetConnectionString("Groundwork")
+            ?? (provider == SupportTicketProvider.Sqlite ? "Data Source=support-tickets.db" : null)
+            ?? throw new InvalidOperationException($"A connection string must be configured for provider '{provider}'.");
 
         return new SupportTicketStorageOptions(
             provider,
