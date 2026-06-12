@@ -111,6 +111,7 @@ public sealed class ProviderCapabilityTests
 
         Assert.False(result.IsCompatible);
         Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-003");
+        Assert.DoesNotContain(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-004");
     }
 
     [Fact]

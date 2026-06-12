@@ -55,7 +55,8 @@ public sealed class ProviderCapabilityValidator
 
     private static void ValidateUnit(StorageUnit unit, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
     {
-        if (!capabilities.SupportedStorageIntents.Contains(unit.Intent.Kind))
+        var supportsStorageIntent = capabilities.SupportedStorageIntents.Contains(unit.Intent.Kind);
+        if (!supportsStorageIntent)
         {
             diagnostics.Add(GroundworkDiagnostic.Error(
                 "GW-CAP-003",
@@ -63,13 +64,16 @@ public sealed class ProviderCapabilityValidator
                 $"storageUnits.{unit.Identity}.intent.kind"));
         }
 
-        var unsupportedRequirements = unit.Intent.Requirements.Except(capabilities.SupportedStorageRequirements).ToList();
-        if (unsupportedRequirements.Count != 0)
+        if (supportsStorageIntent)
         {
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-CAP-004",
-                $"Provider does not support storage requirements: {string.Join(", ", unsupportedRequirements)}.",
-                $"storageUnits.{unit.Identity}.intent.requirements"));
+            var unsupportedRequirements = unit.Intent.Requirements.Except(capabilities.SupportedStorageRequirements).ToList();
+            if (unsupportedRequirements.Count != 0)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-CAP-004",
+                    $"Provider does not support storage requirements: {string.Join(", ", unsupportedRequirements)}.",
+                    $"storageUnits.{unit.Identity}.intent.requirements"));
+            }
         }
 
         if (!capabilities.SupportedConcurrencyModes.Contains(unit.Concurrency.Kind))

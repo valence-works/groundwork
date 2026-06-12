@@ -23,7 +23,7 @@ app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketReposit
     try
     {
         var opened = await tickets.CreateAsync(request.ToTicket(), cancellationToken);
-        return Results.Created($"/tickets/{opened.Ticket.TicketNumber}", ToTicketResponse(opened));
+        return Results.Created($"/tickets/{UrlSegment(opened.Ticket.TicketNumber)}", ToTicketResponse(opened));
     }
     catch (SupportTicketConflictException exception)
     {
@@ -136,7 +136,7 @@ app.MapPost("/tickets/{ticketNumber}/comments", async (
     try
     {
         var comment = await tickets.AddCommentAsync(ticketNumber, request.AuthorId, request.Body, request.ExpectedTicketVersion, null, cancellationToken);
-        return Results.Created($"/tickets/{ticketNumber}/comments/{comment.Comment.CommentId}", ToCommentResponse(comment));
+        return Results.Created($"/tickets/{UrlSegment(ticketNumber)}/comments/{UrlSegment(comment.Comment.CommentId)}", ToCommentResponse(comment));
     }
     catch (KeyNotFoundException)
     {
@@ -159,6 +159,8 @@ app.MapFallbackToFile("index.html");
 await app.RunAsync();
 
 static IResult Conflict(Exception exception) => Results.Conflict(new { error = exception.Message });
+
+static string UrlSegment(string value) => Uri.EscapeDataString(value);
 
 static SupportTicketResponse ToTicketResponse(SupportTicketDocument document) =>
     new(document.Ticket, document.Version);
