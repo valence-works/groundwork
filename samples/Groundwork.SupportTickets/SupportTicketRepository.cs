@@ -53,7 +53,11 @@ public sealed class SupportTicketRepository(IDocumentStore store)
             new DocumentStoreQuery(SupportTicketManifest.CommentDocumentKind, SupportTicketManifest.ByCommentTicket, ticketNumber),
             cancellationToken);
 
-        return envelopes.Select(ToComment).ToList();
+        return envelopes
+            .Select(ToComment)
+            .OrderBy(comment => comment.Comment.CreatedAt)
+            .ThenBy(comment => comment.Comment.CommentId, StringComparer.Ordinal)
+            .ToList();
     }
 
     public async Task<SupportTicketDocument> AssignAsync(

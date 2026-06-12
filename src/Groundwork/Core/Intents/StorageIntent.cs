@@ -6,6 +6,14 @@ public sealed record StorageIntent
         StorageIntentKind kind,
         IReadOnlySet<StorageRequirement>? requirements,
         string? rationale)
+        : this(kind, requirements as IEnumerable<StorageRequirement>, rationale)
+    {
+    }
+
+    private StorageIntent(
+        StorageIntentKind kind,
+        IEnumerable<StorageRequirement>? requirements,
+        string? rationale)
     {
         Kind = kind;
         Requirements = NormalizeRequirements(requirements);
@@ -19,13 +27,13 @@ public sealed record StorageIntent
     public string? Rationale { get; }
 
     public static StorageIntent PortableDocument() =>
-        new(StorageIntentKind.PortableDocument, new HashSet<StorageRequirement>(), null);
+        new(StorageIntentKind.PortableDocument, Array.Empty<StorageRequirement>(), null);
 
     public static StorageIntent BenchmarkGated(string rationale, params StorageRequirement[]? requirements) =>
-        new(StorageIntentKind.BenchmarkGated, NormalizeRequirements(requirements), rationale);
+        new(StorageIntentKind.BenchmarkGated, requirements, rationale);
 
     public static StorageIntent SpecializedProvider(string rationale, params StorageRequirement[]? requirements) =>
-        new(StorageIntentKind.SpecializedProvider, NormalizeRequirements(requirements), rationale);
+        new(StorageIntentKind.SpecializedProvider, requirements, rationale);
 
     public bool Equals(StorageIntent? other) =>
         other is not null &&
