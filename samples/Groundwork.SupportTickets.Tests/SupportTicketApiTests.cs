@@ -29,6 +29,7 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
     {
         using var client = factory.CreateClient();
 
+        var health = await client.GetFromJsonAsync<SupportTicketHealthResponse>("/healthz");
         var create = await client.PostAsJsonAsync("/tickets", new CreateTicketRequest(
             "TCK-API-1",
             "acme",
@@ -37,6 +38,9 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
             "high",
             DateTimeOffset.Parse("2026-06-12T17:00:00Z")));
         var opened = await ReadTicketAsync(create);
+
+        Assert.Equal(SupportTicketProvider.Sqlite.ToString(), health!.Provider);
+        Assert.Equal("Optimized", health.Physicalization);
 
         var assign = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/assign", new AssignTicketRequest("agent-alex", opened.Version));
         var assigned = await ReadTicketAsync(assign);
@@ -79,4 +83,6 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
         return await response.Content.ReadFromJsonAsync<SupportTicketCommentResponse>()
             ?? throw new InvalidOperationException("Comment response was empty.");
     }
+
+    private sealed record SupportTicketHealthResponse(string Provider, string Physicalization);
 }

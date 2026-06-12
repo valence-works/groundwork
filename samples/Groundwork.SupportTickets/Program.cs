@@ -15,7 +15,7 @@ app.MapGet("/healthz", () => Results.Ok(new
 {
     status = "ok",
     provider = storageOptions.Provider.ToString(),
-    physicalization = storageOptions.EffectivePhysicalization.ToString()
+    physicalization = storageOptions.EffectivePhysicalization.Kind.ToString()
 }));
 
 app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketRepository tickets, CancellationToken cancellationToken) =>

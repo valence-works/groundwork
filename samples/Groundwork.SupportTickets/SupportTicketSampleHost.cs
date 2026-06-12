@@ -86,7 +86,9 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
             case SupportTicketProvider.MongoDb:
             {
                 var client = new MongoClient(options.ConnectionString);
-                disposables.Add(new SyncDisposableAdapter(client));
+                if ((object)client is IDisposable disposableClient)
+                    disposables.Add(new SyncDisposableAdapter(disposableClient));
+
                 var database = client.GetDatabase(options.DatabaseName ?? "groundwork_support_tickets");
                 await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, Provider("groundwork-mongodb"), cancellationToken);
                 return (new MongoDbDocumentStore(database, manifest), disposables);
