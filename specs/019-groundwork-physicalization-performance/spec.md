@@ -76,7 +76,7 @@ A MongoDB-backed storage unit can store and index optimized projection values wh
 - **FR-008**: MongoDB save/update/delete operations MUST keep optimized projection values consistent with document content and optimistic concurrency outcomes.
 - **FR-009**: MongoDB equality queries on eligible optimized indexes MUST use optimized projection fields.
 - **FR-010**: Tests MUST prove the optimized path for SQLite and MongoDB using real provider-backed stores.
-- **FR-011**: Generic Groundwork packages MUST remain Elsa-free.
+- **FR-011**: Generic Groundwork packages MUST remain free of host-specific dependencies.
 
 ### Key Entities
 

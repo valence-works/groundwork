@@ -9,7 +9,7 @@ public sealed class MongoDbDependencyBoundaryTests
     private static readonly string RepositoryRoot = RepositoryRootLocator.FindRepositoryRoot();
 
     [Fact]
-    public void GroundworkMongoDbDoesNotReferenceElsaProjects()
+    public void GroundworkMongoDbDoesNotReferenceHostSpecificProjects()
     {
         var project = Path.Combine(RepositoryRoot, "src/Groundwork/MongoDb/Groundwork.MongoDb.csproj");
         var references = XDocument.Load(project)
@@ -18,7 +18,7 @@ public sealed class MongoDbDependencyBoundaryTests
             .OfType<string>()
             .ToList();
 
-        Assert.All(references, reference => Assert.DoesNotContain("Elsa", reference, StringComparison.OrdinalIgnoreCase));
+        Assert.All(references, reference => Assert.DoesNotContain("HostApplication", reference, StringComparison.OrdinalIgnoreCase));
     }
 
 }

@@ -1,13 +1,13 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
 
 namespace Groundwork.Core.Manifests;
 
 public sealed record StorageUnit(
     StorageUnitIdentity Identity,
     string DisplayName,
-    WorkloadClassification Workload,
+    StorageIntent Intent,
     LifecyclePolicy Lifecycle,
     IdentityPolicy IdentityPolicy,
     TenancyPolicy Tenancy,

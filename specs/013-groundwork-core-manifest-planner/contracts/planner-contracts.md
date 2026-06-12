@@ -43,6 +43,6 @@ Rules:
 ## Shared Planner Requirements
 
 - Same sample manifest can produce both plan kinds.
-- Unsupported workload family blocks planning.
+- Unsupported storage intent blocks planning.
 - Unsupported required index capability blocks planning.
 - Planned operations must include schema-history intent.

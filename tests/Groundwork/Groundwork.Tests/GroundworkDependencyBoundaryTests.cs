@@ -31,19 +31,19 @@ public sealed class GroundworkDependencyBoundaryTests
             .ToList();
 
         Assert.Equal(expected, actual);
-        Assert.DoesNotContain(actual, reference => reference.StartsWith("src/Elsa/", StringComparison.Ordinal));
+        Assert.DoesNotContain(actual, reference => reference.StartsWith("src/HostApplication/", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void GenericGroundworkSourceDoesNotUseElsaNamespace()
+    public void GenericGroundworkSourceDoesNotUseHostSpecificNamespace()
     {
         var sourceFiles = Directory.EnumerateFiles(Path.Combine(RepositoryRoot, "src/Groundwork"), "*.cs", SearchOption.AllDirectories);
 
         foreach (var file in sourceFiles)
         {
             var text = File.ReadAllText(file);
-            Assert.DoesNotContain("namespace Elsa", text, StringComparison.Ordinal);
-            Assert.DoesNotContain("using Elsa", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("namespace HostApplication", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("using HostApplication", text, StringComparison.Ordinal);
         }
     }
 

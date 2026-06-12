@@ -31,7 +31,7 @@ Fields:
 
 - Unit identity.
 - Display name or description.
-- Workload classification.
+- Storage intent.
 - Lifecycle policy.
 - Identity policy.
 - Optional tenancy/partition policy.
@@ -43,37 +43,39 @@ Fields:
 
 Validation rules:
 
-- Workload classification is required.
+- Storage intent is required.
 - Lifecycle, identity, concurrency, and serialization policies are required.
 - Index identities must be unique within the unit.
 - Query contract can reference only declared indexes for portable indexed queries.
-- Operational workloads require explicit specialized/benchmark-gated classification.
+- Non-portable-default storage requires explicit benchmark-gated or specialized-provider intent.
 
-## Workload Classification
+## Storage Intent
 
-Declares the family and allowed Groundwork default category.
+Declares whether a storage unit fits Groundwork's portable document/table contract or requires additional evidence/provider-specific behavior.
 
-Families:
+Intent kinds:
 
-- Metadata/configuration.
-- Catalog/authored data.
-- Runtime-defined business data.
-- Runtime continuation state.
-- Operational stream.
-- Projection.
-- Audit trail.
-
-Candidate categories:
-
-- Groundwork default.
-- Groundwork with physicalization.
-- Benchmark-gated.
+- Portable document.
+- Benchmark gated.
 - Specialized provider.
+
+Behavioral requirements:
+
+- Atomic claim.
+- Lease recovery.
+- Ordered consumption.
+- Retry recovery.
+- Idempotency.
+- Retention policy.
+- Atomic commit.
+- Concurrency evidence.
+- Operational diagnostics.
 
 Validation rules:
 
-- Runtime continuation state must be benchmark-gated or explicitly physicalization-required.
-- Operational streams default to specialized provider unless later policy permits otherwise.
+- Portable document intent cannot declare specialized requirements or rationale.
+- Benchmark-gated and specialized-provider intent must declare a rationale.
+- Benchmark-gated and specialized-provider intent must declare at least one behavioral requirement.
 
 ## Index Declaration
 
@@ -119,7 +121,7 @@ Fields:
 
 - Provider identity.
 - Provider version.
-- Supported workload families.
+- Supported storage intent kinds.
 - Supported candidate categories.
 - Supported index capabilities.
 - Supported query operations.

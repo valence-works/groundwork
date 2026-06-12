@@ -10,10 +10,10 @@
 - [x] Requirements are testable.
 - [x] Success criteria are measurable.
 - [x] Physicalization deferral is explicit.
-- [x] Elsa bridge ownership is explicit.
+- [x] host integration bridge ownership is explicit.
 
 ## Boundary Quality
 
-- [x] Runtime entity concepts remain in `Elsa.Persistence.Groundwork`.
-- [x] Generic Groundwork packages remain Elsa-free.
+- [x] Runtime entity concepts remain in `Groundwork.Hosting`.
+- [x] Generic Groundwork packages remain free of host-specific dependencies.
 - [x] Runtime entity instances use `IDocumentStore`.

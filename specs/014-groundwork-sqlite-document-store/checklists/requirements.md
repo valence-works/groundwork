@@ -7,7 +7,7 @@
 ## Content Quality
 
 - [x] Scope is provider-specific and limited to SQLite MVP
-- [x] Elsa integration remains out of scope
+- [x] host integration remains out of scope
 - [x] Provider behavior is testable
 - [x] All mandatory sections completed
 

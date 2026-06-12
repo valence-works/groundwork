@@ -30,4 +30,4 @@
 - [x] T014 Run `dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj`
 - [x] T015 Run `dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj`
 - [x] T016 Run `dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj`
-- [x] T017 Run `dotnet test Elsa.Server.slnx --no-restore`
+- [x] T017 Run `dotnet test Groundwork.slnx --no-restore`

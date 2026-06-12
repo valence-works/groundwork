@@ -11,7 +11,7 @@ public sealed class RelationalProviderDependencyBoundaryTests
     [Theory]
     [InlineData("src/Groundwork/SqlServer/Groundwork.SqlServer.csproj")]
     [InlineData("src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj")]
-    public void ProviderProjectsDoNotReferenceElsaProjects(string projectPath)
+    public void ProviderProjectsDoNotReferenceHostSpecificProjects(string projectPath)
     {
         var project = Path.Combine(RepositoryRoot, projectPath);
         var references = XDocument.Load(project)
@@ -20,7 +20,7 @@ public sealed class RelationalProviderDependencyBoundaryTests
             .OfType<string>()
             .ToList();
 
-        Assert.All(references, reference => Assert.DoesNotContain("Elsa", reference, StringComparison.OrdinalIgnoreCase));
+        Assert.All(references, reference => Assert.DoesNotContain("HostApplication", reference, StringComparison.OrdinalIgnoreCase));
     }
 
 }

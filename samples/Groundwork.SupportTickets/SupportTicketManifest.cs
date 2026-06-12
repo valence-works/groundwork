@@ -1,7 +1,7 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 
 namespace Groundwork.SupportTickets;
 
@@ -36,7 +36,7 @@ public static class SupportTicketManifest
         new(
             new StorageUnitIdentity(DocumentKind),
             "Support ticket",
-            new WorkloadClassification(WorkloadFamily.RuntimeDefinedBusinessData, WorkloadCandidateCategory.GroundworkDefault),
+            StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
             TenancyPolicy.None,
@@ -50,7 +50,7 @@ public static class SupportTicketManifest
         new(
             new StorageUnitIdentity(CommentDocumentKind),
             "Support ticket comment",
-            new WorkloadClassification(WorkloadFamily.RuntimeDefinedBusinessData, WorkloadCandidateCategory.GroundworkDefault),
+            StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
             TenancyPolicy.None,

@@ -22,7 +22,7 @@ Expected result:
 ## Solution Validation
 
 ```bash
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test Groundwork.slnx --no-restore
 ```
 
 Run restore first if assets are missing.

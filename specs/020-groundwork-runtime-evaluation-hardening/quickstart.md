@@ -3,7 +3,7 @@
 ## Validate Runtime Evaluation Tests
 
 ```bash
-dotnet test tests/Elsa/Persistence/Groundwork/Tests/Elsa.Persistence.Groundwork.Tests.csproj
+dotnet test tests/Groundwork/Groundwork.Hosting.Tests/Groundwork.Hosting.Tests.csproj
 ```
 
 Expected result: evaluator tests classify runtime-defined business data as Groundwork default and classify workflow runtime hot paths as benchmark-gated or specialized.
@@ -11,10 +11,10 @@ Expected result: evaluator tests classify runtime-defined business data as Groun
 ## Validate Full Regression
 
 ```bash
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test Groundwork.slnx --no-restore
 ```
 
-Expected result: all Groundwork and Elsa tests pass.
+Expected result: all Groundwork and application tests pass.
 
 ## Review Decision Artifact
 

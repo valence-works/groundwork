@@ -27,7 +27,7 @@
 - [x] All functional requirements have clear acceptance criteria
 - [x] User scenarios cover primary flows
 - [x] Feature meets measurable outcomes defined in Success Criteria
-- [x] Provider-specific and Elsa-specific implementation work is explicitly out of scope
+- [x] Provider-specific and host-specific implementation work is explicitly out of scope
 
 ## Notes
 

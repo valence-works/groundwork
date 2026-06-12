@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Xunit;
@@ -100,6 +101,60 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
+    public void SpecializedProviderIntentIsRejectedByPortableCapabilities()
+    {
+        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+            "Requires atomic task claiming.",
+            StorageRequirement.AtomicClaim));
+
+        var result = _validator.Validate(manifest, SampleManifests.PortableCapabilities());
+
+        Assert.False(result.IsCompatible);
+        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-003");
+    }
+
+    [Fact]
+    public void UnsupportedStorageRequirementBlocksCompatibility()
+    {
+        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+            "Requires task claiming and abandoned claim recovery.",
+            StorageRequirement.AtomicClaim,
+            StorageRequirement.LeaseRecovery));
+        var capabilities = SampleManifests.PortableCapabilities() with
+        {
+            SupportedStorageIntents = new HashSet<StorageIntentKind> { StorageIntentKind.SpecializedProvider },
+            SupportedStorageRequirements = new HashSet<StorageRequirement> { StorageRequirement.AtomicClaim }
+        };
+
+        var result = _validator.Validate(manifest, capabilities);
+
+        Assert.False(result.IsCompatible);
+        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-004");
+    }
+
+    [Fact]
+    public void SupportedSpecializedIntentAndRequirementsAllowCompatibility()
+    {
+        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+            "Requires task claiming and abandoned claim recovery.",
+            StorageRequirement.AtomicClaim,
+            StorageRequirement.LeaseRecovery));
+        var capabilities = SampleManifests.PortableCapabilities() with
+        {
+            SupportedStorageIntents = new HashSet<StorageIntentKind> { StorageIntentKind.SpecializedProvider },
+            SupportedStorageRequirements = new HashSet<StorageRequirement>
+            {
+                StorageRequirement.AtomicClaim,
+                StorageRequirement.LeaseRecovery
+            }
+        };
+
+        var result = _validator.Validate(manifest, capabilities);
+
+        Assert.True(result.IsCompatible);
+    }
+
+    [Fact]
     public void UnsupportedOptimizedProjectionMaterializationBlocksCompatibility()
     {
         var manifest = SampleManifests.MetadataManifest();
@@ -116,5 +171,11 @@ public sealed class ProviderCapabilityTests
 
         Assert.False(result.IsCompatible);
         Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-011");
+    }
+
+    private static StorageManifest WithSingleUnitIntent(StorageIntent intent)
+    {
+        var manifest = SampleManifests.MetadataManifest();
+        return manifest with { StorageUnits = [manifest.StorageUnits.Single() with { Intent = intent }] };
     }
 }

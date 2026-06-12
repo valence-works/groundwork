@@ -18,13 +18,13 @@ Implement the G2 SQLite portable document store MVP. Add document-store contract
 
 **Testing**: xUnit provider integration tests with SQLite in-memory connection
 
-**Target Platform**: Generic .NET library package consumed later by Elsa Foundation
+**Target Platform**: Generic .NET library package consumed by .NET applications
 
 **Project Type**: Provider-specific Groundwork library plus tests
 
 **Performance Goals**: MVP correctness; no benchmark targets in G2
 
-**Constraints**: No Elsa references; no EF Core; equality queries only; document and index mutations must be transactional
+**Constraints**: No host-specific references; no EF Core; equality queries only; document and index mutations must be transactional
 
 **Scale/Scope**: One provider package, document-store contracts, SQLite tests, solution entries
 
@@ -36,7 +36,7 @@ Implement the G2 SQLite portable document store MVP. Add document-store contract
 | Framework §2.9 persistence invariants provider-neutral | PASS | Store contracts remain provider-neutral; SQLite enforces invariants through provider logic. |
 | Framework §2.10 CQS at persistence boundary | PASS | Store operations separate save/delete from load/query methods. |
 | Framework §2.20 provider module decomposition | PASS | SQLite provider is provider-suffixed and references generic Groundwork contracts only. |
-| Elsa §E2.2 / §E2.6 | PASS | G2 has no Elsa references and no workflow runtime migration. |
+| Runtime migration guardrail | PASS | G2 has no host-specific references and no workflow runtime migration. |
 | Framework §2.23 tests | PASS | Provider behavior is covered with focused SQLite integration tests. |
 
 No justified violations.

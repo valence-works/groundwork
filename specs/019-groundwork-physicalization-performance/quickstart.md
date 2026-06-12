@@ -27,7 +27,7 @@ Expected result: MongoDB stores `physicalized` values, creates provider-native i
 ## Full Regression
 
 ```bash
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test Groundwork.slnx --no-restore
 ```
 
-Expected result: all Groundwork and Elsa validation tests pass.
+Expected result: all Groundwork and host integration validation tests pass.

@@ -9,13 +9,13 @@
 - [x] T002 Create `src/Groundwork/Relational/Groundwork.Relational.csproj` referencing `src/Groundwork/Core/Groundwork.Core.csproj`
 - [x] T003 Create `src/Groundwork/Documents/Groundwork.Documents.csproj` referencing `src/Groundwork/Core/Groundwork.Core.csproj`
 - [x] T004 Create `tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj` referencing the three Groundwork source projects
-- [x] T005 Add Groundwork source and test project entries to `Elsa.Server.slnx`
+- [x] T005 Add Groundwork source and test project entries to `Groundwork.slnx`
 
 ## Phase 2: Foundational Core Types
 
 - [x] T006 [P] Define diagnostic result primitives in `src/Groundwork/Core/Validation/GroundworkDiagnostic.cs`
 - [x] T007 [P] Define manifest identity/version records in `src/Groundwork/Core/Manifests/ManifestIdentity.cs`
-- [x] T008 [P] Define workload classification enums/records in `src/Groundwork/Core/Workloads/WorkloadClassification.cs`
+- [x] T008 [P] Define storage intent enums/records in `src/Groundwork/Core/Intents/StorageIntent.cs`
 - [x] T009 [P] Define lifecycle/identity/tenancy/concurrency/serialization/physicalization policies in `src/Groundwork/Core/Manifests/StoragePolicies.cs`
 - [x] T010 [P] Define index declarations in `src/Groundwork/Core/Indexing/IndexDeclaration.cs`
 - [x] T011 [P] Define portable query declarations in `src/Groundwork/Core/Queries/PortableQueryDeclaration.cs`
@@ -26,7 +26,7 @@
 
 **Goal**: Framework/application authors can define and validate provider-neutral storage manifests.
 
-**Independent Test**: A generic sample metadata manifest validates without any provider or Elsa references.
+**Independent Test**: A generic sample metadata manifest validates without any provider or host-specific references.
 
 - [x] T014 [P] [US1] Add manifest validation tests in `tests/Groundwork/Groundwork.Tests/ManifestValidationTests.cs`
 - [x] T015 [P] [US1] Add generic sample manifest factory in `tests/Groundwork/Groundwork.Tests/SampleManifests.cs`
@@ -71,7 +71,7 @@
 ## Phase 7: Validation
 
 - [x] T036 Run `dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj`
-- [x] T037 Run `dotnet test Elsa.Server.slnx --no-restore`
+- [x] T037 Run `dotnet test Groundwork.slnx --no-restore`
 - [x] T038 Update `specs/013-groundwork-core-manifest-planner/quickstart.md` if validation commands need correction
 
 ## Dependencies

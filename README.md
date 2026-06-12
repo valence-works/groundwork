@@ -4,11 +4,11 @@
 
 Groundwork is a provider-neutral persistence foundation for .NET applications. Modules describe storage intent through manifests, and providers translate those manifests into concrete relational or document database structures.
 
-This repository contains the standalone Groundwork library extracted from the Elsa foundation workspace.
+This repository contains the standalone Groundwork library.
 
 ## Projects
 
-- `Groundwork.Core`: manifests, workload classification, provider capability checks, validation, materialization concepts, and physicalization projection rules.
+- `Groundwork.Core`: manifests, storage intent, provider capability checks, validation, materialization concepts, and physicalization projection rules.
 - `Groundwork.Documents`: portable document-store contracts and document planning.
 - `Groundwork.Relational`: relational planning and shared relational document-store infrastructure.
 - `Groundwork.Sqlite`: SQLite materialization and document-store provider.
@@ -55,7 +55,7 @@ Groundwork starts with a provider-neutral `StorageManifest`. The manifest below 
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 
 const string DocumentKind = "supportTicket";
 const string SchemaVersion = "1.0.0";
@@ -68,9 +68,7 @@ var manifest = new StorageManifest(
         new StorageUnit(
             new StorageUnitIdentity(DocumentKind),
             "Support ticket",
-            new WorkloadClassification(
-                WorkloadFamily.RuntimeDefinedBusinessData,
-                WorkloadCandidateCategory.GroundworkDefault),
+            StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
             TenancyPolicy.None,
@@ -117,6 +115,16 @@ static PortableQueryDeclaration Query(
         sort,
         paging);
 ```
+
+### Storage intent
+
+Storage intent declares whether a unit fits Groundwork's portable document/table contract or needs additional evidence or provider-specific behavior:
+
+- `StorageIntent.PortableDocument()`: Groundwork's default portable document/table contract.
+- `StorageIntent.BenchmarkGated(...)`: possible future Groundwork support, but requires benchmark or correctness evidence.
+- `StorageIntent.SpecializedProvider(...)`: requires a provider or module-specific contract.
+
+Use specialized or benchmark-gated intent when correctness depends on behavior beyond ordinary document storage, such as atomic claiming, lease recovery, ordered consumption, retry recovery, idempotency, retention, atomic commit behavior, concurrency evidence, or operational diagnostics.
 
 Configure SQLite by materializing the manifest, then create an `IDocumentStore` over the same connection:
 
@@ -282,7 +290,7 @@ var manifestValidation = new StorageManifestValidator().Validate(manifest);
 if (!manifestValidation.IsValid)
     throw new InvalidOperationException(string.Join(Environment.NewLine, manifestValidation.Errors));
 
-var capabilityReport = ProviderCapabilityReport.FullyPortable(
+var capabilityReport = ProviderCapabilityReport.PortableDocumentProvider(
     new ProviderIdentity("groundwork-sqlite", "1.0.0"));
 
 var compatibility = new ProviderCapabilityValidator().Validate(manifest, capabilityReport);

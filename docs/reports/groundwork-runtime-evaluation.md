@@ -38,4 +38,4 @@ No workflow runtime hot path should move to Groundwork default from this roadmap
 
 ## Validation Surface
 
-The executable matrix lives in `Elsa.Persistence.Groundwork.RuntimeEvaluation` and is covered by `GroundworkRuntimeStoreEvaluatorTests`.
+The executable matrix should live in a Groundwork runtime-evaluation surface and be covered by `GroundworkRuntimeStoreEvaluatorTests`.

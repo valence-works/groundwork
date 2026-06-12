@@ -1,13 +1,13 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
-using Groundwork.Core.Workloads;
 
 namespace Groundwork.Core.Capabilities;
 
 public sealed record ProviderCapabilityReport(
     ProviderIdentity Provider,
-    IReadOnlySet<WorkloadFamily> SupportedWorkloads,
-    IReadOnlySet<WorkloadCandidateCategory> SupportedCandidateCategories,
+    IReadOnlySet<StorageIntentKind> SupportedStorageIntents,
+    IReadOnlySet<StorageRequirement> SupportedStorageRequirements,
     IndexCapabilities Indexes,
     IReadOnlySet<PortableQueryOperation> SupportedQueryOperations,
     IReadOnlySet<ConcurrencyKind> SupportedConcurrencyModes,
@@ -15,11 +15,11 @@ public sealed record ProviderCapabilityReport(
     bool SupportsSchemaHistory,
     IReadOnlyList<string> Warnings)
 {
-    public static ProviderCapabilityReport FullyPortable(ProviderIdentity provider) =>
+    public static ProviderCapabilityReport PortableDocumentProvider(ProviderIdentity provider) =>
         new(
             provider,
-            Enum.GetValues<WorkloadFamily>().ToHashSet(),
-            Enum.GetValues<WorkloadCandidateCategory>().ToHashSet(),
+            new HashSet<StorageIntentKind> { StorageIntentKind.PortableDocument },
+            new HashSet<StorageRequirement>(),
             IndexCapabilities.All,
             Enum.GetValues<PortableQueryOperation>().ToHashSet(),
             Enum.GetValues<ConcurrencyKind>().ToHashSet(),
