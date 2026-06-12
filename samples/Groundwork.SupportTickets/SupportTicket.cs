@@ -9,4 +9,6 @@ public sealed record SupportTicket(
     string Priority,
     string AssigneeId,
     DateTimeOffset OpenedAt,
-    DateTimeOffset? ResolvedAt = null);
+    DateTimeOffset? ResolvedAt = null,
+    DateTimeOffset? SlaDueAt = null,
+    DateTimeOffset? EscalatedAt = null);

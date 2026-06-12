@@ -36,6 +36,17 @@ dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.c
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 ```
 
+The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization:
+
+```bash
+Groundwork__Provider=Sqlite \
+Groundwork__ConnectionString="Data Source=support-tickets.db" \
+Groundwork__Physicalization=Optimized \
+dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+```
+
+The sample also accepts `PostgreSql`, `SqlServer`, and `MongoDb` as `Groundwork__Provider` values when the matching connection string is supplied. For MongoDB, set `Groundwork__DatabaseName` when you want a database name other than `groundwork_support_tickets`.
+
 ## Use Groundwork
 
 Groundwork starts with a provider-neutral `StorageManifest`. The manifest below declares a support-ticket document/table shape with string IDs, JSON content, optimistic concurrency, a unique ticket-number index, and queryable customer/status/assignee/priority indexes.
