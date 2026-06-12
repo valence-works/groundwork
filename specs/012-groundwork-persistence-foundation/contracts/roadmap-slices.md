@@ -70,6 +70,6 @@ Validation: at least one relational provider and MongoDB support optimized physi
 
 Maps to: original S8.
 
-Outcome: workflow runtime stores receive a go/no-go decision for Groundwork default, Groundwork with physicalization, or specialized provider.
+Outcome: workflow runtime stores receive a go/no-go decision for portable document, benchmark-gated, or specialized-provider storage intent, with physicalization evaluated as a separate provider capability.
 
 Validation: runtime benchmarks, concurrency checks, retry diagnostics, and operational guidance exist before any runtime hot-path migration.

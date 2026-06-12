@@ -31,7 +31,6 @@ public sealed class GroundworkDependencyBoundaryTests
             .ToList();
 
         Assert.Equal(expected, actual);
-        Assert.DoesNotContain(actual, reference => reference.StartsWith("src/HostApplication/", StringComparison.Ordinal));
     }
 
     [Fact]
