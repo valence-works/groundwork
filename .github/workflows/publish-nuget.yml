@@ -1,0 +1,85 @@
+name: Publish NuGet Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish, for example 0.1.0-preview.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  NUGET_SOURCE: https://api.nuget.org/v3/index.json
+
+jobs:
+  publish:
+    name: Pack and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          else
+            version="${{ github.event.release.tag_name }}"
+            version="${version#v}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid package version: $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Restore
+        run: dotnet restore Groundwork.slnx
+
+      - name: Test core packages
+        run: |
+          dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj --configuration Release --no-restore
+          dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj --configuration Release --no-restore
+          dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj --configuration Release --no-restore
+
+      - name: Pack
+        run: |
+          mkdir -p artifacts/packages
+          dotnet pack src/Groundwork/Core/Groundwork.Core.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/Documents/Groundwork.Documents.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/Relational/Groundwork.Relational.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/Sqlite/Groundwork.Sqlite.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/SqlServer/Groundwork.SqlServer.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          dotnet pack src/Groundwork/MongoDb/Groundwork.MongoDb.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+
+      - name: Publish
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [[ -z "$NUGET_API_KEY" ]]; then
+            echo "Missing NUGET_API_KEY repository secret." >&2
+            exit 1
+          fi
+
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source "$NUGET_SOURCE" \
+            --skip-duplicate

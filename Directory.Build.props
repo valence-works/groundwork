@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <Authors>Valence Works</Authors>
+    <Company>Valence Works</Company>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/valence-works/Groundwork</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/valence-works/Groundwork</PackageProjectUrl>
+    <PackageTags>groundwork;persistence;documents;database;dotnet</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="" />
+  </ItemGroup>
+</Project>
