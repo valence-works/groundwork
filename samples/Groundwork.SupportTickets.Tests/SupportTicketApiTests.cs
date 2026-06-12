@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Groundwork.SupportTickets;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Xunit;
 
@@ -13,12 +14,14 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
 
     public SupportTicketApiTests()
     {
-        Environment.SetEnvironmentVariable("Groundwork__Provider", SupportTicketProvider.Sqlite.ToString());
-        Environment.SetEnvironmentVariable("Groundwork__ConnectionString", $"Data Source={databasePath}");
-        Environment.SetEnvironmentVariable("Groundwork__Physicalization", "Optimized");
-
         factory = new WebApplicationFactory<Program>()
-            .WithWebHostBuilder(_ => { });
+            .WithWebHostBuilder(builder =>
+            {
+                builder
+                    .UseSetting("Groundwork:Provider", SupportTicketProvider.Sqlite.ToString())
+                    .UseSetting("Groundwork:ConnectionString", $"Data Source={databasePath}")
+                    .UseSetting("Groundwork:Physicalization", "Optimized");
+            });
     }
 
     [Fact]
@@ -57,9 +60,6 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await factory.DisposeAsync();
-        Environment.SetEnvironmentVariable("Groundwork__Provider", null);
-        Environment.SetEnvironmentVariable("Groundwork__ConnectionString", null);
-        Environment.SetEnvironmentVariable("Groundwork__Physicalization", null);
         if (File.Exists(databasePath))
             File.Delete(databasePath);
     }

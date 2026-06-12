@@ -4,7 +4,6 @@ var builder = WebApplication.CreateBuilder(args);
 var storageOptions = SupportTicketStorageOptions.FromConfiguration(builder.Configuration);
 await using var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
 
-builder.Services.AddSingleton(supportTickets);
 builder.Services.AddSingleton(supportTickets.Tickets);
 
 var app = builder.Build();

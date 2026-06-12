@@ -46,7 +46,7 @@ A Groundwork application can save, load, update, delete, and query documents thr
 
 A Groundwork maintainer can inspect MongoDB provider dependencies and see no application host or relational provider coupling.
 
-**Why this priority**: MongoDB should validate the generic Groundwork boundary, not become an host-specific or relationally shaped implementation.
+**Why this priority**: MongoDB should validate the generic Groundwork boundary, not become a host-specific or relationally shaped implementation.
 
 **Independent Test**: Dependency boundary tests verify `Groundwork.MongoDb` references generic Groundwork contracts and MongoDB driver packages only.
 
