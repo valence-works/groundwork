@@ -29,7 +29,7 @@ A provider integrator can take a validated Groundwork document manifest, materia
 
 A document-store consumer can save JSON documents, load them by kind/id, delete them, and rely on declared indexes being updated transactionally with the document envelope.
 
-**Why this priority**: This is the smallest end-to-end document persistence path needed before Elsa can validate a real module.
+**Why this priority**: This is the smallest end-to-end document persistence path needed before an application host can validate a real module.
 
 **Independent Test**: Save a document with indexed fields, load it, query by each declared index, update it, verify old index values no longer match, then delete it and verify document and index rows are gone.
 
@@ -78,7 +78,7 @@ A document-store consumer receives clear failures for unsupported/unindexed quer
 - **FR-010**: The SQLite provider MUST enforce unique declared indexes.
 - **FR-011**: The document store MUST enforce expected-version optimistic concurrency for save and delete.
 - **FR-012**: The tests MUST prove save/load/delete, index maintenance, undeclared-query rejection, unique-index enforcement, and stale-write/delete rejection.
-- **FR-013**: The provider MUST remain generic and must not reference Elsa packages.
+- **FR-013**: The provider MUST remain generic and must not reference host-specific packages.
 
 ### Key Entities *(include if feature involves data)*
 
@@ -96,7 +96,7 @@ A document-store consumer receives clear failures for unsupported/unindexed quer
 - **SC-002**: SQLite document contract tests pass for save, load, update, delete, and equality query by declared indexes.
 - **SC-003**: Tests prove undeclared queries fail clearly and do not scan.
 - **SC-004**: Tests prove stale expected-version save/delete operations fail without changing persisted data.
-- **SC-005**: Tests prove generic Groundwork SQLite projects do not reference `Elsa.*`.
+- **SC-005**: Tests prove generic Groundwork SQLite projects do not reference host-specific packages.
 
 ## Assumptions
 

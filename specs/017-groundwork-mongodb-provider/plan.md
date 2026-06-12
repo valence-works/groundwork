@@ -6,7 +6,7 @@
 
 ## Summary
 
-Implement G5 by adding `Groundwork.MongoDb`, a native MongoDB provider for Groundwork document workloads. The provider materializes one collection per storage unit, creates native indexes for declared indexes, records schema history, implements `IDocumentStore`, and validates the contract against a container-backed MongoDB database.
+Implement G5 by adding `Groundwork.MongoDb`, a native MongoDB provider for Groundwork document storage. The provider materializes one collection per storage unit, creates native indexes for declared indexes, records schema history, implements `IDocumentStore`, and validates the contract against a container-backed MongoDB database.
 
 ## Technical Context
 
@@ -24,7 +24,7 @@ Implement G5 by adding `Groundwork.MongoDb`, a native MongoDB provider for Groun
 
 **Performance Goals**: Contract correctness; no benchmark targets in G5
 
-**Constraints**: No Elsa references; no EF Core; equality queries only; one-field indexes only; no relational index-row emulation
+**Constraints**: No host-specific references; no EF Core; equality queries only; one-field indexes only; no relational index-row emulation
 
 **Scale/Scope**: One provider package, one provider test project, solution entries, Spec Kit artifacts, program-goal pointer updates
 
@@ -35,7 +35,7 @@ Implement G5 by adding `Groundwork.MongoDb`, a native MongoDB provider for Groun
 | Framework §2.1 three-layer separation | PASS | Generic contracts remain in `Groundwork.Documents`; MongoDB implementation remains provider-specific. |
 | Framework §2.9 persistence invariants provider-neutral | PASS | MongoDB implements the same document/query/concurrency invariants as other providers. |
 | Framework §2.20 provider module decomposition | PASS | MongoDB lives in a provider-suffixed Groundwork package. |
-| Elsa §E2.2 / §E2.6 | PASS | G5 adds generic provider support only; no Elsa runtime migration. |
+| Runtime migration guardrail | PASS | G5 adds generic provider support only; no workflow runtime migration. |
 | Framework §2.23 tests | PASS | Provider behavior is covered by real MongoDB integration tests. |
 
 No justified violations.

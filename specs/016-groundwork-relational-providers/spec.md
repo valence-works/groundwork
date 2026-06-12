@@ -12,9 +12,9 @@
 
 ### User Story 1 - Use SQL Server As A Groundwork Provider (Priority: P1)
 
-A .NET application can choose SQL Server as the Groundwork relational provider for portable document workloads.
+A .NET application can choose SQL Server as the Groundwork relational provider for portable document storage.
 
-**Why this priority**: SQL Server is a primary Elsa deployment target and must prove the manifest/document contract is not SQLite-specific.
+**Why this priority**: SQL Server is a primary application deployment target and must prove the manifest/document contract is not SQLite-specific.
 
 **Independent Test**: Start a SQL Server test container, materialize a manifest, run the shared document-store contract, and verify schema history exists.
 
@@ -27,7 +27,7 @@ A .NET application can choose SQL Server as the Groundwork relational provider f
 
 ### User Story 2 - Use PostgreSQL As A Groundwork Provider (Priority: P1)
 
-A .NET application can choose PostgreSQL as the Groundwork relational provider for portable document workloads.
+A .NET application can choose PostgreSQL as the Groundwork relational provider for portable document storage.
 
 **Why this priority**: PostgreSQL is the second relational target in G4 and must pass the same contract without changing generic Groundwork concepts.
 
@@ -50,7 +50,7 @@ A Groundwork maintainer can inspect relational provider code and see that shared
 
 **Acceptance Scenarios**:
 
-1. **Given** `Groundwork.SqlServer` and `Groundwork.PostgreSql`, **When** dependency boundary tests run, **Then** neither package references Elsa projects.
+1. **Given** `Groundwork.SqlServer` and `Groundwork.PostgreSql`, **When** dependency boundary tests run, **Then** neither package references host-specific projects.
 2. **Given** provider-specific SQL dialects, **When** maintainers inspect materializers, **Then** SQL Server and PostgreSQL isolate only DDL, parameter prefixes, upsert, and paging differences.
 
 ### Edge Cases
@@ -74,7 +74,7 @@ A Groundwork maintainer can inspect relational provider code and see that shared
 - **FR-007**: Both providers MUST reject undeclared index queries.
 - **FR-008**: Both providers MUST enforce expected-version optimistic concurrency for save and delete.
 - **FR-009**: Shared relational behavior SHOULD be extracted into `Groundwork.Relational` when it removes meaningful duplication.
-- **FR-010**: Provider packages MUST not reference Elsa projects.
+- **FR-010**: Provider packages MUST not reference host-specific projects.
 - **FR-011**: Provider validation MUST use real SQL Server and PostgreSQL databases through container-backed integration tests.
 - **FR-012**: Existing SQLite behavior MUST remain green after shared relational extraction.
 

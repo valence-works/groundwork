@@ -9,7 +9,7 @@ public sealed class SqliteDependencyBoundaryTests
     private static readonly string RepositoryRoot = RepositoryRootLocator.FindRepositoryRoot();
 
     [Fact]
-    public void GroundworkSqliteDoesNotReferenceElsaProjects()
+    public void GroundworkSqliteDoesNotReferenceHostSpecificProjects()
     {
         var project = Path.Combine(RepositoryRoot, "src/Groundwork/Sqlite/Groundwork.Sqlite.csproj");
         var references = XDocument.Load(project)
@@ -18,7 +18,7 @@ public sealed class SqliteDependencyBoundaryTests
             .OfType<string>()
             .ToList();
 
-        Assert.All(references, reference => Assert.DoesNotContain("Elsa", reference, StringComparison.OrdinalIgnoreCase));
+        Assert.All(references, reference => Assert.DoesNotContain("HostApplication", reference, StringComparison.OrdinalIgnoreCase));
     }
 
 }

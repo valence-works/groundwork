@@ -1,0 +1,19 @@
+{
+  "name": "groundwork-support-tickets-client",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.0.2",
+    "vite": "8.0.16",
+    "typescript": "6.0.3",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "lucide-react": "1.18.0"
+  },
+  "devDependencies": {}
+}

@@ -55,20 +55,25 @@ public sealed class ProviderCapabilityValidator
 
     private static void ValidateUnit(StorageUnit unit, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
     {
-        if (!capabilities.SupportedWorkloads.Contains(unit.Workload.Family))
+        var supportsStorageIntent = capabilities.SupportedStorageIntents.Contains(unit.Intent.Kind);
+        if (!supportsStorageIntent)
         {
             diagnostics.Add(GroundworkDiagnostic.Error(
                 "GW-CAP-003",
-                $"Provider does not support workload family '{unit.Workload.Family}'.",
-                $"storageUnits.{unit.Identity}.workload.family"));
+                $"Provider does not support storage intent '{unit.Intent.Kind}'.",
+                $"storageUnits.{unit.Identity}.intent.kind"));
         }
 
-        if (!capabilities.SupportedCandidateCategories.Contains(unit.Workload.CandidateCategory))
+        if (supportsStorageIntent)
         {
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-CAP-004",
-                $"Provider does not support workload candidate category '{unit.Workload.CandidateCategory}'.",
-                $"storageUnits.{unit.Identity}.workload.candidateCategory"));
+            var unsupportedRequirements = unit.Intent.Requirements.Except(capabilities.SupportedStorageRequirements).ToList();
+            if (unsupportedRequirements.Count != 0)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-CAP-004",
+                    $"Provider does not support storage requirements: {string.Join(", ", unsupportedRequirements)}.",
+                    $"storageUnits.{unit.Identity}.intent.requirements"));
+            }
         }
 
         if (!capabilities.SupportedConcurrencyModes.Contains(unit.Concurrency.Kind))

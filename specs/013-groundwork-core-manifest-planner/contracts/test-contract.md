@@ -6,7 +6,7 @@ G1 is complete only when focused automated tests cover the kernel contract.
 
 - Valid sample manifest succeeds.
 - Empty manifest fails.
-- Missing workload classification fails.
+- Missing storage intent fails.
 - Missing schema version fails.
 - Query referencing undeclared index fails.
 - Provider-specific required physical shape fails.
@@ -17,7 +17,7 @@ G1 is complete only when focused automated tests cover the kernel contract.
 - Same valid sample manifest produces document plan.
 - Relational plan includes declared indexes and schema-history operation.
 - Document plan includes declared indexes and schema-history operation.
-- Unsupported workload blocks planning.
+- Unsupported storage intent blocks planning.
 
 ## Provider Capability Tests
 
@@ -28,7 +28,7 @@ G1 is complete only when focused automated tests cover the kernel contract.
 
 ## Architecture Boundary Tests
 
-- `Groundwork.Core` has no `ProjectReference` to `Elsa.*`.
+- `Groundwork.Core` has no `ProjectReference` to host-specific packages.
 - `Groundwork.Relational` references only `Groundwork.Core`.
 - `Groundwork.Documents` references only `Groundwork.Core`.
-- No generic Groundwork public contract namespace contains `Elsa`.
+- No generic Groundwork public contract namespace contains `application host`.

@@ -15,6 +15,6 @@
 ## Boundary Quality
 
 - [x] MongoDB provider remains a generic Groundwork package.
-- [x] No Elsa package dependency is required or allowed.
+- [x] No host-specific package dependency is required or allowed.
 - [x] Provider uses native collections and indexes.
 - [x] Relational provider abstractions are not required for MongoDB.

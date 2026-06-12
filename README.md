@@ -4,11 +4,11 @@
 
 Groundwork is a provider-neutral persistence foundation for .NET applications. Modules describe storage intent through manifests, and providers translate those manifests into concrete relational or document database structures.
 
-This repository contains the standalone Groundwork library extracted from the Elsa foundation workspace.
+This repository contains the standalone Groundwork library.
 
 ## Projects
 
-- `Groundwork.Core`: manifests, workload classification, provider capability checks, validation, materialization concepts, and physicalization projection rules.
+- `Groundwork.Core`: manifests, storage intent, provider capability checks, validation, materialization concepts, and physicalization projection rules.
 - `Groundwork.Documents`: portable document-store contracts and document planning.
 - `Groundwork.Relational`: relational planning and shared relational document-store infrastructure.
 - `Groundwork.Sqlite`: SQLite materialization and document-store provider.
@@ -19,6 +19,7 @@ This repository contains the standalone Groundwork library extracted from the El
 ## Requirements
 
 - .NET SDK 10.0 or newer.
+- Node.js and npm when rebuilding the support-ticket React client.
 - Docker for provider tests that use container-backed databases.
 
 ## Build And Test
@@ -27,6 +28,7 @@ This repository contains the standalone Groundwork library extracted from the El
 dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
 dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj
+npm --prefix samples/Groundwork.SupportTickets/Client run build
 ```
 
 Provider integration suites can be run separately when Docker-backed databases are available:
@@ -36,6 +38,17 @@ dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.c
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 ```
 
+The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization:
+
+```bash
+Groundwork__Provider=Sqlite \
+Groundwork__ConnectionString="Data Source=support-tickets.db" \
+Groundwork__Physicalization=Optimized \
+dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+```
+
+The sample also accepts `PostgreSql`, `SqlServer`, and `MongoDb` as `Groundwork__Provider` values when the matching connection string is supplied. For MongoDB, set `Groundwork__DatabaseName` when you want a database name other than `groundwork_support_tickets`.
+
 ## Use Groundwork
 
 Groundwork starts with a provider-neutral `StorageManifest`. The manifest below declares a support-ticket document/table shape with string IDs, JSON content, optimistic concurrency, a unique ticket-number index, and queryable customer/status/assignee/priority indexes.
@@ -44,7 +57,7 @@ Groundwork starts with a provider-neutral `StorageManifest`. The manifest below 
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 
 const string DocumentKind = "supportTicket";
 const string SchemaVersion = "1.0.0";
@@ -57,9 +70,7 @@ var manifest = new StorageManifest(
         new StorageUnit(
             new StorageUnitIdentity(DocumentKind),
             "Support ticket",
-            new WorkloadClassification(
-                WorkloadFamily.RuntimeDefinedBusinessData,
-                WorkloadCandidateCategory.GroundworkDefault),
+            StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
             TenancyPolicy.None,
@@ -106,6 +117,16 @@ static PortableQueryDeclaration Query(
         sort,
         paging);
 ```
+
+### Storage intent
+
+Storage intent declares whether a unit fits Groundwork's portable document/table contract or needs additional evidence or provider-specific behavior:
+
+- `StorageIntent.PortableDocument()`: Groundwork's default portable document/table contract.
+- `StorageIntent.BenchmarkGated(...)`: possible future Groundwork support, but requires benchmark or correctness evidence.
+- `StorageIntent.SpecializedProvider(...)`: requires a provider or module-specific contract.
+
+Use specialized or benchmark-gated intent when correctness depends on behavior beyond ordinary document storage, such as atomic claiming, lease recovery, ordered consumption, retry recovery, idempotency, retention, atomic commit behavior, concurrency evidence, or operational diagnostics.
 
 Configure SQLite by materializing the manifest, then create an `IDocumentStore` over the same connection:
 
@@ -271,7 +292,7 @@ var manifestValidation = new StorageManifestValidator().Validate(manifest);
 if (!manifestValidation.IsValid)
     throw new InvalidOperationException(string.Join(Environment.NewLine, manifestValidation.Errors));
 
-var capabilityReport = ProviderCapabilityReport.FullyPortable(
+var capabilityReport = ProviderCapabilityReport.PortableDocumentProvider(
     new ProviderIdentity("groundwork-sqlite", "1.0.0"));
 
 var compatibility = new ProviderCapabilityValidator().Validate(manifest, capabilityReport);
@@ -287,21 +308,30 @@ Set `PhysicalizationPolicy.Optimized` on a storage unit when a provider should m
 
 ## Sample
 
-`samples/Groundwork.SupportTickets` demonstrates a small support ticket domain on top of `Groundwork.Sqlite`.
+`samples/Groundwork.SupportTickets` demonstrates a small support ticket domain as an ASP.NET Core API with a React/Vite client. The same manifest runs against SQLite, PostgreSQL, SQL Server, or MongoDB.
 
 The sample:
 
-- defines a `supportTicket` manifest with unique ticket numbers and queryable customer, status, assignee, and priority indexes;
-- materializes the SQLite schema;
-- creates and loads tickets through `IDocumentStore`;
+- defines `supportTicket` and `supportTicketComment` storage units with portable document intent;
+- materializes the selected provider schema or collection metadata;
+- creates and loads tickets and comments through `IDocumentStore`;
 - queries by declared indexes;
-- updates tickets with optimistic concurrency;
-- surfaces duplicate ticket numbers as write conflicts.
+- updates tickets with optimistic concurrency, including version-gated comment writes;
+- serves a static React workspace from `wwwroot` and proxies client development requests through Vite.
 
 Run it with:
 
 ```bash
+Groundwork__Provider=Sqlite \
+Groundwork__ConnectionString="Data Source=support-tickets.db" \
 dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+```
+
+For client development, run the API and the Vite dev server separately:
+
+```bash
+GROUNDWORK_SUPPORT_TICKETS_API_URL=http://localhost:5000 \
+npm --prefix samples/Groundwork.SupportTickets/Client run dev
 ```
 
 The historical specs and Groundwork-focused planning notes are kept under `specs/` and `docs/`.

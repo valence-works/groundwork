@@ -1,6 +1,6 @@
 # Groundwork.SqlServer
 
-`Groundwork.SqlServer` provides SQL Server materialization and document storage for portable Groundwork document workloads.
+`Groundwork.SqlServer` provides SQL Server materialization and document-store operations for portable Groundwork documents.
 
 ## Current Scope
 
@@ -16,4 +16,4 @@
 - JSON content is stored as text.
 - Document kinds, document ids, declared index names, declared index values, and physicalized projection values are constrained to `NVARCHAR(450)` because they participate in SQL Server keys or indexes. Keep portable identifiers and indexed values within that limit, or add validation before writing.
 - No Entity Framework dependency.
-- No Elsa dependency.
+- No host-specific dependency.

@@ -8,8 +8,8 @@ The reusable persistence framework. It owns generic vocabulary for storage inten
 
 Validation rules:
 
-- Must not depend on Elsa packages.
-- Must not name Elsa domain concepts.
+- Must not depend on host-specific packages.
+- Must not name host-specific domain concepts.
 - Must be extractable from the repository without renaming generic concepts.
 
 ## Groundwork Kernel
@@ -20,7 +20,7 @@ Responsibilities:
 
 - Manifest model.
 - Storage unit model.
-- Workload classification.
+- Storage intent.
 - Capability validation.
 - Materialization plan contracts.
 - Schema/materialization history contracts.
@@ -28,10 +28,10 @@ Responsibilities:
 
 Non-responsibilities:
 
-- Elsa module discovery.
-- Elsa feature registration.
+- host module discovery.
+- application host feature registration.
 - Provider-specific DDL or native index creation.
-- Domain repositories for Elsa modules.
+- Domain repositories for host modules.
 
 ## Storage Manifest
 
@@ -49,7 +49,7 @@ Required conceptual fields:
 Validation rules:
 
 - Must contain at least one storage unit.
-- Must use generic workload and storage vocabulary.
+- Must use generic storage intent vocabulary.
 - Must declare versioning and materialization expectations.
 
 ## Storage Unit
@@ -59,7 +59,7 @@ A named durable unit within a manifest.
 Required conceptual fields:
 
 - Unit identity.
-- Workload classification.
+- Storage intent.
 - Lifecycle policy.
 - Identity policy.
 - Tenancy/partition policy when applicable.
@@ -71,30 +71,31 @@ Required conceptual fields:
 
 Validation rules:
 
-- Operational workloads cannot silently default to ordinary document storage.
+- Storage that needs behavior beyond ordinary document storage cannot silently default to the portable document contract.
 - Unindexed portable queries must be rejected by contract.
 - Provider-specific physicalization preferences must remain optional preferences, not required provider shape.
 
-## Workload Classification
+## Storage Intent
 
-The declared workload family and behavioral profile for a storage unit.
+The declared portability gate and behavioral requirements for a storage unit.
 
-Initial families:
+Intent kinds:
 
-- Metadata/configuration.
-- Catalog/authored data.
-- Runtime-defined business data.
-- Runtime continuation state.
-- Operational stream.
-- Projection.
-- Audit trail.
+- Portable document.
+- Benchmark gated.
+- Specialized provider.
 
-Classification outputs:
+Behavioral requirements:
 
-- Groundwork default candidate.
-- Groundwork candidate with physicalization.
-- Benchmark-gated candidate.
-- Specialized-provider candidate.
+- Atomic claim.
+- Lease recovery.
+- Ordered consumption.
+- Retry recovery.
+- Idempotency.
+- Retention policy.
+- Atomic commit.
+- Concurrency evidence.
+- Operational diagnostics.
 
 ## Provider Capability Report
 
@@ -103,7 +104,7 @@ A provider-owned report that states whether a manifest can be planned and materi
 Required conceptual fields:
 
 - Provider identity and version.
-- Supported workload families.
+- Supported storage intents.
 - Supported index types.
 - Supported concurrency modes.
 - Supported materialization operations.
@@ -133,19 +134,19 @@ Validation rules:
 
 - Plans must be previewable before apply.
 - Applied versions must be recorded in schema/materialization history.
-- Plans must not require Elsa-specific context.
+- Plans must not require host-specific context.
 
-## Elsa Validation Bridge
+## Host Integration Bridge
 
-The Elsa-side integration that validates Groundwork through real Elsa stores.
+The application host-side integration that validates Groundwork through real application host example stores.
 
 Responsibilities:
 
-- Discover Elsa-owned manifests.
-- Register Groundwork providers inside Elsa shell composition.
+- Discover host-owned manifests.
+- Register Groundwork providers inside application host shell composition.
 - Run startup materialization tasks.
-- Expose Elsa diagnostics/status.
-- Implement Elsa repositories over Groundwork stores.
+- Expose application diagnostics/status.
+- Implement application host repositories over Groundwork stores.
 
 Non-responsibilities:
 

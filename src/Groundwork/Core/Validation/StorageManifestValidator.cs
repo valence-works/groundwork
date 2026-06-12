@@ -1,6 +1,6 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
-using Groundwork.Core.Workloads;
 
 namespace Groundwork.Core.Validation;
 
@@ -43,25 +43,13 @@ public sealed class StorageManifestValidator
                 $"{target}.identity"));
         }
 
-        if (unit.Workload is null)
+        if (unit.Intent is null)
         {
-            diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-003", "Storage unit workload classification is required.", $"{target}.workload"));
+            diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-003", "Storage unit intent is required.", $"{target}.intent"));
         }
-        else if (unit.Workload.Family == WorkloadFamily.OperationalStream &&
-            unit.Workload.CandidateCategory is not WorkloadCandidateCategory.SpecializedProvider)
+        else
         {
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-UNIT-004",
-                "Operational stream workloads must use the specialized-provider category unless a provider-specific contract proves otherwise.",
-                $"{target}.workload"));
-        }
-        else if (unit.Workload.Family == WorkloadFamily.RuntimeContinuationState &&
-            unit.Workload.CandidateCategory is WorkloadCandidateCategory.GroundworkDefault)
-        {
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-UNIT-005",
-                "Runtime continuation state cannot use the Groundwork-default category without benchmark evidence.",
-                $"{target}.workload"));
+            ValidateStorageIntent(unit.Intent, target, diagnostics);
         }
 
         if (unit.Lifecycle is null)
@@ -91,6 +79,38 @@ public sealed class StorageManifestValidator
 
         ValidateIndexes(unit, target, diagnostics);
         ValidateQueries(unit, target, diagnostics);
+    }
+
+    private static void ValidateStorageIntent(StorageIntent intent, string unitTarget, List<GroundworkDiagnostic> diagnostics)
+    {
+        if (intent.Kind == StorageIntentKind.PortableDocument)
+        {
+            if (!string.IsNullOrWhiteSpace(intent.Rationale) || intent.Requirements.Count != 0)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-UNIT-004",
+                    "Portable document storage intent cannot declare specialized requirements or rationale.",
+                    $"{unitTarget}.intent"));
+            }
+
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.Rationale))
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-UNIT-005",
+                "Benchmark-gated and specialized-provider storage intents require a rationale.",
+                $"{unitTarget}.intent.rationale"));
+        }
+
+        if (intent.Requirements.Count == 0)
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-UNIT-012",
+                "Benchmark-gated and specialized-provider storage intents require at least one storage requirement.",
+                $"{unitTarget}.intent.requirements"));
+        }
     }
 
     private static void ValidateIndexes(StorageUnit unit, string unitTarget, List<GroundworkDiagnostic> diagnostics)

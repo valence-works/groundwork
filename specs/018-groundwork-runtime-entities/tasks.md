@@ -18,5 +18,5 @@
 
 ## Phase 4: Validation
 
-- [x] T008 Run `dotnet test tests/Elsa/Persistence/Groundwork/Tests/Elsa.Persistence.Groundwork.Tests.csproj`
-- [x] T009 Run `dotnet test Elsa.Server.slnx --no-restore`
+- [x] T008 Run `dotnet test tests/Groundwork/Groundwork.Hosting.Tests/Groundwork.Hosting.Tests.csproj`
+- [x] T009 Run `dotnet test Groundwork.slnx --no-restore`

@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -8,8 +8,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.1" />
+    <PackageReference Include="MongoDB.Driver" Version="3.9.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
     <ProjectReference Include="..\..\src\Groundwork\Core\Groundwork.Core.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Documents\Groundwork.Documents.csproj" />
+    <ProjectReference Include="..\..\src\Groundwork\MongoDb\Groundwork.MongoDb.csproj" />
+    <ProjectReference Include="..\..\src\Groundwork\PostgreSql\Groundwork.PostgreSql.csproj" />
+    <ProjectReference Include="..\..\src\Groundwork\SqlServer\Groundwork.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Sqlite\Groundwork.Sqlite.csproj" />
   </ItemGroup>
 

@@ -1,4 +1,4 @@
-# Requirements Checklist: Groundwork Elsa Bridge
+# Requirements Checklist: Groundwork Host Integration Bridge
 
 **Feature**: [spec.md](../spec.md)
 
@@ -15,6 +15,6 @@
 ## Boundary Quality
 
 - [x] Generic Groundwork package responsibilities remain provider-neutral.
-- [x] Elsa-specific bridge responsibilities live under `Elsa.Persistence.Groundwork`.
+- [x] host-specific bridge responsibilities live under `Groundwork.Hosting`.
 - [x] Provider-specific SQLite usage is constrained to tests for G3.
 - [x] Existing EF persistence paths remain untouched.

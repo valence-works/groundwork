@@ -27,14 +27,14 @@
 - Throw on first error: rejected because manifest authors need all actionable diagnostics.
 - Return only strings: rejected because later diagnostics need stable codes/severity.
 
-## Decision: Workload classification is explicit
+## Decision: Storage intent is explicit
 
-**Rationale**: G0 identified over-unification as a core risk. The manifest must declare workload family and candidate category so operational streams and runtime continuation state do not silently become ordinary documents.
+**Rationale**: G0 identified over-unification as a core risk. The manifest must declare whether a storage unit is portable by default, benchmark-gated, or provider-specialized so storage that needs stronger behavior does not silently become an ordinary document.
 
 **Alternatives considered**:
 
-- Infer workload from storage unit type: rejected because it hides architecture decisions in naming.
-- Leave workload classification to providers: rejected because invalid defaults would reach planning too late.
+- Infer intent from storage unit type: rejected because it hides architecture decisions in naming.
+- Leave storage intent to providers: rejected because invalid defaults would reach planning too late.
 
 ## Decision: Capability validation is separate from planning
 
@@ -45,11 +45,11 @@
 - Let planners perform capability validation implicitly: rejected because partial plans could hide blockers.
 - Skip capability reports until concrete providers: rejected because provider packages need a contract to implement.
 
-## Decision: Tests use sample manifests rather than Elsa stores
+## Decision: Tests use sample manifests rather than host application stores
 
-**Rationale**: Sample manifests prove the generic kernel without importing Elsa concepts. Elsa stores become validation inputs in G3 after the provider-neutral kernel and SQLite document store are available.
+**Rationale**: Sample manifests prove the generic kernel without importing host-specific concepts. Application host example stores become validation inputs in G3 after the provider-neutral kernel and SQLite document store are available.
 
 **Alternatives considered**:
 
-- Use Secrets as the first sample: rejected for G1 because it introduces Elsa-specific vocabulary too early.
+- Use Secrets as the first sample: rejected for G1 because it introduces host-specific vocabulary too early.
 - Use workflow runtime state as the first sample: rejected because runtime state remains benchmark-gated.

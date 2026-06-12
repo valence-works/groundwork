@@ -14,7 +14,7 @@ Expected result:
 
 - All three projects build.
 - No provider package is required.
-- No Elsa project is referenced.
+- No host-specific project is referenced.
 
 ## 2. Run Groundwork Tests
 
@@ -32,13 +32,13 @@ Expected result:
 ## 3. Confirm Solution Wiring
 
 ```bash
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test Groundwork.slnx --no-restore
 ```
 
 Expected result:
 
 - The solution recognizes the new Groundwork projects and test project.
-- Existing Elsa projects are not required by generic Groundwork projects.
+- Existing host-specific projects are not required by generic Groundwork projects.
 
 ## 4. G2 Readiness Check
 

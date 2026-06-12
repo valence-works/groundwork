@@ -2,7 +2,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 
 namespace Groundwork.Tests;
 
@@ -17,7 +17,7 @@ internal static class SampleManifests
                 new StorageUnit(
                     new StorageUnitIdentity("configurationDocument"),
                     "Configuration document",
-                    new WorkloadClassification(WorkloadFamily.MetadataConfiguration, WorkloadCandidateCategory.GroundworkDefault),
+                    StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
                     TenancyPolicy.TenantPartition(),
@@ -61,5 +61,5 @@ internal static class SampleManifests
             ["Sample generic manifest for Groundwork contract tests."]);
 
     public static ProviderCapabilityReport PortableCapabilities() =>
-        ProviderCapabilityReport.FullyPortable(new ProviderIdentity("portable-test-provider", "1.0.0"));
+        ProviderCapabilityReport.PortableDocumentProvider(new ProviderIdentity("portable-test-provider", "1.0.0"));
 }

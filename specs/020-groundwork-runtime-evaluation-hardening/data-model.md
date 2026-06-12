@@ -7,7 +7,7 @@ Represents one persistence surface being evaluated.
 Fields:
 
 - `Name`: Human-readable candidate name.
-- `Family`: Groundwork workload family.
+- `Intent`: Groundwork storage intent.
 - `RequiresAtomicCommit`: Whether writes must atomically persist multiple runtime state changes.
 - `RequiresPostCommitDispatch`: Whether writes are coupled to post-commit intent dispatch.
 - `IsOperationalStream`: Whether the store behaves like a queue, outbox, log, or event stream.
@@ -21,7 +21,7 @@ Represents the recommendation for a candidate.
 Fields:
 
 - `Candidate`: The evaluated candidate.
-- `Recommendation`: Groundwork candidate category.
+- `Recommendation`: Groundwork storage intent kind.
 - `Decision`: Go, benchmark gate, or no-go.
 - `Reason`: Explanation for the recommendation.
 - `EvidenceGates`: Required evidence before implementation or migration.

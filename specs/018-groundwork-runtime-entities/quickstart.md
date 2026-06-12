@@ -20,6 +20,6 @@ await store.SaveInstanceAsync(definition, "customer-1", """{"email":"a@example.c
 ## Validation Commands
 
 ```bash
-dotnet test tests/Elsa/Persistence/Groundwork/Tests/Elsa.Persistence.Groundwork.Tests.csproj
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test tests/Groundwork/Groundwork.Hosting.Tests/Groundwork.Hosting.Tests.csproj
+dotnet test Groundwork.slnx --no-restore
 ```
