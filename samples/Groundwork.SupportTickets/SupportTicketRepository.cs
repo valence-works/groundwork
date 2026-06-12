@@ -167,7 +167,7 @@ public sealed class SupportTicketRepository(IDocumentStore store)
         {
             DocumentStoreWriteStatus.Saved => ToComment(result.Document!),
             DocumentStoreWriteStatus.ConcurrencyConflict => throw new SupportTicketConflictException(conflictMessage),
-            DocumentStoreWriteStatus.NotFound => throw new KeyNotFoundException("Comment parent was not found."),
+            DocumentStoreWriteStatus.NotFound => throw new KeyNotFoundException("Comment was not found."),
             _ => throw new InvalidOperationException($"Unexpected write status '{result.Status}'.")
         };
 

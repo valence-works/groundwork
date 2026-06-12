@@ -1,6 +1,6 @@
 # Groundwork.MongoDb
 
-`Groundwork.MongoDb` provides MongoDB materialization and document storage for portable Groundwork document storage.
+`Groundwork.MongoDb` provides MongoDB materialization and document-store operations for portable Groundwork documents.
 
 ## Current Scope
 
