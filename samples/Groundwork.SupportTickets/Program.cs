@@ -10,6 +10,9 @@ builder.Services.AddSingleton(supportTickets.Tickets);
 var app = builder.Build();
 app.Lifetime.ApplicationStopped.Register(() => supportTickets.DisposeAsync().AsTask().GetAwaiter().GetResult());
 
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 app.MapGet("/healthz", () => Results.Ok(new
 {
     status = "ok",
@@ -152,6 +155,8 @@ app.MapGet("/tickets/{ticketNumber}/comments", async (string ticketNumber, Suppo
     var comments = await tickets.ListCommentsAsync(ticketNumber, cancellationToken);
     return Results.Ok(comments.Select(ToCommentResponse));
 });
+
+app.MapFallbackToFile("index.html");
 
 await app.RunAsync();
 
