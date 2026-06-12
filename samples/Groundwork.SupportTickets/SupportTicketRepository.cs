@@ -98,8 +98,11 @@ public sealed class SupportTicketRepository(IDocumentStore store)
         CancellationToken cancellationToken = default)
     {
         var existing = await RequireAsync(ticketNumber, cancellationToken);
-        if (existing.Version != expectedTicketVersion)
-            throw new SupportTicketConflictException($"Ticket '{ticketNumber}' changed before the comment could be saved.");
+        await SaveExistingAsync(
+            existing.Ticket,
+            expectedTicketVersion,
+            cancellationToken,
+            $"Ticket '{ticketNumber}' changed before the comment could be saved.");
 
         var comment = new SupportTicketComment(
             $"comment-{Guid.NewGuid():N}",
@@ -139,7 +142,8 @@ public sealed class SupportTicketRepository(IDocumentStore store)
     private async Task<SupportTicketDocument> SaveExistingAsync(
         SupportTicket ticket,
         long expectedVersion,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? conflictMessage = null)
     {
         var result = await store.SaveAsync(
             new SaveDocumentRequest(
@@ -150,7 +154,7 @@ public sealed class SupportTicketRepository(IDocumentStore store)
                 expectedVersion),
             cancellationToken);
 
-        return ToSavedTicket(result, $"Ticket '{ticket.TicketNumber}' changed before the update could be saved.");
+        return ToSavedTicket(result, conflictMessage ?? $"Ticket '{ticket.TicketNumber}' changed before the update could be saved.");
     }
 
     private static SupportTicketDocument ToSavedTicket(DocumentStoreWriteResult result, string conflictMessage) =>

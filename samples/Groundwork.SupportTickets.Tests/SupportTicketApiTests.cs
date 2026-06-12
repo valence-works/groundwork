@@ -49,14 +49,16 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
             $"/tickets/{opened.Ticket.TicketNumber}/comments",
             new AddCommentRequest("agent-alex", "Customer confirmed this blocks month-end billing.", assigned.Version));
         var savedComment = await ReadCommentAsync(comment);
+        var commented = await client.GetFromJsonAsync<SupportTicketResponse>($"/tickets/{opened.Ticket.TicketNumber}");
 
-        var resolve = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/resolve", new VersionedTicketRequest(assigned.Version));
+        var resolve = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/resolve", new VersionedTicketRequest(commented!.Version));
         var resolved = await ReadTicketAsync(resolve);
         var comments = await client.GetFromJsonAsync<IReadOnlyList<SupportTicketCommentResponse>>($"/tickets/{opened.Ticket.TicketNumber}/comments");
         var byPriority = await client.GetFromJsonAsync<IReadOnlyList<SupportTicketResponse>>("/tickets?priority=high");
 
         Assert.Equal("assigned", assigned.Ticket.Status);
         Assert.Equal("resolved", resolved.Ticket.Status);
+        Assert.True(commented.Version > assigned.Version);
         Assert.Equal(savedComment.Comment.CommentId, Assert.Single(comments!).Comment.CommentId);
         Assert.Equal("TCK-API-1", Assert.Single(byPriority!).Ticket.TicketNumber);
     }

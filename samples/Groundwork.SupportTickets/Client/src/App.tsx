@@ -222,6 +222,8 @@ export function App() {
     try {
       const saved = await addComment(selectedTicket.ticket.ticketNumber, "agent-alex", newComment.trim(), selectedTicket.version);
       setComments((current) => [...current, saved]);
+      await refreshTickets();
+      setSelectedNumber(selectedTicket.ticket.ticketNumber);
       setNewComment("");
     } catch (exception) {
       setError(exception instanceof Error ? exception.message : "Could not add comment.");
