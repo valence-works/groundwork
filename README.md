@@ -19,6 +19,7 @@ This repository contains the standalone Groundwork library.
 ## Requirements
 
 - .NET SDK 10.0 or newer.
+- Node.js and npm when rebuilding the support-ticket React client.
 - Docker for provider tests that use container-backed databases.
 
 ## Build And Test
@@ -27,6 +28,7 @@ This repository contains the standalone Groundwork library.
 dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
 dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj
+npm --prefix samples/Groundwork.SupportTickets/Client run build
 ```
 
 Provider integration suites can be run separately when Docker-backed databases are available:
@@ -306,21 +308,30 @@ Set `PhysicalizationPolicy.Optimized` on a storage unit when a provider should m
 
 ## Sample
 
-`samples/Groundwork.SupportTickets` demonstrates a small support ticket domain on top of `Groundwork.Sqlite`.
+`samples/Groundwork.SupportTickets` demonstrates a small support ticket domain as an ASP.NET Core API with a React/Vite client. The same manifest runs against SQLite, PostgreSQL, SQL Server, or MongoDB.
 
 The sample:
 
-- defines a `supportTicket` manifest with unique ticket numbers and queryable customer, status, assignee, and priority indexes;
-- materializes the SQLite schema;
-- creates and loads tickets through `IDocumentStore`;
+- defines `supportTicket` and `supportTicketComment` storage units with portable document intent;
+- materializes the selected provider schema or collection metadata;
+- creates and loads tickets and comments through `IDocumentStore`;
 - queries by declared indexes;
-- updates tickets with optimistic concurrency;
-- surfaces duplicate ticket numbers as write conflicts.
+- updates tickets with optimistic concurrency, including version-gated comment writes;
+- serves a static React workspace from `wwwroot` and proxies client development requests through Vite.
 
 Run it with:
 
 ```bash
+Groundwork__Provider=Sqlite \
+Groundwork__ConnectionString="Data Source=support-tickets.db" \
 dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+```
+
+For client development, run the API and the Vite dev server separately:
+
+```bash
+GROUNDWORK_SUPPORT_TICKETS_API_URL=http://localhost:5000 \
+npm --prefix samples/Groundwork.SupportTickets/Client run dev
 ```
 
 The historical specs and Groundwork-focused planning notes are kept under `specs/` and `docs/`.
