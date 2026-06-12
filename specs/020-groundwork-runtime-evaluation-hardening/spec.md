@@ -66,7 +66,7 @@ Maintainers can review a committed report that summarizes the go/no-go decisions
 ### Functional Requirements
 
 - **FR-001**: Add a Groundwork runtime evaluation surface that returns a recommendation for a runtime store candidate.
-- **FR-002**: Recommendations MUST use the existing Groundwork candidate categories: Groundwork default, Groundwork with physicalization, benchmark-gated, and specialized provider.
+- **FR-002**: Recommendations MUST use storage intent kinds: portable document, benchmark-gated, and specialized provider. Physicalization remains a separate optimization policy and MUST NOT by itself make a runtime hot path portable.
 - **FR-003**: Benchmark-gated recommendations MUST include benchmark and concurrency evidence gates.
 - **FR-004**: Specialized-provider recommendations MUST include a reason that identifies the operational behavior requiring specialization.
 - **FR-005**: Workflow checkpoint/bookmark continuation state MUST NOT be classified as Groundwork default.

@@ -122,7 +122,7 @@ Fields:
 - Provider identity.
 - Provider version.
 - Supported storage intent kinds.
-- Supported candidate categories.
+- Supported storage requirements.
 - Supported index capabilities.
 - Supported query operations.
 - Supported concurrency modes.
