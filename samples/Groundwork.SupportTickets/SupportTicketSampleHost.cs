@@ -86,6 +86,7 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
             case SupportTicketProvider.MongoDb:
             {
                 var client = new MongoClient(options.ConnectionString);
+                disposables.Add(new SyncDisposableAdapter(client));
                 var database = client.GetDatabase(options.DatabaseName ?? "groundwork_support_tickets");
                 await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, Provider("groundwork-mongodb"), cancellationToken);
                 return (new MongoDbDocumentStore(database, manifest), disposables);
@@ -96,4 +97,13 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
     }
 
     private static ProviderIdentity Provider(string name) => new(name, "1.0.0");
+
+    private sealed class SyncDisposableAdapter(IDisposable disposable) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            disposable.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
 }
