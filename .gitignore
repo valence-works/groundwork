@@ -8,6 +8,7 @@
 **/.DS_Store
 .idea/
 .agents/
+*.db
 
 # User-specific files
 *.rsuser
