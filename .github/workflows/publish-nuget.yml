@@ -1,22 +1,23 @@
 name: Publish NuGet Packages
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Package version to publish, for example 0.1.0-preview.1"
-        required: true
-        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish-nuget-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
-  NUGET_SOURCE: https://api.nuget.org/v3/index.json
+  MAIN_NUGET_SOURCE: ${{ vars.MAIN_NUGET_SOURCE || 'https://api.nuget.org/v3/index.json' }}
+  FEEDZ_NUGET_SOURCE: ${{ vars.FEEDZ_NUGET_SOURCE }}
 
 jobs:
   publish:
@@ -34,52 +35,92 @@ jobs:
 
       - name: Resolve package version
         id: version
-        shell: bash
+        shell: pwsh
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.version }}"
+          if ("${{ github.event_name }}" -eq "release") {
+            $version = "${{ github.event.release.tag_name }}"
           else
-            version="${{ github.event.release.tag_name }}"
-            version="${version#v}"
-          fi
+            $baseVersion = "0.0.1"
 
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid package version: $version" >&2
-            exit 1
-          fi
+            if (Test-Path "Build.props") {
+              [xml]$buildProps = Get-Content "Build.props"
+              $configuredBaseVersion = $buildProps.SelectSingleNode("//BaseVersion")?.InnerText
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+              if (-not [string]::IsNullOrWhiteSpace($configuredBaseVersion)) {
+                $baseVersion = $configuredBaseVersion.Trim()
+              }
+            }
+
+            $version = "$baseVersion-preview.${{ github.run_number }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Package version could not be resolved."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Restore
         run: dotnet restore Groundwork.slnx
 
+      - name: Build
+        run: dotnet build Groundwork.slnx --configuration Release --no-restore
+
       - name: Test core packages
         run: |
-          dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj --configuration Release --no-restore
-          dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj --configuration Release --no-restore
-          dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj --configuration Release --no-restore
+          dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj --configuration Release --no-build
+          dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj --configuration Release --no-build
+          dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj --configuration Release --no-build
 
       - name: Pack
+        shell: bash
         run: |
           mkdir -p artifacts/packages
-          dotnet pack src/Groundwork/Core/Groundwork.Core.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/Documents/Groundwork.Documents.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/Relational/Groundwork.Relational.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/Sqlite/Groundwork.Sqlite.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/SqlServer/Groundwork.SqlServer.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
-          dotnet pack src/Groundwork/MongoDb/Groundwork.MongoDb.csproj --configuration Release --no-restore --output artifacts/packages /p:PackageVersion=${{ steps.version.outputs.version }}
+          while IFS= read -r -d '' project; do
+            dotnet pack "$project" \
+              --configuration Release \
+              --no-build \
+              --output artifacts/packages \
+              /p:PackageVersion=${{ steps.version.outputs.version }}
+          done < <(find src/Groundwork -name '*.csproj' -print0 | sort -z)
 
-      - name: Publish
+      - name: Publish to Feedz.io
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          FEEDZ_API_KEY: ${{ secrets.FEEDZ_API_KEY }}
+          FEEDZ_NUGET_SOURCE: ${{ env.FEEDZ_NUGET_SOURCE }}
         run: |
-          if [[ -z "$NUGET_API_KEY" ]]; then
-            echo "Missing NUGET_API_KEY repository secret." >&2
+          if [[ -z "$FEEDZ_NUGET_SOURCE" ]]; then
+            echo "Missing FEEDZ_NUGET_SOURCE repository variable." >&2
+            exit 1
+          fi
+
+          if [[ -z "$FEEDZ_API_KEY" ]]; then
+            echo "Missing FEEDZ_API_KEY repository secret." >&2
             exit 1
           fi
 
           dotnet nuget push "artifacts/packages/*.nupkg" \
-            --api-key "$NUGET_API_KEY" \
-            --source "$NUGET_SOURCE" \
+            --api-key "$FEEDZ_API_KEY" \
+            --source "$FEEDZ_NUGET_SOURCE" \
+            --skip-duplicate
+
+      - name: Publish to main NuGet feed
+        if: github.event_name == 'release'
+        env:
+          MAIN_NUGET_API_KEY: ${{ secrets.MAIN_NUGET_API_KEY || secrets.NUGET_API_KEY }}
+          MAIN_NUGET_SOURCE: ${{ env.MAIN_NUGET_SOURCE }}
+        run: |
+          if [[ -z "$MAIN_NUGET_SOURCE" ]]; then
+            echo "Missing MAIN_NUGET_SOURCE repository variable." >&2
+            exit 1
+          fi
+
+          if [[ -z "$MAIN_NUGET_API_KEY" ]]; then
+            echo "Missing MAIN_NUGET_API_KEY or NUGET_API_KEY repository secret." >&2
+            exit 1
+          fi
+
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --api-key "$MAIN_NUGET_API_KEY" \
+            --source "$MAIN_NUGET_SOURCE" \
             --skip-duplicate

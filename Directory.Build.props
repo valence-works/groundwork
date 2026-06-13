@@ -1,5 +1,9 @@
 <Project>
+  <Import Project="$(MSBuildThisFileDirectory)Build.props" Condition="Exists('$(MSBuildThisFileDirectory)Build.props')" />
+
   <PropertyGroup>
+    <BaseVersion Condition="'$(BaseVersion)' == ''">0.0.1</BaseVersion>
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">$(BaseVersion)</VersionPrefix>
     <Authors>Valence Works</Authors>
     <Company>Valence Works</Company>
     <RepositoryType>git</RepositoryType>

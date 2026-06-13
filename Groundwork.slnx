@@ -1,4 +1,5 @@
 <Solution>
+  <File Path="Build.props" />
   <Folder Name="/src/Groundwork/">
     <Project Path="src/Groundwork/Core/Groundwork.Core.csproj" />
     <Project Path="src/Groundwork/Documents/Groundwork.Documents.csproj" />
