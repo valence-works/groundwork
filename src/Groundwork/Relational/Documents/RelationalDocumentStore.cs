@@ -11,103 +11,110 @@ namespace Groundwork.Relational.Documents;
 
 public class RelationalDocumentStore(DbConnection connection, StorageManifest manifest, RelationalDocumentStoreDialect dialect) : IDocumentStore
 {
+    private readonly SemaphoreSlim connectionGate = new(1, 1);
+
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
-        await EnsureOpenAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-
-        var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, cancellationToken);
-        if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
-            return DocumentStoreWriteResult.ConcurrencyConflict;
-
-        if (existing is null && request.ExpectedVersion is not null)
-            return DocumentStoreWriteResult.NotFound;
-
-        var now = DateTimeOffset.UtcNow;
-        var version = existing is null ? 1 : existing.Version + 1;
-        var createdAt = existing?.CreatedAt ?? now;
-
-        if (existing is null)
+        return await ExecuteWithConnectionAsync(async ct =>
         {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+
+            var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, ct);
+            if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
+                return DocumentStoreWriteResult.ConcurrencyConflict;
+
+            if (existing is null && request.ExpectedVersion is not null)
+                return DocumentStoreWriteResult.NotFound;
+
+            var now = DateTimeOffset.UtcNow;
+            var version = existing is null ? 1 : existing.Version + 1;
+            var createdAt = existing?.CreatedAt ?? now;
+
+            if (existing is null)
+            {
+                try
+                {
+                    await InsertDocumentAsync(request, version, createdAt, now, transaction, ct);
+                }
+                catch (DbException exception) when (dialect.IsDuplicateDocumentKeyException(exception))
+                {
+                    return DocumentStoreWriteResult.ConcurrencyConflict;
+                }
+            }
+            else
+            {
+                var updated = await UpdateDocumentAsync(request, version, now, transaction, ct);
+                if (!updated)
+                    return WriteMissResult(request.ExpectedVersion);
+            }
+
             try
             {
-                await InsertDocumentAsync(request, version, createdAt, now, transaction, cancellationToken);
+                await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, ct);
+                await InsertIndexesAsync(unit, request.Id, request.ContentJson, transaction, ct);
+                await RefreshPhysicalizedAsync(unit, request.Id, version, request.ContentJson, transaction, ct);
             }
-            catch (DbException exception) when (dialect.IsDuplicateDocumentKeyException(exception))
+            catch (DbException exception) when (dialect.IsUniqueIndexException(exception))
             {
                 return DocumentStoreWriteResult.ConcurrencyConflict;
             }
-        }
-        else
-        {
-            var updated = await UpdateDocumentAsync(request, version, now, transaction, cancellationToken);
-            if (!updated)
+            catch (DbException exception) when (dialect.IsWriteDependencyException(exception))
+            {
                 return WriteMissResult(request.ExpectedVersion);
-        }
+            }
 
-        try
-        {
-            await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, cancellationToken);
-            await InsertIndexesAsync(unit, request.Id, request.ContentJson, transaction, cancellationToken);
-            await RefreshPhysicalizedAsync(unit, request.Id, version, request.ContentJson, transaction, cancellationToken);
-        }
-        catch (DbException exception) when (dialect.IsUniqueIndexException(exception))
-        {
-            return DocumentStoreWriteResult.ConcurrencyConflict;
-        }
-        catch (DbException exception) when (dialect.IsWriteDependencyException(exception))
-        {
-            return WriteMissResult(request.ExpectedVersion);
-        }
+            await transaction.CommitAsync(ct);
 
-        await transaction.CommitAsync(cancellationToken);
-
-        return DocumentStoreWriteResult.Saved(new DocumentEnvelope(
-            request.DocumentKind,
-            request.Id,
-            request.SchemaVersion,
-            version,
-            request.ContentJson,
-            createdAt,
-            now));
+            return DocumentStoreWriteResult.Saved(new DocumentEnvelope(
+                request.DocumentKind,
+                request.Id,
+                request.SchemaVersion,
+                version,
+                request.ContentJson,
+                createdAt,
+                now));
+        }, cancellationToken);
     }
 
     public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
     {
         _ = GetUnit(documentKind);
-        await EnsureOpenAsync(cancellationToken);
-        return await LoadCoreAsync(documentKind, id, null, cancellationToken);
+        return await ExecuteWithConnectionAsync(
+            ct => LoadCoreAsync(documentKind, id, null, ct),
+            cancellationToken);
     }
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
-        await EnsureOpenAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        return await ExecuteWithConnectionAsync(async ct =>
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
 
-        var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, cancellationToken);
-        if (existing is null)
-            return DocumentStoreWriteResult.NotFound;
+            var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, ct);
+            if (existing is null)
+                return DocumentStoreWriteResult.NotFound;
 
-        if (request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
-            return DocumentStoreWriteResult.ConcurrencyConflict;
+            if (request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
+                return DocumentStoreWriteResult.ConcurrencyConflict;
 
-        await using var command = CreateCommand(dialect.DeleteDocumentCommandSql(request.ExpectedVersion is not null), transaction);
-        AddParameter(command, "kind", request.DocumentKind);
-        AddParameter(command, "id", request.Id);
-        if (request.ExpectedVersion is not null)
-            AddParameter(command, "expectedVersion", request.ExpectedVersion.Value);
+            await using var command = CreateCommand(dialect.DeleteDocumentCommandSql(request.ExpectedVersion is not null), transaction);
+            AddParameter(command, "kind", request.DocumentKind);
+            AddParameter(command, "id", request.Id);
+            if (request.ExpectedVersion is not null)
+                AddParameter(command, "expectedVersion", request.ExpectedVersion.Value);
 
-        var deletedRows = await command.ExecuteNonQueryAsync(cancellationToken);
-        if (deletedRows == 0)
-            return WriteMissResult(request.ExpectedVersion);
+            var deletedRows = await command.ExecuteNonQueryAsync(ct);
+            if (deletedRows == 0)
+                return WriteMissResult(request.ExpectedVersion);
 
-        await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, cancellationToken);
-        await DeletePhysicalizedAsync(unit, request.Id, transaction, cancellationToken);
+            await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, ct);
+            await DeletePhysicalizedAsync(unit, request.Id, transaction, ct);
 
-        await transaction.CommitAsync(cancellationToken);
-        return DocumentStoreWriteResult.Deleted;
+            await transaction.CommitAsync(ct);
+            return DocumentStoreWriteResult.Deleted;
+        }, cancellationToken);
     }
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
@@ -123,20 +130,22 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         if (index.Fields.Count != 1)
             throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
 
-        await EnsureOpenAsync(cancellationToken);
-        await using var command = CreateQueryCommand(unit, query);
-        AddParameter(command, "kind", query.DocumentKind);
-        AddParameter(command, "index", query.IndexName);
-        AddParameter(command, "value", query.Value);
-        AddParameter(command, "take", take);
-        AddParameter(command, "skip", skip);
+        return await ExecuteWithConnectionAsync(async ct =>
+        {
+            await using var command = CreateQueryCommand(unit, query);
+            AddParameter(command, "kind", query.DocumentKind);
+            AddParameter(command, "index", query.IndexName);
+            AddParameter(command, "value", query.Value);
+            AddParameter(command, "take", take);
+            AddParameter(command, "skip", skip);
 
-        var documents = new List<DocumentEnvelope>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-            documents.Add(ReadEnvelope(reader));
+            var documents = new List<DocumentEnvelope>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                documents.Add(ReadEnvelope(reader));
 
-        return documents;
+            return documents;
+        }, cancellationToken);
     }
 
     private DbCommand CreateQueryCommand(StorageUnit unit, DocumentStoreQuery query)
@@ -368,5 +377,21 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
     {
         if (connection.State != ConnectionState.Open)
             await connection.OpenAsync(cancellationToken);
+    }
+
+    private async Task<T> ExecuteWithConnectionAsync<T>(
+        Func<CancellationToken, Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        await connectionGate.WaitAsync(cancellationToken);
+        try
+        {
+            await EnsureOpenAsync(cancellationToken);
+            return await operation(cancellationToken);
+        }
+        finally
+        {
+            connectionGate.Release();
+        }
     }
 }

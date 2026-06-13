@@ -89,6 +89,24 @@ public sealed class SqliteDocumentStoreTests
     }
 
     [Fact]
+    public async Task ConcurrentQueriesCanShareStoreConnection()
+    {
+        await using var harness = await SqliteDocumentStoreHarness.Create();
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        var queries = Enumerable.Range(0, 50)
+            .Select(_ => harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "alpha")));
+
+        var results = await Task.WhenAll(queries);
+
+        Assert.All(results, result => Assert.Single(result));
+    }
+
+    [Fact]
     public async Task CompoundIndexesAreNotQueryableUntilPortableSupportExists()
     {
         var manifest = WithCompoundIndex(SqliteTestManifests.MetadataManifest());
