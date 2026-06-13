@@ -18,13 +18,13 @@ Implement G7 by extending Groundwork's existing manifest/planner/provider stack 
 
 **Testing**: xUnit tests with SQLite in-memory provider and Testcontainers MongoDB
 
-**Target Platform**: Groundwork provider packages inside Elsa Foundation
+**Target Platform**: Groundwork provider packages inside standalone Groundwork
 
 **Project Type**: Library/provider framework
 
 **Performance Goals**: Correctness of optimized physical query path; benchmark suite deferred to G8 runtime hardening
 
-**Constraints**: Portable default remains unchanged; no caller API changes; Elsa concepts cannot leak into generic Groundwork packages; optimized projections must honor optimistic concurrency
+**Constraints**: Portable default remains unchanged; no caller API changes; host-specific concepts cannot leak into generic Groundwork packages; optimized projections must honor optimistic concurrency
 
 **Scale/Scope**: Physicalization plan metadata, relational optimized projections for SQLite validation, MongoDB optimized projections, provider tests, roadmap pointer updates
 
@@ -32,10 +32,10 @@ Implement G7 by extending Groundwork's existing manifest/planner/provider stack 
 
 | Gate | Status | Note |
 |---|---|---|
-| Framework §2.1 three-layer separation | PASS | Manifest vocabulary stays generic; Elsa bridge is not involved. |
+| Framework §2.1 three-layer separation | PASS | Manifest vocabulary stays generic; host integration bridge is not involved. |
 | Framework §2.9 persistence invariants provider-neutral | PASS | `IDocumentStore` remains the caller contract. |
 | Framework §2.20 provider module decomposition | PASS | Provider-specific physicalization stays in provider packages. |
-| Elsa §E2.2 / §E2.6 | PASS | Workflow runtime stores remain out of scope. |
+| Runtime migration guardrail | PASS | Workflow runtime stores remain out of scope. |
 | Framework §2.23 tests | PASS | SQLite and MongoDB provider-backed tests prove optimized behavior. |
 
 No justified violations.
@@ -92,7 +92,7 @@ tests/Groundwork/Groundwork.MongoDb.Tests/
 └── MongoDbOptimizedPhysicalizationTests.cs
 ```
 
-**Structure Decision**: G7 extends existing Groundwork core/provider packages. It does not introduce new provider packages or Elsa bridge code.
+**Structure Decision**: G7 extends existing Groundwork core/provider packages. It does not introduce new provider packages or host integration bridge code.
 
 ## Complexity Tracking
 

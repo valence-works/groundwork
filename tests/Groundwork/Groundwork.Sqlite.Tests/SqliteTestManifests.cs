@@ -2,7 +2,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 
 namespace Groundwork.Sqlite.Tests;
 
@@ -17,7 +17,7 @@ internal static class SqliteTestManifests
                 new StorageUnit(
                     new StorageUnitIdentity("configurationDocument"),
                     "Configuration document",
-                    new WorkloadClassification(WorkloadFamily.MetadataConfiguration, WorkloadCandidateCategory.GroundworkDefault),
+                    StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
                     TenancyPolicy.None,

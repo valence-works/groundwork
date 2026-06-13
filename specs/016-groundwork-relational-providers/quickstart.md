@@ -25,5 +25,5 @@ Docker must be available for provider integration tests.
 ```bash
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test Groundwork.slnx --no-restore
 ```

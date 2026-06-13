@@ -1,6 +1,6 @@
 # Groundwork.PostgreSql
 
-`Groundwork.PostgreSql` provides PostgreSQL materialization and document storage for portable Groundwork document workloads.
+`Groundwork.PostgreSql` provides PostgreSQL materialization and document-store operations for portable Groundwork documents.
 
 ## Current Scope
 
@@ -15,4 +15,4 @@
 - Equality queries only.
 - JSON content is stored as text.
 - No Entity Framework dependency.
-- No Elsa dependency.
+- No host-specific dependency.

@@ -6,25 +6,25 @@
 
 ## Summary
 
-Implement G8 by adding an Elsa Groundwork runtime evaluation surface that classifies workflow runtime persistence candidates using Groundwork workload categories, preserves benchmark/concurrency/retry/operational evidence gates, and publishes a report with explicit go/no-go decisions. No workflow runtime store is migrated in this slice.
+Implement G8 by adding a Groundwork runtime evaluation surface that classifies workflow runtime persistence candidates using Groundwork storage intent kinds, preserves benchmark/concurrency/retry/operational evidence gates, and publishes a report with explicit go/no-go decisions. No workflow runtime store is migrated in this slice.
 
 ## Technical Context
 
 **Language/Version**: C# / .NET 10 (`net10.0`)
 
-**Primary Dependencies**: Existing `Elsa.Persistence.Groundwork`, `Groundwork.Core`
+**Primary Dependencies**: Existing `Groundwork.Hosting`, `Groundwork.Core`
 
 **Storage**: N/A; decision/evaluation surface only
 
-**Testing**: xUnit tests in Elsa Persistence Groundwork tests
+**Testing**: xUnit tests in Groundwork host-integration tests
 
-**Target Platform**: Elsa Groundwork bridge package
+**Target Platform**: Groundwork host bridge package
 
 **Project Type**: Library/integration decision surface plus report
 
 **Performance Goals**: No runtime performance target in code; benchmark gates are recorded as migration prerequisites
 
-**Constraints**: Do not migrate runtime stores; do not classify runtime hot paths as Groundwork default; keep generic Groundwork packages Elsa-free
+**Constraints**: Do not migrate runtime stores; do not classify runtime hot paths as Groundwork default; keep generic Groundwork packages free of host-specific dependencies
 
 **Scale/Scope**: Runtime store evaluator, tests, report, G8 Speckit artifacts, roadmap pointer updates
 
@@ -32,10 +32,10 @@ Implement G8 by adding an Elsa Groundwork runtime evaluation surface that classi
 
 | Gate | Status | Note |
 |---|---|---|
-| Framework §2.1 three-layer separation | PASS | Evaluation lives in Elsa bridge, not generic Groundwork. |
+| Framework §2.1 three-layer separation | PASS | Evaluation lives in host integration bridge, not generic Groundwork. |
 | Framework §2.9 persistence invariants provider-neutral | PASS | Runtime hot paths remain gated until evidence exists. |
 | Framework §2.20 provider module decomposition | PASS | No provider package changes. |
-| Elsa §E2.2 / §E2.6 | PASS | No runtime store implementation or Design/Runtime dependency change. |
+| Runtime migration guardrail | PASS | No runtime store implementation or Design/Runtime dependency change. |
 | Framework §2.23 tests | PASS | Tests preserve conservative runtime candidate classification. |
 
 No justified violations.
@@ -64,16 +64,16 @@ docs/reports/
 ### Source Code
 
 ```text
-src/Elsa/Persistence/Groundwork/RuntimeEvaluation/
+src/Groundwork/Hosting/RuntimeEvaluation/
 ├── RuntimeStoreCandidate.cs
 ├── RuntimeStoreEvaluation.cs
 └── GroundworkRuntimeStoreEvaluator.cs
 
-tests/Elsa/Persistence/Groundwork/Tests/
+tests/Groundwork/Groundwork.Hosting.Tests/
 └── GroundworkRuntimeStoreEvaluatorTests.cs
 ```
 
-**Structure Decision**: G8 is Elsa-specific evaluation of Elsa runtime stores, so it belongs in `Elsa.Persistence.Groundwork`, not generic Groundwork packages.
+**Structure Decision**: G8 is host-integration evaluation of workflow runtime stores, so it belongs in `Groundwork.Hosting`, not generic Groundwork packages.
 
 ## Complexity Tracking
 

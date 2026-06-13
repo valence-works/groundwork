@@ -2,7 +2,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
-using Groundwork.Core.Workloads;
+using Groundwork.Core.Intents;
 using Groundwork.Documents.Planning;
 using Groundwork.Relational.Planning;
 using Xunit;
@@ -71,11 +71,11 @@ public sealed class PlannerContractTests
     }
 
     [Fact]
-    public void UnsupportedWorkloadBlocksPlanning()
+    public void UnsupportedStorageIntentBlocksPlanning()
     {
         var capabilities = SampleManifests.PortableCapabilities() with
         {
-            SupportedWorkloads = new HashSet<WorkloadFamily> { WorkloadFamily.CatalogAuthoredData }
+            SupportedStorageIntents = new HashSet<StorageIntentKind>()
         };
 
         var relational = NewRelationalPlanner().Plan(SampleManifests.MetadataManifest(), capabilities);

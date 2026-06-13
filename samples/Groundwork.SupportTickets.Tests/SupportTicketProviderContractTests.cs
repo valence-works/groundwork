@@ -33,7 +33,9 @@ public abstract class SupportTicketProviderContractTests
             "Customer confirmed this blocks month-end billing.",
             escalated.Version,
             DateTimeOffset.Parse("2026-06-12T10:05:00Z"));
-        var resolved = await harness.Host.Tickets.ResolveAsync(escalated.Ticket.TicketNumber, escalated.Version, DateTimeOffset.Parse("2026-06-12T10:30:00Z"));
+        var commented = await harness.Host.Tickets.LoadAsync(escalated.Ticket.TicketNumber)
+            ?? throw new InvalidOperationException("Commented ticket was not found.");
+        var resolved = await harness.Host.Tickets.ResolveAsync(commented.Ticket.TicketNumber, commented.Version, DateTimeOffset.Parse("2026-06-12T10:30:00Z"));
 
         var acmeTickets = await harness.Host.Tickets.ListByCustomerAsync("acme");
         var highPriorityTickets = await harness.Host.Tickets.ListByPriorityAsync("high");
@@ -44,6 +46,7 @@ public abstract class SupportTicketProviderContractTests
         Assert.Equal("TCK-9001", found.Ticket.TicketNumber);
         Assert.Equal("escalated", escalated.Ticket.Status);
         Assert.Equal("resolved", resolved.Ticket.Status);
+        Assert.True(commented.Version > escalated.Version);
         Assert.NotNull(escalated.Ticket.EscalatedAt);
         Assert.Single(acmeTickets);
         Assert.Single(highPriorityTickets);

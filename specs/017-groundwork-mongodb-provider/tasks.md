@@ -5,7 +5,7 @@
 - [x] T001 Create G5 specification and implementation plan in `specs/017-groundwork-mongodb-provider/`
 - [x] T002 Create `src/Groundwork/MongoDb/Groundwork.MongoDb.csproj`
 - [x] T003 Create `tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj`
-- [x] T004 Add MongoDB provider and test project entries to `Elsa.Server.slnx`
+- [x] T004 Add MongoDB provider and test project entries to `Groundwork.slnx`
 
 ## Phase 2: MongoDB Provider
 
@@ -25,4 +25,4 @@
 - [x] T012 Run `dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj`
 - [x] T013 Run `dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj`
 - [x] T014 Run `dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj`
-- [x] T015 Run `dotnet test Elsa.Server.slnx --no-restore`
+- [x] T015 Run `dotnet test Groundwork.slnx --no-restore`

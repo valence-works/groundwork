@@ -6,13 +6,13 @@
 
 **Status**: Draft
 
-**Input**: User description: "Groundwork G8 runtime evaluation and hardening. Produce explicit go/no-go decisions for Elsa workflow runtime stores: Groundwork default, Groundwork with physicalization, benchmark-gated, or specialized provider. Runtime hot paths must not migrate silently. The result must include benchmark/concurrency/retry/operational gates and tests that preserve the conservative classification."
+**Input**: User description: "Groundwork G8 runtime evaluation and hardening. Produce explicit go/no-go decisions for workflow runtime stores: Groundwork default, Groundwork with physicalization, benchmark-gated, or specialized provider. Runtime hot paths must not migrate silently. The result must include benchmark/concurrency/retry/operational gates and tests that preserve the conservative classification."
 
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Classify Runtime Store Candidates (Priority: P1)
 
-An Elsa architect can evaluate each runtime store candidate and see whether Groundwork is a default fit, a physicalization candidate, a benchmark-gated candidate, or a specialized-provider responsibility.
+An application architect can evaluate each runtime store candidate and see whether Groundwork is a default fit, a physicalization candidate, a benchmark-gated candidate, or a specialized-provider responsibility.
 
 **Why this priority**: G8 is the final roadmap guardrail before runtime hot-path work can begin.
 
@@ -65,8 +65,8 @@ Maintainers can review a committed report that summarizes the go/no-go decisions
 
 ### Functional Requirements
 
-- **FR-001**: Add an Elsa Groundwork runtime evaluation surface that returns a recommendation for a runtime store candidate.
-- **FR-002**: Recommendations MUST use the existing Groundwork candidate categories: Groundwork default, Groundwork with physicalization, benchmark-gated, and specialized provider.
+- **FR-001**: Add a Groundwork runtime evaluation surface that returns a recommendation for a runtime store candidate.
+- **FR-002**: Recommendations MUST use storage intent kinds: portable document, benchmark-gated, and specialized provider. Physicalization remains a separate optimization policy and MUST NOT by itself make a runtime hot path portable.
 - **FR-003**: Benchmark-gated recommendations MUST include benchmark and concurrency evidence gates.
 - **FR-004**: Specialized-provider recommendations MUST include a reason that identifies the operational behavior requiring specialization.
 - **FR-005**: Workflow checkpoint/bookmark continuation state MUST NOT be classified as Groundwork default.
@@ -78,7 +78,7 @@ Maintainers can review a committed report that summarizes the go/no-go decisions
 ### Key Entities
 
 - **Runtime Store Candidate**: A workflow-runtime persistence surface being evaluated for Groundwork.
-- **Runtime Store Recommendation**: The resulting candidate category plus decision, reason, and evidence gates.
+- **Runtime Store Recommendation**: The resulting storage intent kind plus decision, reason, and evidence gates.
 - **Evidence Gate**: Required benchmark, concurrency, retry, diagnostic, or operational evidence before migration.
 - **Runtime Evaluation Report**: Committed decision artifact summarizing candidate classifications.
 

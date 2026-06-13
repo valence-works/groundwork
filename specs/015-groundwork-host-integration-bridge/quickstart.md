@@ -1,19 +1,19 @@
-# Quickstart: Groundwork Elsa Bridge
+# Quickstart: Groundwork Host Integration Bridge
 
 ## Register The Bridge
 
-1. Add `Elsa.Persistence.Groundwork`.
+1. Add `Groundwork.Hosting`.
 2. Register the bridge with one or more manifests:
 
 ```csharp
-services.AddElsaGroundworkPersistence(options =>
+services.AddGroundworkHosting(options =>
 {
     options.Manifests.Add(SecretsGroundworkManifestFactory.Create());
 });
 ```
 
 3. Register one or more `IGroundworkPersistenceProvider` adapters in the application composition.
-4. Run Elsa startup tasks. The bridge startup task materializes the configured manifests against registered providers when `MaterializeOnStartup` is `true`.
+4. Run application host startup tasks. The bridge startup task materializes the configured manifests against registered providers when `MaterializeOnStartup` is `true`.
 
 ## Inspect Diagnostics
 
@@ -26,7 +26,7 @@ Resolve `GroundworkPersistenceDiagnostics` and request a snapshot. The snapshot 
 ## Validation Commands
 
 ```bash
-dotnet test tests/Elsa/Persistence/Groundwork/Tests/Elsa.Persistence.Groundwork.Tests.csproj
-dotnet test tests/Elsa/Architecture/Elsa.Architecture.Tests.csproj
-dotnet test Elsa.Server.slnx --no-restore
+dotnet test tests/Groundwork/Groundwork.Hosting.Tests/Groundwork.Hosting.Tests.csproj
+dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
+dotnet test Groundwork.slnx --no-restore
 ```

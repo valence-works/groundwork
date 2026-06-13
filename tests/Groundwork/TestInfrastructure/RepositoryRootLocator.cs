@@ -9,8 +9,7 @@ internal static class RepositoryRootLocator
 
         while (directory is not null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "Groundwork.slnx")) ||
-                File.Exists(Path.Combine(directory.FullName, "Elsa.Server.slnx")))
+            if (File.Exists(Path.Combine(directory.FullName, "Groundwork.slnx")))
                 return directory.FullName;
 
             if (gitRoot is null && (Directory.Exists(Path.Combine(directory.FullName, ".git")) || File.Exists(Path.Combine(directory.FullName, ".git"))))

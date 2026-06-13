@@ -6,7 +6,7 @@ The original Persistence vNext roadmap is rewritten as Groundwork-first slices.
 
 Maps to: new prerequisite slice.
 
-Outcome: Groundwork has a generic product boundary, package map, workload taxonomy, manifest vocabulary, roadmap mapping, and Elsa validation boundary.
+Outcome: Groundwork has a generic product boundary, package map, storage intent model, manifest vocabulary, roadmap mapping, and host integration validation boundary.
 
 Non-scope: implementation code and provider packages.
 
@@ -16,21 +16,21 @@ Maps to: original S1.
 
 Outcome: `Groundwork.Core`, `Groundwork.Relational`, and `Groundwork.Documents` can validate provider-neutral manifests and produce relational/document plans.
 
-Validation: sample manifest produces relational and document plans; no Elsa references.
+Validation: sample manifest produces relational and document plans; no host-specific references.
 
 ## G2 - SQLite Portable Document Store MVP
 
 Maps to: original S2.
 
-Outcome: SQLite supports save, load, delete, declared indexes, portable query, optimistic concurrency, and schema history for document workloads.
+Outcome: SQLite supports save, load, delete, declared indexes, portable query, optimistic concurrency, and schema history for document storage.
 
 Validation: shared document contract tests pass on SQLite.
 
-## G3 - Elsa Bridge And First Real Module
+## G3 - Host Integration Bridge And First Real Module
 
 Maps to: original S5, moved earlier and narrowed.
 
-Outcome: Elsa can register Groundwork, materialize startup plans, expose diagnostics, and migrate one low-risk module such as Secrets through an opt-in Groundwork-backed path.
+Outcome: An application host can register Groundwork, materialize startup plans, expose diagnostics, and migrate one low-risk module such as Secrets through an opt-in Groundwork-backed path.
 
 Validation: existing behavior remains intact and provider-specific EF migrations are not required for the Groundwork-backed path.
 
@@ -54,7 +54,7 @@ Validation: native indexes are created for declared indexes.
 
 Maps to: original S6.
 
-Outcome: Elsa runtime-defined entity definitions and instances use Groundwork document/index storage without requiring a physical table per runtime entity by default.
+Outcome: workflow runtime-defined entity definitions and instances use Groundwork document/index storage without requiring a physical table per runtime entity by default.
 
 Validation: published runtime entity definitions can create and query instances by declared indexes.
 
@@ -70,6 +70,6 @@ Validation: at least one relational provider and MongoDB support optimized physi
 
 Maps to: original S8.
 
-Outcome: Elsa workflow runtime stores receive a go/no-go decision for Groundwork default, Groundwork with physicalization, or specialized provider.
+Outcome: workflow runtime stores receive a go/no-go decision for portable document, benchmark-gated, or specialized-provider storage intent, with physicalization evaluated as a separate provider capability.
 
 Validation: runtime benchmarks, concurrency checks, retry diagnostics, and operational guidance exist before any runtime hot-path migration.

@@ -1,6 +1,6 @@
 # Groundwork.MongoDb
 
-`Groundwork.MongoDb` provides MongoDB materialization and document storage for portable Groundwork document workloads.
+`Groundwork.MongoDb` provides MongoDB materialization and document-store operations for portable Groundwork documents.
 
 ## Current Scope
 
@@ -16,4 +16,4 @@
 - One-field indexes only.
 - JSON content is stored as native BSON under a `content` field.
 - No Entity Framework dependency.
-- No Elsa dependency.
+- No host-specific dependency.

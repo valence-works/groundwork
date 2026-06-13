@@ -1,6 +1,6 @@
 # Groundwork.Sqlite
 
-`Groundwork.Sqlite` is the first concrete Groundwork provider. It materializes portable document storage for a `StorageManifest` using `Microsoft.Data.Sqlite` directly, without Entity Framework or Elsa dependencies.
+`Groundwork.Sqlite` is the first concrete Groundwork provider. It materializes portable document storage for a `StorageManifest` using `Microsoft.Data.Sqlite` directly, without Entity Framework or host-specific dependencies.
 
 ## Current Scope
 
@@ -16,4 +16,4 @@
 - Equality queries only.
 - Single-field index extraction only.
 - JSON content is stored as text; provider-specific JSON indexing is deferred.
-- This package is a Groundwork provider package, not an Elsa integration package.
+- This package is a Groundwork provider package, not a host-specific integration package.

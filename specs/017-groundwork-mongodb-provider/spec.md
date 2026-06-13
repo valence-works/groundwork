@@ -44,15 +44,15 @@ A Groundwork application can save, load, update, delete, and query documents thr
 
 ### User Story 3 - Keep MongoDB Provider Isolated (Priority: P2)
 
-A Groundwork maintainer can inspect MongoDB provider dependencies and see no Elsa or relational provider coupling.
+A Groundwork maintainer can inspect MongoDB provider dependencies and see no application host or relational provider coupling.
 
-**Why this priority**: MongoDB should validate the generic Groundwork boundary, not become an Elsa-specific or relationally shaped implementation.
+**Why this priority**: MongoDB should validate the generic Groundwork boundary, not become a host-specific or relationally shaped implementation.
 
 **Independent Test**: Dependency boundary tests verify `Groundwork.MongoDb` references generic Groundwork contracts and MongoDB driver packages only.
 
 **Acceptance Scenarios**:
 
-1. **Given** the MongoDB provider project, **When** dependency tests run, **Then** it does not reference Elsa projects.
+1. **Given** the MongoDB provider project, **When** dependency tests run, **Then** it does not reference host-specific projects.
 2. **Given** MongoDB provider source, **When** maintainers inspect storage, **Then** it uses native collections and indexes rather than relational index tables.
 
 ### Edge Cases
@@ -75,7 +75,7 @@ A Groundwork maintainer can inspect MongoDB provider dependencies and see no Els
 - **FR-006**: MongoDB provider MUST enforce unique declared indexes through MongoDB unique indexes.
 - **FR-007**: MongoDB provider MUST reject undeclared index queries.
 - **FR-008**: MongoDB provider MUST enforce expected-version optimistic concurrency for save and delete.
-- **FR-009**: MongoDB provider MUST not reference Elsa projects.
+- **FR-009**: MongoDB provider MUST not reference host-specific projects.
 - **FR-010**: MongoDB validation MUST use a real MongoDB database through container-backed integration tests.
 - **FR-011**: Existing SQLite and relational provider tests MUST remain green.
 
@@ -91,7 +91,7 @@ A Groundwork maintainer can inspect MongoDB provider dependencies and see no Els
 ### Measurable Outcomes
 
 - **SC-001**: MongoDB integration tests pass against a container-backed database.
-- **SC-002**: Dependency boundary tests verify `Groundwork.MongoDb` remains Elsa-free.
+- **SC-002**: Dependency boundary tests verify `Groundwork.MongoDb` remains free of host-specific dependencies.
 - **SC-003**: Full solution tests pass with the MongoDB provider project included.
 
 ## Assumptions

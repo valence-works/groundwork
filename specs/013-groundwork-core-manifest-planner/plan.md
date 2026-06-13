@@ -6,7 +6,7 @@
 
 ## Summary
 
-Implement the first buildable Groundwork kernel slice. Add generic `Groundwork.Core`, `Groundwork.Relational`, and `Groundwork.Documents` projects plus focused tests. The slice defines provider-neutral storage manifests, workload classifications, index/query declarations, provider capability compatibility results, materialization plan/history concepts, and relational/document planners that can consume the same sample manifest. It deliberately stops before concrete database providers, Elsa integration, startup materialization, and live database tests.
+Implement the first buildable Groundwork kernel slice. Add generic `Groundwork.Core`, `Groundwork.Relational`, and `Groundwork.Documents` projects plus focused tests. The slice defines provider-neutral storage manifests, storage intents, index/query declarations, provider capability compatibility results, materialization plan/history concepts, and relational/document planners that can consume the same sample manifest. It deliberately stops before concrete database providers, host integration, startup materialization, and live database tests.
 
 ## Technical Context
 
@@ -18,13 +18,13 @@ Implement the first buildable Groundwork kernel slice. Add generic `Groundwork.C
 
 **Testing**: xUnit unit/contract tests plus architecture boundary tests
 
-**Target Platform**: .NET library packages consumed first by Elsa Foundation
+**Target Platform**: .NET library packages consumed by .NET applications
 
 **Project Type**: Generic persistence framework libraries
 
 **Performance Goals**: N/A for G1; no runtime hot paths or provider execution
 
-**Constraints**: Generic `Groundwork.*` projects must not reference `Elsa.*`; no SQLite/SQL Server/PostgreSQL/MongoDB providers; no Elsa bridge; provider-neutral models only
+**Constraints**: Generic `Groundwork.*` projects must not reference host-specific packages; no SQLite/SQL Server/PostgreSQL/MongoDB providers; no host integration bridge; provider-neutral models only
 
 **Scale/Scope**: Three source projects, one test project, solution entries, focused manifest/planner/capability tests
 
@@ -33,12 +33,12 @@ Implement the first buildable Groundwork kernel slice. Add generic `Groundwork.C
 | Gate | Status | Note |
 |---|---|---|
 | Framework §2.1 three-layer separation | PASS | `Groundwork.Core` owns generic contracts; `Groundwork.Relational` and `Groundwork.Documents` are focused helper/planning packages. |
-| Framework §2.3 primitives admission | PASS | New generic persistence concepts stay in Groundwork, not `Elsa.Primitives`. |
+| Framework §2.3 primitives admission | PASS | New generic persistence concepts stay in Groundwork, not `host-specific primitives`. |
 | Framework §2.9 persistence invariants provider-neutral | PASS | Manifest and storage-unit invariants are independent of provider enforcement. |
 | Framework §2.10 CQS at persistence boundary | PASS | G1 defines plans and contracts only; future stores must keep command/query surfaces separate. |
 | Framework §2.20 provider module decomposition | PASS | Concrete providers are deferred to provider-suffixed packages starting in G2. |
-| Elsa §E2.2 Design/Runtime split | PASS | G1 has no Elsa references and no workflow runtime/design coupling. |
-| Elsa §E2.6 artifact-only runtime | PASS | Runtime migration is not included; workload classification preserves benchmark gating. |
+| Runtime separation guardrail | PASS | G1 has no host-specific references and no workflow runtime/design coupling. |
+| Runtime persistence guardrail | PASS | Runtime migration is not included; storage intent preserves benchmark gating. |
 | Framework §2.23 tests | PASS | G1 includes focused tests for validation, planner output, capability failures, and dependency boundaries. |
 
 No justified violations.
@@ -69,7 +69,7 @@ specs/013-groundwork-core-manifest-planner/
 src/Groundwork/Core/
 ├── Groundwork.Core.csproj
 ├── Manifests/
-├── Workloads/
+├── Intents/
 ├── Indexing/
 ├── Queries/
 ├── Capabilities/
@@ -92,7 +92,7 @@ tests/Groundwork/Groundwork.Tests/
 └── GroundworkDependencyBoundaryTests.cs
 ```
 
-**Structure Decision**: G1 creates generic Groundwork projects outside `src/Elsa`. `Groundwork.Relational` and `Groundwork.Documents` depend only on `Groundwork.Core`. `tests/Groundwork/Groundwork.Tests` references the Groundwork projects and may inspect project files to prove no generic Groundwork project references `Elsa.*`.
+**Structure Decision**: G1 creates generic Groundwork projects outside `host-specific source roots`. `Groundwork.Relational` and `Groundwork.Documents` depend only on `Groundwork.Core`. `tests/Groundwork/Groundwork.Tests` references the Groundwork projects and may inspect project files to prove no generic Groundwork project references host-specific packages.
 
 ## Complexity Tracking
 

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Groundwork.SupportTickets;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Xunit;
 
@@ -13,12 +14,14 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
 
     public SupportTicketApiTests()
     {
-        Environment.SetEnvironmentVariable("Groundwork__Provider", SupportTicketProvider.Sqlite.ToString());
-        Environment.SetEnvironmentVariable("Groundwork__ConnectionString", $"Data Source={databasePath}");
-        Environment.SetEnvironmentVariable("Groundwork__Physicalization", "Optimized");
-
         factory = new WebApplicationFactory<Program>()
-            .WithWebHostBuilder(_ => { });
+            .WithWebHostBuilder(builder =>
+            {
+                builder
+                    .UseSetting("Groundwork:Provider", SupportTicketProvider.Sqlite.ToString())
+                    .UseSetting("Groundwork:ConnectionString", $"Data Source={databasePath}")
+                    .UseSetting("Groundwork:Physicalization", "Optimized");
+            });
     }
 
     [Fact]
@@ -26,6 +29,7 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
     {
         using var client = factory.CreateClient();
 
+        var health = await client.GetFromJsonAsync<SupportTicketHealthResponse>("/healthz");
         var create = await client.PostAsJsonAsync("/tickets", new CreateTicketRequest(
             "TCK-API-1",
             "acme",
@@ -35,6 +39,9 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
             DateTimeOffset.Parse("2026-06-12T17:00:00Z")));
         var opened = await ReadTicketAsync(create);
 
+        Assert.Equal(SupportTicketProvider.Sqlite.ToString(), health!.Provider);
+        Assert.Equal("Optimized", health.Physicalization);
+
         var assign = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/assign", new AssignTicketRequest("agent-alex", opened.Version));
         var assigned = await ReadTicketAsync(assign);
 
@@ -42,14 +49,16 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
             $"/tickets/{opened.Ticket.TicketNumber}/comments",
             new AddCommentRequest("agent-alex", "Customer confirmed this blocks month-end billing.", assigned.Version));
         var savedComment = await ReadCommentAsync(comment);
+        var commented = await client.GetFromJsonAsync<SupportTicketResponse>($"/tickets/{opened.Ticket.TicketNumber}");
 
-        var resolve = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/resolve", new VersionedTicketRequest(assigned.Version));
+        var resolve = await client.PostAsJsonAsync($"/tickets/{opened.Ticket.TicketNumber}/resolve", new VersionedTicketRequest(commented!.Version));
         var resolved = await ReadTicketAsync(resolve);
         var comments = await client.GetFromJsonAsync<IReadOnlyList<SupportTicketCommentResponse>>($"/tickets/{opened.Ticket.TicketNumber}/comments");
         var byPriority = await client.GetFromJsonAsync<IReadOnlyList<SupportTicketResponse>>("/tickets?priority=high");
 
         Assert.Equal("assigned", assigned.Ticket.Status);
         Assert.Equal("resolved", resolved.Ticket.Status);
+        Assert.True(commented.Version > assigned.Version);
         Assert.Equal(savedComment.Comment.CommentId, Assert.Single(comments!).Comment.CommentId);
         Assert.Equal("TCK-API-1", Assert.Single(byPriority!).Ticket.TicketNumber);
     }
@@ -57,9 +66,6 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await factory.DisposeAsync();
-        Environment.SetEnvironmentVariable("Groundwork__Provider", null);
-        Environment.SetEnvironmentVariable("Groundwork__ConnectionString", null);
-        Environment.SetEnvironmentVariable("Groundwork__Physicalization", null);
         if (File.Exists(databasePath))
             File.Delete(databasePath);
     }
@@ -79,4 +85,6 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
         return await response.Content.ReadFromJsonAsync<SupportTicketCommentResponse>()
             ?? throw new InvalidOperationException("Comment response was empty.");
     }
+
+    private sealed record SupportTicketHealthResponse(string Provider, string Physicalization);
 }

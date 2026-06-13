@@ -2,13 +2,11 @@ using Groundwork.SupportTickets;
 
 var builder = WebApplication.CreateBuilder(args);
 var storageOptions = SupportTicketStorageOptions.FromConfiguration(builder.Configuration);
-var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
+await using var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
 
-builder.Services.AddSingleton(supportTickets);
 builder.Services.AddSingleton(supportTickets.Tickets);
 
 var app = builder.Build();
-app.Lifetime.ApplicationStopped.Register(() => supportTickets.DisposeAsync().AsTask().GetAwaiter().GetResult());
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -17,7 +15,7 @@ app.MapGet("/healthz", () => Results.Ok(new
 {
     status = "ok",
     provider = storageOptions.Provider.ToString(),
-    physicalization = storageOptions.EffectivePhysicalization.ToString()
+    physicalization = storageOptions.EffectivePhysicalization.Kind.ToString()
 }));
 
 app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketRepository tickets, CancellationToken cancellationToken) =>
@@ -25,7 +23,7 @@ app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketReposit
     try
     {
         var opened = await tickets.CreateAsync(request.ToTicket(), cancellationToken);
-        return Results.Created($"/tickets/{opened.Ticket.TicketNumber}", ToTicketResponse(opened));
+        return Results.Created($"/tickets/{UrlSegment(opened.Ticket.TicketNumber)}", ToTicketResponse(opened));
     }
     catch (SupportTicketConflictException exception)
     {
@@ -138,7 +136,7 @@ app.MapPost("/tickets/{ticketNumber}/comments", async (
     try
     {
         var comment = await tickets.AddCommentAsync(ticketNumber, request.AuthorId, request.Body, request.ExpectedTicketVersion, null, cancellationToken);
-        return Results.Created($"/tickets/{ticketNumber}/comments/{comment.Comment.CommentId}", ToCommentResponse(comment));
+        return Results.Created($"/tickets/{UrlSegment(ticketNumber)}/comments/{UrlSegment(comment.Comment.CommentId)}", ToCommentResponse(comment));
     }
     catch (KeyNotFoundException)
     {
@@ -161,6 +159,8 @@ app.MapFallbackToFile("index.html");
 await app.RunAsync();
 
 static IResult Conflict(Exception exception) => Results.Conflict(new { error = exception.Message });
+
+static string UrlSegment(string value) => Uri.EscapeDataString(value);
 
 static SupportTicketResponse ToTicketResponse(SupportTicketDocument document) =>
     new(document.Ticket, document.Version);

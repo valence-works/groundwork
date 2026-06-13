@@ -6,7 +6,7 @@
 - [x] T002 Create `src/Groundwork/SqlServer/Groundwork.SqlServer.csproj`
 - [x] T003 Create `src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj`
 - [x] T004 Create `tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj`
-- [x] T005 Add provider and test project entries to `Elsa.Server.slnx`
+- [x] T005 Add provider and test project entries to `Groundwork.slnx`
 
 ## Phase 2: Shared Relational Support
 
@@ -37,4 +37,4 @@
 
 - [x] T019 Run `dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj`
 - [x] T020 Run `dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj`
-- [x] T021 Run `dotnet test Elsa.Server.slnx --no-restore`
+- [x] T021 Run `dotnet test Groundwork.slnx --no-restore`

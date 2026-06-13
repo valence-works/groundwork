@@ -15,6 +15,6 @@
 ## Boundary Quality
 
 - [x] Provider packages remain generic Groundwork packages.
-- [x] No Elsa package dependency is required or allowed.
+- [x] No host-specific package dependency is required or allowed.
 - [x] SQL Server and PostgreSQL differences are provider-local.
 - [x] Shared relational behavior belongs in `Groundwork.Relational`.
