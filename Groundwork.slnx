@@ -1,5 +1,12 @@
 <Solution>
   <File Path="Build.props" />
+  <Folder Name="/solution/">
+    <File Path="Build.props" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/src/" />
   <Folder Name="/src/Groundwork/">
     <Project Path="src/Groundwork/Core/Groundwork.Core.csproj" />
     <Project Path="src/Groundwork/Documents/Groundwork.Documents.csproj" />
@@ -12,6 +19,7 @@
     <Project Path="src/Groundwork/SqlServer/Groundwork.SqlServer.csproj" />
     <Project Path="src/Groundwork/Sqlite/Groundwork.Sqlite.csproj" />
   </Folder>
+  <Folder Name="/tests/" />
   <Folder Name="/tests/Groundwork/">
     <Project Path="tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj" />
