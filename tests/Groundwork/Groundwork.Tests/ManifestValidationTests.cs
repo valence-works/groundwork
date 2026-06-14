@@ -1,3 +1,4 @@
+using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
@@ -121,53 +122,38 @@ public sealed class ManifestValidationTests
     }
 
     [Fact]
-    public void PortableDocumentIntentCannotDeclareSpecializedRequirements()
+    public void IntentWithRequirementsRequiresRationale()
     {
         var manifest = WithSingleUnit(unit => unit with
         {
             Intent = new StorageIntent(
-                StorageIntentKind.PortableDocument,
-                new HashSet<StorageRequirement> { StorageRequirement.AtomicClaim },
-                "Requires claim semantics.")
-        });
-
-        var result = _validator.Validate(manifest);
-
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-004");
-    }
-
-    [Fact]
-    public void BenchmarkGatedIntentRequiresRationaleAndRequirements()
-    {
-        var manifest = WithSingleUnit(unit => unit with
-        {
-            Intent = new StorageIntent(StorageIntentKind.BenchmarkGated, new HashSet<StorageRequirement>(), null)
+                new HashSet<CapabilityId> { WellKnownCapabilities.AtomicClaim },
+                rationale: null,
+                descriptor: WorkloadIntent.OperationalStream)
         });
 
         var result = _validator.Validate(manifest);
 
         Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-005");
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-012");
     }
 
     [Fact]
-    public void SpecializedProviderIntentRequiresRationaleAndRequirements()
+    public void PortableDocumentIntentIsValidWithoutRationale()
     {
-        var manifest = WithSingleUnit(unit => unit with
-        {
-            Intent = new StorageIntent(StorageIntentKind.SpecializedProvider, new HashSet<StorageRequirement>(), null)
-        });
+        var manifest = WithSingleUnit(unit => unit with { Intent = StorageIntent.PortableDocument() });
 
         var result = _validator.Validate(manifest);
 
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-005");
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-012");
+        Assert.DoesNotContain(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-005");
     }
 
     [Fact]
     public void StorageIntentFactoriesNormalizeNullRequirements()
     {
-        var intent = StorageIntent.SpecializedProvider("Requires external coordination.", (StorageRequirement[]?)null!);
+        var intent = StorageIntent.Operational(
+            "Requires external coordination.",
+            WorkloadIntent.OperationalStream,
+            (CapabilityId[]?)null!);
 
         Assert.Empty(intent.Requirements);
     }
@@ -175,18 +161,19 @@ public sealed class ManifestValidationTests
     [Fact]
     public void StorageIntentUsesRequirementSetValueEquality()
     {
-        var first = StorageIntent.SpecializedProvider(
+        var first = StorageIntent.Operational(
             "Requires task claiming.",
-            StorageRequirement.AtomicClaim,
-            StorageRequirement.LeaseRecovery);
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim,
+            WellKnownCapabilities.LeaseRecovery);
         var second = new StorageIntent(
-            StorageIntentKind.SpecializedProvider,
-            new HashSet<StorageRequirement>
+            new HashSet<CapabilityId>
             {
-                StorageRequirement.LeaseRecovery,
-                StorageRequirement.AtomicClaim
+                WellKnownCapabilities.LeaseRecovery,
+                WellKnownCapabilities.AtomicClaim
             },
-            "Requires task claiming.");
+            "Requires task claiming.",
+            WorkloadIntent.OperationalStream);
 
         Assert.Equal(first, second);
         Assert.Equal(first.GetHashCode(), second.GetHashCode());

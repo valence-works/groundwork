@@ -1,0 +1,6 @@
+scripts:
+- name: Sample
+  command: dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+automation:
+  auto_issue_session: true
+  remote_control: true

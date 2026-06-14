@@ -71,20 +71,32 @@ public sealed class PlannerContractTests
     }
 
     [Fact]
-    public void UnsupportedStorageIntentBlocksPlanning()
+    public void UnsupportedStorageRequirementBlocksPlanning()
     {
-        var capabilities = SampleManifests.PortableCapabilities() with
-        {
-            SupportedStorageIntents = new HashSet<StorageIntentKind>()
-        };
+        var operationalManifest = WithOperationalUnit();
+        var capabilities = SampleManifests.PortableCapabilities();
 
-        var relational = NewRelationalPlanner().Plan(SampleManifests.MetadataManifest(), capabilities);
-        var document = NewDocumentPlanner().Plan(SampleManifests.MetadataManifest(), capabilities);
+        var relational = NewRelationalPlanner().Plan(operationalManifest, capabilities);
+        var document = NewDocumentPlanner().Plan(operationalManifest, capabilities);
 
         Assert.False(relational.IsPlannable);
         Assert.False(document.IsPlannable);
-        Assert.Contains(relational.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-003");
-        Assert.Contains(document.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-003");
+        Assert.Contains(relational.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-004");
+        Assert.Contains(document.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-004");
+    }
+
+    private static StorageManifest WithOperationalUnit()
+    {
+        var manifest = SampleManifests.MetadataManifest();
+        var operationalUnit = manifest.StorageUnits.Single() with
+        {
+            Intent = StorageIntent.Operational(
+                "Requires atomic claim semantics.",
+                WorkloadIntent.OperationalStream,
+                WellKnownCapabilities.AtomicClaim)
+        };
+
+        return manifest with { StorageUnits = [operationalUnit] };
     }
 
     private RelationalManifestPlanner NewRelationalPlanner() => new(_manifestValidator, _capabilityValidator);

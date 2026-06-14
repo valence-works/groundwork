@@ -83,33 +83,12 @@ public sealed class StorageManifestValidator
 
     private static void ValidateStorageIntent(StorageIntent intent, string unitTarget, List<GroundworkDiagnostic> diagnostics)
     {
-        if (intent.Kind == StorageIntentKind.PortableDocument)
-        {
-            if (!string.IsNullOrWhiteSpace(intent.Rationale) || intent.Requirements.Count != 0)
-            {
-                diagnostics.Add(GroundworkDiagnostic.Error(
-                    "GW-UNIT-004",
-                    "Portable document storage intent cannot declare specialized requirements or rationale.",
-                    $"{unitTarget}.intent"));
-            }
-
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(intent.Rationale))
+        if (intent.Requirements.Count != 0 && string.IsNullOrWhiteSpace(intent.Rationale))
         {
             diagnostics.Add(GroundworkDiagnostic.Error(
                 "GW-UNIT-005",
-                "Benchmark-gated and specialized-provider storage intents require a rationale.",
+                "Storage intents that declare requirements must provide a rationale.",
                 $"{unitTarget}.intent.rationale"));
-        }
-
-        if (intent.Requirements.Count == 0)
-        {
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-UNIT-012",
-                "Benchmark-gated and specialized-provider storage intents require at least one storage requirement.",
-                $"{unitTarget}.intent.requirements"));
         }
     }
 

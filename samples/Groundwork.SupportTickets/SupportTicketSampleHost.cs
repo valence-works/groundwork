@@ -7,8 +7,11 @@ using Groundwork.PostgreSql.Documents;
 using Groundwork.PostgreSql.Materialization;
 using Groundwork.SqlServer.Documents;
 using Groundwork.SqlServer.Materialization;
+using Groundwork.Operational;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.Materialization;
+using Groundwork.Sqlite.Operational;
+using Groundwork.SupportTickets.Operations;
 using Microsoft.Data.SqlClient;
 using Microsoft.Data.Sqlite;
 using MongoDB.Driver;
@@ -24,17 +27,31 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         StorageManifest manifest,
         IDocumentStore store,
         SupportTicketRepository tickets,
+        SupportTicketOperations operations,
+        OperationalFitReport operationalFit,
         List<IAsyncDisposable> disposables)
     {
         Manifest = manifest;
         Store = store;
         Tickets = tickets;
+        Operations = operations;
+        OperationalFit = operationalFit;
         this.disposables = disposables;
     }
 
     public StorageManifest Manifest { get; }
     public IDocumentStore Store { get; }
     public SupportTicketRepository Tickets { get; }
+
+    /// <summary>The operational hot path (triage queue, ownership leases, notification outbox).</summary>
+    public SupportTicketOperations Operations { get; }
+
+    /// <summary>
+    /// The capability-derived verdict for the operational manifest against an operational-capable
+    /// provider versus a portable document-only provider. Demonstrates that fit is computed from
+    /// requirements, not author-declared.
+    /// </summary>
+    public OperationalFitReport OperationalFit { get; }
 
     public static Task<SupportTicketSampleHost> CreateAsync(string connectionString = "Data Source=:memory:") =>
         CreateAsync(new SupportTicketStorageOptions(SupportTicketProvider.Sqlite, connectionString));
@@ -45,7 +62,8 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
     {
         var manifest = SupportTicketManifest.Create(options.EffectivePhysicalization);
         var (store, disposables) = await CreateStoreAsync(options, manifest, cancellationToken);
-        return new SupportTicketSampleHost(manifest, store, new SupportTicketRepository(store), disposables);
+        var (operations, fit) = await CreateOperationsAsync(disposables, options.OperationalClock, cancellationToken);
+        return new SupportTicketSampleHost(manifest, store, new SupportTicketRepository(store), operations, fit, disposables);
     }
 
     public async ValueTask DisposeAsync()
@@ -96,6 +114,32 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
             default:
                 throw new ArgumentOutOfRangeException(nameof(options), options.Provider, "Unsupported support-ticket provider.");
         }
+    }
+
+    private static async Task<(SupportTicketOperations Operations, OperationalFitReport Fit)> CreateOperationsAsync(
+        List<IAsyncDisposable> disposables,
+        IOperationalClock? clock,
+        CancellationToken cancellationToken)
+    {
+        // The operational hot path always runs on a dedicated SQLite operational provider, regardless
+        // of the chosen document provider. This is the capability-derived fit story in action: the
+        // operational units below are Unsupported on a portable document-only provider, so they must
+        // run on an operational-capable one.
+        var connection = new SqliteConnection("Data Source=:memory:");
+        disposables.Insert(0, connection);
+        await connection.OpenAsync(cancellationToken);
+        await new SqliteOperationalMaterializer(connection).MaterializeAsync(cancellationToken);
+
+        var store = new SqliteOperationalStore(connection, clock);
+        var operations = new SupportTicketOperations(store);
+
+        var operationalManifest = SupportTicketOperationsManifest.Create();
+        var validator = new ProviderCapabilityValidator();
+        var fit = new OperationalFitReport(
+            validator.Evaluate(operationalManifest, SupportTicketOperationsManifest.OperationalProvider()),
+            validator.Evaluate(operationalManifest, SupportTicketOperationsManifest.DocumentOnlyProvider()));
+
+        return (operations, fit);
     }
 
     private static ProviderIdentity Provider(string name) => new(name, "1.0.0");

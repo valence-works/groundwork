@@ -1,10 +1,14 @@
+using Groundwork.Core.Capabilities;
 using Groundwork.SupportTickets;
+using Groundwork.SupportTickets.Operations;
 
 var builder = WebApplication.CreateBuilder(args);
 var storageOptions = SupportTicketStorageOptions.FromConfiguration(builder.Configuration);
 await using var supportTickets = await SupportTicketSampleHost.CreateAsync(storageOptions);
 
 builder.Services.AddSingleton(supportTickets.Tickets);
+builder.Services.AddSingleton(supportTickets.Operations);
+builder.Services.AddSingleton(supportTickets.OperationalFit);
 
 var app = builder.Build();
 
@@ -18,11 +22,13 @@ app.MapGet("/healthz", () => Results.Ok(new
     physicalization = storageOptions.EffectivePhysicalization.Kind.ToString()
 }));
 
-app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketRepository tickets, CancellationToken cancellationToken) =>
+app.MapPost("/tickets", async (CreateTicketRequest request, SupportTicketRepository tickets, SupportTicketOperations operations, CancellationToken cancellationToken) =>
 {
     try
     {
         var opened = await tickets.CreateAsync(request.ToTicket(), cancellationToken);
+        // Operational hot path: queue the new ticket for FIFO triage in its priority lane.
+        await operations.QueueForTriageAsync(opened.Ticket.TicketNumber, opened.Ticket.Priority, cancellationToken);
         return Results.Created($"/tickets/{UrlSegment(opened.Ticket.TicketNumber)}", ToTicketResponse(opened));
     }
     catch (SupportTicketConflictException exception)
@@ -89,11 +95,14 @@ app.MapPost("/tickets/{ticketNumber}/escalate", async (
     string ticketNumber,
     VersionedTicketRequest request,
     SupportTicketRepository tickets,
+    SupportTicketOperations operations,
     CancellationToken cancellationToken) =>
 {
     try
     {
         var escalated = await tickets.EscalateAsync(ticketNumber, request.ExpectedVersion, DateTimeOffset.UtcNow, cancellationToken);
+        // Atomic cross-unit commit: supervisor triage + manager notification land together or not at all.
+        await operations.EscalateAsync(ticketNumber, "Escalated to supervisor review.", cancellationToken);
         return Results.Ok(ToTicketResponse(escalated));
     }
     catch (KeyNotFoundException)
@@ -154,11 +163,78 @@ app.MapGet("/tickets/{ticketNumber}/comments", async (string ticketNumber, Suppo
     return Results.Ok(comments.Select(ToCommentResponse));
 });
 
+// ---- Operational hot path ---------------------------------------------------------------------
+
+// Capability-derived fit: the same operational requirements are Supported on an operational provider
+// and Unsupported on a portable document-only provider — the verdict is computed, not declared.
+app.MapGet("/operational/fit", (OperationalFitReport fit) => Results.Ok(new
+{
+    operationalProvider = DescribeFit(fit.OperationalProvider),
+    documentOnlyProvider = DescribeFit(fit.DocumentOnlyProvider)
+}));
+
+// Triage work queue: claim the next ticket (FIFO, exclusive, lease-protected).
+app.MapPost("/triage/claim", async (ClaimTriageRequest request, SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var assignment = await operations.ClaimNextTriageAsync(
+        request.AgentId,
+        TimeSpan.FromSeconds(request.LeaseSeconds <= 0 ? 30 : request.LeaseSeconds),
+        request.Priority,
+        cancellationToken);
+    return assignment is null ? Results.NoContent() : Results.Ok(assignment);
+});
+
+// Triage work queue: finish a claimed item (ack, fenced by lease token).
+app.MapPost("/triage/{messageId}/complete", async (string messageId, CompleteTriageRequest request, SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var completed = await operations.CompleteTriageAsync(messageId, request.LeaseToken, cancellationToken);
+    return completed ? Results.Ok(new { messageId, completed }) : Results.Conflict(new { error = "Lease lost; triage item was reclaimed." });
+});
+
+// Ownership lease: acquire exclusive edit ownership of a ticket with a fencing token.
+app.MapPost("/tickets/{ticketNumber}/lock", async (string ticketNumber, LockTicketRequest request, SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var ownership = await operations.AcquireOwnershipAsync(
+        ticketNumber,
+        request.AgentId,
+        TimeSpan.FromSeconds(request.LeaseSeconds <= 0 ? 60 : request.LeaseSeconds),
+        cancellationToken);
+    return ownership.Granted ? Results.Ok(ownership) : Results.Conflict(ownership);
+});
+
+// Ownership lease: release ownership (requires the matching fencing token).
+app.MapPost("/tickets/{ticketNumber}/unlock", async (string ticketNumber, UnlockTicketRequest request, SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var released = await operations.ReleaseOwnershipAsync(ticketNumber, request.AgentId, request.FencingToken, cancellationToken);
+    return released ? Results.Ok(new { ticketNumber, released }) : Results.Conflict(new { error = "Not the current owner." });
+});
+
+app.MapGet("/tickets/{ticketNumber}/lock", async (string ticketNumber, SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var state = await operations.ReadOwnershipAsync(ticketNumber, cancellationToken);
+    return state is null ? Results.NoContent() : Results.Ok(state);
+});
+
+// Notification outbox: dispatch pending notifications in order (at-least-once).
+app.MapPost("/notifications/dispatch", async (SupportTicketOperations operations, CancellationToken cancellationToken) =>
+{
+    var dispatched = await operations.DispatchNotificationsAsync(cancellationToken: cancellationToken);
+    return Results.Ok(dispatched);
+});
+
 app.MapFallbackToFile("index.html");
 
 await app.RunAsync();
 
 static IResult Conflict(Exception exception) => Results.Conflict(new { error = exception.Message });
+
+static object DescribeFit(ProviderFit fit) => fit switch
+{
+    ProviderFit.Supported => new { verdict = "Supported", detail = (object?)null },
+    ProviderFit.RequiresEvidence requiresEvidence => new { verdict = "RequiresEvidence", detail = (object?)requiresEvidence.Reasons },
+    ProviderFit.Unsupported unsupported => new { verdict = "Unsupported", detail = (object?)unsupported.MissingRequirements.Select(requirement => requirement.ToString()) },
+    _ => new { verdict = "Unknown", detail = (object?)null }
+};
 
 static string UrlSegment(string value) => Uri.EscapeDataString(value);
 
@@ -194,6 +270,14 @@ public sealed record AssignTicketRequest(string AssigneeId, long ExpectedVersion
 public sealed record VersionedTicketRequest(long ExpectedVersion);
 
 public sealed record AddCommentRequest(string AuthorId, string Body, long ExpectedTicketVersion);
+
+public sealed record ClaimTriageRequest(string AgentId, int LeaseSeconds = 30, string? Priority = null);
+
+public sealed record CompleteTriageRequest(string LeaseToken);
+
+public sealed record LockTicketRequest(string AgentId, int LeaseSeconds = 60);
+
+public sealed record UnlockTicketRequest(string AgentId, long FencingToken);
 
 public sealed record SupportTicketResponse(SupportTicket Ticket, long Version);
 

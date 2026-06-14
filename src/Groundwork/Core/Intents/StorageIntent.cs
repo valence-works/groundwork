@@ -1,78 +1,82 @@
+using Groundwork.Core.Capabilities;
+
 namespace Groundwork.Core.Intents;
 
 public sealed record StorageIntent
 {
     public StorageIntent(
-        StorageIntentKind kind,
-        IReadOnlySet<StorageRequirement>? requirements,
-        string? rationale)
-        : this(kind, requirements as IEnumerable<StorageRequirement>, rationale)
+        IReadOnlySet<CapabilityId>? requirements,
+        string? rationale = null,
+        WorkloadIntent descriptor = WorkloadIntent.Unspecified)
+        : this(requirements as IEnumerable<CapabilityId>, rationale, descriptor)
     {
     }
 
     private StorageIntent(
-        StorageIntentKind kind,
-        IEnumerable<StorageRequirement>? requirements,
-        string? rationale)
+        IEnumerable<CapabilityId>? requirements,
+        string? rationale,
+        WorkloadIntent descriptor)
     {
-        Kind = kind;
         Requirements = NormalizeRequirements(requirements);
         Rationale = rationale;
+        Descriptor = descriptor;
     }
 
-    public StorageIntentKind Kind { get; }
-
-    public IReadOnlySet<StorageRequirement> Requirements { get; }
+    /// <summary>The capabilities this storage unit requires from a provider.</summary>
+    public IReadOnlySet<CapabilityId> Requirements { get; }
 
     public string? Rationale { get; }
 
-    public static StorageIntent PortableDocument() =>
-        new(StorageIntentKind.PortableDocument, Array.Empty<StorageRequirement>(), null);
+    /// <summary>
+    /// Non-binding, human-readable workload label for diagnostics and documentation only.
+    /// Provider fit is derived from <see cref="Requirements"/>, never from this descriptor.
+    /// </summary>
+    public WorkloadIntent Descriptor { get; }
 
-    public static StorageIntent BenchmarkGated(string rationale, params StorageRequirement[]? requirements) =>
-        new(StorageIntentKind.BenchmarkGated, requirements, rationale);
+    public static StorageIntent PortableDocument(
+        WorkloadIntent descriptor = WorkloadIntent.RuntimeDefinedBusinessData) =>
+        new(Array.Empty<CapabilityId>(), null, descriptor);
 
-    public static StorageIntent SpecializedProvider(string rationale, params StorageRequirement[]? requirements) =>
-        new(StorageIntentKind.SpecializedProvider, requirements, rationale);
+    public static StorageIntent Operational(
+        string rationale,
+        WorkloadIntent descriptor,
+        params CapabilityId[]? requirements) =>
+        new(requirements, rationale, descriptor);
 
     public bool Equals(StorageIntent? other) =>
         other is not null &&
-        Kind == other.Kind &&
+        Descriptor == other.Descriptor &&
         string.Equals(Rationale, other.Rationale, StringComparison.Ordinal) &&
         Requirements.SetEquals(other.Requirements);
 
     public override int GetHashCode()
     {
         var hashCode = new HashCode();
-        hashCode.Add(Kind);
+        hashCode.Add(Descriptor);
         hashCode.Add(Rationale, StringComparer.Ordinal);
 
-        foreach (var requirement in Requirements.Order())
+        foreach (var requirement in Requirements.OrderBy(requirement => requirement.Value, StringComparer.Ordinal))
             hashCode.Add(requirement);
 
         return hashCode.ToHashCode();
     }
 
-    private static IReadOnlySet<StorageRequirement> NormalizeRequirements(IEnumerable<StorageRequirement>? requirements) =>
-        requirements?.ToHashSet() ?? new HashSet<StorageRequirement>();
+    private static IReadOnlySet<CapabilityId> NormalizeRequirements(IEnumerable<CapabilityId>? requirements) =>
+        requirements?.ToHashSet() ?? new HashSet<CapabilityId>();
 }
 
-public enum StorageIntentKind
+/// <summary>
+/// Non-binding soft label describing the intended shape of a storage unit. Used only for
+/// diagnostics and human readability; it never participates in provider-fit computation.
+/// </summary>
+public enum WorkloadIntent
 {
-    PortableDocument,
-    BenchmarkGated,
-    SpecializedProvider
-}
-
-public enum StorageRequirement
-{
-    AtomicClaim,
-    LeaseRecovery,
-    OrderedConsumption,
-    RetryRecovery,
-    Idempotency,
-    RetentionPolicy,
-    AtomicCommit,
-    ConcurrencyEvidence,
-    OperationalDiagnostics
+    Unspecified,
+    MetadataConfiguration,
+    CatalogAuthoredData,
+    RuntimeDefinedBusinessData,
+    RuntimeContinuationState,
+    OperationalStream,
+    Projection,
+    AuditTrail
 }

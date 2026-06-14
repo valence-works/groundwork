@@ -4,7 +4,10 @@
     <Project Path="src/Groundwork/Core/Groundwork.Core.csproj" />
     <Project Path="src/Groundwork/Documents/Groundwork.Documents.csproj" />
     <Project Path="src/Groundwork/MongoDb/Groundwork.MongoDb.csproj" />
+    <Project Path="src/Groundwork/Operational/Groundwork.Operational.csproj" />
+    <Project Path="src/Groundwork/Operational.Relational/Groundwork.Operational.Relational.csproj" />
     <Project Path="src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj" />
+    <Project Path="src/Groundwork/Provider.Relational/Groundwork.Provider.Relational.csproj" />
     <Project Path="src/Groundwork/Relational/Groundwork.Relational.csproj" />
     <Project Path="src/Groundwork/SqlServer/Groundwork.SqlServer.csproj" />
     <Project Path="src/Groundwork/Sqlite/Groundwork.Sqlite.csproj" />
@@ -18,5 +21,8 @@
   <Folder Name="/samples/">
     <Project Path="samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj" />
     <Project Path="samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj" />
+    <Project Path="samples/Groundwork.Modules.Inbox/Groundwork.Modules.Inbox.csproj" />
+    <Project Path="samples/Groundwork.Modules.Inbox.Sqlite/Groundwork.Modules.Inbox.Sqlite.csproj" />
+    <Project Path="samples/Groundwork.Modules.Inbox.Tests/Groundwork.Modules.Inbox.Tests.csproj" />
   </Folder>
 </Solution>

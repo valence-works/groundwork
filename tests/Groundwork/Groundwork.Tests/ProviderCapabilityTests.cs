@@ -101,30 +101,31 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
-    public void SpecializedProviderIntentIsRejectedByPortableCapabilities()
+    public void OperationalRequirementIsRejectedByPortableDocumentProvider()
     {
-        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+        var manifest = WithSingleUnitIntent(StorageIntent.Operational(
             "Requires atomic task claiming.",
-            StorageRequirement.AtomicClaim));
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim));
 
         var result = _validator.Validate(manifest, SampleManifests.PortableCapabilities());
 
         Assert.False(result.IsCompatible);
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-003");
-        Assert.DoesNotContain(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-004");
+        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-004");
     }
 
     [Fact]
     public void UnsupportedStorageRequirementBlocksCompatibility()
     {
-        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+        var manifest = WithSingleUnitIntent(StorageIntent.Operational(
             "Requires task claiming and abandoned claim recovery.",
-            StorageRequirement.AtomicClaim,
-            StorageRequirement.LeaseRecovery));
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim,
+            WellKnownCapabilities.LeaseRecovery));
         var capabilities = SampleManifests.PortableCapabilities() with
         {
-            SupportedStorageIntents = new HashSet<StorageIntentKind> { StorageIntentKind.SpecializedProvider },
-            SupportedStorageRequirements = new HashSet<StorageRequirement> { StorageRequirement.AtomicClaim }
+            SupportedCapabilities = new HashSet<CapabilityId> { WellKnownCapabilities.AtomicClaim },
+            EvidencedCapabilities = new HashSet<CapabilityId> { WellKnownCapabilities.AtomicClaim }
         };
 
         var result = _validator.Validate(manifest, capabilities);
@@ -134,25 +135,72 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
-    public void SupportedSpecializedIntentAndRequirementsAllowCompatibility()
+    public void SupportedAndEvidencedRequirementsAllowCompatibility()
     {
-        var manifest = WithSingleUnitIntent(StorageIntent.SpecializedProvider(
+        var manifest = WithSingleUnitIntent(StorageIntent.Operational(
             "Requires task claiming and abandoned claim recovery.",
-            StorageRequirement.AtomicClaim,
-            StorageRequirement.LeaseRecovery));
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim,
+            WellKnownCapabilities.LeaseRecovery));
         var capabilities = SampleManifests.PortableCapabilities() with
         {
-            SupportedStorageIntents = new HashSet<StorageIntentKind> { StorageIntentKind.SpecializedProvider },
-            SupportedStorageRequirements = new HashSet<StorageRequirement>
+            SupportedCapabilities = new HashSet<CapabilityId>
             {
-                StorageRequirement.AtomicClaim,
-                StorageRequirement.LeaseRecovery
+                WellKnownCapabilities.AtomicClaim,
+                WellKnownCapabilities.LeaseRecovery
+            },
+            EvidencedCapabilities = new HashSet<CapabilityId>
+            {
+                WellKnownCapabilities.AtomicClaim,
+                WellKnownCapabilities.LeaseRecovery
             }
         };
 
         var result = _validator.Validate(manifest, capabilities);
 
         Assert.True(result.IsCompatible);
+    }
+
+    [Fact]
+    public void SupportedButUnevidencedRequirementRequiresEvidence()
+    {
+        var manifest = WithSingleUnitIntent(StorageIntent.Operational(
+            "Requires task claiming.",
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim));
+        var capabilities = SampleManifests.PortableCapabilities() with
+        {
+            SupportedCapabilities = new HashSet<CapabilityId> { WellKnownCapabilities.AtomicClaim },
+            EvidencedCapabilities = new HashSet<CapabilityId>()
+        };
+
+        var fit = _validator.Evaluate(manifest, capabilities);
+        var result = _validator.Validate(manifest, capabilities);
+
+        Assert.IsType<ProviderFit.RequiresEvidence>(fit);
+        Assert.False(result.IsCompatible);
+        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-013");
+    }
+
+    [Fact]
+    public void EvaluateDerivesSupportedUnsupportedAndRequiresEvidence()
+    {
+        var manifest = WithSingleUnitIntent(StorageIntent.Operational(
+            "Requires task claiming.",
+            WorkloadIntent.OperationalStream,
+            WellKnownCapabilities.AtomicClaim));
+
+        Assert.IsType<ProviderFit.Unsupported>(
+            _validator.Evaluate(manifest, SampleManifests.PortableCapabilities()));
+
+        var supportedNoEvidence = SampleManifests.PortableCapabilities() with
+        {
+            SupportedCapabilities = new HashSet<CapabilityId> { WellKnownCapabilities.AtomicClaim }
+        };
+        Assert.IsType<ProviderFit.RequiresEvidence>(_validator.Evaluate(manifest, supportedNoEvidence));
+
+        var operational = ProviderCapabilityReport.OperationalProvider(new ProviderIdentity("operational-test-provider", "1.0.0"));
+        Assert.IsType<ProviderFit.Supported>(_validator.Evaluate(manifest, operational));
     }
 
     [Fact]

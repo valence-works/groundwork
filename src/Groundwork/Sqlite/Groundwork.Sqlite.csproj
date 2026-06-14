@@ -14,6 +14,8 @@
     <ProjectReference Include="..\Core\Groundwork.Core.csproj" />
     <ProjectReference Include="..\Documents\Groundwork.Documents.csproj" />
     <ProjectReference Include="..\Relational\Groundwork.Relational.csproj" />
+    <ProjectReference Include="..\Operational\Groundwork.Operational.csproj" />
+    <ProjectReference Include="..\Operational.Relational\Groundwork.Operational.Relational.csproj" />
   </ItemGroup>
 
 </Project>
