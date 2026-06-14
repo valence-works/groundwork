@@ -39,7 +39,7 @@ jobs:
         run: |
           if ("${{ github.event_name }}" -eq "release") {
             $version = "${{ github.event.release.tag_name }}"
-          else
+          } else {
             $baseVersion = "0.0.1"
 
             if (Test-Path "Build.props") {
