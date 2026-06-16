@@ -1,5 +1,7 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Modules.Inbox;
 using Groundwork.SupportTickets;
+using Groundwork.SupportTickets.ExternalModules;
 using Groundwork.SupportTickets.Operations;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -9,6 +11,8 @@ await using var supportTickets = await SupportTicketSampleHost.CreateAsync(stora
 builder.Services.AddSingleton(supportTickets.Tickets);
 builder.Services.AddSingleton(supportTickets.Operations);
 builder.Services.AddSingleton(supportTickets.OperationalFit);
+builder.Services.AddSingleton(supportTickets.Inbox);
+builder.Services.AddSingleton(supportTickets.ExternalModuleFit);
 
 var app = builder.Build();
 
@@ -173,6 +177,26 @@ app.MapGet("/operational/fit", (OperationalFitReport fit) => Results.Ok(new
     documentOnlyProvider = DescribeFit(fit.DocumentOnlyProvider)
 }));
 
+// ---- External module capability extension ----------------------------------------------------
+
+// Open/closed capability proof: the Inbox module contributes a custom capability that the host
+// registers and validates without changing Groundwork core.
+app.MapGet("/modules/inbox/fit", (ExternalModuleFitReport fit) => Results.Ok(new
+{
+    fit.ModuleName,
+    Capability = fit.Capability.ToString(),
+    moduleProvider = DescribeFit(fit.ModuleProvider),
+    documentOnlyProvider = DescribeFit(fit.DocumentOnlyProvider),
+    fit.CoreOnlyValidationErrors
+}));
+
+// Idempotent inbox: the same (consumer, message-key) is admitted once and then reported duplicate.
+app.MapPost("/modules/inbox/admit", async (AdmitInboxMessageRequest request, IInboxStore inbox, CancellationToken cancellationToken) =>
+{
+    var admission = await inbox.TryAdmitAsync(request.Consumer, request.MessageKey, cancellationToken);
+    return Results.Ok(new AdmitInboxMessageResponse(request.Consumer, request.MessageKey, admission.ToString()));
+});
+
 // Triage work queue: claim the next ticket (FIFO, exclusive, lease-protected).
 app.MapPost("/triage/claim", async (ClaimTriageRequest request, SupportTicketOperations operations, CancellationToken cancellationToken) =>
 {
@@ -278,6 +302,10 @@ public sealed record CompleteTriageRequest(string LeaseToken);
 public sealed record LockTicketRequest(string AgentId, int LeaseSeconds = 60);
 
 public sealed record UnlockTicketRequest(string AgentId, long FencingToken);
+
+public sealed record AdmitInboxMessageRequest(string Consumer, string MessageKey);
+
+public sealed record AdmitInboxMessageResponse(string Consumer, string MessageKey, string Admission);
 
 public sealed record SupportTicketResponse(SupportTicket Ticket, long Version);
 

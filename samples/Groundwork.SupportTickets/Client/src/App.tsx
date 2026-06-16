@@ -16,15 +16,24 @@ import {
 } from "lucide-react";
 import {
   addComment,
+  admitInboxMessage,
   assignTicket,
   createTicket,
   escalateTicket,
+  getExternalModuleFit,
   getHealth,
   listComments,
   listTickets,
   resolveTicket
 } from "./api";
-import type { HealthResponse, SupportTicketCommentResponse, SupportTicketResponse, TicketStatus } from "./types";
+import type {
+  ExternalModuleFitResponse,
+  HealthResponse,
+  InboxAdmissionResponse,
+  SupportTicketCommentResponse,
+  SupportTicketResponse,
+  TicketStatus
+} from "./types";
 
 const seedTickets = [
   {
@@ -65,6 +74,9 @@ const assignees = ["agent-alex", "agent-sam", "agent-mira", "agent-jo"];
 
 export function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [externalModuleFit, setExternalModuleFit] = useState<ExternalModuleFitResponse | null>(null);
+  const [inboxMessageKey, setInboxMessageKey] = useState("evt-ticket-1001");
+  const [inboxAdmission, setInboxAdmission] = useState<InboxAdmissionResponse | null>(null);
   const [tickets, setTickets] = useState<SupportTicketResponse[]>([]);
   const [selectedNumber, setSelectedNumber] = useState<string | null>(null);
   const [comments, setComments] = useState<SupportTicketCommentResponse[]>([]);
@@ -81,6 +93,7 @@ export function App() {
   });
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isAdmittingInboxMessage, setIsAdmittingInboxMessage] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedTicket = useMemo(
@@ -128,8 +141,13 @@ export function App() {
     setError(null);
 
     try {
-      const [nextHealth, nextTickets] = await Promise.all([getHealth(), listTickets()]);
+      const [nextHealth, nextTickets, nextExternalModuleFit] = await Promise.all([
+        getHealth(),
+        listTickets(),
+        getExternalModuleFit()
+      ]);
       setHealth(nextHealth);
+      setExternalModuleFit(nextExternalModuleFit);
       if (nextTickets.length === 0) {
         await seedDemoTickets();
       }
@@ -232,6 +250,25 @@ export function App() {
     }
   }
 
+  async function handleAdmitInboxMessage(event: FormEvent) {
+    event.preventDefault();
+    const messageKey = inboxMessageKey.trim();
+    if (messageKey.length === 0) {
+      return;
+    }
+
+    setIsAdmittingInboxMessage(true);
+    setError(null);
+
+    try {
+      setInboxAdmission(await admitInboxMessage("ticket-webhook", messageKey));
+    } catch (exception) {
+      setError(exception instanceof Error ? exception.message : "Inbox admission failed.");
+    } finally {
+      setIsAdmittingInboxMessage(false);
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -307,6 +344,35 @@ export function App() {
           <Metric label="Assigned" value={metrics.assigned} icon={<UserRoundCheck size={19} />} tone="blue" />
           <Metric label="Escalated" value={metrics.escalated} icon={<Zap size={19} />} tone="amber" />
           <Metric label="Resolved" value={metrics.resolved} icon={<CheckCircle2 size={19} />} tone="green" />
+        </section>
+
+        <section className="extension-panel" aria-label="External module capability">
+          <div className="extension-summary">
+            <span>
+              <ShieldCheck size={18} />
+              External module
+            </span>
+            <strong>{externalModuleFit?.moduleName ?? "Loading"}</strong>
+            <small>{externalModuleFit?.capability ?? "community capability"}</small>
+          </div>
+          <div className="fit-grid">
+            <FitPill label="Module provider" verdict={externalModuleFit?.moduleProvider.verdict} />
+            <FitPill label="Document-only" verdict={externalModuleFit?.documentOnlyProvider.verdict} />
+            <FitPill label="Core-only validator" verdict={externalModuleFit?.coreOnlyValidationErrors[0]?.split(":")[0] ?? "Loading"} />
+          </div>
+          <form className="inbox-form" onSubmit={handleAdmitInboxMessage}>
+            <input
+              aria-label="Inbox message key"
+              onChange={(event) => setInboxMessageKey(event.target.value)}
+              value={inboxMessageKey}
+            />
+            <button disabled={isAdmittingInboxMessage || inboxMessageKey.trim().length === 0} type="submit">
+              Admit
+            </button>
+            <output className={`admission ${inboxAdmission?.admission.toLowerCase() ?? ""}`}>
+              {inboxAdmission?.admission ?? "Not submitted"}
+            </output>
+          </form>
         </section>
 
         <div className="content-grid">
@@ -506,6 +572,16 @@ function StatusBadge({ status }: { status: TicketStatus }) {
 
 function PriorityBadge({ priority }: { priority: string }) {
   return <span className={`priority-badge ${priority}`}>{priority}</span>;
+}
+
+function FitPill({ label, verdict }: { label: string; verdict?: string }) {
+  const normalized = (verdict ?? "Loading").toLowerCase();
+  return (
+    <div className={`fit-pill ${normalized}`}>
+      <span>{label}</span>
+      <strong>{verdict ?? "Loading"}</strong>
+    </div>
+  );
 }
 
 function TimelineItem({ label, value }: { label: string; value: string }) {

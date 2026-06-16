@@ -19,6 +19,8 @@
     <ProjectReference Include="..\..\src\Groundwork\PostgreSql\Groundwork.PostgreSql.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\SqlServer\Groundwork.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Sqlite\Groundwork.Sqlite.csproj" />
+    <ProjectReference Include="..\Groundwork.Modules.Inbox\Groundwork.Modules.Inbox.csproj" />
+    <ProjectReference Include="..\Groundwork.Modules.Inbox.Sqlite\Groundwork.Modules.Inbox.Sqlite.csproj" />
   </ItemGroup>
 
 </Project>

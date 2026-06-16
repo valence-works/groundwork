@@ -38,6 +38,25 @@ export interface HealthResponse {
   physicalization: string;
 }
 
+export interface ProviderFitView {
+  verdict: string;
+  detail?: string[] | null;
+}
+
+export interface ExternalModuleFitResponse {
+  moduleName: string;
+  capability: string;
+  moduleProvider: ProviderFitView;
+  documentOnlyProvider: ProviderFitView;
+  coreOnlyValidationErrors: string[];
+}
+
+export interface InboxAdmissionResponse {
+  consumer: string;
+  messageKey: string;
+  admission: "Admitted" | "Duplicate";
+}
+
 export interface CreateTicketRequest {
   ticketNumber: string;
   customerId: string;

@@ -63,6 +63,27 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
         Assert.Equal("TCK-API-1", Assert.Single(byPriority!).Ticket.TicketNumber);
     }
 
+    [Fact]
+    public async Task HttpApiDemonstratesExternalInboxModule()
+    {
+        using var client = factory.CreateClient();
+
+        var fit = await client.GetFromJsonAsync<ExternalModuleFitResponse>("/modules/inbox/fit");
+        var first = await client.PostAsJsonAsync("/modules/inbox/admit", new AdmitInboxMessageRequest("ticket-webhook", "evt-api-1"));
+        var redelivery = await client.PostAsJsonAsync("/modules/inbox/admit", new AdmitInboxMessageRequest("ticket-webhook", "evt-api-1"));
+
+        var admitted = await ReadInboxAdmissionAsync(first);
+        var duplicate = await ReadInboxAdmissionAsync(redelivery);
+
+        Assert.Equal("community.inbox", fit!.ModuleName);
+        Assert.Equal("community.inbox.idempotent-consumer", fit.Capability);
+        Assert.Equal("Supported", fit.ModuleProvider.Verdict);
+        Assert.Equal("Unsupported", fit.DocumentOnlyProvider.Verdict);
+        Assert.Contains(fit.CoreOnlyValidationErrors, error => error.StartsWith("GW-CAP-014:", StringComparison.Ordinal));
+        Assert.Equal("Admitted", admitted.Admission);
+        Assert.Equal("Duplicate", duplicate.Admission);
+    }
+
     public async ValueTask DisposeAsync()
     {
         await factory.DisposeAsync();
@@ -86,5 +107,25 @@ public sealed class SupportTicketApiTests : IAsyncDisposable
             ?? throw new InvalidOperationException("Comment response was empty.");
     }
 
+    private static async Task<InboxAdmissionResponse> ReadInboxAdmissionAsync(HttpResponseMessage response)
+    {
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await response.Content.ReadFromJsonAsync<InboxAdmissionResponse>()
+            ?? throw new InvalidOperationException("Inbox admission response was empty.");
+    }
+
     private sealed record SupportTicketHealthResponse(string Provider, string Physicalization);
+
+    private sealed record AdmitInboxMessageRequest(string Consumer, string MessageKey);
+
+    private sealed record InboxAdmissionResponse(string Consumer, string MessageKey, string Admission);
+
+    private sealed record ExternalModuleFitResponse(
+        string ModuleName,
+        string Capability,
+        FitResponse ModuleProvider,
+        FitResponse DocumentOnlyProvider,
+        IReadOnlyList<string> CoreOnlyValidationErrors);
+
+    private sealed record FitResponse(string Verdict);
 }

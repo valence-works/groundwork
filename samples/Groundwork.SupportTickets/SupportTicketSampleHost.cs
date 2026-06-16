@@ -3,6 +3,8 @@ using Groundwork.Core.Manifests;
 using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
+using Groundwork.Modules.Inbox;
+using Groundwork.Modules.Inbox.Sqlite;
 using Groundwork.PostgreSql.Documents;
 using Groundwork.PostgreSql.Materialization;
 using Groundwork.SqlServer.Documents;
@@ -11,6 +13,7 @@ using Groundwork.Operational;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.Materialization;
 using Groundwork.Sqlite.Operational;
+using Groundwork.SupportTickets.ExternalModules;
 using Groundwork.SupportTickets.Operations;
 using Microsoft.Data.SqlClient;
 using Microsoft.Data.Sqlite;
@@ -29,6 +32,8 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         SupportTicketRepository tickets,
         SupportTicketOperations operations,
         OperationalFitReport operationalFit,
+        IInboxStore inbox,
+        ExternalModuleFitReport externalModuleFit,
         List<IAsyncDisposable> disposables)
     {
         Manifest = manifest;
@@ -36,6 +41,8 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         Tickets = tickets;
         Operations = operations;
         OperationalFit = operationalFit;
+        Inbox = inbox;
+        ExternalModuleFit = externalModuleFit;
         this.disposables = disposables;
     }
 
@@ -53,6 +60,14 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
     /// </summary>
     public OperationalFitReport OperationalFit { get; }
 
+    /// <summary>An external module store proving custom capabilities can be wired without core edits.</summary>
+    public IInboxStore Inbox { get; }
+
+    /// <summary>
+    /// Capability-derived verdict for the externally registered Inbox module.
+    /// </summary>
+    public ExternalModuleFitReport ExternalModuleFit { get; }
+
     public static Task<SupportTicketSampleHost> CreateAsync(string connectionString = "Data Source=:memory:") =>
         CreateAsync(new SupportTicketStorageOptions(SupportTicketProvider.Sqlite, connectionString));
 
@@ -63,7 +78,8 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         var manifest = SupportTicketManifest.Create(options.EffectivePhysicalization);
         var (store, disposables) = await CreateStoreAsync(options, manifest, cancellationToken);
         var (operations, fit) = await CreateOperationsAsync(disposables, options.OperationalClock, cancellationToken);
-        return new SupportTicketSampleHost(manifest, store, new SupportTicketRepository(store), operations, fit, disposables);
+        var (inbox, externalModuleFit) = await CreateExternalModulesAsync(disposables, cancellationToken);
+        return new SupportTicketSampleHost(manifest, store, new SupportTicketRepository(store), operations, fit, inbox, externalModuleFit, disposables);
     }
 
     public async ValueTask DisposeAsync()
@@ -140,6 +156,18 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
             validator.Evaluate(operationalManifest, SupportTicketOperationsManifest.DocumentOnlyProvider()));
 
         return (operations, fit);
+    }
+
+    private static async Task<(IInboxStore Inbox, ExternalModuleFitReport Fit)> CreateExternalModulesAsync(
+        List<IAsyncDisposable> disposables,
+        CancellationToken cancellationToken)
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        disposables.Insert(0, connection);
+        await connection.OpenAsync(cancellationToken);
+        await new SqliteInboxMaterializer(connection).MaterializeAsync(cancellationToken);
+
+        return (new SqliteInboxStore(connection), SupportTicketExternalModuleManifest.EvaluateInboxFit());
     }
 
     private static ProviderIdentity Provider(string name) => new(name, "1.0.0");

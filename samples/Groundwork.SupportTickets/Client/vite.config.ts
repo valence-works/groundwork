@@ -12,6 +12,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/healthz": backendUrl,
+      "/modules": backendUrl,
       "/tickets": backendUrl
     }
   }

@@ -1,6 +1,8 @@
 import type {
   CreateTicketRequest,
+  ExternalModuleFitResponse,
   HealthResponse,
+  InboxAdmissionResponse,
   SupportTicketCommentResponse,
   SupportTicketResponse
 } from "./types";
@@ -9,6 +11,14 @@ const statuses = ["open", "assigned", "escalated", "resolved"] as const;
 
 export async function getHealth(): Promise<HealthResponse> {
   return readJson(await fetch("/healthz"));
+}
+
+export async function getExternalModuleFit(): Promise<ExternalModuleFitResponse> {
+  return readJson(await fetch("/modules/inbox/fit"));
+}
+
+export async function admitInboxMessage(consumer: string, messageKey: string): Promise<InboxAdmissionResponse> {
+  return readJson(await fetch("/modules/inbox/admit", jsonRequest("POST", { consumer, messageKey })));
 }
 
 export async function listTickets(): Promise<SupportTicketResponse[]> {
