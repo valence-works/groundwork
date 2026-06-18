@@ -65,7 +65,7 @@ public sealed class ClosedQueryCapabilityTests
             PhysicalizationPolicy.Portable);
 
     [Fact]
-    public void DescribeSurfacesOperatorsSortAndContractFlags()
+    public void DescribeSurfacesOperatorsAndSortDirection()
     {
         var support = ClosedQueryCapabilityModel.Describe(Unit());
 
@@ -75,12 +75,6 @@ public sealed class ClosedQueryCapabilityTests
         Assert.True(support.SupportsOrderBy("by-name"));
         Assert.True(support.SupportsOrderBy("by-name", descending: true));
         Assert.False(support.SupportsOrderBy("by-color"));
-        Assert.True(support.SupportsDisjunction("by-name"));
-        Assert.False(support.SupportsDisjunction("by-color"));
-        Assert.True(support.SupportsTotalCount("by-name"));
-        Assert.False(support.SupportsTotalCount("by-color"));
-        Assert.True(support.SupportsOffsetPaging("by-name"));
-        Assert.False(support.SupportsOffsetPaging("by-color"));
     }
 
     [Fact]
@@ -142,16 +136,32 @@ public sealed class ClosedQueryCapabilityTests
     }
 
     [Fact]
-    public void EvaluateRejectsPagingWhenTotalCountNotDeclared()
+    public void EvaluateTreatsOrCountAndPagingAsUniversal()
     {
+        // OR composition, total count, and offset paging are universal in the closed-query contract:
+        // they are native even when the declaration leaves the advisory flags unset.
+        var unit = Unit(supportsDisjunction: false, supportsTotalCount: false, paging: QueryPagingSupport.None);
         var query = new PortableDocumentQuery("widget")
-            .Where(QueryClause.Of(QueryComparison.Equal("by-name", "a")))
+            .Where(QueryClause.AnyOf(
+                QueryComparison.Equal("by-name", "a"),
+                QueryComparison.Equal("by-name", "b")))
             .Page(0, 10);
 
-        var result = ClosedQueryNativeSupport.Evaluate(Unit(supportsTotalCount: false), query);
+        var result = ClosedQueryNativeSupport.Evaluate(unit, query);
 
-        Assert.False(result.IsNativelySupported);
-        Assert.Contains(result.Reasons, reason => reason.Contains("by-name") && reason.Contains("total count"));
+        Assert.True(result.IsNativelySupported);
+        Assert.Empty(result.Reasons);
+    }
+
+    [Fact]
+    public void EvaluateTreatsMatchAllPagedQueryAsUniversal()
+    {
+        var query = new PortableDocumentQuery("widget", take: 10);
+
+        var result = ClosedQueryNativeSupport.Evaluate(Unit(paging: QueryPagingSupport.None), query);
+
+        Assert.True(result.IsNativelySupported);
+        Assert.Empty(result.Reasons);
     }
 
     [Fact]
@@ -195,8 +205,9 @@ public sealed class ClosedQueryCapabilityTests
     }
 
     [Fact]
-    public void EvaluateRejectsDisjunctionWhenNotDeclared()
+    public void EvaluateAcceptsOrCompositionWithoutDisjunctionFlag()
     {
+        // OR is a universal query shape; an OR clause is native regardless of the advisory flag.
         var query = new PortableDocumentQuery("widget")
             .Where(QueryClause.AnyOf(
                 QueryComparison.Equal("by-name", "a"),
@@ -204,8 +215,8 @@ public sealed class ClosedQueryCapabilityTests
 
         var result = ClosedQueryNativeSupport.Evaluate(Unit(supportsDisjunction: false), query);
 
-        Assert.False(result.IsNativelySupported);
-        Assert.Contains(result.Reasons, reason => reason.Contains("OR composition"));
+        Assert.True(result.IsNativelySupported);
+        Assert.Empty(result.Reasons);
     }
 
     [Fact]

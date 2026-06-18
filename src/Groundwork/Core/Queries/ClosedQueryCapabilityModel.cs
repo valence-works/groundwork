@@ -5,11 +5,18 @@ namespace Groundwork.Core.Queries;
 
 /// <summary>
 /// Projects a <see cref="StorageUnit"/>'s <see cref="PortableQueryDeclaration"/> entries into a flat,
-/// provider-neutral, per-index description of which closed-query operators, ordering, paging, and
-/// contract flags it natively supports. Detection is driven by the unit's declarations (not by raw
-/// index capability), so an index that physically supports an operator the unit never declared is not
-/// reported as native. Adapters read this to decide whether Groundwork can execute a given query shape
+/// provider-neutral, per-index description of the closed-query capabilities that <em>vary per index</em>:
+/// which comparison operators each declared single-field index supports, and whether (and in which
+/// direction) it can be ordered. Detection is driven by the unit's declarations (not by raw index
+/// capability), so an index that physically supports an operator the unit never declared is not reported
+/// as native.
+/// <para>
+/// OR-composition, total-count, and offset paging are deliberately <em>not</em> modelled here: per the
+/// closed-query contract they are universal query shapes/features (OR is a query shape, total count rides
+/// with offset paging, and offset paging is a base store capability), so they do not vary per index and
+/// are not gated. Adapters read this surface to decide whether Groundwork can execute a given query shape
 /// server-side or whether they must fall back to an in-memory evaluation.
+/// </para>
 /// </summary>
 public static class ClosedQueryCapabilityModel
 {
@@ -54,26 +61,16 @@ public static class ClosedQueryCapabilityModel
                 _ => QuerySortSupport.None
             };
 
-            var paging = declarations
-                .Select(declaration => declaration.PagingSupport)
-                .Aggregate(QueryPagingSupport.None, MaxPaging);
-
             supports[declarations.Key] = new ClosedQueryIndexSupport(
                 declarations.Key,
                 index.Fields[0].Path,
                 operators,
                 index.IsSortable,
-                sortSupport,
-                paging,
-                declarations.Any(d => d.SupportsDisjunction),
-                declarations.Any(d => d.SupportsTotalCount));
+                sortSupport);
         }
 
         return new StorageUnitClosedQuerySupport(supports);
     }
-
-    private static QueryPagingSupport MaxPaging(QueryPagingSupport current, QueryPagingSupport candidate) =>
-        (QueryPagingSupport)Math.Max((int)current, (int)candidate);
 }
 
 /// <summary>Native closed-query support a single declared single-field index offers.</summary>
@@ -82,10 +79,7 @@ public sealed record ClosedQueryIndexSupport(
     string FieldPath,
     IReadOnlySet<PortableQueryOperation> Operators,
     bool IsSortable,
-    QuerySortSupport SortSupport,
-    QueryPagingSupport Paging,
-    bool SupportsDisjunction,
-    bool SupportsTotalCount);
+    QuerySortSupport SortSupport);
 
 /// <summary>The per-index closed-query capabilities a storage unit natively supports.</summary>
 public sealed record StorageUnitClosedQuerySupport(
@@ -100,19 +94,6 @@ public sealed record StorageUnitClosedQuerySupport(
         Indexes.TryGetValue(indexIdentity, out var support)
         && support.IsSortable
         && SortCovers(support.SortSupport, descending);
-
-    /// <summary>Whether <paramref name="indexIdentity"/> declares OR-composition (disjunction) support.</summary>
-    public bool SupportsDisjunction(string indexIdentity) =>
-        Indexes.TryGetValue(indexIdentity, out var support) && support.SupportsDisjunction;
-
-    /// <summary>Whether <paramref name="indexIdentity"/> declares total-count support.</summary>
-    public bool SupportsTotalCount(string indexIdentity) =>
-        Indexes.TryGetValue(indexIdentity, out var support) && support.SupportsTotalCount;
-
-    /// <summary>Whether <paramref name="indexIdentity"/> declares offset paging support.</summary>
-    public bool SupportsOffsetPaging(string indexIdentity) =>
-        Indexes.TryGetValue(indexIdentity, out var support)
-        && support.Paging is QueryPagingSupport.Offset or QueryPagingSupport.Cursor;
 
     private static bool SortCovers(QuerySortSupport support, bool descending) =>
         descending
