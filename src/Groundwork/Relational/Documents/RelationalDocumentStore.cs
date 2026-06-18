@@ -4,7 +4,9 @@ using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Groundwork.Relational.Physicalization;
 
 namespace Groundwork.Relational.Documents;
@@ -138,14 +140,16 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         return DocumentStoreWriteResult.Deleted;
     }
 
-    public async Task<IDocumentTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+    public TransactionBoundary TransactionBoundary => TransactionBoundary.CrossUnitAtomic;
+
+    public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
         await connectionGate.WaitAsync(cancellationToken);
         try
         {
             await EnsureOpenAsync(cancellationToken);
             var transaction = await connection.BeginTransactionAsync(cancellationToken);
-            return new RelationalDocumentTransaction(this, transaction);
+            return new RelationalDocumentUnitOfWork(this, transaction);
         }
         catch
         {
@@ -494,7 +498,7 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         }
     }
 
-    private sealed class RelationalDocumentTransaction(RelationalDocumentStore store, DbTransaction transaction) : IDocumentTransaction
+    private sealed class RelationalDocumentUnitOfWork(RelationalDocumentStore store, DbTransaction transaction) : IDocumentUnitOfWork
     {
         private bool completed;
 

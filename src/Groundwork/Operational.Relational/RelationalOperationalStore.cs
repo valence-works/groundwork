@@ -1,4 +1,5 @@
 using System.Data.Common;
+using Groundwork.Core.Transactions;
 using Groundwork.Operational.Leases;
 using Groundwork.Operational.Outbox;
 using Groundwork.Operational.UnitOfWork;
@@ -45,7 +46,7 @@ public class RelationalOperationalStore : IOperationalSessionFactory
     public async Task<IOperationalUnitOfWork> BeginAsync(OperationalCommitScope scope, CancellationToken cancellationToken = default)
     {
         if (boundary != TransactionBoundary.CrossUnitAtomic)
-            throw new UnsupportedAtomicCommitException(scope);
+            throw new UnsupportedAtomicCommitException(scope.Units);
 
         var unitOfWork = await session.BeginUnitOfWorkAsync(cancellationToken);
         return new RelationalOperationalUnitOfWork(unitOfWork, clock);

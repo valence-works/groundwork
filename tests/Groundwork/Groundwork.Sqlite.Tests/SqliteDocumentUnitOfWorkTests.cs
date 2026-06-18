@@ -1,4 +1,6 @@
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.Materialization;
 using Microsoft.Data.Sqlite;
@@ -6,18 +8,27 @@ using Xunit;
 
 namespace Groundwork.Sqlite.Tests;
 
-public sealed class SqliteDocumentTransactionTests
+public sealed class SqliteDocumentUnitOfWorkTests
 {
+    private static readonly DocumentCommitScope Scope = DocumentCommitScope.Of("widget");
+
+    [Fact]
+    public async Task RelationalStoreDeclaresCrossUnitAtomicBoundary()
+    {
+        await using var harness = await TxHarness.Create();
+        Assert.Equal(TransactionBoundary.CrossUnitAtomic, harness.Store.TransactionBoundary);
+    }
+
     [Fact]
     public async Task CommitPersistsAllStagedWrites()
     {
         await using var harness = await TxHarness.Create();
 
-        await using (var tx = await harness.Store.BeginTransactionAsync())
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
         {
-            await tx.SaveAsync(Save("w1", "tools"));
-            await tx.SaveAsync(Save("w2", "gadgets"));
-            await tx.CommitAsync();
+            await unitOfWork.SaveAsync(Save("w1", "tools"));
+            await unitOfWork.SaveAsync(Save("w2", "gadgets"));
+            await unitOfWork.CommitAsync();
         }
 
         Assert.NotNull(await harness.Store.LoadAsync("widget", "w1"));
@@ -29,11 +40,11 @@ public sealed class SqliteDocumentTransactionTests
     {
         await using var harness = await TxHarness.Create();
 
-        await using (var tx = await harness.Store.BeginTransactionAsync())
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
         {
-            await tx.SaveAsync(Save("w1", "tools"));
-            await tx.SaveAsync(Save("w2", "gadgets"));
-            await tx.RollbackAsync();
+            await unitOfWork.SaveAsync(Save("w1", "tools"));
+            await unitOfWork.SaveAsync(Save("w2", "gadgets"));
+            await unitOfWork.RollbackAsync();
         }
 
         Assert.Null(await harness.Store.LoadAsync("widget", "w1"));
@@ -45,9 +56,9 @@ public sealed class SqliteDocumentTransactionTests
     {
         await using var harness = await TxHarness.Create();
 
-        await using (var tx = await harness.Store.BeginTransactionAsync())
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
         {
-            await tx.SaveAsync(Save("w1", "tools"));
+            await unitOfWork.SaveAsync(Save("w1", "tools"));
             // no commit -> dispose rolls back
         }
 
@@ -55,18 +66,18 @@ public sealed class SqliteDocumentTransactionTests
     }
 
     [Fact]
-    public async Task LoadWithinTransactionSeesStagedWrite()
+    public async Task LoadWithinUnitOfWorkSeesStagedWrite()
     {
         await using var harness = await TxHarness.Create();
 
-        await using var tx = await harness.Store.BeginTransactionAsync();
-        await tx.SaveAsync(Save("w1", "tools"));
+        await using var unitOfWork = await harness.Store.BeginAsync(Scope);
+        await unitOfWork.SaveAsync(Save("w1", "tools"));
 
-        var staged = await tx.LoadAsync("widget", "w1");
+        var staged = await unitOfWork.LoadAsync("widget", "w1");
         Assert.NotNull(staged);
         Assert.Equal(1, staged!.Version);
 
-        await tx.RollbackAsync();
+        await unitOfWork.RollbackAsync();
     }
 
     [Fact]
@@ -74,16 +85,16 @@ public sealed class SqliteDocumentTransactionTests
     {
         await using var harness = await TxHarness.Create();
 
-        await using (var tx = await harness.Store.BeginTransactionAsync())
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
         {
-            var first = await tx.SaveAsync(Save("w1", "tools"));
+            var first = await unitOfWork.SaveAsync(Save("w1", "tools"));
             Assert.Equal(DocumentStoreWriteStatus.Saved, first.Status);
 
             // Expected-version mismatch against a non-existent document => not a success.
-            var conflict = await tx.SaveAsync(new SaveDocumentRequest("widget", "w2", "1.0.0", """{"category":"gadgets"}""", ExpectedVersion: 7));
+            var conflict = await unitOfWork.SaveAsync(new SaveDocumentRequest("widget", "w2", "1.0.0", """{"category":"gadgets"}""", ExpectedVersion: 7));
             Assert.Equal(DocumentStoreWriteStatus.NotFound, conflict.Status);
 
-            await tx.RollbackAsync();
+            await unitOfWork.RollbackAsync();
         }
 
         // Because the caller rolled back, the earlier successful save is also discarded.
@@ -95,22 +106,22 @@ public sealed class SqliteDocumentTransactionTests
     {
         await using var harness = await TxHarness.Create();
 
-        var tx = await harness.Store.BeginTransactionAsync();
-        await tx.CommitAsync();
+        var unitOfWork = await harness.Store.BeginAsync(Scope);
+        await unitOfWork.CommitAsync();
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => tx.SaveAsync(Save("w1", "tools")));
-        await tx.DisposeAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.SaveAsync(Save("w1", "tools")));
+        await unitOfWork.DisposeAsync();
     }
 
     [Fact]
-    public async Task StoreUsableAfterTransactionReleasesConnection()
+    public async Task StoreUsableAfterUnitOfWorkReleasesConnection()
     {
         await using var harness = await TxHarness.Create();
 
-        await using (var tx = await harness.Store.BeginTransactionAsync())
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
         {
-            await tx.SaveAsync(Save("w1", "tools"));
-            await tx.CommitAsync();
+            await unitOfWork.SaveAsync(Save("w1", "tools"));
+            await unitOfWork.CommitAsync();
         }
 
         // The connection gate must be released so ordinary store operations work afterwards.

@@ -276,40 +276,48 @@ else
 
 #### Multi-document transactions
 
-For write commands that persist several related documents all-or-nothing, an `IDocumentStore` can begin a multi-document transaction. Staged `Save`/`Delete` operations are applied to the underlying database transaction and become visible only on `CommitAsync`; `RollbackAsync` (or disposing without committing) discards them.
+For write commands that persist several related documents all-or-nothing, an `IDocumentStore` is also an `IDocumentSessionFactory`: it begins a document unit of work over a declared `DocumentCommitScope`. This mirrors the operational `IOperationalSessionFactory`/`IOperationalUnitOfWork` shape. Staged `Save`/`Delete` operations are applied to the underlying database transaction and become visible only on `CommitAsync`; `RollbackAsync` (or disposing without committing) discards them.
 
 ```csharp
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 
-await using var transaction = await store.BeginTransactionAsync();
+// Detect native cross-document atomicity before committing to a path (no exception needed).
+if (store.TransactionBoundary != TransactionBoundary.CrossUnitAtomic)
+    /* use a compensation fallback */;
+
+await using var unitOfWork = await store.BeginAsync(
+    DocumentCommitScope.Of("workflow-version", "workflow-definition", "layout"));
 try
 {
-    var saved = await transaction.SaveAsync(new SaveDocumentRequest(/* version doc */));
+    var saved = await unitOfWork.SaveAsync(new SaveDocumentRequest(/* version doc */));
     if (saved.Status != DocumentStoreWriteStatus.Saved)
     {
-        await transaction.RollbackAsync();   // all-or-nothing: caller rolls back on any non-success
+        await unitOfWork.RollbackAsync();   // all-or-nothing: caller rolls back on any non-success
         return;
     }
 
-    await transaction.SaveAsync(new SaveDocumentRequest(/* updated definition doc */));
-    await transaction.DeleteAsync(new DeleteDocumentRequest(/* stale layout record */));
+    await unitOfWork.SaveAsync(new SaveDocumentRequest(/* updated definition doc */));
+    await unitOfWork.DeleteAsync(new DeleteDocumentRequest(/* stale layout record */));
 
-    await transaction.CommitAsync();
+    await unitOfWork.CommitAsync();
 }
 catch
 {
-    await transaction.RollbackAsync();
+    await unitOfWork.RollbackAsync();
     throw;
 }
 ```
 
 Contract:
 
-- **Staging.** `SaveAsync`/`DeleteAsync` run against the open transaction and return their normal `DocumentStoreWriteResult` immediately (including `ConcurrencyConflict`/`NotFound`). They are **not** auto-committed. The all-or-nothing guarantee is the caller's: roll back on any non-success result or exception.
-- **Read-your-writes.** `LoadAsync` inside the transaction sees staged writes.
+- **Boundary detection.** `IDocumentSessionFactory.TransactionBoundary` reports `CrossUnitAtomic` when the store can commit multiple documents atomically, or `PerOperation` when it cannot — letting callers choose a compensation path without catching an exception.
+- **Staging.** `SaveAsync`/`DeleteAsync` run against the open unit of work and return their normal `DocumentStoreWriteResult` immediately (including `ConcurrencyConflict`/`NotFound`). They are **not** auto-committed. The all-or-nothing guarantee is the caller's: roll back on any non-success result or exception.
+- **Read-your-writes.** `LoadAsync` inside the unit of work sees staged writes.
 - **Commit/rollback.** `CommitAsync` makes every staged change durable atomically; `RollbackAsync` (and `DisposeAsync` without a prior commit) discards them all. After completion, further operations throw.
-- **Relational** (SQLite/PostgreSQL/SQL Server) is backed by a real `DbTransaction` and serializes store access for the transaction's lifetime. Note that some engines (e.g. PostgreSQL) abort the whole transaction on the first failed statement, so rollback is the only valid next step after a non-success result.
-- **MongoDB** uses a multi-document transaction over a client session, which requires a **replica set or sharded** deployment. On a standalone deployment `BeginTransactionAsync` throws `UnsupportedDocumentTransactionException` (a loud failure rather than silent non-atomic writes) — that is the documented fallback contract for that topology.
+- **Relational** (SQLite/PostgreSQL/SQL Server) is `CrossUnitAtomic`, backed by a real `DbTransaction` and serializing store access for the unit of work's lifetime. Note that some engines (e.g. PostgreSQL) abort the whole transaction on the first failed statement, so rollback is the only valid next step after a non-success result.
+- **MongoDB** uses a multi-document transaction over a client session, which requires a **replica set or sharded** deployment (reported as `CrossUnitAtomic`). On a standalone deployment the boundary is `PerOperation` and `BeginAsync` throws `UnsupportedAtomicCommitException` (a loud failure rather than silent non-atomic writes) — that is the documented fallback contract for that topology.
 
 For application code, use a regular CLR type and serialize it with the same JSON field names declared by the manifest indexes:
 

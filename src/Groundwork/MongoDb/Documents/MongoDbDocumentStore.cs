@@ -3,7 +3,9 @@ using System.Text.RegularExpressions;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
@@ -110,13 +112,18 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
             : DocumentStoreWriteResult.ConcurrencyConflict;
     }
 
-    public async Task<IDocumentTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+    public TransactionBoundary TransactionBoundary =>
+        database.Client.Cluster.Description.Type is ClusterType.ReplicaSet or ClusterType.Sharded
+            ? TransactionBoundary.CrossUnitAtomic
+            : TransactionBoundary.PerOperation;
+
+    public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
         var clusterType = database.Client.Cluster.Description.Type;
         if (clusterType is not ClusterType.ReplicaSet and not ClusterType.Sharded)
-            throw new UnsupportedDocumentTransactionException(
-                "MongoDB",
-                $"multi-document transactions require a replica set or sharded cluster, but the connected deployment is '{clusterType}'.");
+            throw new UnsupportedAtomicCommitException(
+                scope.Kinds,
+                $"MongoDB multi-document transactions require a replica set or sharded cluster, but the connected deployment is '{clusterType}'.");
 
         var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
         try
@@ -126,10 +133,10 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
         catch (NotSupportedException exception)
         {
             session.Dispose();
-            throw new UnsupportedDocumentTransactionException("MongoDB", exception.Message);
+            throw new UnsupportedAtomicCommitException(scope.Kinds, exception.Message);
         }
 
-        return new MongoDocumentTransaction(this, session);
+        return new MongoDocumentUnitOfWork(this, session);
     }
 
     private static Task InsertOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, BsonDocument document, CancellationToken cancellationToken) =>
@@ -418,7 +425,7 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
     private static bool IsDuplicateKey(MongoWriteException exception) =>
         exception.WriteError?.Code == 11000;
 
-    private sealed class MongoDocumentTransaction(MongoDbDocumentStore store, IClientSessionHandle session) : IDocumentTransaction
+    private sealed class MongoDocumentUnitOfWork(MongoDbDocumentStore store, IClientSessionHandle session) : IDocumentUnitOfWork
     {
         private bool completed;
 

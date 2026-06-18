@@ -1,3 +1,4 @@
+using Groundwork.Core.Transactions;
 using Groundwork.Operational.Outbox;
 using Groundwork.Operational.UnitOfWork;
 using Groundwork.Operational.WorkQueue;
@@ -75,7 +76,7 @@ public sealed class SqliteOperationalUnitOfWorkTests
         var store = new RelationalOperationalStore(connection, boundary: TransactionBoundary.PerOperation);
 
         var exception = await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.BeginAsync(Scope));
-        Assert.Equal(Scope.Units, exception.Scope.Units);
+        Assert.Equal(Scope.Units, exception.Units);
 
         await connection.DisposeAsync();
     }
