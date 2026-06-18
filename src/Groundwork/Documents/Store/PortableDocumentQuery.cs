@@ -26,9 +26,21 @@ public sealed record QueryComparison
         if (string.IsNullOrWhiteSpace(indexName))
             throw new ArgumentException("Index name must be provided.", nameof(indexName));
 
+        ArgumentNullException.ThrowIfNull(values);
+
+        switch (@operator)
+        {
+            case QueryComparisonOperator.Equal when values.Count != 1:
+                throw new ArgumentException("Equal requires exactly one value.", nameof(values));
+            case QueryComparisonOperator.Contains when values.Count != 1:
+                throw new ArgumentException("Contains requires exactly one value.", nameof(values));
+            case QueryComparisonOperator.Contains when values[0] is null:
+                throw new ArgumentException("Contains does not accept a null value.", nameof(values));
+        }
+
         IndexName = indexName;
         Operator = @operator;
-        Values = values ?? throw new ArgumentNullException(nameof(values));
+        Values = values;
     }
 
     public string IndexName { get; }
@@ -98,12 +110,6 @@ public sealed record PortableDocumentQuery
         if (string.IsNullOrWhiteSpace(documentKind))
             throw new ArgumentException("Document kind must be provided.", nameof(documentKind));
 
-        if (skip is < 0)
-            throw new ArgumentOutOfRangeException(nameof(skip), skip, "Skip must be greater than or equal to 0.");
-
-        if (take is < 0)
-            throw new ArgumentOutOfRangeException(nameof(take), take, "Take must be greater than or equal to 0.");
-
         DocumentKind = documentKind;
         Clauses = clauses ?? Array.Empty<QueryClause>();
         Order = order;
@@ -115,8 +121,31 @@ public sealed record PortableDocumentQuery
     public string DocumentKind { get; }
     public IReadOnlyList<QueryClause> Clauses { get; init; }
     public QueryOrder? Order { get; init; }
-    public int? Skip { get; init; }
-    public int? Take { get; init; }
+
+    private readonly int? skip;
+    public int? Skip
+    {
+        get => skip;
+        init
+        {
+            if (value is < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Skip must be greater than or equal to 0.");
+            skip = value;
+        }
+    }
+
+    private readonly int? take;
+    public int? Take
+    {
+        get => take;
+        init
+        {
+            if (value is < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Take must be greater than or equal to 0.");
+            take = value;
+        }
+    }
+
     public QueryTenantScope TenantScope { get; init; }
 
     public PortableDocumentQuery Where(QueryClause clause) =>

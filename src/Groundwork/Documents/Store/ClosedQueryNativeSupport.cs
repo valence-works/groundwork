@@ -23,23 +23,42 @@ public static class ClosedQueryNativeSupport
 
         foreach (var clause in query.Clauses)
         {
-            if (clause.Comparisons.Count > 1 && !profile.SupportsDisjunction)
-                reasons.Add($"Index '{clause.Comparisons[0].IndexName}' clause uses OR composition but the unit does not declare disjunction support.");
+            var isDisjunction = clause.Comparisons.Count > 1;
 
             foreach (var comparison in clause.Comparisons)
             {
                 var operation = ToPortableOperation(comparison.Operator);
                 if (!profile.SupportsOperator(comparison.IndexName, operation))
                     reasons.Add($"Index '{comparison.IndexName}' does not natively support operator '{operation}'.");
+
+                if (isDisjunction && !profile.SupportsDisjunction(comparison.IndexName))
+                    reasons.Add($"Index '{comparison.IndexName}' participates in an OR composition but does not declare disjunction support.");
             }
         }
 
-        if (query.Order is not null && !profile.SupportsOrderBy(query.Order.IndexName))
-            reasons.Add($"Index '{query.Order.IndexName}' is not sortable, so ORDER BY is not natively supported.");
+        if (query.Order is not null && !profile.SupportsOrderBy(query.Order.IndexName, query.Order.Descending))
+            reasons.Add($"Index '{query.Order.IndexName}' does not natively support the requested ORDER BY (index not sortable or direction not declared).");
 
         var usesOffsetPaging = (query.Skip ?? 0) > 0 || query.Take is not null;
-        if (usesOffsetPaging && !profile.SupportsOffsetPaging)
-            reasons.Add("Offset paging is requested but the unit does not declare offset paging support.");
+        if (usesOffsetPaging)
+        {
+            // Total count rides with offset paging, so a paged query needs both capabilities on every
+            // index it references. A match-all paged query references no index and uses the store's
+            // base offset paging, so it is not gated here.
+            var referencedIndexes = query.Clauses
+                .SelectMany(clause => clause.Comparisons.Select(comparison => comparison.IndexName))
+                .Concat(query.Order is null ? Array.Empty<string>() : new[] { query.Order.IndexName })
+                .Distinct(StringComparer.Ordinal);
+
+            foreach (var indexName in referencedIndexes)
+            {
+                if (!profile.SupportsOffsetPaging(indexName))
+                    reasons.Add($"Offset paging is requested but index '{indexName}' does not declare offset paging support.");
+
+                if (!profile.SupportsTotalCount(indexName))
+                    reasons.Add($"Offset paging requires a total count, but index '{indexName}' does not declare total-count support.");
+            }
+        }
 
         return reasons.Count == 0
             ? ClosedQuerySupportResult.Native

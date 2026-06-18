@@ -73,10 +73,85 @@ public sealed class ClosedQueryCapabilityTests
         Assert.True(support.SupportsOperator("by-name", PortableQueryOperation.Contains));
         Assert.False(support.SupportsOperator("by-color", PortableQueryOperation.In));
         Assert.True(support.SupportsOrderBy("by-name"));
+        Assert.True(support.SupportsOrderBy("by-name", descending: true));
         Assert.False(support.SupportsOrderBy("by-color"));
-        Assert.True(support.SupportsDisjunction);
-        Assert.True(support.SupportsTotalCount);
-        Assert.True(support.SupportsOffsetPaging);
+        Assert.True(support.SupportsDisjunction("by-name"));
+        Assert.False(support.SupportsDisjunction("by-color"));
+        Assert.True(support.SupportsTotalCount("by-name"));
+        Assert.False(support.SupportsTotalCount("by-color"));
+        Assert.True(support.SupportsOffsetPaging("by-name"));
+        Assert.False(support.SupportsOffsetPaging("by-color"));
+    }
+
+    [Fact]
+    public void DescribeIgnoresUndeclaredIndexOperators()
+    {
+        // 'by-color' physically supports Equal but has no PortableQueryDeclaration, so it is not
+        // part of the closed surface and must not appear as natively supported.
+        var support = ClosedQueryCapabilityModel.Describe(Unit());
+
+        Assert.False(support.Indexes.ContainsKey("by-color"));
+        Assert.False(support.SupportsOperator("by-color", PortableQueryOperation.Equal));
+    }
+
+    [Fact]
+    public void DescribeRespectsDeclaredSortDirection()
+    {
+        var unit = Unit() with
+        {
+            Queries =
+            [
+                new PortableQueryDeclaration(
+                    "search-by-name",
+                    "by-name",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.Ascending,
+                    QueryPagingSupport.Offset),
+            ],
+        };
+
+        var support = ClosedQueryCapabilityModel.Describe(unit);
+
+        Assert.True(support.SupportsOrderBy("by-name"));
+        Assert.False(support.SupportsOrderBy("by-name", descending: true));
+    }
+
+    [Fact]
+    public void EvaluateRejectsDescendingOrderWhenOnlyAscendingDeclared()
+    {
+        var unit = Unit() with
+        {
+            Queries =
+            [
+                new PortableQueryDeclaration(
+                    "search-by-name",
+                    "by-name",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.Ascending,
+                    QueryPagingSupport.Offset,
+                    SupportsTotalCount: true),
+            ],
+        };
+        var query = new PortableDocumentQuery("widget")
+            .OrderBy(new QueryOrder("by-name", Descending: true));
+
+        var result = ClosedQueryNativeSupport.Evaluate(unit, query);
+
+        Assert.False(result.IsNativelySupported);
+        Assert.Contains(result.Reasons, reason => reason.Contains("by-name") && reason.Contains("ORDER BY"));
+    }
+
+    [Fact]
+    public void EvaluateRejectsPagingWhenTotalCountNotDeclared()
+    {
+        var query = new PortableDocumentQuery("widget")
+            .Where(QueryClause.Of(QueryComparison.Equal("by-name", "a")))
+            .Page(0, 10);
+
+        var result = ClosedQueryNativeSupport.Evaluate(Unit(supportsTotalCount: false), query);
+
+        Assert.False(result.IsNativelySupported);
+        Assert.Contains(result.Reasons, reason => reason.Contains("by-name") && reason.Contains("total count"));
     }
 
     [Fact]

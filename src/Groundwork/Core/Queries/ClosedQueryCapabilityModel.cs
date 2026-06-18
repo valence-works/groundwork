@@ -4,10 +4,12 @@ using Groundwork.Core.Manifests;
 namespace Groundwork.Core.Queries;
 
 /// <summary>
-/// Projects a <see cref="StorageUnit"/>'s declared indexes and portable-query declarations into a
-/// flat, provider-neutral description of which closed-query operators it natively supports. Adapters
-/// read this to decide whether Groundwork can execute a given query shape server-side or whether they
-/// must fall back to an in-memory evaluation.
+/// Projects a <see cref="StorageUnit"/>'s <see cref="PortableQueryDeclaration"/> entries into a flat,
+/// provider-neutral, per-index description of which closed-query operators, ordering, paging, and
+/// contract flags it natively supports. Detection is driven by the unit's declarations (not by raw
+/// index capability), so an index that physically supports an operator the unit never declared is not
+/// reported as native. Adapters read this to decide whether Groundwork can execute a given query shape
+/// server-side or whether they must fall back to an in-memory evaluation.
 /// </summary>
 public static class ClosedQueryCapabilityModel
 {
@@ -20,59 +22,100 @@ public static class ClosedQueryCapabilityModel
             PortableQueryOperation.Contains
         };
 
-    /// <summary>Builds the closed-query support profile for a storage unit.</summary>
+    /// <summary>Builds the per-index closed-query support profile for a storage unit from its declarations.</summary>
     public static StorageUnitClosedQuerySupport Describe(StorageUnit unit)
     {
         ArgumentNullException.ThrowIfNull(unit);
 
-        var indexes = unit.Indexes
+        var singleFieldIndexes = unit.Indexes
             .Where(index => index.Fields.Count == 1)
-            .ToDictionary(
-                index => index.Identity,
-                index => new ClosedQueryIndexSupport(
-                    index.Identity,
-                    index.Fields[0].Path,
-                    index.SupportedOperations
-                        .Where(ClosedComparisonOperators.Contains)
-                        .ToHashSet(),
-                    index.IsSortable),
-                StringComparer.Ordinal);
+            .ToDictionary(index => index.Identity, StringComparer.Ordinal);
 
-        var supportsDisjunction = unit.Queries.Any(query => query.SupportsDisjunction);
-        var supportsTotalCount = unit.Queries.Any(query => query.SupportsTotalCount);
-        var paging = unit.Queries
-            .Select(query => query.PagingSupport)
-            .Aggregate(QueryPagingSupport.None, MaxPaging);
+        var supports = new Dictionary<string, ClosedQueryIndexSupport>(StringComparer.Ordinal);
 
-        return new StorageUnitClosedQuerySupport(indexes, supportsDisjunction, supportsTotalCount, paging);
+        foreach (var declarations in unit.Queries.GroupBy(query => query.IndexIdentity, StringComparer.Ordinal))
+        {
+            // Declarations targeting a multi-field or unknown index are outside the closed surface.
+            if (!singleFieldIndexes.TryGetValue(declarations.Key, out var index))
+                continue;
+
+            var operators = declarations
+                .SelectMany(declaration => declaration.Operations)
+                .Where(ClosedComparisonOperators.Contains)
+                .ToHashSet();
+
+            var canAscend = declarations.Any(d => d.SortSupport is QuerySortSupport.Ascending or QuerySortSupport.Both);
+            var canDescend = declarations.Any(d => d.SortSupport is QuerySortSupport.Descending or QuerySortSupport.Both);
+            var sortSupport = (canAscend, canDescend) switch
+            {
+                (true, true) => QuerySortSupport.Both,
+                (true, false) => QuerySortSupport.Ascending,
+                (false, true) => QuerySortSupport.Descending,
+                _ => QuerySortSupport.None
+            };
+
+            var paging = declarations
+                .Select(declaration => declaration.PagingSupport)
+                .Aggregate(QueryPagingSupport.None, MaxPaging);
+
+            supports[declarations.Key] = new ClosedQueryIndexSupport(
+                declarations.Key,
+                index.Fields[0].Path,
+                operators,
+                index.IsSortable,
+                sortSupport,
+                paging,
+                declarations.Any(d => d.SupportsDisjunction),
+                declarations.Any(d => d.SupportsTotalCount));
+        }
+
+        return new StorageUnitClosedQuerySupport(supports);
     }
 
     private static QueryPagingSupport MaxPaging(QueryPagingSupport current, QueryPagingSupport candidate) =>
         (QueryPagingSupport)Math.Max((int)current, (int)candidate);
 }
 
-/// <summary>Native closed-query support a single-field index offers.</summary>
+/// <summary>Native closed-query support a single declared single-field index offers.</summary>
 public sealed record ClosedQueryIndexSupport(
     string IndexIdentity,
     string FieldPath,
     IReadOnlySet<PortableQueryOperation> Operators,
-    bool IsSortable);
-
-/// <summary>The closed-query capabilities a storage unit natively supports.</summary>
-public sealed record StorageUnitClosedQuerySupport(
-    IReadOnlyDictionary<string, ClosedQueryIndexSupport> Indexes,
+    bool IsSortable,
+    QuerySortSupport SortSupport,
+    QueryPagingSupport Paging,
     bool SupportsDisjunction,
-    bool SupportsTotalCount,
-    QueryPagingSupport Paging)
+    bool SupportsTotalCount);
+
+/// <summary>The per-index closed-query capabilities a storage unit natively supports.</summary>
+public sealed record StorageUnitClosedQuerySupport(
+    IReadOnlyDictionary<string, ClosedQueryIndexSupport> Indexes)
 {
     /// <summary>Whether <paramref name="indexIdentity"/> natively supports <paramref name="operation"/>.</summary>
     public bool SupportsOperator(string indexIdentity, PortableQueryOperation operation) =>
         Indexes.TryGetValue(indexIdentity, out var support) && support.Operators.Contains(operation);
 
-    /// <summary>Whether <paramref name="indexIdentity"/> can be used to order results.</summary>
-    public bool SupportsOrderBy(string indexIdentity) =>
-        Indexes.TryGetValue(indexIdentity, out var support) && support.IsSortable;
+    /// <summary>Whether <paramref name="indexIdentity"/> can order results in the requested direction.</summary>
+    public bool SupportsOrderBy(string indexIdentity, bool descending = false) =>
+        Indexes.TryGetValue(indexIdentity, out var support)
+        && support.IsSortable
+        && SortCovers(support.SortSupport, descending);
 
-    /// <summary>Whether offset paging is natively available.</summary>
-    public bool SupportsOffsetPaging => Paging == QueryPagingSupport.Offset || Paging == QueryPagingSupport.Cursor;
+    /// <summary>Whether <paramref name="indexIdentity"/> declares OR-composition (disjunction) support.</summary>
+    public bool SupportsDisjunction(string indexIdentity) =>
+        Indexes.TryGetValue(indexIdentity, out var support) && support.SupportsDisjunction;
+
+    /// <summary>Whether <paramref name="indexIdentity"/> declares total-count support.</summary>
+    public bool SupportsTotalCount(string indexIdentity) =>
+        Indexes.TryGetValue(indexIdentity, out var support) && support.SupportsTotalCount;
+
+    /// <summary>Whether <paramref name="indexIdentity"/> declares offset paging support.</summary>
+    public bool SupportsOffsetPaging(string indexIdentity) =>
+        Indexes.TryGetValue(indexIdentity, out var support)
+        && support.Paging is QueryPagingSupport.Offset or QueryPagingSupport.Cursor;
+
+    private static bool SortCovers(QuerySortSupport support, bool descending) =>
+        descending
+            ? support is QuerySortSupport.Descending or QuerySortSupport.Both
+            : support is QuerySortSupport.Ascending or QuerySortSupport.Both;
 }
