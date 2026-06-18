@@ -7,7 +7,9 @@ public sealed record PortableQueryDeclaration(
     string IndexIdentity,
     IReadOnlySet<PortableQueryOperation> Operations,
     QuerySortSupport SortSupport,
-    QueryPagingSupport PagingSupport);
+    QueryPagingSupport PagingSupport,
+    bool SupportsDisjunction = false,
+    bool SupportsTotalCount = false);
 
 public enum QuerySortSupport
 {

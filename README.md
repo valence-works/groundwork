@@ -254,6 +254,26 @@ bool any = await store.AnyAsync(query);
 
 Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `QueryClause` (`QueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Queries are tenant-aware by default — pass `QueryTenantScope.TenantAgnostic` to bypass ambient tenant filtering, which is supplied to the store via an optional ambient-tenant accessor.
 
+#### Declaring and detecting closed-query support
+
+A `StorageUnit` declares which closed-query capabilities it supports through `PortableQueryDeclaration` entries on the manifest: the comparison `Operations` (`Equal`/`In`/`Contains`, validated against the index's `SupportedOperations`), `SortSupport` (single-field ordering, validated against the index's `IsSortable`), `PagingSupport` (offset paging), and the `SupportsDisjunction` (OR within a clause) and `SupportsTotalCount` flags. Adapters that want to skip an in-memory fallback can detect native support without trial execution:
+
+```csharp
+using Groundwork.Core.Queries;
+using Groundwork.Documents.Store;
+
+// Manifest-level profile: which operators/sort/paging a unit natively supports.
+StorageUnitClosedQuerySupport support = ClosedQueryCapabilityModel.Describe(unit);
+bool canContainsByName = support.SupportsOperator("by-name", PortableQueryOperation.Contains);
+
+// Whole-query check: is this exact query shape executable server-side?
+ClosedQuerySupportResult result = ClosedQueryNativeSupport.Evaluate(unit, query);
+if (result.IsNativelySupported)
+    await store.QueryAsync(query);     // native push-down
+else
+    /* fall back */;                   // result.Reasons explains why
+```
+
 For application code, use a regular CLR type and serialize it with the same JSON field names declared by the manifest indexes:
 
 ```csharp
