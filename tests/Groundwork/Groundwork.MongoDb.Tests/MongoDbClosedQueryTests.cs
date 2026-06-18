@@ -88,6 +88,43 @@ public sealed class MongoDbClosedQueryTests : IAsyncLifetime
         Assert.Equal(3, agnostic.TotalCount);
     }
 
+    [Fact]
+    public async Task DocumentTransactionCommitsAtomicallyOrFailsLoudlyOnStandalone()
+    {
+        await using var harness = await Harness.CreateWidgets(container.GetConnectionString());
+        var store = harness.Store;
+
+        IDocumentTransaction transaction;
+        try
+        {
+            transaction = await store.BeginTransactionAsync();
+        }
+        catch (UnsupportedDocumentTransactionException exception)
+        {
+            // On a standalone deployment the contract is a loud failure, not silent non-atomic writes.
+            Assert.Contains("replica set", exception.Reason);
+            return;
+        }
+
+        await using (transaction)
+        {
+            await transaction.SaveAsync(new SaveDocumentRequest("configurationDocument", "t1", "1.0.0", """{"key":"K1","category":"tools","sort":"001"}"""));
+            await transaction.SaveAsync(new SaveDocumentRequest("configurationDocument", "t2", "1.0.0", """{"key":"K2","category":"tools","sort":"002"}"""));
+            await transaction.CommitAsync();
+        }
+
+        Assert.NotNull(await store.LoadAsync("configurationDocument", "t1"));
+        Assert.NotNull(await store.LoadAsync("configurationDocument", "t2"));
+
+        await using (var rollback = await store.BeginTransactionAsync())
+        {
+            await rollback.SaveAsync(new SaveDocumentRequest("configurationDocument", "t3", "1.0.0", """{"key":"K3","category":"tools","sort":"003"}"""));
+            await rollback.RollbackAsync();
+        }
+
+        Assert.Null(await store.LoadAsync("configurationDocument", "t3"));
+    }
+
     private sealed class Harness : IAsyncDisposable
     {
         private Harness(IMongoClient client, IMongoDatabase database, MongoDbDocumentStore store)

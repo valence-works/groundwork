@@ -15,4 +15,12 @@ public interface IDocumentStore
 
     /// <summary>Returns whether any document matches the query.</summary>
     Task<bool> AnyAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Begins a multi-document atomic transaction. Save/delete operations staged on the returned
+    /// <see cref="IDocumentTransaction"/> commit all-or-nothing. Throws
+    /// <see cref="UnsupportedDocumentTransactionException"/> if the provider/deployment cannot honour
+    /// multi-document atomicity.
+    /// </summary>
+    Task<IDocumentTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default);
 }

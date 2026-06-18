@@ -7,6 +7,7 @@ using Groundwork.Documents.Store;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Clusters;
 
 namespace Groundwork.MongoDb.Documents;
 
@@ -15,8 +16,13 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
+        return await SaveCoreAsync(unit, request, session: null, cancellationToken);
+    }
+
+    private async Task<DocumentStoreWriteResult> SaveCoreAsync(StorageUnit unit, SaveDocumentRequest request, IClientSessionHandle? session, CancellationToken cancellationToken)
+    {
         var collection = GetCollection(unit);
-        var existing = await LoadCoreAsync(unit, request.Id, cancellationToken);
+        var existing = await LoadCoreAsync(unit, request.Id, session, cancellationToken);
 
         if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
@@ -33,7 +39,7 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
         {
             try
             {
-                await collection.InsertOneAsync(document, cancellationToken: cancellationToken);
+                await InsertOneAsync(collection, session, document, cancellationToken);
             }
             catch (MongoWriteException exception) when (IsDuplicateKey(exception))
             {
@@ -48,7 +54,7 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
             ReplaceOneResult result;
             try
             {
-                result = await collection.ReplaceOneAsync(filter, document, cancellationToken: cancellationToken);
+                result = await ReplaceOneAsync(collection, session, filter, document, cancellationToken);
             }
             catch (MongoWriteException exception) when (IsDuplicateKey(exception))
             {
@@ -60,7 +66,7 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
                 if (request.ExpectedVersion is null)
                     return DocumentStoreWriteResult.NotFound;
 
-                return await LoadCoreAsync(unit, request.Id, cancellationToken) is null
+                return await LoadCoreAsync(unit, request.Id, session, cancellationToken) is null
                     ? DocumentStoreWriteResult.NotFound
                     : DocumentStoreWriteResult.ConcurrencyConflict;
             }
@@ -79,25 +85,67 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
     public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(documentKind);
-        return await LoadCoreAsync(unit, id, cancellationToken);
+        return await LoadCoreAsync(unit, id, session: null, cancellationToken);
     }
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
+        return await DeleteCoreAsync(unit, request, session: null, cancellationToken);
+    }
+
+    private async Task<DocumentStoreWriteResult> DeleteCoreAsync(StorageUnit unit, DeleteDocumentRequest request, IClientSessionHandle? session, CancellationToken cancellationToken)
+    {
         var collection = GetCollection(unit);
         var filter = request.ExpectedVersion is null
             ? Builders<BsonDocument>.Filter.Eq("_id", request.Id)
             : Builders<BsonDocument>.Filter.Eq("_id", request.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
 
-        var result = await collection.DeleteOneAsync(filter, cancellationToken);
+        var result = await DeleteOneAsync(collection, session, filter, cancellationToken);
         if (result.DeletedCount == 1)
             return DocumentStoreWriteResult.Deleted;
 
-        return await LoadCoreAsync(unit, request.Id, cancellationToken) is null
+        return await LoadCoreAsync(unit, request.Id, session, cancellationToken) is null
             ? DocumentStoreWriteResult.NotFound
             : DocumentStoreWriteResult.ConcurrencyConflict;
     }
+
+    public async Task<IDocumentTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+    {
+        var clusterType = database.Client.Cluster.Description.Type;
+        if (clusterType is not ClusterType.ReplicaSet and not ClusterType.Sharded)
+            throw new UnsupportedDocumentTransactionException(
+                "MongoDB",
+                $"multi-document transactions require a replica set or sharded cluster, but the connected deployment is '{clusterType}'.");
+
+        var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
+        try
+        {
+            session.StartTransaction();
+        }
+        catch (NotSupportedException exception)
+        {
+            session.Dispose();
+            throw new UnsupportedDocumentTransactionException("MongoDB", exception.Message);
+        }
+
+        return new MongoDocumentTransaction(this, session);
+    }
+
+    private static Task InsertOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, BsonDocument document, CancellationToken cancellationToken) =>
+        session is null
+            ? collection.InsertOneAsync(document, cancellationToken: cancellationToken)
+            : collection.InsertOneAsync(session, document, cancellationToken: cancellationToken);
+
+    private static Task<ReplaceOneResult> ReplaceOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, BsonDocument document, CancellationToken cancellationToken) =>
+        session is null
+            ? collection.ReplaceOneAsync(filter, document, cancellationToken: cancellationToken)
+            : collection.ReplaceOneAsync(session, filter, document, cancellationToken: cancellationToken);
+
+    private static Task<DeleteResult> DeleteOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, CancellationToken cancellationToken) =>
+        session is null
+            ? collection.DeleteOneAsync(filter, cancellationToken)
+            : collection.DeleteOneAsync(session, filter, cancellationToken: cancellationToken);
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {
@@ -279,11 +327,12 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
     private static FilterDefinition<BsonDocument> MatchNone { get; } =
         Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true);
 
-    private async Task<DocumentEnvelope?> LoadCoreAsync(StorageUnit unit, string id, CancellationToken cancellationToken)
+    private async Task<DocumentEnvelope?> LoadCoreAsync(StorageUnit unit, string id, IClientSessionHandle? session, CancellationToken cancellationToken)
     {
-        var document = await GetCollection(unit)
-            .Find(Builders<BsonDocument>.Filter.Eq("_id", id))
-            .SingleOrDefaultAsync(cancellationToken);
+        var collection = GetCollection(unit);
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", id);
+        var find = session is null ? collection.Find(filter) : collection.Find(session, filter);
+        var document = await find.SingleOrDefaultAsync(cancellationToken);
 
         return document is null ? null : ReadEnvelope(unit, document);
     }
@@ -368,4 +417,91 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
 
     private static bool IsDuplicateKey(MongoWriteException exception) =>
         exception.WriteError?.Code == 11000;
+
+    private sealed class MongoDocumentTransaction(MongoDbDocumentStore store, IClientSessionHandle session) : IDocumentTransaction
+    {
+        private bool completed;
+
+        public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
+        {
+            EnsureActive();
+            var unit = store.GetUnit(request.DocumentKind);
+            return await store.SaveCoreAsync(unit, request, session, cancellationToken);
+        }
+
+        public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
+        {
+            EnsureActive();
+            var unit = store.GetUnit(request.DocumentKind);
+            return await store.DeleteCoreAsync(unit, request, session, cancellationToken);
+        }
+
+        public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
+        {
+            EnsureActive();
+            var unit = store.GetUnit(documentKind);
+            return await store.LoadCoreAsync(unit, id, session, cancellationToken);
+        }
+
+        public async Task CommitAsync(CancellationToken cancellationToken = default)
+        {
+            EnsureActive();
+            try
+            {
+                await session.CommitTransactionAsync(cancellationToken);
+            }
+            finally
+            {
+                Complete();
+            }
+        }
+
+        public async Task RollbackAsync(CancellationToken cancellationToken = default)
+        {
+            EnsureActive();
+            try
+            {
+                await session.AbortTransactionAsync(cancellationToken);
+            }
+            finally
+            {
+                Complete();
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (completed)
+                return;
+
+            try
+            {
+                if (session.IsInTransaction)
+                    await session.AbortTransactionAsync();
+            }
+            catch
+            {
+                // Best-effort rollback when disposed without an explicit commit/rollback.
+            }
+            finally
+            {
+                Complete();
+            }
+        }
+
+        private void Complete()
+        {
+            if (completed)
+                return;
+
+            completed = true;
+            session.Dispose();
+        }
+
+        private void EnsureActive()
+        {
+            if (completed)
+                throw new InvalidOperationException("The document transaction has already been committed or rolled back.");
+        }
+    }
 }
