@@ -226,6 +226,34 @@ var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
     ExpectedVersion: updated.Document!.Version));
 ```
 
+### Closed portable queries
+
+For provider-neutral reads that go beyond a single equality, `IDocumentStore` also accepts a closed `PortableDocumentQuery`: an `AND` of `OR`-groups of single-field comparisons (`Equal`, `In`, `Contains`), with at most one ordering, optional offset paging, a total count, and a tenant-scope flag. Comparisons address a declared index by identity, and each operator must be declared on that index. The same query shape executes server-side on every provider (SQLite, SQL Server, PostgreSQL, MongoDB).
+
+```csharp
+using Groundwork.Documents.Store;
+
+// status IN ('open','assigned') AND subject contains 'invoice' (case-insensitive),
+// newest first, second page of 25, with the full predicate count.
+var query = new PortableDocumentQuery(
+    "supportTicket",
+    [
+        QueryClause.Of(QueryComparison.In("by-status", ["open", "assigned"])),
+        QueryClause.Of(QueryComparison.Contains("by-subject", "invoice"))
+    ],
+    order: new QueryOrder("by-opened-at", Descending: true),
+    skip: 25,
+    take: 25);
+
+DocumentQueryResult page = await store.QueryAsync(query);
+long total = page.TotalCount;
+
+DocumentEnvelope? first = await store.FirstOrDefaultAsync(query);
+bool any = await store.AnyAsync(query);
+```
+
+Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `QueryClause` (`QueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Queries are tenant-aware by default — pass `QueryTenantScope.TenantAgnostic` to bypass ambient tenant filtering, which is supplied to the store via an optional ambient-tenant accessor.
+
 For application code, use a regular CLR type and serialize it with the same JSON field names declared by the manifest indexes:
 
 ```csharp

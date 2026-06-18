@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
@@ -9,7 +10,7 @@ using MongoDB.Driver;
 
 namespace Groundwork.MongoDb.Documents;
 
-public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifest manifest) : IDocumentStore
+public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifest manifest, Func<string?>? ambientTenantId = null) : IDocumentStore
 {
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
@@ -125,6 +126,158 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
 
         return documents.Select(document => ReadEnvelope(unit, document)).ToList();
     }
+
+    public async Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var collection = GetCollection(unit);
+        var filter = BuildFilter(unit, query);
+
+        var total = await collection.CountDocumentsAsync(filter, cancellationToken: cancellationToken);
+        if (total == 0 || query.Take == 0)
+            return new DocumentQueryResult(Array.Empty<DocumentEnvelope>(), total);
+
+        var find = collection.Find(filter).Sort(BuildSort(unit, query.Order)).Skip(query.Skip ?? 0);
+        if (query.Take is { } take)
+            find = find.Limit(take);
+
+        var documents = await find.ToListAsync(cancellationToken);
+        return new DocumentQueryResult(documents.Select(document => ReadEnvelope(unit, document)).ToList(), total);
+    }
+
+    public async Task<DocumentEnvelope?> FirstOrDefaultAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var collection = GetCollection(unit);
+        var filter = BuildFilter(unit, query);
+
+        var document = await collection
+            .Find(filter)
+            .Sort(BuildSort(unit, query.Order))
+            .Limit(1)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        return document is null ? null : ReadEnvelope(unit, document);
+    }
+
+    public async Task<bool> AnyAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var collection = GetCollection(unit);
+        var filter = BuildFilter(unit, query);
+
+        return await collection.Find(filter).Limit(1).AnyAsync(cancellationToken);
+    }
+
+    private FilterDefinition<BsonDocument> BuildFilter(StorageUnit unit, PortableDocumentQuery query)
+    {
+        var filters = new List<FilterDefinition<BsonDocument>>();
+
+        foreach (var clause in query.Clauses)
+            filters.Add(BuildClauseFilter(unit, clause));
+
+        var tenantFilter = BuildTenantFilter(unit, query);
+        if (tenantFilter is not null)
+            filters.Add(tenantFilter);
+
+        return filters.Count == 0 ? Builders<BsonDocument>.Filter.Empty : Builders<BsonDocument>.Filter.And(filters);
+    }
+
+    private FilterDefinition<BsonDocument> BuildClauseFilter(StorageUnit unit, QueryClause clause)
+    {
+        if (clause.Comparisons.Count == 0)
+            return MatchNone;
+
+        var comparisons = clause.Comparisons.Select(comparison => BuildComparisonFilter(unit, comparison)).ToList();
+        return Builders<BsonDocument>.Filter.Or(comparisons);
+    }
+
+    private FilterDefinition<BsonDocument> BuildComparisonFilter(StorageUnit unit, QueryComparison comparison)
+    {
+        var index = ClosedQueryIndexResolver.ResolveComparisonIndex(unit, comparison.IndexName, comparison.Operator);
+        var path = IndexPath(unit, index);
+
+        return comparison.Operator switch
+        {
+            QueryComparisonOperator.Equal => BuildEqualFilter(index, path, comparison),
+            QueryComparisonOperator.In => BuildInFilter(index, path, comparison),
+            QueryComparisonOperator.Contains => BuildContainsFilter(path, comparison),
+            _ => throw new ArgumentOutOfRangeException(nameof(comparison), comparison.Operator, "Unsupported operator.")
+        };
+    }
+
+    private static FilterDefinition<BsonDocument> BuildEqualFilter(IndexDeclaration index, string path, QueryComparison comparison)
+    {
+        var value = comparison.Values.Count > 0 ? comparison.Values[0] : null;
+        return value is null
+            ? Builders<BsonDocument>.Filter.Eq(path, BsonNull.Value)
+            : Builders<BsonDocument>.Filter.Eq(path, ToBsonValue(index.ValueKind, value));
+    }
+
+    private static FilterDefinition<BsonDocument> BuildInFilter(IndexDeclaration index, string path, QueryComparison comparison)
+    {
+        var nonNull = comparison.Values.Where(value => value is not null).Cast<string>().ToList();
+        var hasNull = comparison.Values.Any(value => value is null);
+
+        if (nonNull.Count == 0)
+            return hasNull ? Builders<BsonDocument>.Filter.Eq(path, BsonNull.Value) : MatchNone;
+
+        var membership = Builders<BsonDocument>.Filter.In(path, nonNull.Select(value => ToBsonValue(index.ValueKind, value)));
+        return hasNull
+            ? Builders<BsonDocument>.Filter.Or(membership, Builders<BsonDocument>.Filter.Eq(path, BsonNull.Value))
+            : membership;
+    }
+
+    private static FilterDefinition<BsonDocument> BuildContainsFilter(string path, QueryComparison comparison)
+    {
+        var value = comparison.Values.Count > 0 ? comparison.Values[0] : null;
+        if (value is null)
+            throw new InvalidOperationException("Contains requires a non-null value.");
+
+        var pattern = new BsonRegularExpression(Regex.Escape(value), "i");
+        return Builders<BsonDocument>.Filter.Regex(path, pattern);
+    }
+
+    private FilterDefinition<BsonDocument>? BuildTenantFilter(StorageUnit unit, PortableDocumentQuery query)
+    {
+        if (query.TenantScope == QueryTenantScope.TenantAgnostic)
+            return null;
+
+        var tenantId = ambientTenantId?.Invoke();
+        if (tenantId is null)
+            return null;
+
+        var tenantIndex = ClosedQueryIndexResolver.ResolveTenantIndex(unit);
+        if (tenantIndex is null)
+            return null;
+
+        return Builders<BsonDocument>.Filter.Eq(IndexPath(unit, tenantIndex), ToBsonValue(tenantIndex.ValueKind, tenantId));
+    }
+
+    private static SortDefinition<BsonDocument> BuildSort(StorageUnit unit, QueryOrder? order)
+    {
+        if (order is null)
+            return Builders<BsonDocument>.Sort.Ascending("_id");
+
+        var index = ClosedQueryIndexResolver.ResolveOrderIndex(unit, order.IndexName);
+        var path = IndexPath(unit, index);
+        var primary = order.Descending
+            ? Builders<BsonDocument>.Sort.Descending(path)
+            : Builders<BsonDocument>.Sort.Ascending(path);
+
+        return Builders<BsonDocument>.Sort.Combine(primary, Builders<BsonDocument>.Sort.Ascending("_id"));
+    }
+
+    private static string IndexPath(StorageUnit unit, IndexDeclaration index)
+    {
+        var physicalizedField = PhysicalizationProjection.EligibleFields(unit).SingleOrDefault(field => field.Name == index.Identity);
+        return physicalizedField is null
+            ? $"content.{index.Fields[0].Path}"
+            : $"physicalized.{MongoDbGroundworkNames.PhysicalizedFieldName(physicalizedField)}";
+    }
+
+    private static FilterDefinition<BsonDocument> MatchNone { get; } =
+        Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true);
 
     private async Task<DocumentEnvelope?> LoadCoreAsync(StorageUnit unit, string id, CancellationToken cancellationToken)
     {

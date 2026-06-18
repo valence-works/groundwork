@@ -9,7 +9,7 @@ using Groundwork.Relational.Physicalization;
 
 namespace Groundwork.Relational.Documents;
 
-public class RelationalDocumentStore(DbConnection connection, StorageManifest manifest, RelationalDocumentStoreDialect dialect) : IDocumentStore
+public class RelationalDocumentStore(DbConnection connection, StorageManifest manifest, RelationalDocumentStoreDialect dialect, Func<string?>? ambientTenantId = null) : IDocumentStore
 {
     private readonly SemaphoreSlim connectionGate = new(1, 1);
 
@@ -146,6 +146,68 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
 
             return documents;
         }, cancellationToken);
+    }
+
+    public async Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
+
+        return await ExecuteWithConnectionAsync(async ct =>
+        {
+            var total = await CountClosedAsync(translator, whereSql, ct);
+            if (total == 0 || query.Take == 0)
+                return new DocumentQueryResult(Array.Empty<DocumentEnvelope>(), total);
+
+            await using var command = CreateCommand(translator.SelectSql(whereSql, orderSql, query.Skip ?? 0, query.Take));
+            AddClosedQueryParameters(command, translator.Parameters);
+
+            var documents = new List<DocumentEnvelope>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                documents.Add(ReadEnvelope(reader));
+
+            return new DocumentQueryResult(documents, total);
+        }, cancellationToken);
+    }
+
+    public async Task<DocumentEnvelope?> FirstOrDefaultAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
+
+        return await ExecuteWithConnectionAsync(async ct =>
+        {
+            await using var command = CreateCommand(translator.SelectSql(whereSql, orderSql, 0, 1));
+            AddClosedQueryParameters(command, translator.Parameters);
+
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? ReadEnvelope(reader) : null;
+        }, cancellationToken);
+    }
+
+    public async Task<bool> AnyAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        var unit = GetUnit(query.DocumentKind);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out _);
+
+        return await ExecuteWithConnectionAsync(
+            async ct => await CountClosedAsync(translator, whereSql, ct) > 0,
+            cancellationToken);
+    }
+
+    private async Task<long> CountClosedAsync(RelationalClosedQueryTranslator translator, string whereSql, CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(translator.CountSql(whereSql));
+        AddClosedQueryParameters(command, translator.WhereParameters);
+        var scalar = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt64(scalar);
+    }
+
+    private void AddClosedQueryParameters(DbCommand command, IEnumerable<KeyValuePair<string, object>> values)
+    {
+        foreach (var (name, value) in values)
+            AddParameter(command, name, value);
     }
 
     private DbCommand CreateQueryCommand(StorageUnit unit, DocumentStoreQuery query)
