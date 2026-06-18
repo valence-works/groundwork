@@ -10,6 +10,19 @@ public class RelationalDocumentStoreDialect
 
     public virtual object Boolean(bool value) => value ? 1 : 0;
 
+    /// <summary>Builds the offset-paging clause appended to a closed query. Skip/take are validated non-negative integers.</summary>
+    public virtual string PaginationClause(int skip, int? take)
+    {
+        if (take is { } limit)
+            return $"LIMIT {limit} OFFSET {skip}";
+
+        return skip > 0 ? $"LIMIT -1 OFFSET {skip}" : string.Empty;
+    }
+
+    /// <summary>Builds a case-insensitive substring predicate for the Contains operator.</summary>
+    public virtual string ContainsPredicate(string columnExpression, string patternParameterName) =>
+        $@"LOWER({columnExpression}) LIKE LOWER({Parameter(patternParameterName)}) ESCAPE '\'";
+
     public virtual bool IsDuplicateDocumentKeyException(DbException exception) => false;
 
     public virtual bool IsUniqueIndexException(DbException exception) => false;

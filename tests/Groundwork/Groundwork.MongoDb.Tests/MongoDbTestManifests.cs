@@ -31,10 +31,18 @@ internal static class MongoDbTestManifests
                             true,
                             true,
                             MissingValueBehavior.Excluded,
-                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains }),
                         new IndexDeclaration(
                             "by-category",
                             [new IndexField("category")],
+                            IndexValueKind.String,
+                            false,
+                            true,
+                            MissingValueBehavior.Excluded,
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.In }),
+                        new IndexDeclaration(
+                            "by-sort",
+                            [new IndexField("sort")],
                             IndexValueKind.String,
                             false,
                             true,
@@ -61,4 +69,43 @@ internal static class MongoDbTestManifests
             []);
 
     public static ProviderIdentity Provider { get; } = new("groundwork-mongodb", "1.0.0");
+
+    public static StorageManifest TenantManifest() =>
+        new(
+            new StorageManifestIdentity("closed.query.scoped"),
+            new StorageManifestOwner("sample.application"),
+            new StorageManifestVersion("1.0.0"),
+            [
+                new StorageUnit(
+                    new StorageUnitIdentity("scopedDocument"),
+                    "Scoped document",
+                    StorageIntent.PortableDocument(),
+                    LifecyclePolicy.Mutable,
+                    IdentityPolicy.StringId(),
+                    TenancyPolicy.TenantPartition("tenantId"),
+                    ConcurrencyPolicy.Optimistic(),
+                    SerializationPolicy.Json(),
+                    [
+                        new IndexDeclaration(
+                            "by-tenant",
+                            [new IndexField("tenantId")],
+                            IndexValueKind.String,
+                            false,
+                            false,
+                            MissingValueBehavior.Excluded,
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                        new IndexDeclaration(
+                            "by-name",
+                            [new IndexField("name")],
+                            IndexValueKind.String,
+                            false,
+                            true,
+                            MissingValueBehavior.Excluded,
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.Contains })
+                    ],
+                    [],
+                    PhysicalizationPolicy.Portable)
+            ],
+            new HashSet<string> { "schema-history", "optimistic-concurrency" },
+            []);
 }

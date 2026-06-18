@@ -1,6 +1,7 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Queries;
 
 namespace Groundwork.Core.Validation;
 
@@ -148,6 +149,14 @@ public sealed class StorageManifestValidator
                     "GW-QUERY-003",
                     $"Portable query '{query.Identity}' requires operations not supported by index '{query.IndexIdentity}': {string.Join(", ", unsupportedOperations)}.",
                     $"{target}.operations"));
+            }
+
+            if (query.SortSupport != QuerySortSupport.None && !index.IsSortable)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-QUERY-004",
+                    $"Portable query '{query.Identity}' declares ordering support but index '{query.IndexIdentity}' is not sortable.",
+                    $"{target}.sortSupport"));
             }
         }
     }

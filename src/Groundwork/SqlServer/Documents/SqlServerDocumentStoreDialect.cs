@@ -6,6 +6,14 @@ namespace Groundwork.SqlServer.Documents;
 
 internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDialect
 {
+    public override string PaginationClause(int skip, int? take)
+    {
+        if (take is { } limit)
+            return $"OFFSET {skip} ROWS FETCH NEXT {limit} ROWS ONLY";
+
+        return skip > 0 ? $"OFFSET {skip} ROWS" : string.Empty;
+    }
+
     public override string QueryByIndexSql => $$"""
         SELECT d.document_kind, d.id, d.schema_version, d.version, d.content_json, d.created_utc, d.updated_utc
         FROM groundwork_documents d
