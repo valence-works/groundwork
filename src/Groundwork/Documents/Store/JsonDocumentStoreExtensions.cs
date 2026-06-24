@@ -95,4 +95,3 @@ public static class JsonDocumentStoreExtensions
 }
 
 public sealed record DocumentJsonQueryResult<TDocument>(IReadOnlyList<TDocument> Documents, long TotalCount);
-

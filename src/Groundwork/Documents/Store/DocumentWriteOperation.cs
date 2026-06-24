@@ -7,7 +7,6 @@ public enum DocumentWriteOperationKind
     Save,
     Delete
 }
-
 public sealed record DocumentWriteOperation
 {
     private DocumentWriteOperation(
@@ -65,4 +64,3 @@ public sealed record DocumentWriteOperation
             _ => throw new ArgumentOutOfRangeException(nameof(Kind), Kind, "Unsupported document write operation.")
         };
 }
-

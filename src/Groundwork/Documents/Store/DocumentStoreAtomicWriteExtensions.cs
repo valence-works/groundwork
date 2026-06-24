@@ -13,7 +13,6 @@ public static class DocumentStoreAtomicWriteExtensions
         ArgumentNullException.ThrowIfNull(saves);
         return store.WriteAllAsync(scope, saves.Select(DocumentWriteOperation.Save).ToArray(), cancellationToken);
     }
-
     public static Task DeleteAllAsync(
         this IDocumentStore store,
         DocumentCommitScope scope,
@@ -51,4 +50,3 @@ public static class DocumentStoreAtomicWriteExtensions
         await unitOfWork.CommitAsync(cancellationToken);
     }
 }
-

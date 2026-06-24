@@ -20,4 +20,3 @@ public sealed class DocumentAtomicWriteException(
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unsupported document write operation.")
         };
 }
-

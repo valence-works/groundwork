@@ -12,7 +12,6 @@ public sealed class DocumentIdTests
 
         Assert.Equal("workflow%3A1:activity%252:", id);
     }
-
     [Fact]
     public void ParseRoundTripsComposedParts()
     {
@@ -42,4 +41,3 @@ public sealed class DocumentIdTests
         Assert.Equal("parts", exception.ParamName);
     }
 }
-

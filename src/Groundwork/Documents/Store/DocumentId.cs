@@ -16,7 +16,6 @@ public static class DocumentId
 
         return string.Join(Separator, parts.Select(Escape));
     }
-
     public static IReadOnlyList<string> Parse(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -106,4 +105,3 @@ public static class DocumentId
         return false;
     }
 }
-
