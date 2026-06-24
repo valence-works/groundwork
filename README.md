@@ -38,12 +38,21 @@ dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.c
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 ```
 
-The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization:
+The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization for every eligible index:
 
 ```bash
 Groundwork__Provider=Sqlite \
 Groundwork__ConnectionString="Data Source=support-tickets.db" \
 Groundwork__Physicalization=Optimized \
+dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
+```
+
+Or keep the storage units portable and physicalize only named hot indexes:
+
+```bash
+Groundwork__Provider=Sqlite \
+Groundwork__ConnectionString="Data Source=support-tickets.db" \
+Groundwork__PhysicalizedIndexes="by-ticket-number,by-status" \
 dotnet run --project samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj
 ```
 
@@ -79,7 +88,7 @@ var manifest = new StorageManifest(
             [
                 Keyword("by-ticket-number", "ticketNumber", isUnique: true),
                 Keyword("by-customer", "customerId"),
-                Keyword("by-status", "status"),
+                Keyword("by-status", "status", physicalization: IndexPhysicalizationPolicy.Optimized),
                 Keyword("by-assignee", "assigneeId"),
                 Keyword("by-priority", "priority")
             ],
@@ -95,7 +104,11 @@ var manifest = new StorageManifest(
     new HashSet<string> { "schema-history", "optimistic-concurrency" },
     []);
 
-static IndexDeclaration Keyword(string identity, string field, bool isUnique = false) =>
+static IndexDeclaration Keyword(
+    string identity,
+    string field,
+    bool isUnique = false,
+    IndexPhysicalizationPolicy physicalization = IndexPhysicalizationPolicy.Default) =>
     new(
         identity,
         [new IndexField(field)],
@@ -103,7 +116,8 @@ static IndexDeclaration Keyword(string identity, string field, bool isUnique = f
         isUnique,
         true,
         MissingValueBehavior.Excluded,
-        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+        physicalization);
 
 static PortableQueryDeclaration Query(
     string identity,

@@ -20,19 +20,23 @@ public static class SupportTicketManifest
 
     public static StorageManifest Create() => Create(PhysicalizationPolicy.Portable);
 
-    public static StorageManifest Create(PhysicalizationPolicy physicalization) =>
+    public static StorageManifest Create(
+        PhysicalizationPolicy physicalization,
+        IReadOnlySet<string>? physicalizedIndexes = null) =>
         new(
             new StorageManifestIdentity("support-tickets"),
             new StorageManifestOwner("groundwork.sample.support"),
             new StorageManifestVersion(SchemaVersion),
             [
-                TicketUnit(physicalization),
-                CommentUnit(physicalization)
+                TicketUnit(physicalization, physicalizedIndexes ?? EmptyPhysicalizedIndexes),
+                CommentUnit(physicalization, physicalizedIndexes ?? EmptyPhysicalizedIndexes)
             ],
             new HashSet<string> { "schema-history", "optimistic-concurrency" },
             []);
 
-    private static StorageUnit TicketUnit(PhysicalizationPolicy physicalization) =>
+    private static readonly IReadOnlySet<string> EmptyPhysicalizedIndexes = new HashSet<string>(StringComparer.Ordinal);
+
+    private static StorageUnit TicketUnit(PhysicalizationPolicy physicalization, IReadOnlySet<string> physicalizedIndexes) =>
         new(
             new StorageUnitIdentity(DocumentKind),
             "Support ticket",
@@ -42,11 +46,11 @@ public static class SupportTicketManifest
             TenancyPolicy.None,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
-            TicketIndexes(),
+            TicketIndexes(physicalizedIndexes),
             TicketQueries(),
             physicalization);
 
-    private static StorageUnit CommentUnit(PhysicalizationPolicy physicalization) =>
+    private static StorageUnit CommentUnit(PhysicalizationPolicy physicalization, IReadOnlySet<string> physicalizedIndexes) =>
         new(
             new StorageUnitIdentity(CommentDocumentKind),
             "Support ticket comment",
@@ -56,23 +60,23 @@ public static class SupportTicketManifest
             TenancyPolicy.None,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
-            CommentIndexes(),
+            CommentIndexes(physicalizedIndexes),
             CommentQueries(),
             physicalization);
 
-    private static IReadOnlyList<IndexDeclaration> TicketIndexes() =>
+    private static IReadOnlyList<IndexDeclaration> TicketIndexes(IReadOnlySet<string> physicalizedIndexes) =>
     [
-        Keyword(ByTicketNumber, "ticketNumber", isUnique: true),
-        Keyword(ByCustomer, "customerId"),
-        Keyword(ByStatus, "status"),
-        Keyword(ByAssignee, "assigneeId"),
-        Keyword(ByPriority, "priority")
+        Keyword(ByTicketNumber, "ticketNumber", physicalizedIndexes, isUnique: true),
+        Keyword(ByCustomer, "customerId", physicalizedIndexes),
+        Keyword(ByStatus, "status", physicalizedIndexes),
+        Keyword(ByAssignee, "assigneeId", physicalizedIndexes),
+        Keyword(ByPriority, "priority", physicalizedIndexes)
     ];
 
-    private static IReadOnlyList<IndexDeclaration> CommentIndexes() =>
+    private static IReadOnlyList<IndexDeclaration> CommentIndexes(IReadOnlySet<string> physicalizedIndexes) =>
     [
-        Keyword(ByCommentTicket, "ticketNumber"),
-        Keyword(ByCommentAuthor, "authorId")
+        Keyword(ByCommentTicket, "ticketNumber", physicalizedIndexes),
+        Keyword(ByCommentAuthor, "authorId", physicalizedIndexes)
     ];
 
     private static IReadOnlyList<PortableQueryDeclaration> TicketQueries() =>
@@ -90,7 +94,11 @@ public static class SupportTicketManifest
         Query("list-comments-by-author", ByCommentAuthor, QuerySortSupport.Both, QueryPagingSupport.Offset)
     ];
 
-    private static IndexDeclaration Keyword(string identity, string field, bool isUnique = false) =>
+    private static IndexDeclaration Keyword(
+        string identity,
+        string field,
+        IReadOnlySet<string> physicalizedIndexes,
+        bool isUnique = false) =>
         new(
             identity,
             [new IndexField(field)],
@@ -98,7 +106,10 @@ public static class SupportTicketManifest
             isUnique,
             true,
             MissingValueBehavior.Excluded,
-            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            physicalizedIndexes.Contains(identity)
+                ? IndexPhysicalizationPolicy.Optimized
+                : IndexPhysicalizationPolicy.Default);
 
     private static PortableQueryDeclaration Query(
         string identity,

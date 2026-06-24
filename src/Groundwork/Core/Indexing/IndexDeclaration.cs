@@ -7,7 +7,8 @@ public sealed record IndexDeclaration(
     bool IsUnique,
     bool IsSortable,
     MissingValueBehavior MissingValueBehavior,
-    IReadOnlySet<PortableQueryOperation> SupportedOperations);
+    IReadOnlySet<PortableQueryOperation> SupportedOperations,
+    IndexPhysicalizationPolicy Physicalization = IndexPhysicalizationPolicy.Default);
 
 public sealed record IndexField(string Path);
 
@@ -37,4 +38,11 @@ public enum PortableQueryOperation
     LessThan,
     LessThanOrEqual,
     In
+}
+
+public enum IndexPhysicalizationPolicy
+{
+    Default,
+    Portable,
+    Optimized
 }

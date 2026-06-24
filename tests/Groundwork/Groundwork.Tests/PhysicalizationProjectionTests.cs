@@ -32,6 +32,39 @@ public sealed class PhysicalizationProjectionTests
     }
 
     [Fact]
+    public void PortableUnitsProduceExplicitlyOptimizedIndexProjections()
+    {
+        var unit = SampleManifests.MetadataManifest().StorageUnits.Single();
+        var indexes = unit.Indexes
+            .Select(index => index.Identity == "by-key"
+                ? index with { Physicalization = IndexPhysicalizationPolicy.Optimized }
+                : index)
+            .ToList();
+
+        var fields = PhysicalizationProjection.EligibleFields(unit with { Indexes = indexes });
+
+        Assert.Equal(["by-key"], fields.Select(field => field.Name));
+    }
+
+    [Fact]
+    public void OptimizedUnitsSkipExplicitlyPortableIndexes()
+    {
+        var unit = SampleManifests.MetadataManifest().StorageUnits.Single() with
+        {
+            Physicalization = PhysicalizationPolicy.Optimized
+        };
+        var indexes = unit.Indexes
+            .Select(index => index.Identity == "by-category"
+                ? index with { Physicalization = IndexPhysicalizationPolicy.Portable }
+                : index)
+            .ToList();
+
+        var fields = PhysicalizationProjection.EligibleFields(unit with { Indexes = indexes });
+
+        Assert.Equal(["by-key"], fields.Select(field => field.Name));
+    }
+
+    [Fact]
     public void CompoundIndexesAreNotEligibleForG7Physicalization()
     {
         var unit = SampleManifests.MetadataManifest().StorageUnits.Single();
@@ -73,6 +106,24 @@ public sealed class PhysicalizationProjectionTests
         };
 
         Assert.Equal(names.Length, names.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public void PhysicalizedRelationalNamesUseReadableSlugs()
+    {
+        var unit = SampleManifests.MetadataManifest().StorageUnits.Single() with
+        {
+            Identity = new StorageUnitIdentity("supportTicket")
+        };
+        var field = new PhysicalizedFieldPlan("by-ticket-number", "ticketNumber", IndexValueKind.Keyword, true, true);
+
+        var tableName = RelationalPhysicalizationNames.TableName(unit);
+        var columnName = RelationalPhysicalizationNames.ColumnName(field);
+
+        Assert.Contains("support_ticket", tableName, StringComparison.Ordinal);
+        Assert.Contains("by_ticket_number", columnName, StringComparison.Ordinal);
+        Assert.DoesNotContain("_x", tableName, StringComparison.Ordinal);
+        Assert.DoesNotContain("_x", columnName, StringComparison.Ordinal);
     }
 
     [Fact]

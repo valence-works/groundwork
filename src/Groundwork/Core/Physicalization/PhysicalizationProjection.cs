@@ -7,11 +7,8 @@ public static class PhysicalizationProjection
 {
     public static IReadOnlyList<PhysicalizedFieldPlan> EligibleFields(StorageUnit unit)
     {
-        if (unit.Physicalization.Kind != PhysicalizationKind.Optimized)
-            return [];
-
         return unit.Indexes
-            .Where(IsEligible)
+            .Where(index => IsPhysicalized(unit, index) && IsEligible(index))
             .Select(index => new PhysicalizedFieldPlan(
                 index.Identity,
                 index.Fields[0].Path,
@@ -23,6 +20,15 @@ public static class PhysicalizationProjection
 
     public static bool IsEligible(StorageUnit unit, string indexName) =>
         EligibleFields(unit).Any(field => field.Name == indexName);
+
+    private static bool IsPhysicalized(StorageUnit unit, IndexDeclaration index) =>
+        index.Physicalization switch
+        {
+            IndexPhysicalizationPolicy.Optimized => true,
+            IndexPhysicalizationPolicy.Portable => false,
+            IndexPhysicalizationPolicy.Default => unit.Physicalization.Kind == PhysicalizationKind.Optimized,
+            _ => throw new ArgumentOutOfRangeException(nameof(index), index.Physicalization, "Unsupported index physicalization policy.")
+        };
 
     private static bool IsEligible(IndexDeclaration index) =>
         index.Fields.Count == 1 &&

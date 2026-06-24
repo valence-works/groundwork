@@ -68,7 +68,7 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         SupportTicketStorageOptions options,
         CancellationToken cancellationToken = default)
     {
-        var manifest = SupportTicketManifest.Create(options.EffectivePhysicalization);
+        var manifest = SupportTicketManifest.Create(options.EffectivePhysicalization, options.EffectivePhysicalizedIndexes);
         var (store, disposables) = await CreateStoreAsync(options, manifest, cancellationToken);
         var (operations, fit) = await CreateOperationsAsync(disposables, options.OperationalClock, cancellationToken);
         var (inbox, externalModuleFit) = await CreateExternalModulesAsync(disposables, cancellationToken);
