@@ -30,8 +30,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
             if (fields.Count == 0)
                 continue;
 
-            foreach (var statement in CreateOptimizedProjectionStatements(unit, fields))
-                await ExecuteAsync(statement, transaction, cancellationToken);
+            await MaterializeOptimizedProjectionAsync(unit, fields, transaction, cancellationToken);
         }
 
         await using var command = CreateCommand(InsertSchemaHistorySql, transaction);
@@ -45,13 +44,23 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         await transaction.CommitAsync(cancellationToken);
     }
 
-    private async Task ExecuteAsync(string sql, DbTransaction transaction, CancellationToken cancellationToken)
+    protected virtual async Task MaterializeOptimizedProjectionAsync(
+        StorageUnit unit,
+        IReadOnlyList<PhysicalizedFieldPlan> fields,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        foreach (var statement in CreateOptimizedProjectionStatements(unit, fields))
+            await ExecuteAsync(statement, transaction, cancellationToken);
+    }
+
+    protected async Task ExecuteAsync(string sql, DbTransaction transaction, CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(sql, transaction);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private DbCommand CreateCommand(string commandText, DbTransaction transaction)
+    protected DbCommand CreateCommand(string commandText, DbTransaction transaction)
     {
         var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -59,7 +68,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         return command;
     }
 
-    private void AddParameter(DbCommand command, string name, object value)
+    protected void AddParameter(DbCommand command, string name, object value)
     {
         var parameter = command.CreateParameter();
         parameter.ParameterName = $"{ParameterPrefix}{name}";

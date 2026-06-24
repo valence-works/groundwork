@@ -10,6 +10,8 @@
 - Enforces optimistic concurrency with expected document versions.
 - Rejects queries for undeclared indexes.
 - Enforces unique declared indexes through SQLite constraints.
+- Provides a durable Groundwork migration executor backed by `groundwork_migration_history`.
+- Adds and backfills new optimized physicalized projection columns during materialization.
 
 ## Deliberate Limits
 

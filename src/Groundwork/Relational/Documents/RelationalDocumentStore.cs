@@ -372,8 +372,8 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
 
         for (var index = 0; index < fields.Count; index++)
         {
-            var value = TryGetPropertyPath(document.RootElement, fields[index].Path, out var element)
-                ? NormalizeValue(element)
+            var value = RelationalPhysicalizationValues.TryRead(document.RootElement, fields[index].Path, out var physicalizedValue)
+                ? physicalizedValue
                 : null;
             AddParameter(command, $"physicalized{index}", value is null ? DBNull.Value : value);
         }
@@ -418,34 +418,12 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         if (index.Fields.Count != 1)
             return false;
 
-        if (!TryGetPropertyPath(root, index.Fields[0].Path, out var element))
+        if (!RelationalPhysicalizationValues.TryGetPropertyPath(root, index.Fields[0].Path, out var element))
             return false;
 
-        value = NormalizeValue(element);
+        value = RelationalPhysicalizationValues.NormalizeValue(element);
         return value.Length > 0 || element.ValueKind == JsonValueKind.String;
     }
-
-    private static bool TryGetPropertyPath(JsonElement root, string path, out JsonElement element)
-    {
-        element = root;
-        foreach (var segment in path.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(segment, out element))
-                return false;
-        }
-
-        return element.ValueKind is not JsonValueKind.Null and not JsonValueKind.Undefined;
-    }
-
-    private static string NormalizeValue(JsonElement element) =>
-        element.ValueKind switch
-        {
-            JsonValueKind.String => element.GetString() ?? "",
-            JsonValueKind.Number => element.GetRawText(),
-            JsonValueKind.True => "true",
-            JsonValueKind.False => "false",
-            _ => element.GetRawText()
-        };
 
     private static DocumentEnvelope ReadEnvelope(DbDataReader reader) =>
         new(

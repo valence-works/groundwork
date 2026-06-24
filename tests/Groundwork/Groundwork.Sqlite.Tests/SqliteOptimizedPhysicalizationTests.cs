@@ -1,4 +1,5 @@
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Indexing;
 using Groundwork.Core.Physicalization;
 using Groundwork.Documents.Store;
 using Groundwork.Relational.Physicalization;
@@ -63,6 +64,33 @@ public sealed class SqliteOptimizedPhysicalizationTests
         Assert.Equal(("alpha", "system", 1L), await harness.LoadProjectionAsync("doc-1"));
     }
 
+    [Fact]
+    public async Task AdditivePhysicalizedIndexChangesAddColumnsAndBackfillExistingDocuments()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var firstManifest = WithPhysicalizedIndexes(SqliteTestManifests.MetadataManifest(), "by-key");
+        var firstUnit = firstManifest.StorageUnits.Single();
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(firstManifest, SqliteTestManifests.Provider);
+        var firstStore = new SqliteDocumentStore(connection, firstManifest);
+
+        await firstStore.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        var secondManifest = WithPhysicalizedIndexes(SqliteTestManifests.MetadataManifest(), "by-key", "by-category");
+        var secondUnit = secondManifest.StorageUnits.Single();
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(secondManifest, SqliteTestManifests.Provider);
+        var secondStore = new SqliteDocumentStore(connection, secondManifest);
+        var categoryField = PhysicalizationProjection.EligibleFields(secondUnit).Single(field => field.Name == "by-category");
+        var categoryColumn = RelationalPhysicalizationNames.ColumnName(categoryField);
+
+        Assert.True(await ColumnExistsAsync(connection, RelationalPhysicalizationNames.TableName(secondUnit), categoryColumn));
+        Assert.Equal("system", await LoadProjectionValueAsync(connection, secondUnit, categoryColumn, "doc-1"));
+        Assert.Single(await secondStore.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-category", "system")));
+    }
+
     private sealed class SqliteOptimizedHarness : IAsyncDisposable
     {
         private SqliteOptimizedHarness(SqliteConnection connection, SqliteDocumentStore store, StorageUnit unit)
@@ -114,5 +142,59 @@ public sealed class SqliteOptimizedPhysicalizationTests
         }
 
         public async ValueTask DisposeAsync() => await Connection.DisposeAsync();
+    }
+
+    private static StorageManifest WithPhysicalizedIndexes(StorageManifest manifest, params string[] indexNames)
+    {
+        var physicalized = indexNames.ToHashSet(StringComparer.Ordinal);
+        var unit = manifest.StorageUnits.Single();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                unit with
+                {
+                    Indexes = unit.Indexes
+                        .Select(index => index with
+                        {
+                            Physicalization = physicalized.Contains(index.Identity)
+                                ? IndexPhysicalizationPolicy.Optimized
+                                : IndexPhysicalizationPolicy.Portable
+                        })
+                        .ToList()
+                }
+            ]
+        };
+    }
+
+    private static async Task<bool> ColumnExistsAsync(SqliteConnection connection, string tableName, string columnName)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({tableName});";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            if (reader.GetString(1) == columnName)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static async Task<string> LoadProjectionValueAsync(
+        SqliteConnection connection,
+        StorageUnit unit,
+        string columnName,
+        string documentId)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {columnName}
+            FROM {RelationalPhysicalizationNames.TableName(unit)}
+            WHERE document_kind = $kind AND document_id = $id;
+            """;
+        command.Parameters.AddWithValue("$kind", unit.Identity.Value);
+        command.Parameters.AddWithValue("$id", documentId);
+        return (string)(await command.ExecuteScalarAsync() ?? "");
     }
 }
