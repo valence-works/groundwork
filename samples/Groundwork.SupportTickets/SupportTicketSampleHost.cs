@@ -2,23 +2,16 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
-using Groundwork.MongoDb.Materialization;
 using Groundwork.Modules.Inbox;
 using Groundwork.Modules.Inbox.Sqlite;
 using Groundwork.PostgreSql.Documents;
-using Groundwork.PostgreSql.Materialization;
 using Groundwork.SqlServer.Documents;
-using Groundwork.SqlServer.Materialization;
 using Groundwork.Operational;
 using Groundwork.Sqlite.Documents;
-using Groundwork.Sqlite.Materialization;
 using Groundwork.Sqlite.Operational;
 using Groundwork.SupportTickets.ExternalModules;
 using Groundwork.SupportTickets.Operations;
-using Microsoft.Data.SqlClient;
 using Microsoft.Data.Sqlite;
-using MongoDB.Driver;
-using Npgsql;
 
 namespace Groundwork.SupportTickets;
 
@@ -98,34 +91,44 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
         {
             case SupportTicketProvider.Sqlite:
             {
-                var connection = new SqliteConnection(options.ConnectionString);
-                disposables.Add(connection);
-                await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, Provider("groundwork-sqlite"), cancellationToken);
-                return (new SqliteDocumentStore(connection, manifest), disposables);
+                var handle = await SqliteDocumentStoreFactory.CreateAsync(
+                    options.ConnectionString,
+                    manifest,
+                    Provider("groundwork-sqlite"),
+                    cancellationToken: cancellationToken);
+                disposables.Add(handle);
+                return (handle.Store, disposables);
             }
             case SupportTicketProvider.PostgreSql:
             {
-                var connection = new NpgsqlConnection(options.ConnectionString);
-                disposables.Add(connection);
-                await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(manifest, Provider("groundwork-postgresql"), cancellationToken);
-                return (new PostgreSqlDocumentStore(connection, manifest), disposables);
+                var handle = await PostgreSqlDocumentStoreFactory.CreateAsync(
+                    options.ConnectionString,
+                    manifest,
+                    Provider("groundwork-postgresql"),
+                    cancellationToken: cancellationToken);
+                disposables.Add(handle);
+                return (handle.Store, disposables);
             }
             case SupportTicketProvider.SqlServer:
             {
-                var connection = new SqlConnection(options.ConnectionString);
-                disposables.Add(connection);
-                await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(manifest, Provider("groundwork-sqlserver"), cancellationToken);
-                return (new SqlServerDocumentStore(connection, manifest), disposables);
+                var handle = await SqlServerDocumentStoreFactory.CreateAsync(
+                    options.ConnectionString,
+                    manifest,
+                    Provider("groundwork-sqlserver"),
+                    cancellationToken: cancellationToken);
+                disposables.Add(handle);
+                return (handle.Store, disposables);
             }
             case SupportTicketProvider.MongoDb:
             {
-                var client = new MongoClient(options.ConnectionString);
-                if ((object)client is IDisposable disposableClient)
-                    disposables.Add(new SyncDisposableAdapter(disposableClient));
-
-                var database = client.GetDatabase(options.DatabaseName ?? "groundwork_support_tickets");
-                await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, Provider("groundwork-mongodb"), cancellationToken);
-                return (new MongoDbDocumentStore(database, manifest), disposables);
+                var handle = await MongoDbDocumentStoreFactory.CreateAsync(
+                    options.ConnectionString,
+                    options.DatabaseName ?? "groundwork_support_tickets",
+                    manifest,
+                    Provider("groundwork-mongodb"),
+                    cancellationToken: cancellationToken);
+                disposables.Add(handle);
+                return (handle.Store, disposables);
             }
             default:
                 throw new ArgumentOutOfRangeException(nameof(options), options.Provider, "Unsupported support-ticket provider.");
@@ -171,13 +174,4 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
     }
 
     private static ProviderIdentity Provider(string name) => new(name, "1.0.0");
-
-    private sealed class SyncDisposableAdapter(IDisposable disposable) : IAsyncDisposable
-    {
-        public ValueTask DisposeAsync()
-        {
-            disposable.Dispose();
-            return ValueTask.CompletedTask;
-        }
-    }
 }

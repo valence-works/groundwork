@@ -58,6 +58,72 @@ public sealed class SqliteDocumentStoreTests
     }
 
     [Fact]
+    public async Task JsonHelpersSaveLoadAndQueryTypedDocuments()
+    {
+        await using var harness = await SqliteDocumentStoreHarness.Create();
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var document = new JsonConfigurationDocument("alpha", "system", 1);
+
+        var saved = await harness.Store.SaveJsonAsync(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            document,
+            options);
+
+        var loaded = await harness.Store.LoadJsonAsync<JsonConfigurationDocument>(
+            "configurationDocument",
+            "doc-1",
+            options);
+        var byKey = await harness.Store.QueryJsonAsync<JsonConfigurationDocument>(
+            new DocumentStoreQuery("configurationDocument", "by-key", "alpha"),
+            options);
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(document, loaded);
+        Assert.Single(byKey);
+        Assert.Equal(document, byKey[0]);
+    }
+
+    [Fact]
+    public async Task FactoryMaterializesAndReturnsUsableStore()
+    {
+        var manifest = SqliteTestManifests.MetadataManifest();
+        await using var handle = await SqliteDocumentStoreFactory.CreateAsync(
+            "Data Source=:memory:",
+            manifest,
+            SqliteTestManifests.Provider);
+
+        var saved = await handle.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.NotNull(await handle.Store.LoadAsync("configurationDocument", "doc-1"));
+    }
+
+    [Fact]
+    public void DeserializeJsonFailsClearlyForNullDocumentContent()
+    {
+        var envelope = new DocumentEnvelope(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            1,
+            "null",
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow);
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            envelope.DeserializeJson<JsonConfigurationDocument>());
+
+        Assert.Contains("doc-1", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task UndeclaredIndexQueryFailsClearly()
     {
         await using var harness = await SqliteDocumentStoreHarness.Create();
@@ -294,4 +360,6 @@ public sealed class SqliteDocumentStoreTests
 
         public override bool IsWriteDependencyException(System.Data.Common.DbException exception) => exception is SqliteException;
     }
+
+    private sealed record JsonConfigurationDocument(string Key, string Category, int Value);
 }
