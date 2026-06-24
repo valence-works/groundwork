@@ -12,13 +12,13 @@ public sealed class SupportTicketRepository(IDocumentStore store)
         if (await LoadAsync(ticket.TicketNumber, cancellationToken) is not null)
             throw new SupportTicketConflictException($"Ticket '{ticket.TicketNumber}' already exists.");
 
-        var result = await store.SaveAsync(
-            new SaveDocumentRequest(
-                SupportTicketManifest.DocumentKind,
-                ticket.TicketNumber,
-                SupportTicketManifest.SchemaVersion,
-                Serialize(ticket)),
-            cancellationToken);
+        var result = await store.SaveJsonAsync(
+            SupportTicketManifest.DocumentKind,
+            ticket.TicketNumber,
+            SupportTicketManifest.SchemaVersion,
+            ticket,
+            SerializerOptions,
+            cancellationToken: cancellationToken);
 
         return ToSavedTicket(result, $"Ticket '{ticket.TicketNumber}' already exists.");
     }
@@ -114,13 +114,13 @@ public sealed class SupportTicketRepository(IDocumentStore store)
             authorId,
             body,
             createdAt ?? DateTimeOffset.UtcNow);
-        var result = await store.SaveAsync(
-            new SaveDocumentRequest(
-                SupportTicketManifest.CommentDocumentKind,
-                comment.CommentId,
-                SupportTicketManifest.SchemaVersion,
-                Serialize(comment)),
-            cancellationToken);
+        var result = await store.SaveJsonAsync(
+            SupportTicketManifest.CommentDocumentKind,
+            comment.CommentId,
+            SupportTicketManifest.SchemaVersion,
+            comment,
+            SerializerOptions,
+            cancellationToken: cancellationToken);
 
         return ToSavedComment(result, $"Comment '{comment.CommentId}' already exists.");
     }
@@ -149,13 +149,13 @@ public sealed class SupportTicketRepository(IDocumentStore store)
         CancellationToken cancellationToken,
         string? conflictMessage = null)
     {
-        var result = await store.SaveAsync(
-            new SaveDocumentRequest(
-                SupportTicketManifest.DocumentKind,
-                ticket.TicketNumber,
-                SupportTicketManifest.SchemaVersion,
-                Serialize(ticket),
-                expectedVersion),
+        var result = await store.SaveJsonAsync(
+            SupportTicketManifest.DocumentKind,
+            ticket.TicketNumber,
+            SupportTicketManifest.SchemaVersion,
+            ticket,
+            SerializerOptions,
+            expectedVersion,
             cancellationToken);
 
         return ToSavedTicket(result, conflictMessage ?? $"Ticket '{ticket.TicketNumber}' changed before the update could be saved.");
@@ -180,19 +180,8 @@ public sealed class SupportTicketRepository(IDocumentStore store)
         };
 
     private static SupportTicketDocument ToTicket(DocumentEnvelope envelope) =>
-        new(Deserialize(envelope.ContentJson), envelope.Version);
+        new(envelope.DeserializeJson<SupportTicket>(SerializerOptions), envelope.Version);
 
     private static SupportTicketCommentDocument ToComment(DocumentEnvelope envelope) =>
-        new(DeserializeComment(envelope.ContentJson), envelope.Version);
-
-    private static string Serialize<T>(T document) =>
-        JsonSerializer.Serialize(document, SerializerOptions);
-
-    private static SupportTicket Deserialize(string contentJson) =>
-        JsonSerializer.Deserialize<SupportTicket>(contentJson, SerializerOptions)
-        ?? throw new InvalidOperationException("Support ticket document content was empty.");
-
-    private static SupportTicketComment DeserializeComment(string contentJson) =>
-        JsonSerializer.Deserialize<SupportTicketComment>(contentJson, SerializerOptions)
-        ?? throw new InvalidOperationException("Support ticket comment document content was empty.");
+        new(envelope.DeserializeJson<SupportTicketComment>(SerializerOptions), envelope.Version);
 }

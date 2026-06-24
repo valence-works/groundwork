@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
@@ -127,6 +128,93 @@ public sealed class SqliteDocumentUnitOfWorkTests
         // The connection gate must be released so ordinary store operations work afterwards.
         await harness.Store.SaveAsync(Save("w2", "gadgets"));
         Assert.NotNull(await harness.Store.LoadAsync("widget", "w2"));
+    }
+
+    [Fact]
+    public async Task SaveAllCommitsWhenAllSavesSucceed()
+    {
+        await using var harness = await TxHarness.Create();
+
+        await harness.Store.SaveAllAsync(Scope, [Save("w1", "tools"), Save("w2", "gadgets")]);
+
+        Assert.NotNull(await harness.Store.LoadAsync("widget", "w1"));
+        Assert.NotNull(await harness.Store.LoadAsync("widget", "w2"));
+    }
+
+    [Fact]
+    public async Task SaveAllRollsBackWhenStagedSaveReturnsNonSuccess()
+    {
+        await using var harness = await TxHarness.Create();
+
+        var exception = await Assert.ThrowsAsync<DocumentAtomicWriteException>(() =>
+            harness.Store.SaveAllAsync(
+                Scope,
+                [
+                    Save("w1", "tools"),
+                    new SaveDocumentRequest("widget", "w2", "1.0.0", """{"category":"gadgets"}""", ExpectedVersion: 7)
+                ]));
+
+        Assert.Equal(DocumentWriteOperationKind.Save, exception.Operation);
+        Assert.Equal("widget", exception.DocumentKind);
+        Assert.Equal("w2", exception.Id);
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, exception.Status);
+        Assert.Null(await harness.Store.LoadAsync("widget", "w1"));
+        Assert.Null(await harness.Store.LoadAsync("widget", "w2"));
+    }
+
+    [Fact]
+    public async Task WriteAllSupportsMixedSaveAndDelete()
+    {
+        await using var harness = await TxHarness.Create();
+        await harness.Store.SaveAsync(Save("w1", "tools"));
+
+        await harness.Store.WriteAllAsync(
+            Scope,
+            [
+                DocumentWriteOperation.Delete(new DeleteDocumentRequest("widget", "w1")),
+                DocumentWriteOperation.Save(Save("w2", "gadgets"))
+            ]);
+
+        Assert.Null(await harness.Store.LoadAsync("widget", "w1"));
+        Assert.NotNull(await harness.Store.LoadAsync("widget", "w2"));
+    }
+
+    [Fact]
+    public async Task WriteAllRollsBackWhenStagedDeleteReturnsNonSuccess()
+    {
+        await using var harness = await TxHarness.Create();
+        await harness.Store.SaveAsync(Save("w1", "tools"));
+
+        var exception = await Assert.ThrowsAsync<DocumentAtomicWriteException>(() =>
+            harness.Store.WriteAllAsync(
+                Scope,
+                [
+                    DocumentWriteOperation.Save(Save("w2", "gadgets")),
+                    DocumentWriteOperation.Delete(new DeleteDocumentRequest("widget", "missing"))
+                ]));
+
+        Assert.Equal(DocumentWriteOperationKind.Delete, exception.Operation);
+        Assert.Equal("missing", exception.Id);
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, exception.Status);
+        Assert.NotNull(await harness.Store.LoadAsync("widget", "w1"));
+        Assert.Null(await harness.Store.LoadAsync("widget", "w2"));
+    }
+
+    [Fact]
+    public async Task WriteAllRollsBackWhenStagedOperationThrows()
+    {
+        await using var harness = await TxHarness.Create();
+
+        await Assert.ThrowsAnyAsync<JsonException>(() =>
+            harness.Store.SaveAllAsync(
+                Scope,
+                [
+                    Save("w1", "tools"),
+                    new SaveDocumentRequest("widget", "broken", "1.0.0", "{")
+                ]));
+
+        Assert.Null(await harness.Store.LoadAsync("widget", "w1"));
+        Assert.Null(await harness.Store.LoadAsync("widget", "broken"));
     }
 
     private static SaveDocumentRequest Save(string id, string category) =>
