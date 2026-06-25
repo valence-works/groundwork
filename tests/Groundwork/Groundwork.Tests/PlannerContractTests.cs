@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Materialization;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Core.Intents;

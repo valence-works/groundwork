@@ -65,28 +65,6 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
-    public void MissingSchemaHistorySupportBlocksCompatibility()
-    {
-        var capabilities = SampleManifests.PortableCapabilities() with { SupportsSchemaHistory = false };
-
-        var result = _validator.Validate(SampleManifests.MetadataManifest(), capabilities);
-
-        Assert.False(result.IsCompatible);
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-001");
-    }
-
-    [Fact]
-    public void MissingSchemaHistorySupportEmitsSingleDiagnosticWhenRequiredExplicitly()
-    {
-        var capabilities = SampleManifests.PortableCapabilities() with { SupportsSchemaHistory = false };
-
-        var result = _validator.Validate(SampleManifests.MetadataManifest(), capabilities);
-
-        Assert.False(result.IsCompatible);
-        Assert.Equal(1, result.Errors.Count(diagnostic => diagnostic.Code == "GW-CAP-001"));
-    }
-
-    [Fact]
     public void UnknownManifestRequiredCapabilityBlocksCompatibility()
     {
         var manifest = SampleManifests.MetadataManifest() with
@@ -204,22 +182,14 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
-    public void UnsupportedOptimizedProjectionMaterializationBlocksCompatibility()
+    public void ProviderCapabilityReportDoesNotCarryMaterializationCapability()
     {
-        var manifest = SampleManifests.MetadataManifest();
-        var optimizedUnit = manifest.StorageUnits.Single() with { Physicalization = PhysicalizationPolicy.Optimized };
-        var capabilities = SampleManifests.PortableCapabilities() with
-        {
-            SupportedMaterializationOperations =
-                Enum.GetValues<MaterializationOperationKind>()
-                    .Where(operation => operation != MaterializationOperationKind.CreateOptimizedProjection)
-                    .ToHashSet()
-        };
+        var propertyNames = typeof(ProviderCapabilityReport)
+            .GetProperties()
+            .Select(property => property.Name);
 
-        var result = _validator.Validate(manifest with { StorageUnits = [optimizedUnit] }, capabilities);
-
-        Assert.False(result.IsCompatible);
-        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-CAP-011");
+        Assert.DoesNotContain("SupportedMaterializationOperations", propertyNames);
+        Assert.DoesNotContain("SupportsSchemaHistory", propertyNames);
     }
 
     private static StorageManifest WithSingleUnitIntent(StorageIntent intent)

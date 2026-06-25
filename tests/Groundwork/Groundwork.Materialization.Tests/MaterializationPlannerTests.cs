@@ -110,17 +110,24 @@ public sealed class MaterializationPlannerTests
     public void PlanUsesMaterializationCapabilitiesInsteadOfRuntimeMaterializationFields()
     {
         var manifest = CreateManifest();
-        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider) with
-        {
-            SupportedMaterializationOperations = new HashSet<MaterializationOperationKind>(),
-            SupportsSchemaHistory = false
-        };
+        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider);
 
         var plan = planner.Plan(manifest, runtimeCapabilities, CreateCapabilities());
 
         Assert.True(plan.IsPlannable);
         Assert.Empty(plan.Diagnostics);
         Assert.IsType<RecordSchemaHistoryOperation>(plan.Operations[^1]);
+    }
+
+    [Fact]
+    public void RuntimeProviderCapabilityReportDoesNotCarryMaterializationCapabilityFields()
+    {
+        var propertyNames = typeof(ProviderCapabilityReport)
+            .GetProperties()
+            .Select(property => property.Name);
+
+        Assert.DoesNotContain("SupportedMaterializationOperations", propertyNames);
+        Assert.DoesNotContain("SupportsSchemaHistory", propertyNames);
     }
 
     [Fact]

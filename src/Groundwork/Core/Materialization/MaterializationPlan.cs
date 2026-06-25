@@ -17,3 +17,11 @@ public sealed record MaterializationOperation(
     MaterializationOperationKind Kind,
     string Target,
     IReadOnlyDictionary<string, string> Metadata);
+
+public enum MaterializationOperationKind
+{
+    CreateStorageUnit,
+    CreateIndex,
+    CreateOptimizedProjection,
+    RecordSchemaHistory
+}

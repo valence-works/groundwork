@@ -10,8 +10,6 @@ public sealed record ProviderCapabilityReport(
     IndexCapabilities Indexes,
     IReadOnlySet<PortableQueryOperation> SupportedQueryOperations,
     IReadOnlySet<ConcurrencyKind> SupportedConcurrencyModes,
-    IReadOnlySet<MaterializationOperationKind> SupportedMaterializationOperations,
-    bool SupportsSchemaHistory,
     IReadOnlyList<string> Warnings)
 {
     /// <summary>
@@ -26,8 +24,6 @@ public sealed record ProviderCapabilityReport(
             IndexCapabilities.All,
             Enum.GetValues<PortableQueryOperation>().ToHashSet(),
             Enum.GetValues<ConcurrencyKind>().ToHashSet(),
-            Enum.GetValues<MaterializationOperationKind>().ToHashSet(),
-            true,
             []);
 
     /// <summary>
@@ -44,8 +40,6 @@ public sealed record ProviderCapabilityReport(
             IndexCapabilities.All,
             Enum.GetValues<PortableQueryOperation>().ToHashSet(),
             Enum.GetValues<ConcurrencyKind>().ToHashSet(),
-            Enum.GetValues<MaterializationOperationKind>().ToHashSet(),
-            true,
             []);
     }
 
@@ -75,12 +69,4 @@ public sealed record IndexCapabilities(
             true,
             true,
             Enum.GetValues<MissingValueBehavior>().ToHashSet());
-}
-
-public enum MaterializationOperationKind
-{
-    CreateStorageUnit,
-    CreateIndex,
-    CreateOptimizedProjection,
-    RecordSchemaHistory
 }

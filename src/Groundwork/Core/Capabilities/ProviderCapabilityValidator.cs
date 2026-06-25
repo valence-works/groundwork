@@ -1,6 +1,5 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
-using Groundwork.Core.Physicalization;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.Capabilities;
@@ -59,32 +58,21 @@ public sealed class ProviderCapabilityValidator
 
     public CapabilityCompatibilityResult Validate(StorageManifest manifest, ProviderCapabilityReport capabilities)
     {
-        var diagnostics = ValidateCompatibility(manifest, capabilities, validateSchemaHistory: true, validateMaterializationOperations: true);
+        var diagnostics = ValidateCompatibility(manifest, capabilities);
 
         return diagnostics.Count == 0
             ? CapabilityCompatibilityResult.Compatible
             : new CapabilityCompatibilityResult(diagnostics);
     }
 
-    public CapabilityCompatibilityResult ValidateRuntimeFit(StorageManifest manifest, ProviderCapabilityReport capabilities)
-    {
-        var diagnostics = ValidateCompatibility(manifest, capabilities, validateSchemaHistory: false, validateMaterializationOperations: false);
-
-        return diagnostics.Count == 0
-            ? CapabilityCompatibilityResult.Compatible
-            : new CapabilityCompatibilityResult(diagnostics);
-    }
+    public CapabilityCompatibilityResult ValidateRuntimeFit(StorageManifest manifest, ProviderCapabilityReport capabilities) =>
+        Validate(manifest, capabilities);
 
     private List<GroundworkDiagnostic> ValidateCompatibility(
         StorageManifest manifest,
-        ProviderCapabilityReport capabilities,
-        bool validateSchemaHistory,
-        bool validateMaterializationOperations)
+        ProviderCapabilityReport capabilities)
     {
         var diagnostics = new List<GroundworkDiagnostic>();
-
-        if (validateSchemaHistory && !capabilities.SupportsSchemaHistory)
-            diagnostics.Add(GroundworkDiagnostic.Error("GW-CAP-001", "Provider must support schema history for materializable plans.", "provider.schemaHistory"));
 
         foreach (var warning in capabilities.Warnings)
             diagnostics.Add(GroundworkDiagnostic.Warning("GW-CAP-002", warning, "provider.warnings"));
@@ -92,7 +80,7 @@ public sealed class ProviderCapabilityValidator
         ValidateRequiredCapabilities(manifest, capabilities, diagnostics);
 
         foreach (var unit in manifest.StorageUnits)
-            ValidateUnit(unit, capabilities, diagnostics, validateMaterializationOperations);
+            ValidateUnit(unit, capabilities, diagnostics);
 
         return diagnostics;
     }
@@ -150,11 +138,7 @@ public sealed class ProviderCapabilityValidator
         }
     }
 
-    private void ValidateUnit(
-        StorageUnit unit,
-        ProviderCapabilityReport capabilities,
-        List<GroundworkDiagnostic> diagnostics,
-        bool validateMaterializationOperations)
+    private void ValidateUnit(StorageUnit unit, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
     {
         foreach (var requirement in unit.Intent.Requirements)
         {
@@ -191,36 +175,8 @@ public sealed class ProviderCapabilityValidator
                 $"storageUnits.{unit.Identity}.concurrency"));
         }
 
-        if (validateMaterializationOperations)
-            ValidateMaterializationOperations(unit, capabilities, diagnostics);
-
         foreach (var index in unit.Indexes)
             ValidateIndex(unit, index, capabilities, diagnostics);
-    }
-
-    private static void ValidateMaterializationOperations(StorageUnit unit, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
-    {
-        foreach (var operation in RequiredMaterializationOperations(unit))
-        {
-            if (capabilities.SupportedMaterializationOperations.Contains(operation))
-                continue;
-
-            diagnostics.Add(GroundworkDiagnostic.Error(
-                "GW-CAP-011",
-                $"Provider does not support materialization operation '{operation}' required by storage unit '{unit.Identity.Value}'.",
-                $"storageUnits.{unit.Identity}.materialization"));
-        }
-    }
-
-    private static IEnumerable<MaterializationOperationKind> RequiredMaterializationOperations(StorageUnit unit)
-    {
-        yield return MaterializationOperationKind.CreateStorageUnit;
-
-        if (unit.Indexes.Count != 0)
-            yield return MaterializationOperationKind.CreateIndex;
-
-        if (PhysicalizationProjection.EligibleFields(unit).Count != 0)
-            yield return MaterializationOperationKind.CreateOptimizedProjection;
     }
 
     private static void ValidateIndex(StorageUnit unit, IndexDeclaration index, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
