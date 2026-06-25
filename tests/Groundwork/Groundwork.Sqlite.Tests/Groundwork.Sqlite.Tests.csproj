@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\Sqlite\Groundwork.Sqlite.csproj" />
   </ItemGroup>
 

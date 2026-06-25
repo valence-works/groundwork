@@ -1,6 +1,6 @@
 using System.Data.Common;
-using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Materialization;
 using Groundwork.Relational.Materialization;
 using Groundwork.Relational.Physicalization;
 using Microsoft.Data.Sqlite;
@@ -17,9 +17,10 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         VALUES (@manifestId, @manifestVersion, @providerName, @providerVersion, @appliedUtc);
         """;
 
-    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(StorageUnit unit, IReadOnlyList<PhysicalizedFieldPlan> fields)
+    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
-        var table = RelationalPhysicalizationNames.TableName(unit);
+        var table = RelationalPhysicalizationNames.TableName(projection.UnitIdentity);
+        var fields = projection.Fields;
         var columns = string.Join(",\n    ", fields.Select(field => $"{RelationalPhysicalizationNames.ColumnName(field)} TEXT NULL"));
         var statements = new List<string>
         {
@@ -39,7 +40,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         statements.AddRange(fields.Select(field =>
         {
             var column = RelationalPhysicalizationNames.ColumnName(field);
-            var indexName = RelationalPhysicalizationNames.IndexName(unit, field, field.IsUnique);
+            var indexName = RelationalPhysicalizationNames.IndexName(projection.UnitIdentity, field, field.IsUnique);
             var unique = field.IsUnique ? "UNIQUE " : "";
             return $"""
                 CREATE {unique}INDEX IF NOT EXISTS {indexName}
@@ -52,12 +53,12 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
     }
 
     protected override async Task MaterializeOptimizedProjectionAsync(
-        StorageUnit unit,
-        IReadOnlyList<PhysicalizedFieldPlan> fields,
+        MaterializedProjection projection,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
-        var table = RelationalPhysicalizationNames.TableName(unit);
+        var table = RelationalPhysicalizationNames.TableName(projection.UnitIdentity);
+        var fields = projection.Fields;
         var columns = string.Join(",\n    ", fields.Select(field => $"{RelationalPhysicalizationNames.ColumnName(field)} TEXT NULL"));
         await ExecuteAsync(
             $"""
@@ -85,7 +86,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         foreach (var field in fields)
         {
             var column = RelationalPhysicalizationNames.ColumnName(field);
-            var indexName = RelationalPhysicalizationNames.IndexName(unit, field, field.IsUnique);
+            var indexName = RelationalPhysicalizationNames.IndexName(projection.UnitIdentity, field, field.IsUnique);
             var unique = field.IsUnique ? "UNIQUE " : "";
             await ExecuteAsync(
                 $"""
@@ -97,7 +98,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
                 cancellationToken);
         }
 
-        await BackfillPhysicalizedAsync(unit, fields, table, transaction, cancellationToken);
+        await BackfillPhysicalizedAsync(projection.UnitIdentity, fields, table, transaction, cancellationToken);
     }
 
     private async Task<HashSet<string>> ReadColumnsAsync(
@@ -115,23 +116,23 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
     }
 
     private async Task BackfillPhysicalizedAsync(
-        StorageUnit unit,
+        string unitIdentity,
         IReadOnlyList<PhysicalizedFieldPlan> fields,
         string table,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
-        var documents = await LoadDocumentsAsync(unit, transaction, cancellationToken);
+        var documents = await LoadDocumentsAsync(unitIdentity, transaction, cancellationToken);
         var columnNames = fields.Select(RelationalPhysicalizationNames.ColumnName).ToList();
         foreach (var document in documents)
         {
-            await DeletePhysicalizedAsync(table, unit.Identity.Value, document.Id, transaction, cancellationToken);
-            await InsertPhysicalizedAsync(table, columnNames, fields, unit.Identity.Value, document, transaction, cancellationToken);
+            await DeletePhysicalizedAsync(table, unitIdentity, document.Id, transaction, cancellationToken);
+            await InsertPhysicalizedAsync(table, columnNames, fields, unitIdentity, document, transaction, cancellationToken);
         }
     }
 
     private async Task<IReadOnlyList<(string Id, long Version, string ContentJson)>> LoadDocumentsAsync(
-        StorageUnit unit,
+        string unitIdentity,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -142,7 +143,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             WHERE document_kind = @kind;
             """,
             transaction);
-        AddParameter(command, "kind", unit.Identity.Value);
+        AddParameter(command, "kind", unitIdentity);
 
         var documents = new List<(string Id, long Version, string ContentJson)>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);

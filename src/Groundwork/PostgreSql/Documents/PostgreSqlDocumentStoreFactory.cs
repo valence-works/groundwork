@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Materialization;
 using Groundwork.PostgreSql.Materialization;
 using Npgsql;
 
@@ -21,7 +22,9 @@ public static class PostgreSqlDocumentStoreFactory
         var connection = new NpgsqlConnection(connectionString);
         try
         {
-            await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(manifest, provider, cancellationToken);
+            await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(
+                PortableMaterializationPlanFactory.Create(manifest, provider),
+                cancellationToken);
             return new PostgreSqlDocumentStoreHandle(connection, new PostgreSqlDocumentStore(connection, manifest, ambientTenantId));
         }
         catch
@@ -30,6 +33,7 @@ public static class PostgreSqlDocumentStoreFactory
             throw;
         }
     }
+
 }
 
 public sealed class PostgreSqlDocumentStoreHandle(NpgsqlConnection connection, PostgreSqlDocumentStore store) : IAsyncDisposable

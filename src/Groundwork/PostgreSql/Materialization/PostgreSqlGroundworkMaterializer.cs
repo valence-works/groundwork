@@ -1,5 +1,5 @@
-using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Materialization;
 using Groundwork.Relational.Materialization;
 using Groundwork.Relational.Physicalization;
 using Npgsql;
@@ -17,9 +17,10 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
         ON CONFLICT (manifest_id, manifest_version, provider_name, provider_version) DO NOTHING;
         """;
 
-    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(StorageUnit unit, IReadOnlyList<PhysicalizedFieldPlan> fields)
+    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
-        var table = RelationalPhysicalizationNames.TableName(unit);
+        var table = RelationalPhysicalizationNames.TableName(projection.UnitIdentity);
+        var fields = projection.Fields;
         var columns = string.Join(",\n    ", fields.Select(field => $"{RelationalPhysicalizationNames.ColumnName(field)} TEXT NULL"));
         var statements = new List<string>
         {
@@ -39,7 +40,7 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
         statements.AddRange(fields.Select(field =>
         {
             var column = RelationalPhysicalizationNames.ColumnName(field);
-            var indexName = RelationalPhysicalizationNames.IndexName(unit, field, field.IsUnique);
+            var indexName = RelationalPhysicalizationNames.IndexName(projection.UnitIdentity, field, field.IsUnique);
             var unique = field.IsUnique ? "UNIQUE " : "";
             return $"""
                 CREATE {unique}INDEX IF NOT EXISTS {indexName}
