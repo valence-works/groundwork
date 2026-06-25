@@ -11,8 +11,9 @@ public sealed class GroundworkDependencyBoundaryTests
     public static TheoryData<string, string[]> GroundworkProjectReferences => new()
     {
         { "src/Groundwork/Core/Groundwork.Core.csproj", [] },
-        { "src/Groundwork/Relational/Groundwork.Relational.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj", "src/Groundwork/Documents/Groundwork.Documents.csproj"] },
-        { "src/Groundwork/Documents/Groundwork.Documents.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj"] },
+        { "src/Groundwork/Materialization/Groundwork.Materialization.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj"] },
+        { "src/Groundwork/Relational/Groundwork.Relational.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj", "src/Groundwork/Documents/Groundwork.Documents.csproj", "src/Groundwork/Materialization/Groundwork.Materialization.csproj"] },
+        { "src/Groundwork/Documents/Groundwork.Documents.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj", "src/Groundwork/Materialization/Groundwork.Materialization.csproj"] },
         { "src/Groundwork/Operational/Groundwork.Operational.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj"] },
         { "src/Groundwork/Provider.Relational/Groundwork.Provider.Relational.csproj", [] },
         { "src/Groundwork/Operational.Relational/Groundwork.Operational.Relational.csproj", ["src/Groundwork/Core/Groundwork.Core.csproj", "src/Groundwork/Operational/Groundwork.Operational.csproj", "src/Groundwork/Provider.Relational/Groundwork.Provider.Relational.csproj"] }
