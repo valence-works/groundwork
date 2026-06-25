@@ -9,6 +9,7 @@
 - Maintains declared indexes transactionally with document writes.
 - Enforces unique declared indexes with a partial unique index.
 - Uses optimistic concurrency through expected document versions.
+- Exposes `PostgreSqlGroundworkCapabilities.Runtime()` and `PostgreSqlGroundworkCapabilities.Materialization()`.
 
 ## Deliberate Limits
 

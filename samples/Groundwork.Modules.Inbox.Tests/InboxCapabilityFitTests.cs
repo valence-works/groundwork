@@ -1,4 +1,5 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Modules.Inbox;
@@ -48,8 +49,7 @@ public sealed class InboxCapabilityFitTests
     public void FitIsSupportedWhenProviderAdvertisesTheCustomCapability()
     {
         var (validator, policy) = ValidatorWithInboxModule();
-        var provider = ProviderCapabilityReport
-            .PortableDocumentProvider(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
+        var provider = PortableCapabilities(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
             .WithCapabilities(InboxCapabilities.IdempotentConsumer);
 
         var fit = validator.Evaluate(InboxManifest(), provider, policy);
@@ -61,7 +61,7 @@ public sealed class InboxCapabilityFitTests
     public void FitIsUnsupportedWhenProviderLacksTheCustomCapability()
     {
         var (validator, policy) = ValidatorWithInboxModule();
-        var provider = ProviderCapabilityReport.PortableDocumentProvider(new ProviderIdentity("document-only", "1.0.0"));
+        var provider = PortableCapabilities(new ProviderIdentity("document-only", "1.0.0"));
 
         var fit = validator.Evaluate(InboxManifest(), provider, policy);
 
@@ -74,8 +74,7 @@ public sealed class InboxCapabilityFitTests
     {
         // A core-only validator does not know the module's capability, so it flags it as unregistered.
         var coreValidator = new ProviderCapabilityValidator();
-        var provider = ProviderCapabilityReport
-            .PortableDocumentProvider(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
+        var provider = PortableCapabilities(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
             .WithCapabilities(InboxCapabilities.IdempotentConsumer);
 
         var result = coreValidator.Validate(InboxManifest(), provider);
@@ -88,12 +87,21 @@ public sealed class InboxCapabilityFitTests
     public void RegisteredCapabilityPassesValidateAgainstCapableProvider()
     {
         var (validator, _) = ValidatorWithInboxModule();
-        var provider = ProviderCapabilityReport
-            .PortableDocumentProvider(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
+        var provider = PortableCapabilities(new ProviderIdentity("inbox-capable-sqlite", "1.0.0"))
             .WithCapabilities(InboxCapabilities.IdempotentConsumer);
 
         var result = validator.Validate(InboxManifest(), provider);
 
         Assert.True(result.IsCompatible);
     }
+
+    private static ProviderCapabilityReport PortableCapabilities(ProviderIdentity provider) =>
+        new(
+            provider,
+            new HashSet<CapabilityId>(),
+            new HashSet<CapabilityId>(),
+            IndexCapabilities.All,
+            Enum.GetValues<PortableQueryOperation>().ToHashSet(),
+            Enum.GetValues<ConcurrencyKind>().ToHashSet(),
+            []);
 }

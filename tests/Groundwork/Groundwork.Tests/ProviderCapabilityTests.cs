@@ -79,7 +79,7 @@ public sealed class ProviderCapabilityTests
     }
 
     [Fact]
-    public void OperationalRequirementIsRejectedByPortableDocumentProvider()
+    public void OperationalRequirementIsRejectedByPortableRuntimeProvider()
     {
         var manifest = WithSingleUnitIntent(StorageIntent.Operational(
             "Requires atomic task claiming.",
@@ -177,7 +177,7 @@ public sealed class ProviderCapabilityTests
         };
         Assert.IsType<ProviderFit.RequiresEvidence>(_validator.Evaluate(manifest, supportedNoEvidence));
 
-        var operational = ProviderCapabilityReport.OperationalProvider(new ProviderIdentity("operational-test-provider", "1.0.0"));
+        var operational = SampleManifests.OperationalCapabilities(new ProviderIdentity("operational-test-provider", "1.0.0"));
         Assert.IsType<ProviderFit.Supported>(_validator.Evaluate(manifest, operational));
     }
 

@@ -9,6 +9,7 @@
 - Maintains declared indexes transactionally with document writes.
 - Enforces unique declared indexes with a filtered unique index.
 - Uses optimistic concurrency through expected document versions.
+- Exposes `SqlServerGroundworkCapabilities.Runtime()` and `SqlServerGroundworkCapabilities.Materialization()`.
 
 ## Deliberate Limits
 

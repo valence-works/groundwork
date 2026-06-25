@@ -12,6 +12,7 @@
 - Enforces unique declared indexes through SQLite constraints.
 - Provides a durable Groundwork migration executor backed by `groundwork_migration_history`.
 - Adds and backfills new optimized physicalized projection columns during materialization.
+- Exposes `SqliteGroundworkCapabilities.Runtime()` and `SqliteGroundworkCapabilities.Materialization()`.
 
 ## Deliberate Limits
 

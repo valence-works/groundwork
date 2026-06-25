@@ -17,7 +17,7 @@ public sealed class MaterializationPlannerTests
     public void PlanCreatesTypedOperationsAndSchemaHistoryForPlannableManifest()
     {
         var manifest = CreateManifest();
-        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider);
+        var runtimeCapabilities = RuntimeCapabilities();
         var materializationCapabilities = CreateCapabilities();
 
         var plan = planner.Plan(manifest, runtimeCapabilities, materializationCapabilities);
@@ -52,7 +52,7 @@ public sealed class MaterializationPlannerTests
         var manifest = CreateManifest();
         var materializationCapabilities = CreateCapabilities(supportsSchemaHistory: false);
 
-        var plan = planner.Plan(manifest, ProviderCapabilityReport.PortableDocumentProvider(provider), materializationCapabilities);
+        var plan = planner.Plan(manifest, RuntimeCapabilities(), materializationCapabilities);
 
         Assert.False(plan.IsPlannable);
         Assert.Empty(plan.Operations);
@@ -68,7 +68,7 @@ public sealed class MaterializationPlannerTests
             .ToHashSet();
         var materializationCapabilities = CreateCapabilities(supportedOperations: supportedOperations);
 
-        var plan = planner.Plan(manifest, ProviderCapabilityReport.PortableDocumentProvider(provider), materializationCapabilities);
+        var plan = planner.Plan(manifest, RuntimeCapabilities(), materializationCapabilities);
 
         Assert.False(plan.IsPlannable);
         Assert.Empty(plan.Operations);
@@ -79,7 +79,7 @@ public sealed class MaterializationPlannerTests
     public void PlanReturnsDiagnosticsAndNoOperationsWhenCapabilityProvidersDiffer()
     {
         var manifest = CreateManifest();
-        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider);
+        var runtimeCapabilities = RuntimeCapabilities();
         var materializationCapabilities = CreateCapabilities(provider: new ProviderIdentity("other-provider", "2.0.0"));
 
         var plan = planner.Plan(manifest, runtimeCapabilities, materializationCapabilities);
@@ -97,7 +97,7 @@ public sealed class MaterializationPlannerTests
                 "Needs an atomic claim provider for worker coordination.",
                 WorkloadIntent.OperationalStream,
                 WellKnownCapabilities.AtomicClaim));
-        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider);
+        var runtimeCapabilities = RuntimeCapabilities();
 
         var plan = planner.Plan(manifest, runtimeCapabilities, CreateCapabilities());
 
@@ -110,7 +110,7 @@ public sealed class MaterializationPlannerTests
     public void PlanUsesMaterializationCapabilitiesInsteadOfRuntimeMaterializationFields()
     {
         var manifest = CreateManifest();
-        var runtimeCapabilities = ProviderCapabilityReport.PortableDocumentProvider(provider);
+        var runtimeCapabilities = RuntimeCapabilities();
 
         var plan = planner.Plan(manifest, runtimeCapabilities, CreateCapabilities());
 
@@ -149,6 +149,16 @@ public sealed class MaterializationPlannerTests
             provider ?? this.provider,
             supportedOperations ?? Enum.GetValues<MaterializationOperationKind>().ToHashSet(),
             supportsSchemaHistory);
+
+    private ProviderCapabilityReport RuntimeCapabilities() =>
+        new(
+            provider,
+            new HashSet<CapabilityId>(),
+            new HashSet<CapabilityId>(),
+            IndexCapabilities.All,
+            Enum.GetValues<PortableQueryOperation>().ToHashSet(),
+            Enum.GetValues<ConcurrencyKind>().ToHashSet(),
+            []);
 
     private static StorageManifest CreateManifest(StorageIntent? intent = null) =>
         new(
