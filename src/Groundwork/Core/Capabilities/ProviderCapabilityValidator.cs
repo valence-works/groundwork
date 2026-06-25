@@ -59,9 +59,31 @@ public sealed class ProviderCapabilityValidator
 
     public CapabilityCompatibilityResult Validate(StorageManifest manifest, ProviderCapabilityReport capabilities)
     {
+        var diagnostics = ValidateCompatibility(manifest, capabilities, validateSchemaHistory: true, validateMaterializationOperations: true);
+
+        return diagnostics.Count == 0
+            ? CapabilityCompatibilityResult.Compatible
+            : new CapabilityCompatibilityResult(diagnostics);
+    }
+
+    public CapabilityCompatibilityResult ValidateRuntimeFit(StorageManifest manifest, ProviderCapabilityReport capabilities)
+    {
+        var diagnostics = ValidateCompatibility(manifest, capabilities, validateSchemaHistory: false, validateMaterializationOperations: false);
+
+        return diagnostics.Count == 0
+            ? CapabilityCompatibilityResult.Compatible
+            : new CapabilityCompatibilityResult(diagnostics);
+    }
+
+    private List<GroundworkDiagnostic> ValidateCompatibility(
+        StorageManifest manifest,
+        ProviderCapabilityReport capabilities,
+        bool validateSchemaHistory,
+        bool validateMaterializationOperations)
+    {
         var diagnostics = new List<GroundworkDiagnostic>();
 
-        if (!capabilities.SupportsSchemaHistory)
+        if (validateSchemaHistory && !capabilities.SupportsSchemaHistory)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-CAP-001", "Provider must support schema history for materializable plans.", "provider.schemaHistory"));
 
         foreach (var warning in capabilities.Warnings)
@@ -70,11 +92,9 @@ public sealed class ProviderCapabilityValidator
         ValidateRequiredCapabilities(manifest, capabilities, diagnostics);
 
         foreach (var unit in manifest.StorageUnits)
-            ValidateUnit(unit, capabilities, diagnostics);
+            ValidateUnit(unit, capabilities, diagnostics, validateMaterializationOperations);
 
-        return diagnostics.Count == 0
-            ? CapabilityCompatibilityResult.Compatible
-            : new CapabilityCompatibilityResult(diagnostics);
+        return diagnostics;
     }
 
     private ProviderFit EvaluateUnit(StorageUnit unit, ProviderCapabilityReport capabilities, WorkloadEvidencePolicy policy)
@@ -130,7 +150,11 @@ public sealed class ProviderCapabilityValidator
         }
     }
 
-    private void ValidateUnit(StorageUnit unit, ProviderCapabilityReport capabilities, List<GroundworkDiagnostic> diagnostics)
+    private void ValidateUnit(
+        StorageUnit unit,
+        ProviderCapabilityReport capabilities,
+        List<GroundworkDiagnostic> diagnostics,
+        bool validateMaterializationOperations)
     {
         foreach (var requirement in unit.Intent.Requirements)
         {
@@ -167,7 +191,8 @@ public sealed class ProviderCapabilityValidator
                 $"storageUnits.{unit.Identity}.concurrency"));
         }
 
-        ValidateMaterializationOperations(unit, capabilities, diagnostics);
+        if (validateMaterializationOperations)
+            ValidateMaterializationOperations(unit, capabilities, diagnostics);
 
         foreach (var index in unit.Indexes)
             ValidateIndex(unit, index, capabilities, diagnostics);
