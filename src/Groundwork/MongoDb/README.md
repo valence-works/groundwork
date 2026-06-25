@@ -9,6 +9,7 @@
 - Saves, loads, updates, deletes, and equality-queries JSON document envelopes.
 - Enforces unique declared indexes with MongoDB unique indexes.
 - Uses optimistic concurrency through expected document versions.
+- Exposes `MongoDbGroundworkCapabilities.Runtime()` and `MongoDbGroundworkCapabilities.Materialization()`.
 
 ## Deliberate Limits
 

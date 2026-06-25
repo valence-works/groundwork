@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.PostgreSql.Materialization;
 using Npgsql;
@@ -23,7 +24,7 @@ public static class PostgreSqlDocumentStoreFactory
         try
         {
             await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(
-                PortableMaterializationPlanFactory.Create(manifest, provider),
+                CreateMaterializationPlan(manifest, provider),
                 cancellationToken);
             return new PostgreSqlDocumentStoreHandle(connection, new PostgreSqlDocumentStore(connection, manifest, ambientTenantId));
         }
@@ -34,6 +35,9 @@ public static class PostgreSqlDocumentStoreFactory
         }
     }
 
+    private static MaterializationPlan CreateMaterializationPlan(StorageManifest manifest, ProviderIdentity provider) =>
+        new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+            .Plan(manifest, PostgreSqlGroundworkCapabilities.Runtime(provider), PostgreSqlGroundworkCapabilities.Materialization(provider));
 }
 
 public sealed class PostgreSqlDocumentStoreHandle(NpgsqlConnection connection, PostgreSqlDocumentStore store) : IAsyncDisposable

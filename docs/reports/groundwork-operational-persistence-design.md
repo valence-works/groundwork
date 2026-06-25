@@ -189,8 +189,9 @@ IReadOnlySet<StorageRequirement> SupportedStorageRequirements;   // the provider
 IReadOnlySet<StorageRequirement> EvidencedStorageRequirements;   // ...and has benchmark/operational evidence
 ```
 
-Factories: `PortableDocumentProvider(identity)` (no operational requirements) and
-`OperationalProvider(identity)` (all operational requirements, all evidenced).
+Provider packages expose provider-owned runtime capability factories, such as
+`SqliteGroundworkCapabilities.Runtime()`. Tests or samples that need synthetic provider reports build
+`ProviderCapabilityReport` values locally.
 
 ### `ProviderFit` — the computed verdict
 

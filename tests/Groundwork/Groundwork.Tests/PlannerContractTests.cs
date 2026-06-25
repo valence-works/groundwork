@@ -109,7 +109,7 @@ public sealed class PlannerContractTests
     }
 
     private ProviderCapabilityReport RuntimeCapabilities() =>
-        ProviderCapabilityReport.PortableDocumentProvider(_provider);
+        SampleManifests.PortableCapabilities(_provider);
 
     private MaterializationCapabilityReport MaterializationCapabilities() =>
         new(
