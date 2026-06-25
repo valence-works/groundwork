@@ -1,16 +1,17 @@
 using Groundwork.Core.Indexing;
-using Groundwork.Core.Materialization;
 using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 
 namespace Groundwork.Documents.Planning;
 
 public sealed record DocumentPlan(
     IReadOnlyList<DocumentStoragePlan> Documents,
-    IReadOnlyList<MaterializationOperation> Operations,
-    SchemaHistoryEntry SchemaHistory,
-    IReadOnlyList<GroundworkDiagnostic> Diagnostics)
+    MaterializationPlan MaterializationPlan)
 {
-    public bool IsPlannable => Diagnostics.All(diagnostic => !diagnostic.IsError);
+    public IReadOnlyList<MaterializationOperation> Operations => MaterializationPlan.Operations;
+    public SchemaHistoryEntry SchemaHistory => MaterializationPlan.SchemaHistory;
+    public IReadOnlyList<GroundworkDiagnostic> Diagnostics => MaterializationPlan.Diagnostics;
+    public bool IsPlannable => MaterializationPlan.IsPlannable;
 }
 
 public sealed record DocumentStoragePlan(
