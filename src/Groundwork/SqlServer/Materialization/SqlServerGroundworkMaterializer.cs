@@ -1,5 +1,5 @@
-using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Materialization;
 using Groundwork.Relational.Materialization;
 using Groundwork.Relational.Physicalization;
 using Microsoft.Data.SqlClient;
@@ -26,9 +26,10 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
         END;
         """;
 
-    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(StorageUnit unit, IReadOnlyList<PhysicalizedFieldPlan> fields)
+    protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
-        var table = RelationalPhysicalizationNames.TableName(unit);
+        var table = RelationalPhysicalizationNames.TableName(projection.UnitIdentity);
+        var fields = projection.Fields;
         var columns = string.Join(",\n        ", fields.Select(field => $"{RelationalPhysicalizationNames.ColumnName(field)} NVARCHAR(450) NULL"));
         var statements = new List<string>
         {
@@ -51,7 +52,7 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
         statements.AddRange(fields.Select(field =>
         {
             var column = RelationalPhysicalizationNames.ColumnName(field);
-            var indexName = RelationalPhysicalizationNames.IndexName(unit, field, field.IsUnique);
+            var indexName = RelationalPhysicalizationNames.IndexName(projection.UnitIdentity, field, field.IsUnique);
             var unique = field.IsUnique ? "UNIQUE " : "";
             return $"""
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{indexName}' AND object_id = OBJECT_ID(N'{table}'))

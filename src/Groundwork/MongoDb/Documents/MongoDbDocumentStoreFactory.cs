@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Materialization;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Driver;
 
@@ -25,7 +26,9 @@ public static class MongoDbDocumentStoreFactory
         try
         {
             var database = client.GetDatabase(databaseName);
-            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, provider, cancellationToken);
+            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
+                PortableMaterializationPlanFactory.Create(manifest, provider),
+                cancellationToken);
             return new MongoDbDocumentStoreHandle(disposableClient, new MongoDbDocumentStore(database, manifest, ambientTenantId));
         }
         catch
@@ -34,6 +37,7 @@ public static class MongoDbDocumentStoreFactory
             throw;
         }
     }
+
 }
 
 public sealed class MongoDbDocumentStoreHandle(IDisposable? client, MongoDbDocumentStore store) : IAsyncDisposable

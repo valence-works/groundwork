@@ -1,3 +1,5 @@
+using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 using Groundwork.Sqlite.Materialization;
 using Microsoft.Data.Sqlite;
 using Xunit;
@@ -22,8 +24,31 @@ public sealed class SqliteGroundworkMaterializerTests
         Assert.Equal(1, await CountRows(connection, "groundwork_schema_history"));
     }
 
+    [Fact]
+    public async Task MaterializeRejectsUnplannablePlansWithoutExecutingOperations()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var manifest = SqliteTestManifests.MetadataManifest();
+        var plan = new MaterializationPlan(
+            SqliteTestManifests.Provider,
+            manifest.Identity,
+            manifest.Version,
+            [],
+            new SchemaHistoryEntry(manifest.Identity, manifest.Version, SqliteTestManifests.Provider, DateTimeOffset.UnixEpoch, []),
+            [GroundworkDiagnostic.Error("GW-MAT-999", "Test diagnostic.")]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(plan));
+
+        Assert.False(await TableExists(connection, "groundwork_documents"));
+        Assert.False(await TableExists(connection, "groundwork_schema_history"));
+    }
+
     private static async Task<bool> TableExists(SqliteConnection connection, string tableName)
     {
+        if (connection.State != System.Data.ConnectionState.Open)
+            await connection.OpenAsync();
+
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = $name;";
         command.Parameters.AddWithValue("$name", tableName);

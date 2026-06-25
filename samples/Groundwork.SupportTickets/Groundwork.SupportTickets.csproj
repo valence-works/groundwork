@@ -13,6 +13,7 @@
     <PackageReference Include="Npgsql" />
     <ProjectReference Include="..\..\src\Groundwork\Core\Groundwork.Core.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Documents\Groundwork.Documents.csproj" />
+    <ProjectReference Include="..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Operational\Groundwork.Operational.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\Operational.Relational\Groundwork.Operational.Relational.csproj" />
     <ProjectReference Include="..\..\src\Groundwork\MongoDb\Groundwork.MongoDb.csproj" />

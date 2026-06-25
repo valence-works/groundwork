@@ -1,8 +1,7 @@
 using System.Data;
 using System.Data.Common;
-using Groundwork.Core.Capabilities;
-using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
+using Groundwork.Materialization;
 
 namespace Groundwork.Relational.Materialization;
 
@@ -14,43 +13,60 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
 
     protected abstract string InsertSchemaHistorySql { get; }
 
-    protected abstract IReadOnlyList<string> CreateOptimizedProjectionStatements(StorageUnit unit, IReadOnlyList<PhysicalizedFieldPlan> fields);
+    protected abstract IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection);
 
-    public async Task MaterializeAsync(StorageManifest manifest, ProviderIdentity provider, CancellationToken cancellationToken = default)
+    public async Task MaterializeAsync(MaterializationPlan plan, CancellationToken cancellationToken = default)
     {
+        if (!plan.IsPlannable)
+            throw new InvalidOperationException("Cannot execute an unplannable materialization plan.");
+
         await EnsureOpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
         foreach (var statement in SchemaStatements)
             await ExecuteAsync(statement, transaction, cancellationToken);
 
-        foreach (var unit in manifest.StorageUnits)
+        foreach (var operation in plan.Operations)
         {
-            var fields = PhysicalizationProjection.EligibleFields(unit);
-            if (fields.Count == 0)
-                continue;
-
-            await MaterializeOptimizedProjectionAsync(unit, fields, transaction, cancellationToken);
+            switch (operation)
+            {
+                case CreateStorageUnitOperation:
+                case CreateIndexOperation:
+                    break;
+                case CreateOptimizedProjectionOperation projection:
+                    await MaterializeOptimizedProjectionAsync(projection.Projection, transaction, cancellationToken);
+                    break;
+                case RecordSchemaHistoryOperation history:
+                    await RecordSchemaHistoryAsync(history.Entry, transaction, cancellationToken);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported materialization operation '{operation.Kind}'.");
+            }
         }
-
-        await using var command = CreateCommand(InsertSchemaHistorySql, transaction);
-        AddParameter(command, "manifestId", manifest.Identity.Value);
-        AddParameter(command, "manifestVersion", manifest.Version.Value);
-        AddParameter(command, "providerName", provider.Name);
-        AddParameter(command, "providerVersion", provider.Version);
-        AddParameter(command, "appliedUtc", DateTimeOffset.UtcNow.ToString("O"));
-        await command.ExecuteNonQueryAsync(cancellationToken);
 
         await transaction.CommitAsync(cancellationToken);
     }
 
-    protected virtual async Task MaterializeOptimizedProjectionAsync(
-        StorageUnit unit,
-        IReadOnlyList<PhysicalizedFieldPlan> fields,
+    private async Task RecordSchemaHistoryAsync(
+        SchemaHistoryEntry history,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
-        foreach (var statement in CreateOptimizedProjectionStatements(unit, fields))
+        await using var command = CreateCommand(InsertSchemaHistorySql, transaction);
+        AddParameter(command, "manifestId", history.ManifestIdentity.Value);
+        AddParameter(command, "manifestVersion", history.ManifestVersion.Value);
+        AddParameter(command, "providerName", history.Provider.Name);
+        AddParameter(command, "providerVersion", history.Provider.Version);
+        AddParameter(command, "appliedUtc", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    protected virtual async Task MaterializeOptimizedProjectionAsync(
+        MaterializedProjection projection,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        foreach (var statement in CreateOptimizedProjectionStatements(projection))
             await ExecuteAsync(statement, transaction, cancellationToken);
     }
 

@@ -24,6 +24,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\PostgreSql\Groundwork.PostgreSql.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\SqlServer\Groundwork.SqlServer.csproj" />
   </ItemGroup>

@@ -1,6 +1,6 @@
-using Groundwork.Core.Capabilities;
-using Groundwork.Core.Manifests;
+using Groundwork.Core.Indexing;
 using Groundwork.Core.Physicalization;
+using Groundwork.Materialization;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -12,20 +12,44 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
     private const int IndexKeySpecsConflictErrorCode = 86;
     private const int NamespaceExistsErrorCode = 48;
 
-    public async Task MaterializeAsync(StorageManifest manifest, ProviderIdentity provider, CancellationToken cancellationToken = default)
+    public async Task MaterializeAsync(MaterializationPlan plan, CancellationToken cancellationToken = default)
     {
+        if (!plan.IsPlannable)
+            throw new InvalidOperationException("Cannot execute an unplannable materialization plan.");
+
         var collections = await GetCollectionNamesAsync(cancellationToken);
-        await EnsureCollectionAsync(collections, MongoDbGroundworkNames.SchemaHistoryCollection, cancellationToken);
-        await EnsureSchemaHistoryIndexAsync(cancellationToken);
+        var physicalizedFields = plan.Operations
+            .OfType<CreateOptimizedProjectionOperation>()
+            .SelectMany(operation => operation.Projection.Fields.Select(field => new
+            {
+                operation.Projection.UnitIdentity,
+                Field = field
+            }))
+            .ToDictionary(
+                item => (item.UnitIdentity, item.Field.Name),
+                item => item.Field);
 
-        foreach (var unit in manifest.StorageUnits)
+        foreach (var operation in plan.Operations)
         {
-            var collectionName = MongoDbGroundworkNames.CollectionName(unit);
-            await EnsureCollectionAsync(collections, collectionName, cancellationToken);
-            await EnsureDeclaredIndexesAsync(database.GetCollection<BsonDocument>(collectionName), unit, cancellationToken);
+            switch (operation)
+            {
+                case CreateStorageUnitOperation storageUnit:
+                    await EnsureCollectionAsync(collections, MongoDbGroundworkNames.CollectionName(storageUnit.StorageUnit.Identity), cancellationToken);
+                    break;
+                case CreateIndexOperation index:
+                    await EnsureIndexAsync(index.Index, physicalizedFields, cancellationToken);
+                    break;
+                case CreateOptimizedProjectionOperation:
+                    break;
+                case RecordSchemaHistoryOperation history:
+                    await EnsureCollectionAsync(collections, MongoDbGroundworkNames.SchemaHistoryCollection, cancellationToken);
+                    await EnsureSchemaHistoryIndexAsync(cancellationToken);
+                    await RecordSchemaHistoryAsync(history.Entry, cancellationToken);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported materialization operation '{operation.Kind}'.");
+            }
         }
-
-        await RecordSchemaHistoryAsync(manifest, provider, cancellationToken);
     }
 
     private async Task<HashSet<string>> GetCollectionNamesAsync(CancellationToken cancellationToken)
@@ -68,25 +92,26 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         await CreateIndexWithAdvisoryAsync(collection, model, model.Options.Name, cancellationToken);
     }
 
-    private async Task EnsureDeclaredIndexesAsync(IMongoCollection<BsonDocument> collection, StorageUnit unit, CancellationToken cancellationToken)
+    private async Task EnsureIndexAsync(
+        MaterializedIndex index,
+        IReadOnlyDictionary<(string UnitIdentity, string FieldName), PhysicalizedFieldPlan> physicalizedFields,
+        CancellationToken cancellationToken)
     {
-        var physicalizedFields = PhysicalizationProjection.EligibleFields(unit)
-            .ToDictionary(field => field.Name, StringComparer.Ordinal);
+        if (index.FieldPaths.Count != 1)
+            return;
 
-        foreach (var index in unit.Indexes.Where(index => index.Fields.Count == 1))
+        var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.CollectionName(index.UnitIdentity));
+        var path = !physicalizedFields.TryGetValue((index.UnitIdentity, index.Identity), out var physicalizedField)
+            ? $"content.{index.FieldPaths[0]}"
+            : $"physicalized.{MongoDbGroundworkNames.PhysicalizedFieldName(physicalizedField)}";
+        var keys = Builders<BsonDocument>.IndexKeys.Ascending(path);
+        var options = new CreateIndexOptions
         {
-            var path = !physicalizedFields.TryGetValue(index.Identity, out var physicalizedField)
-                ? $"content.{index.Fields[0].Path}"
-                : $"physicalized.{MongoDbGroundworkNames.PhysicalizedFieldName(physicalizedField)}";
-            var keys = Builders<BsonDocument>.IndexKeys.Ascending(path);
-            var options = new CreateIndexOptions
-            {
-                Name = index.Identity,
-                Unique = index.IsUnique,
-                Sparse = index.MissingValueBehavior == Groundwork.Core.Indexing.MissingValueBehavior.Excluded
-            };
-            await CreateIndexWithAdvisoryAsync(collection, new CreateIndexModel<BsonDocument>(keys, options), index.Identity, cancellationToken);
-        }
+            Name = index.Identity,
+            Unique = index.IsUnique,
+            Sparse = index.MissingValueBehavior == MissingValueBehavior.Excluded
+        };
+        await CreateIndexWithAdvisoryAsync(collection, new CreateIndexModel<BsonDocument>(keys, options), index.Identity, cancellationToken);
     }
 
     private async Task CreateIndexWithAdvisoryAsync(
@@ -109,18 +134,18 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
     private static bool IsIndexConflictException(MongoCommandException exception) =>
         exception.Code is IndexOptionsConflictErrorCode or IndexKeySpecsConflictErrorCode;
 
-    private async Task RecordSchemaHistoryAsync(StorageManifest manifest, ProviderIdentity provider, CancellationToken cancellationToken)
+    private async Task RecordSchemaHistoryAsync(SchemaHistoryEntry history, CancellationToken cancellationToken)
     {
         var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.SchemaHistoryCollection);
-        var filter = Builders<BsonDocument>.Filter.Eq("manifest_id", manifest.Identity.Value) &
-                     Builders<BsonDocument>.Filter.Eq("manifest_version", manifest.Version.Value) &
-                     Builders<BsonDocument>.Filter.Eq("provider_name", provider.Name) &
-                     Builders<BsonDocument>.Filter.Eq("provider_version", provider.Version);
+        var filter = Builders<BsonDocument>.Filter.Eq("manifest_id", history.ManifestIdentity.Value) &
+                     Builders<BsonDocument>.Filter.Eq("manifest_version", history.ManifestVersion.Value) &
+                     Builders<BsonDocument>.Filter.Eq("provider_name", history.Provider.Name) &
+                     Builders<BsonDocument>.Filter.Eq("provider_version", history.Provider.Version);
         var update = Builders<BsonDocument>.Update
-            .SetOnInsert("manifest_id", manifest.Identity.Value)
-            .SetOnInsert("manifest_version", manifest.Version.Value)
-            .SetOnInsert("provider_name", provider.Name)
-            .SetOnInsert("provider_version", provider.Version)
+            .SetOnInsert("manifest_id", history.ManifestIdentity.Value)
+            .SetOnInsert("manifest_version", history.ManifestVersion.Value)
+            .SetOnInsert("provider_name", history.Provider.Name)
+            .SetOnInsert("provider_version", history.Provider.Version)
             .SetOnInsert("applied_utc", DateTimeOffset.UtcNow.ToString("O"));
 
         await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true }, cancellationToken);
