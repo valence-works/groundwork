@@ -2,6 +2,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Modules.Inbox;
+using Groundwork.Sqlite;
 
 namespace Groundwork.SupportTickets.ExternalModules;
 
@@ -54,10 +55,10 @@ public static class SupportTicketExternalModuleManifest
     }
 
     private static ProviderCapabilityReport InboxProvider() =>
-        ProviderCapabilityReport
-            .PortableDocumentProvider(new ProviderIdentity("community-inbox-sqlite", "1.0.0"))
+        SqliteGroundworkCapabilities
+            .Runtime(new ProviderIdentity("community-inbox-sqlite", "1.0.0"))
             .WithCapabilities(InboxCapabilities.IdempotentConsumer);
 
     private static ProviderCapabilityReport DocumentOnlyProvider() =>
-        ProviderCapabilityReport.PortableDocumentProvider(new ProviderIdentity("groundwork-document-only", "1.0.0"));
+        SqliteGroundworkCapabilities.Runtime(new ProviderIdentity("groundwork-document-only", "1.0.0"));
 }

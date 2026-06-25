@@ -4,6 +4,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Core.Intents;
 using Groundwork.Documents.Planning;
+using Groundwork.Materialization;
 using Groundwork.Relational.Planning;
 using Xunit;
 
@@ -13,15 +14,17 @@ public sealed class PlannerContractTests
 {
     private readonly StorageManifestValidator _manifestValidator = new();
     private readonly ProviderCapabilityValidator _capabilityValidator = new();
+    private readonly ProviderIdentity _provider = new("planner-contract-provider", "1.0.0");
 
     [Fact]
     public void SameManifestProducesRelationalAndDocumentPlans()
     {
         var manifest = SampleManifests.MetadataManifest();
-        var capabilities = SampleManifests.PortableCapabilities();
+        var capabilities = RuntimeCapabilities();
+        var materializationCapabilities = MaterializationCapabilities();
 
-        var relational = NewRelationalPlanner().Plan(manifest, capabilities);
-        var document = NewDocumentPlanner().Plan(manifest, capabilities);
+        var relational = NewRelationalPlanner().Plan(manifest, capabilities, materializationCapabilities);
+        var document = NewDocumentPlanner().Plan(manifest, capabilities, materializationCapabilities);
 
         Assert.True(relational.IsPlannable);
         Assert.True(document.IsPlannable);
@@ -32,24 +35,26 @@ public sealed class PlannerContractTests
     [Fact]
     public void RelationalPlanPreservesIndexesAndSchemaHistory()
     {
-        var plan = NewRelationalPlanner().Plan(SampleManifests.MetadataManifest(), SampleManifests.PortableCapabilities());
+        var plan = NewRelationalPlanner().Plan(SampleManifests.MetadataManifest(), RuntimeCapabilities(), MaterializationCapabilities());
 
         var table = Assert.Single(plan.Tables);
         Assert.Equal(["by-key", "by-category"], table.Indexes.Select(index => index.Name));
         Assert.Contains(plan.Operations, operation => operation.Kind == MaterializationOperationKind.RecordSchemaHistory);
         Assert.Equal("configuration.documents", plan.SchemaHistory.ManifestIdentity.Value);
+        Assert.Same(plan.MaterializationPlan.Operations, plan.Operations);
     }
 
     [Fact]
     public void DocumentPlanPreservesIndexesQueriesAndSchemaHistory()
     {
-        var plan = NewDocumentPlanner().Plan(SampleManifests.MetadataManifest(), SampleManifests.PortableCapabilities());
+        var plan = NewDocumentPlanner().Plan(SampleManifests.MetadataManifest(), RuntimeCapabilities(), MaterializationCapabilities());
 
         var document = Assert.Single(plan.Documents);
         Assert.Equal(["by-key", "by-category"], document.Indexes.Select(index => index.Name));
         Assert.Equal(["find-by-key", "list-by-category"], document.Queries.Select(query => query.Name));
         Assert.Contains(plan.Operations, operation => operation.Kind == MaterializationOperationKind.RecordSchemaHistory);
         Assert.Equal("configuration.documents", plan.SchemaHistory.ManifestIdentity.Value);
+        Assert.Same(plan.MaterializationPlan.Operations, plan.Operations);
     }
 
     [Fact]
@@ -63,26 +68,30 @@ public sealed class PlannerContractTests
 
         var plan = NewDocumentPlanner().Plan(
             manifest with { StorageUnits = [optimizedUnit] },
-            SampleManifests.PortableCapabilities());
+            RuntimeCapabilities(),
+            MaterializationCapabilities());
 
         Assert.Contains(plan.Operations, operation =>
             operation.Kind == MaterializationOperationKind.CreateOptimizedProjection &&
-            operation.Target == "configurationDocument.by-key");
+            operation.Target == "configurationDocument.optimized-projection");
     }
 
     [Fact]
     public void UnsupportedStorageRequirementBlocksPlanning()
     {
         var operationalManifest = WithOperationalUnit();
-        var capabilities = SampleManifests.PortableCapabilities();
+        var capabilities = RuntimeCapabilities();
+        var materializationCapabilities = MaterializationCapabilities();
 
-        var relational = NewRelationalPlanner().Plan(operationalManifest, capabilities);
-        var document = NewDocumentPlanner().Plan(operationalManifest, capabilities);
+        var relational = NewRelationalPlanner().Plan(operationalManifest, capabilities, materializationCapabilities);
+        var document = NewDocumentPlanner().Plan(operationalManifest, capabilities, materializationCapabilities);
 
         Assert.False(relational.IsPlannable);
         Assert.False(document.IsPlannable);
         Assert.Contains(relational.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-004");
         Assert.Contains(document.Diagnostics, diagnostic => diagnostic.Code == "GW-CAP-004");
+        Assert.Empty(relational.Operations);
+        Assert.Empty(document.Operations);
     }
 
     private static StorageManifest WithOperationalUnit()
@@ -99,7 +108,18 @@ public sealed class PlannerContractTests
         return manifest with { StorageUnits = [operationalUnit] };
     }
 
-    private RelationalManifestPlanner NewRelationalPlanner() => new(_manifestValidator, _capabilityValidator);
+    private ProviderCapabilityReport RuntimeCapabilities() =>
+        SampleManifests.PortableCapabilities(_provider);
 
-    private DocumentManifestPlanner NewDocumentPlanner() => new(_manifestValidator, _capabilityValidator);
+    private MaterializationCapabilityReport MaterializationCapabilities() =>
+        new(
+            _provider,
+            Enum.GetValues<MaterializationOperationKind>().ToHashSet(),
+            true);
+
+    private MaterializationPlanner NewMaterializationPlanner() => new(_manifestValidator, _capabilityValidator);
+
+    private RelationalManifestPlanner NewRelationalPlanner() => new(NewMaterializationPlanner());
+
+    private DocumentManifestPlanner NewDocumentPlanner() => new(NewMaterializationPlanner());
 }

@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Core\Groundwork.Core.csproj" />
+    <ProjectReference Include="..\Materialization\Groundwork.Materialization.csproj" />
   </ItemGroup>
 
 </Project>

@@ -22,6 +22,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\Groundwork\Core\Groundwork.Core.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\Documents\Groundwork.Documents.csproj" />
+    <ProjectReference Include="..\..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\Relational\Groundwork.Relational.csproj" />
   </ItemGroup>
 

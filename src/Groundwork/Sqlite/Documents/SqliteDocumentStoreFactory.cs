@@ -1,5 +1,7 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 using Groundwork.Sqlite.Materialization;
 using Microsoft.Data.Sqlite;
 
@@ -21,7 +23,9 @@ public static class SqliteDocumentStoreFactory
         var connection = new SqliteConnection(connectionString);
         try
         {
-            await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, provider, cancellationToken);
+            await new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+                CreateMaterializationPlan(manifest, provider),
+                cancellationToken);
             return new SqliteDocumentStoreHandle(connection, new SqliteDocumentStore(connection, manifest, ambientTenantId));
         }
         catch
@@ -30,6 +34,10 @@ public static class SqliteDocumentStoreFactory
             throw;
         }
     }
+
+    private static MaterializationPlan CreateMaterializationPlan(StorageManifest manifest, ProviderIdentity provider) =>
+        new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+            .Plan(manifest, SqliteGroundworkCapabilities.Runtime(provider), SqliteGroundworkCapabilities.Materialization(provider));
 }
 
 public sealed class SqliteDocumentStoreHandle(SqliteConnection connection, SqliteDocumentStore store) : IAsyncDisposable

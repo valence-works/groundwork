@@ -1,15 +1,16 @@
-using Groundwork.Core.Materialization;
 using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 
 namespace Groundwork.Relational.Planning;
 
 public sealed record RelationalPlan(
     IReadOnlyList<RelationalTablePlan> Tables,
-    IReadOnlyList<MaterializationOperation> Operations,
-    SchemaHistoryEntry SchemaHistory,
-    IReadOnlyList<GroundworkDiagnostic> Diagnostics)
+    MaterializationPlan MaterializationPlan)
 {
-    public bool IsPlannable => Diagnostics.All(diagnostic => !diagnostic.IsError);
+    public IReadOnlyList<MaterializationOperation> Operations => MaterializationPlan.Operations;
+    public SchemaHistoryEntry SchemaHistory => MaterializationPlan.SchemaHistory;
+    public IReadOnlyList<GroundworkDiagnostic> Diagnostics => MaterializationPlan.Diagnostics;
+    public bool IsPlannable => MaterializationPlan.IsPlannable;
 }
 
 public sealed record RelationalTablePlan(

@@ -1,6 +1,8 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
+using Groundwork.Sqlite;
 
 namespace Groundwork.SupportTickets.Operations;
 
@@ -68,11 +70,24 @@ public static class SupportTicketOperationsManifest
 
     /// <summary>The dedicated operational provider supports and has evidence for every requirement.</summary>
     public static ProviderCapabilityReport OperationalProvider() =>
-        ProviderCapabilityReport.OperationalProvider(new ProviderIdentity("groundwork-sqlite-operational", "1.0.0"));
+        OperationalProvider(new ProviderIdentity("groundwork-sqlite-operational", "1.0.0"));
 
     /// <summary>A portable document-only provider supports no operational requirements.</summary>
     public static ProviderCapabilityReport DocumentOnlyProvider() =>
-        ProviderCapabilityReport.PortableDocumentProvider(new ProviderIdentity("groundwork-document-only", "1.0.0"));
+        SqliteGroundworkCapabilities.Runtime(new ProviderIdentity("groundwork-document-only", "1.0.0"));
+
+    private static ProviderCapabilityReport OperationalProvider(ProviderIdentity provider)
+    {
+        var capabilities = WellKnownCapabilities.All.Select(descriptor => descriptor.Id).ToHashSet();
+        return new(
+            provider,
+            capabilities,
+            capabilities.ToHashSet(),
+            IndexCapabilities.All,
+            Enum.GetValues<PortableQueryOperation>().ToHashSet(),
+            Enum.GetValues<ConcurrencyKind>().ToHashSet(),
+            []);
+    }
 
     private static StorageUnit Unit(
         string identity,

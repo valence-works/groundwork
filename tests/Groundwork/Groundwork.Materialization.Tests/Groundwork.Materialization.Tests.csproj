@@ -10,8 +10,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
-    <PackageReference Include="MongoDB.Driver" />
-    <PackageReference Include="Testcontainers.MongoDb" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="coverlet.collector" />
@@ -23,7 +21,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
-    <ProjectReference Include="..\..\..\src\Groundwork\MongoDb\Groundwork.MongoDb.csproj" />
   </ItemGroup>
 
 </Project>

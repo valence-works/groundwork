@@ -1,5 +1,7 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 using Groundwork.SqlServer.Materialization;
 using Microsoft.Data.SqlClient;
 
@@ -21,7 +23,9 @@ public static class SqlServerDocumentStoreFactory
         var connection = new SqlConnection(connectionString);
         try
         {
-            await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(manifest, provider, cancellationToken);
+            await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(
+                CreateMaterializationPlan(manifest, provider),
+                cancellationToken);
             return new SqlServerDocumentStoreHandle(connection, new SqlServerDocumentStore(connection, manifest, ambientTenantId));
         }
         catch
@@ -30,6 +34,10 @@ public static class SqlServerDocumentStoreFactory
             throw;
         }
     }
+
+    private static MaterializationPlan CreateMaterializationPlan(StorageManifest manifest, ProviderIdentity provider) =>
+        new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+            .Plan(manifest, SqlServerGroundworkCapabilities.Runtime(provider), SqlServerGroundworkCapabilities.Materialization(provider));
 }
 
 public sealed class SqlServerDocumentStoreHandle(SqlConnection connection, SqlServerDocumentStore store) : IAsyncDisposable

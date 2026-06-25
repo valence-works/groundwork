@@ -1,31 +1,20 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
-using Groundwork.Core.Materialization;
-using Groundwork.Core.Physicalization;
-using Groundwork.Core.Validation;
+using Groundwork.Materialization;
 
 namespace Groundwork.Documents.Planning;
 
-public sealed class DocumentManifestPlanner(
-    StorageManifestValidator manifestValidator,
-    ProviderCapabilityValidator capabilityValidator)
+public sealed class DocumentManifestPlanner(MaterializationPlanner materializationPlanner)
 {
-    public DocumentPlan Plan(StorageManifest manifest, ProviderCapabilityReport capabilities)
+    public DocumentPlan Plan(
+        StorageManifest manifest,
+        ProviderCapabilityReport runtimeCapabilities,
+        MaterializationCapabilityReport materializationCapabilities)
     {
-        var manifestValidation = manifestValidator.Validate(manifest);
-        var compatibility = manifestValidation.IsValid
-            ? capabilityValidator.Validate(manifest, capabilities)
-            : CapabilityCompatibilityResult.Compatible;
-        var diagnostics = manifestValidation.Diagnostics.Concat(compatibility.Diagnostics).ToList();
+        var materializationPlan = materializationPlanner.Plan(manifest, runtimeCapabilities, materializationCapabilities);
 
-        if (diagnostics.Any(diagnostic => diagnostic.IsError))
-        {
-            return new DocumentPlan(
-                [],
-                [],
-                CreateHistory(manifest, capabilities, []),
-                diagnostics);
-        }
+        if (!materializationPlan.IsPlannable)
+            return new DocumentPlan([], materializationPlan);
 
         var documents = manifest.StorageUnits
             .Select(unit => new DocumentStoragePlan(
@@ -50,54 +39,6 @@ public sealed class DocumentManifestPlanner(
                     .ToList()))
             .ToList();
 
-        var operations = manifest.StorageUnits
-            .SelectMany(unit => CreateOperations(unit))
-            .Append(new MaterializationOperation(MaterializationOperationKind.RecordSchemaHistory, manifest.Identity.Value, new Dictionary<string, string>()))
-            .ToList();
-
-        return new DocumentPlan(
-            documents,
-            operations,
-            CreateHistory(manifest, capabilities, operations),
-            diagnostics);
+        return new DocumentPlan(documents, materializationPlan);
     }
-
-    private static IEnumerable<MaterializationOperation> CreateOperations(StorageUnit unit)
-    {
-        yield return new MaterializationOperation(
-            MaterializationOperationKind.CreateStorageUnit,
-            unit.Identity.Value,
-            new Dictionary<string, string> { ["shape"] = "document-envelope" });
-
-        foreach (var index in unit.Indexes)
-        {
-            yield return new MaterializationOperation(
-                MaterializationOperationKind.CreateIndex,
-                $"{unit.Identity.Value}.{index.Identity}",
-                new Dictionary<string, string> { ["shape"] = "document-index" });
-        }
-
-        foreach (var field in PhysicalizationProjection.EligibleFields(unit))
-        {
-            yield return new MaterializationOperation(
-                MaterializationOperationKind.CreateOptimizedProjection,
-                $"{unit.Identity.Value}.{field.Name}",
-                new Dictionary<string, string>
-                {
-                    ["shape"] = "optimized-projection",
-                    ["path"] = field.Path,
-                    ["unique"] = field.IsUnique.ToString()
-                });
-        }
-    }
-
-    private static SchemaHistoryEntry CreateHistory(
-        StorageManifest manifest,
-        ProviderCapabilityReport capabilities,
-        IReadOnlyList<MaterializationOperation> operations) =>
-        new(
-            manifest.Identity,
-            manifest.Version,
-            capabilities.Provider,
-            operations.Select(operation => operation.Target).ToList());
 }

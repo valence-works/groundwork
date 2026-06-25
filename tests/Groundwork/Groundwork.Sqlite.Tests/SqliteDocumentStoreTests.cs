@@ -177,14 +177,9 @@ public sealed class SqliteDocumentStoreTests
     {
         var manifest = WithCompoundIndex(SqliteTestManifests.MetadataManifest());
         await using var connection = new SqliteConnection("Data Source=:memory:");
-        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
-        var store = new SqliteDocumentStore(connection, manifest);
 
-        var exception = await Assert.ThrowsAsync<UndeclaredDocumentIndexException>(() =>
-            store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key-and-category", "alpha")));
-
-        Assert.Equal("configurationDocument", exception.DocumentKind);
-        Assert.Equal("by-key-and-category", exception.IndexName);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider));
     }
 
     [Fact]

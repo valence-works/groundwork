@@ -146,15 +146,22 @@ Configure SQLite by materializing the manifest, then create an `IDocumentStore` 
 
 ```csharp
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Validation;
 using Groundwork.Documents.Store;
+using Groundwork.Materialization;
+using Groundwork.Sqlite;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.Materialization;
 using Microsoft.Data.Sqlite;
 
 var connection = new SqliteConnection("Data Source=support-tickets.db");
-var provider = new ProviderIdentity("groundwork-sqlite", "1.0.0");
+var plan = new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+    .Plan(
+        manifest,
+        SqliteGroundworkCapabilities.Runtime(),
+        SqliteGroundworkCapabilities.Materialization());
 
-await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, provider);
+await new SqliteGroundworkMaterializer(connection).MaterializeAsync(plan);
 
 IDocumentStore store = new SqliteDocumentStore(connection, manifest);
 ```
@@ -163,16 +170,23 @@ Configure MongoDB with the same manifest:
 
 ```csharp
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Validation;
 using Groundwork.Documents.Store;
+using Groundwork.Materialization;
+using Groundwork.MongoDb;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Driver;
 
 var client = new MongoClient("mongodb://localhost:27017");
 var database = client.GetDatabase("support");
-var provider = new ProviderIdentity("groundwork-mongodb", "1.0.0");
+var plan = new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+    .Plan(
+        manifest,
+        MongoDbGroundworkCapabilities.Runtime(),
+        MongoDbGroundworkCapabilities.Materialization());
 
-await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, provider);
+await new MongoDbGroundworkMaterializer(database).MaterializeAsync(plan);
 
 IDocumentStore store = new MongoDbDocumentStore(database, manifest);
 ```
@@ -394,21 +408,26 @@ The same manifest also supports planning, validation, and provider capability ch
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Validation;
 using Groundwork.Documents.Planning;
+using Groundwork.Materialization;
+using Groundwork.Sqlite;
 
 var manifestValidation = new StorageManifestValidator().Validate(manifest);
 if (!manifestValidation.IsValid)
     throw new InvalidOperationException(string.Join(Environment.NewLine, manifestValidation.Errors));
 
-var capabilityReport = ProviderCapabilityReport.PortableDocumentProvider(
-    new ProviderIdentity("groundwork-sqlite", "1.0.0"));
+var runtimeCapabilities = SqliteGroundworkCapabilities.Runtime();
+var materializationCapabilities = SqliteGroundworkCapabilities.Materialization();
 
-var compatibility = new ProviderCapabilityValidator().Validate(manifest, capabilityReport);
+var compatibility = new ProviderCapabilityValidator().Validate(manifest, runtimeCapabilities);
 if (!compatibility.IsCompatible)
     throw new InvalidOperationException(string.Join(Environment.NewLine, compatibility.Errors));
 
+var materializationPlan = new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
+    .Plan(manifest, runtimeCapabilities, materializationCapabilities);
+
 var documentPlan = new DocumentManifestPlanner(
-    new StorageManifestValidator(),
-    new ProviderCapabilityValidator()).Plan(manifest, capabilityReport);
+    new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator()))
+    .Plan(manifest, runtimeCapabilities, materializationCapabilities);
 ```
 
 Set `PhysicalizationPolicy.Optimized` on a storage unit when a provider should maintain native query projections for eligible declared indexes. SQLite creates provider tables for those projections, while MongoDB stores physicalized fields and indexes them natively.
