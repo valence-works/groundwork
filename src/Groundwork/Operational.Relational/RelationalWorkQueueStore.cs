@@ -1,11 +1,15 @@
+using Groundwork.Core.Identity;
 using Groundwork.Provider.Relational;
 using System.Data.Common;
 using Groundwork.Operational.WorkQueue;
 
 namespace Groundwork.Operational.Relational;
 
-internal sealed class RelationalWorkQueueStore(RelationalExecutor executor, IOperationalClock clock)
-    : RelationalOperationalStoreBase(executor, clock), IWorkQueueStore
+internal sealed class RelationalWorkQueueStore(
+    RelationalExecutor executor,
+    IOperationalClock clock,
+    IIdentityGenerator identityGenerator)
+    : RelationalOperationalStoreBase(executor, clock, identityGenerator), IWorkQueueStore
 {
     public Task<EnqueueResult> EnqueueAsync(EnqueueRequest request, CancellationToken cancellationToken = default) =>
         Executor.ExecuteAsync(async (connection, transaction, ct) =>

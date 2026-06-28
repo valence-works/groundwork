@@ -1,10 +1,14 @@
+using Groundwork.Core.Identity;
 using Groundwork.Provider.Relational;
 using Groundwork.Operational.Outbox;
 
 namespace Groundwork.Operational.Relational;
 
-internal sealed class RelationalOutboxStore(RelationalExecutor executor, IOperationalClock clock)
-    : RelationalOperationalStoreBase(executor, clock), IOutboxStore
+internal sealed class RelationalOutboxStore(
+    RelationalExecutor executor,
+    IOperationalClock clock,
+    IIdentityGenerator identityGenerator)
+    : RelationalOperationalStoreBase(executor, clock, identityGenerator), IOutboxStore
 {
     public Task AppendAsync(OutboxAppendRequest request, CancellationToken cancellationToken = default) =>
         Executor.ExecuteAsync<object?>(async (connection, transaction, ct) =>

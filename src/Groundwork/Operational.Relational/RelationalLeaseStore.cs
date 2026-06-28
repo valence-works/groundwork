@@ -1,11 +1,15 @@
+using Groundwork.Core.Identity;
 using Groundwork.Provider.Relational;
 using System.Data.Common;
 using Groundwork.Operational.Leases;
 
 namespace Groundwork.Operational.Relational;
 
-internal sealed class RelationalLeaseStore(RelationalExecutor executor, IOperationalClock clock)
-    : RelationalOperationalStoreBase(executor, clock), ILeaseStore
+internal sealed class RelationalLeaseStore(
+    RelationalExecutor executor,
+    IOperationalClock clock,
+    IIdentityGenerator identityGenerator)
+    : RelationalOperationalStoreBase(executor, clock, identityGenerator), ILeaseStore
 {
     public Task<LeaseAcquisition> TryAcquireAsync(AcquireLeaseRequest request, CancellationToken cancellationToken = default) =>
         Executor.ExecuteAsync<LeaseAcquisition>(async (connection, transaction, ct) =>
