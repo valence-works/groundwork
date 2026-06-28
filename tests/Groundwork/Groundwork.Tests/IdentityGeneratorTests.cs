@@ -198,6 +198,29 @@ public sealed class IdentityGeneratorTests
         Assert.Throws<InvalidOperationException>(() => generator.Generate());
     }
 
+    // --- Epoch range guards ---
+
+    [Fact]
+    public void ShortThrowsWhenClockIsBeforeEpoch()
+    {
+        var time = new MutableTimeProvider();
+        time.Advance(TimeSpan.FromDays(-365 * 7)); // ~2019, before the 2020-01-01Z epoch
+        var generator = new ShortIdentityGenerator(time);
+
+        Assert.Throws<InvalidOperationException>(() => generator.Generate());
+    }
+
+    [Fact]
+    public void SnowflakeThrowsWhenClockIsBeforeEpoch()
+    {
+        var time = new MutableTimeProvider();
+        time.Advance(TimeSpan.FromDays(-365 * 7)); // ~2019, before the 2020-01-01Z epoch
+        var generator = new SnowflakeIdentityGenerator(time,
+            new SnowflakeIdentityGeneratorOptions { WorkerId = 1 });
+
+        Assert.Throws<InvalidOperationException>(() => generator.Generate());
+    }
+
     // --- Factory ---
 
     [Fact]

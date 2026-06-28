@@ -8,12 +8,12 @@ namespace Groundwork.Operational.Relational;
 /// Shared command helpers for the relational operational stores. Delegates to the reusable
 /// <see cref="RelationalCommands"/> toolkit; the only operational specialization is the sequence
 /// table name used for FIFO ordering. Message ids and lease tokens come from the injected
-/// <see cref="IGroundworkIdentityGenerator"/>.
+/// <see cref="IIdentityGenerator"/>.
 /// </summary>
 internal abstract class RelationalOperationalStoreBase(
     RelationalExecutor executor,
     IOperationalClock clock,
-    IGroundworkIdentityGenerator identityGenerator)
+    IIdentityGenerator identityGenerator)
 {
     private const string SequenceTable = "groundwork_operational_sequence";
 
@@ -21,7 +21,7 @@ internal abstract class RelationalOperationalStoreBase(
 
     protected IOperationalClock Clock { get; } = clock;
 
-    protected IGroundworkIdentityGenerator IdentityGenerator { get; } = identityGenerator;
+    protected IIdentityGenerator IdentityGenerator { get; } = identityGenerator;
 
     protected static string Format(DateTimeOffset value) => RelationalCommands.FormatTimestamp(value);
 

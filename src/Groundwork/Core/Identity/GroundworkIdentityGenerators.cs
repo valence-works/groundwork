@@ -20,11 +20,11 @@ public enum IdentityGeneratorKind
 public static class GroundworkIdentityGenerators
 {
     /// <summary>
-    /// Creates an <see cref="IGroundworkIdentityGenerator"/> for the requested <paramref name="kind"/>.
+    /// Creates an <see cref="IIdentityGenerator"/> for the requested <paramref name="kind"/>.
     /// <paramref name="snowflakeOptions"/> is required when <paramref name="kind"/> is
     /// <see cref="IdentityGeneratorKind.Snowflake"/> and ignored otherwise.
     /// </summary>
-    public static IGroundworkIdentityGenerator Create(
+    public static IIdentityGenerator Create(
         IdentityGeneratorKind kind,
         TimeProvider? timeProvider = null,
         SnowflakeIdentityGeneratorOptions? snowflakeOptions = null)

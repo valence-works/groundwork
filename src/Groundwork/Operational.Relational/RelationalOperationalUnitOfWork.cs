@@ -19,7 +19,7 @@ internal sealed class RelationalOperationalUnitOfWork : IOperationalUnitOfWork
     public RelationalOperationalUnitOfWork(
         RelationalUnitOfWork unitOfWork,
         IOperationalClock clock,
-        IGroundworkIdentityGenerator identityGenerator)
+        IIdentityGenerator identityGenerator)
     {
         this.unitOfWork = unitOfWork;
 

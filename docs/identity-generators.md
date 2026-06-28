@@ -4,11 +4,11 @@ Groundwork generates a handful of identifiers itself — outbox/inbox **message 
 tokens** in the operational stores. These land in indexed/PK columns, so the id format matters: a
 random GUID is not sortable and fragments the B-tree it lives in.
 
-The `IGroundworkIdentityGenerator` abstraction (in `Groundwork.Core`, namespace
+The `IIdentityGenerator` abstraction (in `Groundwork.Core`, namespace
 `Groundwork.Core.Identity`) lets a consumer pick the id format. It is a single method:
 
 ```csharp
-public interface IGroundworkIdentityGenerator
+public interface IIdentityGenerator
 {
     string Generate();
 }
@@ -20,8 +20,9 @@ default — pass one in to override it.
 
 ## The catalog
 
-All generators take a `TimeProvider` for their time source (so tests can drive them deterministically).
-All except `Guid` are sortable by ordinal string comparison.
+The time-ordered generators take a `TimeProvider` for their time source (so tests can drive them
+deterministically); `GuidIdentityGenerator` takes no parameters. All except `Guid` are sortable by
+ordinal string comparison.
 
 | Generator | Output | Length | Sortable | Coordination | When to use |
 | --- | --- | --- | --- | --- | --- |
@@ -79,7 +80,7 @@ var gen = GroundworkIdentityGenerators.Create(IdentityGeneratorKind.Short, TimeP
 
 ## Passing a generator into the operational stores
 
-The store constructors accept an optional `IGroundworkIdentityGenerator? identityGenerator = null`,
+The store constructors accept an optional `IIdentityGenerator? identityGenerator = null`,
 defaulting to `new ShortIdentityGenerator()`. Existing call sites keep compiling unchanged and pick up
 the short, sortable default automatically.
 

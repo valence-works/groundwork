@@ -8,7 +8,7 @@ namespace Groundwork.Operational.Relational;
 internal sealed class RelationalLeaseStore(
     RelationalExecutor executor,
     IOperationalClock clock,
-    IGroundworkIdentityGenerator identityGenerator)
+    IIdentityGenerator identityGenerator)
     : RelationalOperationalStoreBase(executor, clock, identityGenerator), ILeaseStore
 {
     public Task<LeaseAcquisition> TryAcquireAsync(AcquireLeaseRequest request, CancellationToken cancellationToken = default) =>

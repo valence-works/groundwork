@@ -20,13 +20,13 @@ public class RelationalOperationalStore : IOperationalSessionFactory
     private readonly RelationalSession session;
     private readonly IOperationalClock clock;
     private readonly TransactionBoundary boundary;
-    private readonly IGroundworkIdentityGenerator identityGenerator;
+    private readonly IIdentityGenerator identityGenerator;
 
     public RelationalOperationalStore(
         DbConnection connection,
         IOperationalClock? clock = null,
         TransactionBoundary boundary = TransactionBoundary.CrossUnitAtomic,
-        IGroundworkIdentityGenerator? identityGenerator = null)
+        IIdentityGenerator? identityGenerator = null)
     {
         this.session = new RelationalSession(connection);
         this.clock = clock ?? SystemOperationalClock.Instance;

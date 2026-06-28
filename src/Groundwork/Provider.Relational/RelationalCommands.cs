@@ -5,7 +5,7 @@ namespace Groundwork.Provider.Relational;
 /// <summary>
 /// Reusable command helpers for relational Groundwork modules: parameterized command creation,
 /// ISO-8601 timestamp encoding suitable for lexical range comparisons, and monotonic sequence
-/// allocation. Identifier generation now lives behind <c>IGroundworkIdentityGenerator</c> in
+/// allocation. Identifier generation now lives behind <c>IIdentityGenerator</c> in
 /// <c>Groundwork.Core.Identity</c>.
 /// </summary>
 public static class RelationalCommands

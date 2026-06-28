@@ -6,7 +6,7 @@ namespace Groundwork.Core.Identity;
 /// relevant store constructor. The default catalog lives alongside this interface in
 /// <see cref="Groundwork.Core.Identity"/>.
 /// </summary>
-public interface IGroundworkIdentityGenerator
+public interface IIdentityGenerator
 {
     /// <summary>Produces a new identifier. Must be safe to call from multiple threads concurrently.</summary>
     string Generate();

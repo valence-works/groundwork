@@ -5,7 +5,7 @@ namespace Groundwork.Core.Identity;
 /// callers that don't need ordering. <b>Not</b> sortable, so it is not recommended for indexed keys —
 /// prefer <see cref="ShortIdentityGenerator"/> or <see cref="UuidV7IdentityGenerator"/> there.
 /// </summary>
-public sealed class GuidIdentityGenerator : IGroundworkIdentityGenerator
+public sealed class GuidIdentityGenerator : IIdentityGenerator
 {
     public string Generate() => Guid.NewGuid().ToString("N");
 }

@@ -21,7 +21,7 @@ public sealed class SnowflakeIdentityGeneratorOptions
         init
         {
             if (value is < MinWorkerId or > MaxWorkerId)
-                throw new ArgumentOutOfRangeException(nameof(value), value,
+                throw new ArgumentOutOfRangeException(nameof(WorkerId), value,
                     $"WorkerId must be in [{MinWorkerId}, {MaxWorkerId}].");
             workerId = value;
         }

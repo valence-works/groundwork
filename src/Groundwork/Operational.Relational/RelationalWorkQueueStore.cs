@@ -8,7 +8,7 @@ namespace Groundwork.Operational.Relational;
 internal sealed class RelationalWorkQueueStore(
     RelationalExecutor executor,
     IOperationalClock clock,
-    IGroundworkIdentityGenerator identityGenerator)
+    IIdentityGenerator identityGenerator)
     : RelationalOperationalStoreBase(executor, clock, identityGenerator), IWorkQueueStore
 {
     public Task<EnqueueResult> EnqueueAsync(EnqueueRequest request, CancellationToken cancellationToken = default) =>

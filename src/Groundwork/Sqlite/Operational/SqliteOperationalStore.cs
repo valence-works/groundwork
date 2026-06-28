@@ -14,5 +14,5 @@ namespace Groundwork.Sqlite.Operational;
 public sealed class SqliteOperationalStore(
     SqliteConnection connection,
     IOperationalClock? clock = null,
-    IGroundworkIdentityGenerator? identityGenerator = null)
+    IIdentityGenerator? identityGenerator = null)
     : RelationalOperationalStore(connection, clock, TransactionBoundary.CrossUnitAtomic, identityGenerator);

@@ -5,7 +5,7 @@ namespace Groundwork.Core.Identity;
 /// collision-free, and sortable by its canonical string because the high bits carry a millisecond
 /// timestamp. Use when you want full UUID width with chronological ordering.
 /// </summary>
-public sealed class UuidV7IdentityGenerator(TimeProvider? timeProvider = null) : IGroundworkIdentityGenerator
+public sealed class UuidV7IdentityGenerator(TimeProvider? timeProvider = null) : IIdentityGenerator
 {
     private readonly TimeProvider timeProvider = timeProvider ?? TimeProvider.System;
 

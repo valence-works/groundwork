@@ -6,11 +6,13 @@ namespace Groundwork.Core.Identity;
 /// (0–1023) | 12-bit sequence. Strictly increasing and collision-free per worker; distinct workers
 /// never collide. A single instance holds the monotonic state, so create one per worker and reuse it.
 /// </summary>
-public sealed class SnowflakeIdentityGenerator : IGroundworkIdentityGenerator
+public sealed class SnowflakeIdentityGenerator : IIdentityGenerator
 {
     private const int WorkerIdBits = 10;
     private const int SequenceBits = 12;
+    private const int TimestampBits = 41;
     private const long MaxSequence = (1L << SequenceBits) - 1;
+    private const long MaxTimestamp = (1L << TimestampBits) - 1;
     private const int TimestampShift = WorkerIdBits + SequenceBits;
     private const int WorkerIdShift = SequenceBits;
 
@@ -34,6 +36,10 @@ public sealed class SnowflakeIdentityGenerator : IGroundworkIdentityGenerator
         lock (gate)
         {
             var timestamp = CurrentMilliseconds();
+
+            if (timestamp is < 0 or > MaxTimestamp)
+                throw new InvalidOperationException(
+                    $"Timestamp {timestamp} ms is outside the representable {TimestampBits}-bit range [0, {MaxTimestamp}] relative to epoch {options.Epoch:O}; cannot generate a snowflake id.");
 
             if (timestamp < lastTimestamp)
                 throw new InvalidOperationException(
