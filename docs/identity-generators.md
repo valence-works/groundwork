@@ -110,3 +110,8 @@ This catalog deliberately mirrors Elsa's `Elsa.Primitives.Identity` catalog (`II
 `ShortIdentityGenerator`, `UuidV7IdentityGenerator`, `SnowflakeIdentityGenerator`,
 `GuidIdentityGenerator`) — same Base62 alphabet and the same bit layouts — so identifiers produced by
 either repository are format-compatible.
+
+Because the two are independent copies, that compatibility is a convention rather than an automatic
+invariant. It is pinned by golden-value tests (`IdentityFormatCompatibilityTests`) that exist with
+**identical literals** in both repos. If you change an epoch, bit split, or alphabet here, update
+Elsa's copy and its golden test to match.
