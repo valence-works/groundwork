@@ -4,8 +4,9 @@ namespace Groundwork.Provider.Relational;
 
 /// <summary>
 /// Reusable command helpers for relational Groundwork modules: parameterized command creation,
-/// ISO-8601 timestamp encoding suitable for lexical range comparisons, monotonic sequence allocation,
-/// and id generation.
+/// ISO-8601 timestamp encoding suitable for lexical range comparisons, and monotonic sequence
+/// allocation. Identifier generation now lives behind <c>IGroundworkIdentityGenerator</c> in
+/// <c>Groundwork.Core.Identity</c>.
 /// </summary>
 public static class RelationalCommands
 {
@@ -33,8 +34,6 @@ public static class RelationalCommands
         parameter.Value = value ?? DBNull.Value;
         command.Parameters.Add(parameter);
     }
-
-    public static string NewId() => Guid.NewGuid().ToString("n");
 
     /// <summary>
     /// Allocates the next monotonic sequence for a (unit, scope) pair within the given transaction,

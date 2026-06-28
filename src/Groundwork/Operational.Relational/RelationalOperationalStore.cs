@@ -1,4 +1,5 @@
 using System.Data.Common;
+using Groundwork.Core.Identity;
 using Groundwork.Core.Transactions;
 using Groundwork.Operational.Leases;
 using Groundwork.Operational.Outbox;
@@ -19,20 +20,23 @@ public class RelationalOperationalStore : IOperationalSessionFactory
     private readonly RelationalSession session;
     private readonly IOperationalClock clock;
     private readonly TransactionBoundary boundary;
+    private readonly IGroundworkIdentityGenerator identityGenerator;
 
     public RelationalOperationalStore(
         DbConnection connection,
         IOperationalClock? clock = null,
-        TransactionBoundary boundary = TransactionBoundary.CrossUnitAtomic)
+        TransactionBoundary boundary = TransactionBoundary.CrossUnitAtomic,
+        IGroundworkIdentityGenerator? identityGenerator = null)
     {
         this.session = new RelationalSession(connection);
         this.clock = clock ?? SystemOperationalClock.Instance;
         this.boundary = boundary;
+        this.identityGenerator = identityGenerator ?? new ShortIdentityGenerator();
 
         var executor = session.AutonomousExecutor;
-        WorkQueue = new RelationalWorkQueueStore(executor, this.clock);
-        Leases = new RelationalLeaseStore(executor, this.clock);
-        Outbox = new RelationalOutboxStore(executor, this.clock);
+        WorkQueue = new RelationalWorkQueueStore(executor, this.clock, this.identityGenerator);
+        Leases = new RelationalLeaseStore(executor, this.clock, this.identityGenerator);
+        Outbox = new RelationalOutboxStore(executor, this.clock, this.identityGenerator);
     }
 
     public IWorkQueueStore WorkQueue { get; }
@@ -49,6 +53,6 @@ public class RelationalOperationalStore : IOperationalSessionFactory
             throw new UnsupportedAtomicCommitException(scope.Units);
 
         var unitOfWork = await session.BeginUnitOfWorkAsync(cancellationToken);
-        return new RelationalOperationalUnitOfWork(unitOfWork, clock);
+        return new RelationalOperationalUnitOfWork(unitOfWork, clock, identityGenerator);
     }
 }

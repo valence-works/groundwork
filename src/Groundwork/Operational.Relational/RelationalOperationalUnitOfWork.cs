@@ -1,3 +1,4 @@
+using Groundwork.Core.Identity;
 using Groundwork.Operational.Leases;
 using Groundwork.Operational.Outbox;
 using Groundwork.Operational.UnitOfWork;
@@ -15,14 +16,17 @@ internal sealed class RelationalOperationalUnitOfWork : IOperationalUnitOfWork
 {
     private readonly RelationalUnitOfWork unitOfWork;
 
-    public RelationalOperationalUnitOfWork(RelationalUnitOfWork unitOfWork, IOperationalClock clock)
+    public RelationalOperationalUnitOfWork(
+        RelationalUnitOfWork unitOfWork,
+        IOperationalClock clock,
+        IGroundworkIdentityGenerator identityGenerator)
     {
         this.unitOfWork = unitOfWork;
 
         var executor = unitOfWork.Executor;
-        WorkQueue = new RelationalWorkQueueStore(executor, clock);
-        Leases = new RelationalLeaseStore(executor, clock);
-        Outbox = new RelationalOutboxStore(executor, clock);
+        WorkQueue = new RelationalWorkQueueStore(executor, clock, identityGenerator);
+        Leases = new RelationalLeaseStore(executor, clock, identityGenerator);
+        Outbox = new RelationalOutboxStore(executor, clock, identityGenerator);
     }
 
     public IWorkQueueStore WorkQueue { get; }
