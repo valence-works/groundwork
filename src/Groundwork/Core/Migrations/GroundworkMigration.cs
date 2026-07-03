@@ -48,8 +48,15 @@ public enum GroundworkMigrationOperationKind
     CreateStorageUnit,
     CreateIndex,
     CreateOptimizedProjection,
+
+    // BackfillDocuments and BackfillOptimizedProjection are reserved for the imperative migration pipeline
+    // (IGroundworkMigrationExecutor), which runs hand-authored ProviderSql operations; no executor consumes
+    // them today. Automatic additive-index and optimized-projection backfill instead lives in the declarative
+    // materializer (RelationalMaterializerBase), alongside the existing projection maintenance. See
+    // docs/adr/0002-additive-index-backfill-in-materializer.md.
     BackfillDocuments,
     BackfillOptimizedProjection,
+
     TransformDocuments,
     ProviderSql,
     ProviderDestructive,

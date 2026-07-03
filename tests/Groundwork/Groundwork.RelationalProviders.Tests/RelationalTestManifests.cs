@@ -70,4 +70,20 @@ internal static class RelationalTestManifests
 
     public static ProviderIdentity SqlServerProvider { get; } = new("groundwork-sqlserver", "1.0.0");
     public static ProviderIdentity PostgreSqlProvider { get; } = new("groundwork-postgresql", "1.0.0");
+
+    public static StorageManifest WithoutIndex(string indexIdentity)
+    {
+        var unit = MetadataManifest().StorageUnits.Single();
+        return MetadataManifest() with
+        {
+            StorageUnits =
+            [
+                unit with
+                {
+                    Indexes = unit.Indexes.Where(index => index.Identity != indexIdentity).ToList(),
+                    Queries = unit.Queries.Where(query => query.IndexIdentity != indexIdentity).ToList()
+                }
+            ]
+        };
+    }
 }

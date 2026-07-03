@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Groundwork.Core.Manifests;
 using Groundwork.Documents.Store;
 using Xunit;
 
@@ -164,6 +165,47 @@ public abstract class RelationalProviderContractTests
     protected abstract Task<IRelationalProviderHarness> CreateHarnessAsync();
 
     [Fact]
+    public async Task AddedIndexBackfillsPreexistingDocuments()
+    {
+        await using var harness = await CreateHarnessAsync();
+        await AssertAddedIndexBackfillsAsync(harness, RelationalTestManifests.MetadataManifest());
+    }
+
+    [Fact]
+    public async Task AddedIndexBackfillsPreexistingDocumentsAcrossManifestVersionBump()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var bumped = RelationalTestManifests.MetadataManifest() with { Version = new StorageManifestVersion("1.1.0") };
+        await AssertAddedIndexBackfillsAsync(harness, bumped);
+    }
+
+    private static async Task AssertAddedIndexBackfillsAsync(IRelationalProviderHarness harness, StorageManifest withCategory)
+    {
+        // Phase 1: materialize a manifest whose unit has no "by-category" index and save documents against it.
+        var withoutCategory = RelationalTestManifests.WithoutIndex("by-category") with { Version = withCategory.Version };
+        var initialStore = await harness.ApplyManifestAsync(withoutCategory);
+
+        var systemA = NewId();
+        var systemB = NewId();
+        var other = NewId();
+        var tag = NewValue("cat");
+        var otherTag = NewValue("cat");
+
+        await initialStore.SaveAsync(new SaveDocumentRequest("configurationDocument", systemA, "1.0.0", $$"""{"key":"{{NewValue("k")}}","category":"{{tag}}"}"""));
+        await initialStore.SaveAsync(new SaveDocumentRequest("configurationDocument", systemB, "1.0.0", $$"""{"key":"{{NewValue("k")}}","category":"{{tag}}"}"""));
+        await initialStore.SaveAsync(new SaveDocumentRequest("configurationDocument", other, "1.0.0", $$"""{"key":"{{NewValue("k")}}","category":"{{otherTag}}"}"""));
+
+        // Phase 2: add the "by-category" index to the unit that already holds documents; backfill must run.
+        var store = await harness.ApplyManifestAsync(withCategory);
+
+        var byTag = await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-category", tag));
+        Assert.Equal(new[] { systemA, systemB }.OrderBy(id => id), byTag.Select(document => document.Id).OrderBy(id => id));
+
+        var byOtherTag = await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-category", otherTag));
+        Assert.Equal(new[] { other }, byOtherTag.Select(document => document.Id));
+    }
+
+    [Fact]
     public async Task ClosedQueryHonoursClosedContractServerSide()
     {
         await using var harness = await CreateHarnessAsync();
@@ -254,5 +296,6 @@ public interface IRelationalProviderHarness : IAsyncDisposable
 {
     IDocumentStore Store { get; }
     Task MaterializeAsync();
+    Task<IDocumentStore> ApplyManifestAsync(StorageManifest manifest);
     Task<long> CountSchemaHistoryRowsAsync();
 }
