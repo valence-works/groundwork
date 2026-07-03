@@ -412,18 +412,8 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         manifest.StorageUnits.SingleOrDefault(unit => unit.Identity.Value == documentKind)
         ?? throw new InvalidOperationException($"Document kind '{documentKind}' is not declared by manifest '{manifest.Identity}'.");
 
-    private static bool TryGetIndexValue(JsonElement root, IndexDeclaration index, out string value)
-    {
-        value = "";
-        if (index.Fields.Count != 1)
-            return false;
-
-        if (!RelationalPhysicalizationValues.TryGetPropertyPath(root, index.Fields[0].Path, out var element))
-            return false;
-
-        value = RelationalPhysicalizationValues.NormalizeValue(element);
-        return value.Length > 0 || element.ValueKind == JsonValueKind.String;
-    }
+    private static bool TryGetIndexValue(JsonElement root, IndexDeclaration index, out string value) =>
+        RelationalIndexValues.TryGetIndexValue(root, index.Fields, out value);
 
     private static DocumentEnvelope ReadEnvelope(DbDataReader reader) =>
         new(

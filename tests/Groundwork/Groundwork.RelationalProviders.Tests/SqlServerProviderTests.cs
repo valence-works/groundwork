@@ -32,6 +32,12 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
         public Task MaterializeAsync() =>
             new SqlServerGroundworkMaterializer(connection).MaterializeAsync(manifest, RelationalTestManifests.SqlServerProvider);
 
+        public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
+        {
+            await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.SqlServerProvider);
+            return new SqlServerDocumentStore(connection, targetManifest);
+        }
+
         public async Task<long> CountSchemaHistoryRowsAsync()
         {
             await EnsureOpenAsync();

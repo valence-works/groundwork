@@ -35,6 +35,12 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
         public Task MaterializeAsync() =>
             new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(manifest, RelationalTestManifests.PostgreSqlProvider);
 
+        public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
+        {
+            await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.PostgreSqlProvider);
+            return new PostgreSqlDocumentStore(connection, targetManifest);
+        }
+
         public async Task<long> CountSchemaHistoryRowsAsync()
         {
             await EnsureOpenAsync();
