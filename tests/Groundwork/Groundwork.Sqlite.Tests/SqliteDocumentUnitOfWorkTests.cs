@@ -1,7 +1,4 @@
-<<<<<<< HEAD
 using System.Text.Json;
-=======
->>>>>>> origin/sfmskywalker/feature-closed-query-capability
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
@@ -133,7 +130,6 @@ public sealed class SqliteDocumentUnitOfWorkTests
         Assert.NotNull(await harness.Store.LoadAsync("widget", "w2"));
     }
 
-<<<<<<< HEAD
     [Fact]
     public async Task SaveAllCommitsWhenAllSavesSucceed()
     {
@@ -221,8 +217,6 @@ public sealed class SqliteDocumentUnitOfWorkTests
         Assert.Null(await harness.Store.LoadAsync("widget", "broken"));
     }
 
-=======
->>>>>>> origin/sfmskywalker/feature-closed-query-capability
     private static SaveDocumentRequest Save(string id, string category) =>
         new("widget", id, "1.0.0", $$"""{"name":"{{id}}","category":"{{category}}","sortKey":"001"}""");
 
