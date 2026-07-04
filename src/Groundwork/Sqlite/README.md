@@ -6,6 +6,8 @@
 
 - Creates the shared document, declared-index, and schema-history tables.
 - Saves, loads, updates, deletes, and queries JSON document envelopes.
+- Supports equality, set-membership (`IN`), and case-insensitive `Contains` (LIKE) query operations over declared indexes.
+- Supports declared-index ordering and skip/take pagination.
 - Maintains declared index rows transactionally with document writes.
 - Enforces optimistic concurrency with expected document versions.
 - Rejects queries for undeclared indexes.
@@ -16,7 +18,6 @@
 
 ## Deliberate Limits
 
-- Equality queries only.
 - Single-field index extraction only.
 - JSON content is stored as text; provider-specific JSON indexing is deferred.
 - This package is a Groundwork provider package, not a host-specific integration package.

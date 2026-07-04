@@ -5,7 +5,9 @@
 ## Current Scope
 
 - Creates document, declared-index, and schema-history tables.
-- Saves, loads, updates, deletes, and equality-queries JSON document envelopes.
+- Saves, loads, updates, deletes, and queries JSON document envelopes.
+- Supports equality, set-membership (`IN`), and case-insensitive `Contains` (LIKE) query operations over declared indexes.
+- Supports declared-index ordering and skip/take pagination (`OFFSET`/`FETCH`).
 - Maintains declared indexes transactionally with document writes.
 - Enforces unique declared indexes with a filtered unique index.
 - Uses optimistic concurrency through expected document versions.
@@ -13,7 +15,6 @@
 
 ## Deliberate Limits
 
-- Equality queries only.
 - JSON content is stored as text.
 - Document kinds, document ids, declared index names, declared index values, and physicalized projection values are constrained to `NVARCHAR(450)` because they participate in SQL Server keys or indexes. Keep portable identifiers and indexed values within that limit, or add validation before writing.
 - No Entity Framework dependency.
