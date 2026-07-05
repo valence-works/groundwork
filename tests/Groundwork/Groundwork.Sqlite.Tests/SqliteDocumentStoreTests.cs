@@ -292,6 +292,61 @@ public sealed class SqliteDocumentStoreTests
         Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "beta")));
     }
 
+    [Fact]
+    public async Task ExpectedVersionZeroCreatesWhenAbsentAndConflictsWhenPresent()
+    {
+        await using var harness = await SqliteDocumentStoreHarness.Create();
+
+        // Create-only: expected version 0 against an absent document inserts version 1.
+        var created = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}""",
+            ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, created.Status);
+        Assert.Equal(1, created.Document!.Version);
+        Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "alpha")));
+
+        // Create-only against an existing document is refused and mutates neither document nor indexes.
+        var refused = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"clobber","category":"system"}""",
+            ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, refused.Status);
+        var loaded = await harness.Store.LoadAsync("configurationDocument", "doc-1");
+        Assert.Equal(1, loaded!.Version);
+        Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "alpha")));
+        Assert.Empty(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "clobber")));
+    }
+
+    [Fact]
+    public async Task PositiveExpectedVersionAgainstAbsentDocumentIsNotFoundAndWritesNothing()
+    {
+        await using var harness = await SqliteDocumentStoreHarness.Create();
+
+        // A positive expected version can never match an absent document: NotFound, nothing persisted.
+        var missing = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "doc-1",
+            "1.0.0",
+            """{"key":"ghost","category":"system"}""",
+            ExpectedVersion: 3));
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, missing.Status);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", "doc-1"));
+        Assert.Empty(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "ghost")));
+
+        // Delete semantics are unchanged: expected version 0 against an absent document stays NotFound.
+        var deleteMissing = await harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "doc-1", ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, deleteMissing.Status);
+    }
+
     private sealed class SqliteDocumentStoreHarness : IAsyncDisposable
     {
         private SqliteDocumentStoreHarness(SqliteConnection connection, SqliteDocumentStore store)

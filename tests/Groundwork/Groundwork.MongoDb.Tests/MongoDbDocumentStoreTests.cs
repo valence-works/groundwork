@@ -219,6 +219,66 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
         Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", key)));
     }
 
+    [Fact]
+    public async Task ExpectedVersionZeroCreatesWhenAbsentAndConflictsWhenPresent()
+    {
+        await using var harness = await MongoDbDocumentStoreHarness.Create(container.GetConnectionString());
+        var id = NewId();
+        var createdKey = NewValue("created");
+        var clobberKey = NewValue("clobber");
+
+        // Create-only: expected version 0 against an absent document inserts version 1.
+        var created = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            id,
+            "1.0.0",
+            $$"""{"key":"{{createdKey}}","category":"system"}""",
+            ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, created.Status);
+        Assert.Equal(1, created.Document!.Version);
+        Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", createdKey)));
+
+        // Create-only against an existing document is refused and mutates nothing.
+        var refused = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            id,
+            "1.0.0",
+            $$"""{"key":"{{clobberKey}}","category":"system"}""",
+            ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, refused.Status);
+        var loaded = await harness.Store.LoadAsync("configurationDocument", id);
+        Assert.Equal(1, loaded!.Version);
+        Assert.Single(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", createdKey)));
+        Assert.Empty(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", clobberKey)));
+    }
+
+    [Fact]
+    public async Task PositiveExpectedVersionAgainstAbsentDocumentIsNotFoundAndWritesNothing()
+    {
+        await using var harness = await MongoDbDocumentStoreHarness.Create(container.GetConnectionString());
+        var id = NewId();
+        var key = NewValue("ghost");
+
+        // A positive expected version can never match an absent document: NotFound, nothing persisted.
+        var missing = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            id,
+            "1.0.0",
+            $$"""{"key":"{{key}}","category":"system"}""",
+            ExpectedVersion: 3));
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, missing.Status);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", id));
+        Assert.Empty(await harness.Store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", key)));
+
+        // Delete semantics are unchanged: expected version 0 against an absent document stays NotFound.
+        var deleteMissing = await harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", id, ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, deleteMissing.Status);
+    }
+
     private static string NewId() => $"doc-{Guid.NewGuid():N}";
 
     private static string NewValue(string prefix) => $"{prefix}-{Guid.NewGuid():N}";

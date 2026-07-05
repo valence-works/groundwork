@@ -103,6 +103,42 @@ public sealed class SqliteDocumentUnitOfWorkTests
     }
 
     [Fact]
+    public async Task ExpectedVersionZeroWithinUnitOfWorkCreatesOnly()
+    {
+        await using var harness = await TxHarness.Create();
+
+        // Create-only inside a unit of work: expected version 0 against an absent document inserts version 1.
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
+        {
+            var created = await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "widget", "w1", "1.0.0", """{"category":"tools"}""", ExpectedVersion: 0));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, created.Status);
+            Assert.Equal(1, created.Document!.Version);
+
+            await unitOfWork.CommitAsync();
+        }
+
+        Assert.NotNull(await harness.Store.LoadAsync("widget", "w1"));
+
+        // Create-only against the now-existing document is refused; the committed document is untouched.
+        await using (var unitOfWork = await harness.Store.BeginAsync(Scope))
+        {
+            var refused = await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "widget", "w1", "1.0.0", """{"category":"clobber"}""", ExpectedVersion: 0));
+
+            Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, refused.Status);
+
+            await unitOfWork.RollbackAsync();
+        }
+
+        var loaded = await harness.Store.LoadAsync("widget", "w1");
+        Assert.Equal(1, loaded!.Version);
+        using var content = JsonDocument.Parse(loaded.ContentJson);
+        Assert.Equal("tools", content.RootElement.GetProperty("category").GetString());
+    }
+
+    [Fact]
     public async Task OperationsAfterCompletionThrow()
     {
         await using var harness = await TxHarness.Create();
