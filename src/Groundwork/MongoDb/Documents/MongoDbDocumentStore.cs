@@ -29,7 +29,10 @@ public sealed class MongoDbDocumentStore(IMongoDatabase database, StorageManifes
         if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
 
-        if (existing is null && request.ExpectedVersion is not null)
+        // ExpectedVersion 0 is the create-only claim ("no document exists yet") and falls through to the insert
+        // path, where a concurrent duplicate insert surfaces as a duplicate-key ConcurrencyConflict. Any other
+        // expected version can never match an absent document.
+        if (existing is null && request.ExpectedVersion is { } expected && expected != 0)
             return DocumentStoreWriteResult.NotFound;
 
         var now = DateTimeOffset.UtcNow;
