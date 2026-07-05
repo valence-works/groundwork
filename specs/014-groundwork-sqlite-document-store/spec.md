@@ -104,3 +104,35 @@ A document-store consumer receives clear failures for unsupported/unindexed quer
 - G2 can use `Microsoft.Data.Sqlite` directly; EF Core is intentionally not used.
 - Equality queries are sufficient for the G2 portable query MVP.
 - SQLite in-memory databases are acceptable for provider integration tests.
+
+## Amendment: ExpectedVersion semantics matrix (2026-07-05)
+
+FR-011 requires expected-version optimistic concurrency for save and delete but originally left the
+absent-document cases unspecified, which allowed providers and consumers to diverge silently. This
+amendment specifies the complete semantics. It applies to every document store provider (the contract
+lives in `Groundwork.Documents`; the relational providers and MongoDB implement it), and every case is
+pinned by cross-provider contract tests.
+
+### Save (`SaveDocumentRequest.ExpectedVersion`)
+
+| ExpectedVersion | Document absent | Document present |
+| --- | --- | --- |
+| `null` | Creates at version 1 (`Saved`) | Unconditional overwrite, version increments (`Saved`) |
+| `0` | **Create-only:** inserts version 1 (`Saved`) | `ConcurrencyConflict`; nothing written |
+| other | `NotFound`; nothing written | Version match: `Saved` (increment). Mismatch: `ConcurrencyConflict`; nothing written |
+
+The `0` row is the first-writer-wins creation primitive: a distributed consumer that must not silently
+overwrite a competitor's initial document claims creation with expected version `0`, and the provider
+enforces the race at its storage layer (duplicate-key rejection inside the save transaction), not by a
+read-check-write in application code. Concurrent create-only writers therefore observe exactly one
+`Saved` and otherwise `ConcurrencyConflict`.
+
+### Delete (`DeleteDocumentRequest.ExpectedVersion`)
+
+| ExpectedVersion | Document absent | Document present |
+| --- | --- | --- |
+| `null` | `NotFound` | Deletes (`Deleted`) |
+| any value | `NotFound` | Version match: `Deleted`. Mismatch: `ConcurrencyConflict`; nothing deleted |
+
+Delete has no create-only analogue; `0` receives no special treatment and behaves as any other
+non-matching expectation.
