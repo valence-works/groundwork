@@ -14,7 +14,7 @@ This bucket succeeds the completed [Groundwork Persistence Readiness](groundwork
 
 ## Governing Decision
 
-[ADR 0003](../adr/0003-adopt-three-physical-storage-forms.md) proposes the architectural boundary for this program:
+[ADR 0003](../adr/0003-adopt-three-physical-storage-forms.md) establishes the architectural boundary for this program:
 
 - three physical storage forms with canonical JSON as the source of truth;
 - a provider-neutral `PhysicalTableDefinition` and bounded query contract;
@@ -22,7 +22,7 @@ This bucket succeeds the completed [Groundwork Persistence Readiness](groundwork
 - provider-neutral schema evolution and an operations CLI;
 - pooled sessions, executable capability claims, and provider conformance.
 
-Once accepted, implementation specs and issues must link to that ADR and must not silently reopen its decisions. Vocabulary and public API names remain a deliberate follow-up review before the first broad API implementation.
+Implementation specs and issues must link to that ADR and must not silently reopen its decisions. Vocabulary and public API names remain a deliberate follow-up review before the first broad API implementation.
 
 ## In Scope
 

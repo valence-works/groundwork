@@ -1,6 +1,6 @@
 # Adopt three physical storage forms
 
-Status: proposed.
+Status: accepted (2026-07-12; ratified through the maintainer grilling and PR #26 review).
 
 Date: 2026-07-12.
 
