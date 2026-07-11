@@ -22,7 +22,7 @@ This bucket succeeds the completed [Groundwork Persistence Readiness](groundwork
 - provider-neutral schema evolution and an operations CLI;
 - pooled sessions, executable capability claims, and provider conformance.
 
-Implementation specs and issues must link to that ADR and must not silently reopen its accepted decisions. Vocabulary and public API names remain a deliberate follow-up review before the first broad API implementation.
+Once accepted, implementation specs and issues must link to that ADR and must not silently reopen its decisions. Vocabulary and public API names remain a deliberate follow-up review before the first broad API implementation.
 
 ## In Scope
 
@@ -36,6 +36,7 @@ Implementation specs and issues must link to that ADR and must not silently reop
 - Derive provider capability reports from executable handlers and verify every advertised capability through conformance tests.
 - Generate provider-neutral schema changes from manifest diffs, support explicitly authored semantic transforms, and translate plans in each provider.
 - Provide deterministic plan, validate, status, and apply workflows through a Groundwork CLI suitable for CI and deployment pipelines.
+- Instrument storage, query planning, materialization, migrations, sessions, and provider health with structured logs, traces, metrics, health checks, and actionable diagnostics.
 - Add a specialized append/query/retention primitive for time-ordered diagnostic data when ordinary document CRUD is not an honest fit.
 - Measure correctness, latency, throughput, allocation, database work, storage cost, write amplification, migration/backfill cost, and recovery behavior.
 
@@ -58,7 +59,8 @@ Implementation specs and issues must link to that ADR and must not silently reop
 6. Close required query and operational-storage gaps without introducing arbitrary query translation.
 7. Pass the same capability, storage, query-plan, migration, concurrency, tenancy, restart, and failure-recovery conformance suites for SQLite, SQL Server, PostgreSQL, and MongoDB.
 8. Establish reproducible performance baselines across shared documents, dedicated document tables, and physical entity tables, including an EF Core relational oracle where an application migration needs one.
-9. Publish versioned Groundwork releases that downstream application work can consume without coordinating long-lived cross-repository branches.
+9. Provide operational observability for storage, session, query-plan, materialization, migration, and provider-health behavior.
+10. Publish versioned Groundwork releases that downstream application work can consume without coordinating long-lived cross-repository branches.
 
 ## Readiness Gates
 
@@ -69,6 +71,7 @@ Implementation specs and issues must link to that ADR and must not silently reop
 - Additive and backfill changes can be planned and safely applied across all four providers; destructive operations require explicit authorization.
 - Tenant-aware storage cannot read or mutate another tenant's data through missing ambient filters.
 - Provider capability reports cannot claim behavior that lacks an executable handler and a conformance test.
+- Operators can observe provider health, migration/materialization progress and failures, query-plan selection, session/pool pressure, retries, and dropped or rejected work through stable logs, traces, metrics, health checks, and diagnostics.
 - Performance evidence is collected only after the session lifecycle and query-routing baselines are correct.
 
 ## Linked Surfaces
@@ -93,4 +96,4 @@ Implementation specs and issues must link to that ADR and must not silently reop
 
 ## Completion Conditions
 
-Complete this bucket when the objectives and readiness gates above are implemented, verified for all four providers, released in versioned Groundwork packages, and no unresolved Groundwork gap blocks downstream removal of an in-repository EF Core implementation.
+Complete this bucket when the objectives and readiness gates above—including operational observability—are implemented, verified for all four providers, released in versioned Groundwork packages, and no unresolved Groundwork gap blocks downstream removal of an in-repository EF Core implementation.

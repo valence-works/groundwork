@@ -129,6 +129,8 @@ Shared conformance suites verify advertised behavior for SQLite, SQL Server, Pos
 
 Tenant-aware units stamp and validate tenant identity at the storage boundary. Unique indexes include tenant scope. Tenant-agnostic access requires an explicit privileged session; an ambient query filter is not sufficient isolation.
 
+Groundwork exposes operational evidence for the same executable paths. Storage and query operations, session/pool pressure, query-plan selection, materialization and migration progress, retries/failures, and provider health emit structured logs, traces, metrics, health checks, or diagnostics appropriate to their lifecycle. Capability conformance includes the presence and accuracy of this evidence where the capability is operationally significant.
+
 ## Performance acceptance policy
 
 Correctness, durability, concurrency, tenant isolation, and restart behavior are absolute prerequisites. Performance comparisons must include the shared-document, dedicated-document, and physical-entity forms and must not be treated as evidence until pooled sessions and native query routing are in place.
@@ -177,4 +179,5 @@ This simplifies ownership but serializes unrelated operations, hides pool behavi
 - Canonical JSON permits rebuilds and cross-provider semantics at the cost of retaining JSON storage alongside native projected columns.
 - Application hosts gain naming and deployment control without leaking provider identifier mechanics into feature definitions.
 - Operators gain deterministic validation and migration tooling suitable for CI/CD.
+- Operators gain first-class provider health, migration/materialization, query-plan, session, retry, and failure observability rather than relying on application-specific instrumentation.
 - Specialized operational contracts remain allowed inside Groundwork; standardization means one concrete persistence ecosystem, not one universal CRUD abstraction.
