@@ -91,6 +91,7 @@ of objectives 7 and 9.
 - [ADR 0003: Adopt three physical storage forms](../adr/0003-adopt-three-physical-storage-forms.md)
 - [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md)
 - [Relational session lifecycle prototype](../reports/relational-session-lifecycle-prototype.md)
+- [Diagnostic record-store contract](../../src/Groundwork/DiagnosticRecords/README.md) ([issue #30](https://github.com/valence-works/Groundwork/issues/30))
 - [Stateless relational document-store factory migration](https://github.com/valence-works/Groundwork/issues/34)
 - [Groundwork Physicalization and Performance specification](../../specs/019-groundwork-physicalization-performance/spec.md)
 - [Groundwork Runtime Evaluation and Hardening report](../reports/groundwork-runtime-evaluation.md)
