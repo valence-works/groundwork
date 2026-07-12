@@ -6,6 +6,8 @@ Date: 2026-07-12.
 
 Tracking: [PRD #25](https://github.com/valence-works/Groundwork/issues/25).
 
+Follow-up: [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md).
+
 ## Context
 
 Groundwork currently offers portable document storage and optimized projections. In relational providers, the portable form stores canonical JSON in a shared documents table and declared index values in a shared index table. Optimized physicalization adds a per-storage-unit projection table linked back to the canonical document row. MongoDB uses native collections and indexes while preserving the same document contract.
@@ -62,7 +64,7 @@ Groundwork will introduce a provider-neutral `PhysicalTableDefinition`. At minim
 
 Typed expressions may be an authoring convenience, but they must resolve to stable serialized paths before the definition is fingerprinted or materialized. Portable definitions do not contain raw SQL or require provider-native types. Optional provider extensions may add provider-specific features without changing the portable meaning.
 
-The exact relationship between `PhysicalTableDefinition`, `StorageUnit`, `PhysicalizationPolicy`, and existing projection vocabulary will be settled by a dedicated vocabulary and public-API review before broad implementation. That review may rename existing API elements, but it may not erase the three distinct forms decided here.
+The exact relationship between `PhysicalTableDefinition`, `StorageUnit`, `PhysicalizationPolicy`, and existing projection vocabulary is settled by the [vocabulary and public-API review](../reports/groundwork-vocabulary-and-public-api.md). That review renames existing API elements without erasing the three distinct forms decided here.
 
 ### 4. Expose one bounded query contract
 
@@ -174,7 +176,7 @@ This simplifies ownership but serializes unrelated operations, hides pool behavi
 
 - Groundwork gains a larger materialization and query-planning surface, but one that is bounded by declared manifests and executable provider capabilities.
 - Existing optimized projection behavior remains valid as the index-table form; “physicalization” can no longer be used as a synonym for projection side tables alone.
-- `PhysicalizationPolicy`, portable/optimized terminology, projection APIs, and migration vocabulary require an explicit follow-up review before implementation stabilizes their public surface.
+- `PhysicalizationPolicy`, portable/optimized terminology, projection APIs, and migration vocabulary are reconciled by the [vocabulary and public-API review](../reports/groundwork-vocabulary-and-public-api.md); implementation should follow its staged compatibility strategy.
 - Providers must implement more schema and query-plan conformance, not merely return equivalent documents.
 - Canonical JSON permits rebuilds and cross-provider semantics at the cost of retaining JSON storage alongside native projected columns.
 - Application hosts gain naming and deployment control without leaking provider identifier mechanics into feature definitions.
