@@ -101,7 +101,7 @@ public static class SupportTicketOperationsManifest
             StorageIntent.Operational(rationale, descriptor, requirements),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
-            TenancyPolicy.None,
+            TenancyPolicy.Global,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
             [],

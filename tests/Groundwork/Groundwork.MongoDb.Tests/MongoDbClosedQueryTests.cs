@@ -72,21 +72,23 @@ public sealed class MongoDbClosedQueryTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TenantAwareFiltersAndAgnosticBypasses()
+    public async Task ScopeIsBoundToTheSessionAndPrivilegedSessionCanCrossScopes()
     {
         await using var harness = await Harness.CreateTenant(container.GetConnectionString(), "tenant-a");
         var store = harness.Store;
 
         await store.SaveAsync(new SaveDocumentRequest("scopedDocument", "s1", "1.0.0", """{"tenantId":"tenant-a","name":"A1"}"""));
-        await store.SaveAsync(new SaveDocumentRequest("scopedDocument", "s2", "1.0.0", """{"tenantId":"tenant-b","name":"B1"}"""));
+        var other = harness.CreateStore(Groundwork.Documents.Scoping.DocumentStoreAccess.Scoped(new Groundwork.Core.Scoping.StorageScope("tenant-b")));
+        var privileged = harness.CreateStore(Groundwork.Documents.Scoping.DocumentStoreAccess.PrivilegedAcrossScopes(
+            new Groundwork.Documents.Scoping.PrivilegedStorageAccess("query conformance")));
+        await other.SaveAsync(new SaveDocumentRequest("scopedDocument", "s2", "1.0.0", """{"tenantId":"tenant-a","name":"B1"}"""));
         await store.SaveAsync(new SaveDocumentRequest("scopedDocument", "s3", "1.0.0", """{"tenantId":"tenant-a","name":"A2"}"""));
 
         var aware = await store.QueryAsync(new PortableDocumentQuery("scopedDocument"));
         Assert.Equal(new[] { "s1", "s3" }, aware.Documents.Select(d => d.Id).OrderBy(x => x));
         Assert.Equal(2, aware.TotalCount);
 
-        var agnostic = await store.QueryAsync(new PortableDocumentQuery(
-            "scopedDocument", tenantScope: QueryTenantScope.TenantAgnostic));
+        var agnostic = await privileged.QueryAsync(new PortableDocumentQuery("scopedDocument"));
         Assert.Equal(3, agnostic.TotalCount);
     }
 
@@ -134,28 +136,44 @@ public sealed class MongoDbClosedQueryTests : IAsyncLifetime
 
     private sealed class Harness : IAsyncDisposable
     {
-        private Harness(IMongoClient client, IMongoDatabase database, MongoDbDocumentStore store)
+        private Harness(
+            IMongoClient client,
+            IMongoDatabase database,
+            Groundwork.Core.Manifests.StorageManifest manifest,
+            MongoDbDocumentStore store)
         {
             this.client = client;
             this.database = database;
+            this.manifest = manifest;
             Store = store;
         }
 
         private readonly IMongoClient client;
         private readonly IMongoDatabase database;
+        private readonly Groundwork.Core.Manifests.StorageManifest manifest;
         public MongoDbDocumentStore Store { get; }
 
         public static async Task<Harness> CreateWidgets(string connectionString)
         {
             var (client, database, manifest) = await Materialize(connectionString, MongoDbTestManifests.MetadataManifest());
-            return new Harness(client, database, new MongoDbDocumentStore(database, manifest));
+            return new Harness(client, database, manifest, new MongoDbDocumentStore(database, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
         }
 
-        public static async Task<Harness> CreateTenant(string connectionString, string ambientTenantId)
+        public static async Task<Harness> CreateTenant(string connectionString, string storageScope)
         {
             var (client, database, manifest) = await Materialize(connectionString, MongoDbTestManifests.TenantManifest());
-            return new Harness(client, database, new MongoDbDocumentStore(database, manifest, () => ambientTenantId));
+            return new Harness(
+                client,
+                database,
+                manifest,
+                new MongoDbDocumentStore(
+                    database,
+                    manifest,
+                    Groundwork.Documents.Scoping.DocumentStoreAccess.Scoped(new Groundwork.Core.Scoping.StorageScope(storageScope))));
         }
+
+        public MongoDbDocumentStore CreateStore(Groundwork.Documents.Scoping.DocumentStoreAccess access) =>
+            new(database, manifest, access);
 
         private static async Task<(IMongoClient, IMongoDatabase, Groundwork.Core.Manifests.StorageManifest)> Materialize(
             string connectionString, Groundwork.Core.Manifests.StorageManifest manifest)

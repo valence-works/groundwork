@@ -3,12 +3,107 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
+using Groundwork.Documents.Scoping;
+using Groundwork.Core.Scoping;
+using Groundwork.TestInfrastructure;
 using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
 
 public abstract class RelationalProviderContractTests
 {
+    [Fact]
+    public async Task SatisfiesSharedStorageScopeBlackBoxContract()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var manifest = RelationalTestManifests.ScopedManifest();
+
+        await StorageScopeDocumentStoreConformance.VerifyAsync(
+            manifest,
+            harness.CreateStoreAsync);
+    }
+
+    [Fact]
+    public async Task StorageScopeIsAnInvariantAcrossEveryDocumentPath()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var manifest = RelationalTestManifests.ScopedManifest();
+        var scopeA = DocumentStoreAccess.Scoped(new StorageScope("tenant-a"));
+        var scopeB = DocumentStoreAccess.Scoped(new StorageScope("TENANT-A"));
+        var unicodeScope = DocumentStoreAccess.Scoped(new StorageScope("租户-Å"));
+        var privileged = DocumentStoreAccess.PrivilegedAcrossScopes(new PrivilegedStorageAccess("provider conformance"));
+        var a = await harness.CreateStoreAsync(manifest, scopeA);
+        var b = await harness.CreateStoreAsync(manifest, scopeB);
+        var unicode = await harness.CreateStoreAsync(manifest, unicodeScope);
+        var all = await harness.CreateStoreAsync(manifest, privileged);
+        var sqlServer = harness.ProviderName == "sqlserver";
+        Assert.Equal(
+            sqlServer
+                ? ["document_kind_key", "storage_scope_key", "id_key"]
+                : ["document_kind", "storage_scope", "id"],
+            await harness.ReadDocumentPrimaryKeyColumnsAsync());
+        Assert.Equal(
+            sqlServer
+                ? ["document_kind_key", "storage_scope_key", "index_name_key", "index_value_key"]
+                : ["document_kind", "storage_scope", "index_name", "index_value"],
+            await harness.ReadPortableUniqueIndexColumnsAsync());
+        Assert.Equal(
+            sqlServer
+                ? ["document_kind_key", "storage_scope_key", "document_id_key"]
+                : ["document_kind", "storage_scope", "document_id"],
+            await harness.ReadOptimizedPrimaryKeyColumnsAsync());
+        Assert.Equal(
+            sqlServer
+                ? ["storage_scope_key", "p_by_key_e69a184def06_key"]
+                : ["storage_scope", "p_by_key_e69a184def06"],
+            await harness.ReadOptimizedUniqueIndexColumnsAsync());
+        if (harness.ProviderName == "sqlserver")
+            Assert.Equal("Latin1_General_100_BIN2", await harness.ReadStorageScopeCollationAsync());
+        const string kind = "configurationDocument";
+        var sharedId = NewId();
+        var onlyA = NewId();
+        var key = NewValue("same-unique-key");
+
+        var savedA = await a.SaveAsync(new SaveDocumentRequest(kind, sharedId, "1", $$"""{"key":"{{key}}","category":"scope","sort":"1"}"""));
+        var savedB = await b.SaveAsync(new SaveDocumentRequest(kind, sharedId, "1", $$"""{"key":"{{key}}","category":"scope","sort":"1"}"""));
+        var savedUnicode = await unicode.SaveAsync(new SaveDocumentRequest(kind, sharedId, "1", $$"""{"key":"{{key}}","category":"scope","sort":"1"}"""));
+        await a.SaveAsync(new SaveDocumentRequest(kind, onlyA, "1", $$"""{"key":"{{NewValue("only-a")}}","category":"scope","sort":"2"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, savedA.Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, savedB.Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, savedUnicode.Status);
+        Assert.Equal("tenant-a", savedA.Document!.Scope!.Value);
+        Assert.Equal("TENANT-A", savedB.Document!.Scope!.Value);
+        Assert.Equal("租户-Å", savedUnicode.Document!.Scope!.Value);
+        Assert.Null(await b.LoadAsync(kind, onlyA));
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, (await b.SaveAsync(new SaveDocumentRequest(
+            kind, onlyA, "1", $$"""{"key":"{{NewValue("wrong-update")}}"}""", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, (await b.DeleteAsync(new DeleteDocumentRequest(kind, onlyA))).Status);
+        Assert.NotNull(await a.LoadAsync(kind, onlyA));
+
+        Assert.Single(await a.QueryAsync(new DocumentStoreQuery(kind, "by-key", key)));
+        Assert.Single(await b.QueryAsync(new DocumentStoreQuery(kind, "by-key", key)));
+        Assert.Equal(3, (await all.QueryAsync(new DocumentStoreQuery(kind, "by-key", key))).Count);
+        Assert.Equal(2, (await a.QueryAsync(new PortableDocumentQuery(kind))).TotalCount);
+        Assert.Equal(1, (await b.QueryAsync(new PortableDocumentQuery(kind))).TotalCount);
+        Assert.Equal(4, (await all.QueryAsync(new PortableDocumentQuery(kind))).TotalCount);
+        Assert.True(await a.AnyAsync(new PortableDocumentQuery(kind)));
+        Assert.Equal("tenant-a", (await a.FirstOrDefaultAsync(new PortableDocumentQuery(kind)))!.Scope!.Value);
+
+        var duplicateInA = await a.SaveAsync(new SaveDocumentRequest(kind, NewId(), "1", $$"""{"key":"{{key}}"}"""));
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, duplicateInA.Status);
+
+        await using var unitOfWork = await a.BeginAsync(DocumentCommitScope.Of(kind));
+        var rolledBackId = NewId();
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await unitOfWork.SaveAsync(new SaveDocumentRequest(
+            kind, rolledBackId, "1", $$"""{"key":"{{NewValue("rollback")}}"}"""))).Status);
+        await unitOfWork.RollbackAsync();
+        Assert.Null(await a.LoadAsync(kind, rolledBackId));
+
+        var restarted = await harness.CreateStoreAsync(manifest, scopeA);
+        Assert.NotNull(await restarted.LoadAsync(kind, sharedId));
+    }
+
     [Fact]
     public async Task MaterializeCreatesSchemaHistoryIdempotently()
     {
@@ -392,8 +487,15 @@ public abstract class RelationalProviderContractTests
 
 public interface IRelationalProviderHarness : IAsyncDisposable
 {
+    string ProviderName { get; }
     IDocumentStore Store { get; }
     Task MaterializeAsync();
     Task<IDocumentStore> ApplyManifestAsync(StorageManifest manifest);
+    Task<IDocumentStore> CreateStoreAsync(StorageManifest manifest, DocumentStoreAccess access);
+    Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync();
+    Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync();
+    Task<IReadOnlyList<string>> ReadOptimizedPrimaryKeyColumnsAsync();
+    Task<IReadOnlyList<string>> ReadOptimizedUniqueIndexColumnsAsync();
+    Task<string?> ReadStorageScopeCollationAsync();
     Task<long> CountSchemaHistoryRowsAsync();
 }

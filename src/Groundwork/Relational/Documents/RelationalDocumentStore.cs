@@ -5,7 +5,9 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
 using Groundwork.Core.Transactions;
+using Groundwork.Core.Scoping;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.Scoping;
 using Groundwork.Documents.UnitOfWork;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Physicalization;
@@ -18,40 +20,50 @@ public class RelationalDocumentStore : IDocumentStore
     private readonly RelationalSessionFactory? sessionFactory;
     private readonly StorageManifest manifest;
     private readonly RelationalDocumentStoreDialect dialect;
-    private readonly Func<string?>? ambientTenantId;
+    private readonly DocumentStoreAccess access;
+    private readonly IStorageScopeObserver scopeObserver;
     private readonly SemaphoreSlim connectionGate = new(1, 1);
+
+    public DocumentStoreAccess Access => access;
 
     public RelationalDocumentStore(
         DbConnection connection,
         StorageManifest manifest,
         RelationalDocumentStoreDialect dialect,
-        Func<string?>? ambientTenantId = null)
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null)
     {
         this.connection = connection ?? throw new ArgumentNullException(nameof(connection));
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
-        this.ambientTenantId = ambientTenantId;
+        this.access = access ?? throw new ArgumentNullException(nameof(access));
+        this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
+        DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
     }
 
     public RelationalDocumentStore(
         RelationalSessionFactory sessionFactory,
         StorageManifest manifest,
         RelationalDocumentStoreDialect dialect,
-        Func<string?>? ambientTenantId = null)
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null)
     {
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
-        this.ambientTenantId = ambientTenantId;
+        this.access = access ?? throw new ArgumentNullException(nameof(access));
+        this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
+        DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
     }
 
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
+        var scope = ResolveScope(unit, StorageScopeOperation.Save);
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
             await using var transaction = await currentConnection.BeginTransactionAsync(ct);
-            var result = await SaveCoreAsync(request, unit, transaction, ct);
+            var result = await SaveCoreAsync(request, unit, scope, transaction, ct);
             if (result.Status == DocumentStoreWriteStatus.Saved)
                 await transaction.CommitAsync(ct);
 
@@ -62,10 +74,11 @@ public class RelationalDocumentStore : IDocumentStore
     private async Task<DocumentStoreWriteResult> SaveCoreAsync(
         SaveDocumentRequest request,
         StorageUnit unit,
+        DocumentScopeSelection scope,
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, transaction, ct);
+        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, scope, transaction, ct);
         if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
 
@@ -83,7 +96,7 @@ public class RelationalDocumentStore : IDocumentStore
         {
             try
             {
-                await InsertDocumentAsync(request, version, createdAt, now, transaction, ct);
+                await InsertDocumentAsync(request, scope, version, createdAt, now, transaction, ct);
             }
             catch (DbException exception) when (dialect.IsDuplicateDocumentKeyException(exception))
             {
@@ -92,16 +105,16 @@ public class RelationalDocumentStore : IDocumentStore
         }
         else
         {
-            var updated = await UpdateDocumentAsync(request, version, now, transaction, ct);
+            var updated = await UpdateDocumentAsync(request, scope, version, now, transaction, ct);
             if (!updated)
                 return WriteMissResult(request.ExpectedVersion);
         }
 
         try
         {
-            await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, ct);
-            await InsertIndexesAsync(unit, request.Id, request.ContentJson, transaction, ct);
-            await RefreshPhysicalizedAsync(unit, request.Id, version, request.ContentJson, transaction, ct);
+            await DeleteIndexesAsync(request.DocumentKind, request.Id, scope, transaction, ct);
+            await InsertIndexesAsync(unit, request.Id, request.ContentJson, scope, transaction, ct);
+            await RefreshPhysicalizedAsync(unit, request.Id, version, request.ContentJson, scope, transaction, ct);
         }
         catch (DbException exception) when (dialect.IsUniqueIndexException(exception))
         {
@@ -119,24 +132,27 @@ public class RelationalDocumentStore : IDocumentStore
             version,
             request.ContentJson,
             createdAt,
-            now));
+            now)
+        { Scope = scope.Scope });
     }
 
     public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
     {
-        _ = GetUnit(documentKind);
+        var unit = GetUnit(documentKind);
+        var scope = ResolveScope(unit, StorageScopeOperation.Load);
         return await ExecuteWithConnectionAsync(
-            (currentConnection, ct) => LoadCoreAsync(currentConnection, documentKind, id, null, ct),
+            (currentConnection, ct) => LoadCoreAsync(currentConnection, documentKind, id, scope, null, ct),
             cancellationToken);
     }
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
+        var scope = ResolveScope(unit, StorageScopeOperation.Delete);
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
             await using var transaction = await currentConnection.BeginTransactionAsync(ct);
-            var result = await DeleteCoreAsync(request, unit, transaction, ct);
+            var result = await DeleteCoreAsync(request, unit, scope, transaction, ct);
             if (result.Status == DocumentStoreWriteStatus.Deleted)
                 await transaction.CommitAsync(ct);
 
@@ -147,10 +163,11 @@ public class RelationalDocumentStore : IDocumentStore
     private async Task<DocumentStoreWriteResult> DeleteCoreAsync(
         DeleteDocumentRequest request,
         StorageUnit unit,
+        DocumentScopeSelection scope,
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, transaction, ct);
+        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, scope, transaction, ct);
         if (existing is null)
             return DocumentStoreWriteResult.NotFound;
 
@@ -159,6 +176,7 @@ public class RelationalDocumentStore : IDocumentStore
 
         await using var command = CreateCommand(dialect.DeleteDocumentCommandSql(request.ExpectedVersion is not null), transaction);
         AddParameter(command, "kind", request.DocumentKind);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", request.Id);
         if (request.ExpectedVersion is not null)
             AddParameter(command, "expectedVersion", request.ExpectedVersion.Value);
@@ -167,8 +185,8 @@ public class RelationalDocumentStore : IDocumentStore
         if (deletedRows == 0)
             return WriteMissResult(request.ExpectedVersion);
 
-        await DeleteIndexesAsync(request.DocumentKind, request.Id, transaction, ct);
-        await DeletePhysicalizedAsync(unit, request.Id, transaction, ct);
+        await DeleteIndexesAsync(request.DocumentKind, request.Id, scope, transaction, ct);
+        await DeletePhysicalizedAsync(unit, request.Id, scope, transaction, ct);
 
         return DocumentStoreWriteResult.Deleted;
     }
@@ -177,6 +195,16 @@ public class RelationalDocumentStore : IDocumentStore
 
     public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
+        var units = scope.Kinds.Select(GetUnit).ToArray();
+        if (units.Select(ScopePolicy).Distinct().Count() != 1)
+            throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(units[0]));
+
+        var selections = units
+            .Select(unit => ResolveScope(unit, StorageScopeOperation.BeginUnitOfWork))
+            .ToArray();
+        if (selections.Select(x => x.StorageKey).Distinct(StringComparer.Ordinal).Count() != 1)
+            throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(GetUnit(scope.Kinds[0])));
+
         if (sessionFactory is not null)
             return new RelationalDocumentUnitOfWork(this, await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
 
@@ -197,6 +225,8 @@ public class RelationalDocumentStore : IDocumentStore
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(query.DocumentKind);
+        var scope = DocumentStoreScopeResolver.Resolve(
+            unit, access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
         var (skip, take) = NormalizePaging(query);
         var index = unit.Indexes.SingleOrDefault(index => index.Identity == query.IndexName)
             ?? throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
@@ -209,8 +239,10 @@ public class RelationalDocumentStore : IDocumentStore
 
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            await using var command = CreateQueryCommand(currentConnection, unit, query);
+            await using var command = CreateQueryCommand(currentConnection, unit, query, scope.AcrossScopes);
             AddParameter(command, "kind", query.DocumentKind);
+            if (scope.StorageKey is not null)
+                AddParameter(command, "scope", scope.StorageKey);
             AddParameter(command, "index", query.IndexName);
             AddParameter(command, "value", query.Value);
             AddParameter(command, "take", take);
@@ -228,7 +260,8 @@ public class RelationalDocumentStore : IDocumentStore
     public async Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(query.DocumentKind);
-        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
+        var scope = ResolveQueryScope(unit);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, scope.StorageKey, out var whereSql, out var orderSql);
 
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
@@ -251,7 +284,8 @@ public class RelationalDocumentStore : IDocumentStore
     public async Task<DocumentEnvelope?> FirstOrDefaultAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(query.DocumentKind);
-        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
+        var scope = ResolveQueryScope(unit);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, scope.StorageKey, out var whereSql, out var orderSql);
 
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
@@ -266,7 +300,8 @@ public class RelationalDocumentStore : IDocumentStore
     public async Task<bool> AnyAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(query.DocumentKind);
-        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out _);
+        var scope = ResolveQueryScope(unit);
+        var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, scope.StorageKey, out var whereSql, out _);
 
         return await ExecuteWithConnectionAsync(
             async (currentConnection, ct) => await CountClosedAsync(currentConnection, translator, whereSql, ct) > 0,
@@ -287,19 +322,24 @@ public class RelationalDocumentStore : IDocumentStore
             AddParameter(command, name, value);
     }
 
-    private DbCommand CreateQueryCommand(DbConnection currentConnection, StorageUnit unit, DocumentStoreQuery query)
+    private DbCommand CreateQueryCommand(DbConnection currentConnection, StorageUnit unit, DocumentStoreQuery query, bool acrossScopes)
     {
         var physicalizedField = PhysicalizationProjection.EligibleFields(unit).SingleOrDefault(field => field.Name == query.IndexName);
         if (physicalizedField is null)
-            return CreateCommand(currentConnection, dialect.QueryByIndexSql);
+            return CreateCommand(currentConnection, acrossScopes ? dialect.QueryByIndexAcrossScopesSql : dialect.QueryByIndexSql);
 
         var table = RelationalPhysicalizationNames.TableName(unit);
         var column = RelationalPhysicalizationNames.ColumnName(physicalizedField);
-        return CreateCommand(currentConnection, dialect.QueryByPhysicalizedSql(table, column));
+        return CreateCommand(
+            currentConnection,
+            acrossScopes
+                ? dialect.QueryByPhysicalizedAcrossScopesSql(table, column)
+                : dialect.QueryByPhysicalizedSql(table, column));
     }
 
     private async Task InsertDocumentAsync(
         SaveDocumentRequest request,
+        DocumentScopeSelection scope,
         long version,
         DateTimeOffset createdAt,
         DateTimeOffset updatedAt,
@@ -307,66 +347,70 @@ public class RelationalDocumentStore : IDocumentStore
         CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(dialect.InsertDocumentSql, transaction);
-        AddDocumentParameters(command, request, version, createdAt, updatedAt);
+        AddDocumentParameters(command, request, scope, version, createdAt, updatedAt);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private async Task<bool> UpdateDocumentAsync(
         SaveDocumentRequest request,
+        DocumentScopeSelection scope,
         long version,
         DateTimeOffset updatedAt,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(dialect.UpdateDocumentCommandSql(request.ExpectedVersion is not null), transaction);
-        AddDocumentParameters(command, request, version, updatedAt);
+        AddDocumentParameters(command, request, scope, version, updatedAt);
         if (request.ExpectedVersion is not null)
             AddParameter(command, "expectedVersion", request.ExpectedVersion.Value);
 
         return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 
-    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, long version, DateTimeOffset createdAt, DateTimeOffset updatedAt)
+    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, DocumentScopeSelection scope, long version, DateTimeOffset createdAt, DateTimeOffset updatedAt)
     {
-        AddDocumentParameters(command, request, version);
+        AddDocumentParameters(command, request, scope, version);
         AddParameter(command, "createdUtc", createdAt.ToString("O"));
         AddParameter(command, "updatedUtc", updatedAt.ToString("O"));
     }
 
-    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, long version, DateTimeOffset updatedAt)
+    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, DocumentScopeSelection scope, long version, DateTimeOffset updatedAt)
     {
-        AddDocumentParameters(command, request, version);
+        AddDocumentParameters(command, request, scope, version);
         AddParameter(command, "updatedUtc", updatedAt.ToString("O"));
     }
 
-    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, long version)
+    private void AddDocumentParameters(DbCommand command, SaveDocumentRequest request, DocumentScopeSelection scope, long version)
     {
         AddParameter(command, "kind", request.DocumentKind);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", request.Id);
         AddParameter(command, "schemaVersion", request.SchemaVersion);
         AddParameter(command, "version", version);
         AddParameter(command, "content", request.ContentJson);
     }
 
-    private async Task<DocumentEnvelope?> LoadCoreAsync(DbConnection currentConnection, string documentKind, string id, DbTransaction? transaction, CancellationToken cancellationToken)
+    private async Task<DocumentEnvelope?> LoadCoreAsync(DbConnection currentConnection, string documentKind, string id, DocumentScopeSelection scope, DbTransaction? transaction, CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(currentConnection, dialect.LoadDocumentSql, transaction);
         AddParameter(command, "kind", documentKind);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", id);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? ReadEnvelope(reader) : null;
     }
 
-    private async Task DeleteIndexesAsync(string documentKind, string id, DbTransaction transaction, CancellationToken cancellationToken)
+    private async Task DeleteIndexesAsync(string documentKind, string id, DocumentScopeSelection scope, DbTransaction transaction, CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(dialect.DeleteIndexesSql, transaction);
         AddParameter(command, "kind", documentKind);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", id);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private async Task InsertIndexesAsync(StorageUnit unit, string id, string contentJson, DbTransaction transaction, CancellationToken cancellationToken)
+    private async Task InsertIndexesAsync(StorageUnit unit, string id, string contentJson, DocumentScopeSelection scope, DbTransaction transaction, CancellationToken cancellationToken)
     {
         using var document = JsonDocument.Parse(contentJson);
         foreach (var index in unit.Indexes)
@@ -376,6 +420,7 @@ public class RelationalDocumentStore : IDocumentStore
 
             await using var command = CreateCommand(dialect.InsertIndexSql, transaction);
             AddParameter(command, "kind", unit.Identity.Value);
+            AddParameter(command, "scope", scope.StorageKey!);
             AddParameter(command, "index", index.Identity);
             AddParameter(command, "value", value);
             AddParameter(command, "documentId", id);
@@ -389,6 +434,7 @@ public class RelationalDocumentStore : IDocumentStore
         string id,
         long version,
         string contentJson,
+        DocumentScopeSelection scope,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -396,13 +442,14 @@ public class RelationalDocumentStore : IDocumentStore
         if (fields.Count == 0)
             return;
 
-        await DeletePhysicalizedAsync(unit, id, transaction, cancellationToken);
+        await DeletePhysicalizedAsync(unit, id, scope, transaction, cancellationToken);
 
         using var document = JsonDocument.Parse(contentJson);
         var table = RelationalPhysicalizationNames.TableName(unit);
         var columnNames = fields.Select(RelationalPhysicalizationNames.ColumnName).ToList();
         await using var command = CreateCommand(dialect.InsertPhysicalizedSql(table, columnNames), transaction);
         AddParameter(command, "kind", unit.Identity.Value);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", id);
         AddParameter(command, "version", version);
 
@@ -417,13 +464,14 @@ public class RelationalDocumentStore : IDocumentStore
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private async Task DeletePhysicalizedAsync(StorageUnit unit, string id, DbTransaction transaction, CancellationToken cancellationToken)
+    private async Task DeletePhysicalizedAsync(StorageUnit unit, string id, DocumentScopeSelection scope, DbTransaction transaction, CancellationToken cancellationToken)
     {
         if (PhysicalizationProjection.EligibleFields(unit).Count == 0)
             return;
 
         await using var command = CreateCommand(dialect.DeletePhysicalizedSql(RelationalPhysicalizationNames.TableName(unit)), transaction);
         AddParameter(command, "kind", unit.Identity.Value);
+        AddParameter(command, "scope", scope.StorageKey!);
         AddParameter(command, "id", id);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -451,18 +499,32 @@ public class RelationalDocumentStore : IDocumentStore
         manifest.StorageUnits.SingleOrDefault(unit => unit.Identity.Value == documentKind)
         ?? throw new InvalidOperationException($"Document kind '{documentKind}' is not declared by manifest '{manifest.Identity}'.");
 
+    private DocumentScopeSelection ResolveScope(StorageUnit unit, StorageScopeOperation operation) =>
+        DocumentStoreScopeResolver.Resolve(unit, access, operation, scopeObserver);
+
+    private DocumentScopeSelection ResolveQueryScope(StorageUnit unit) =>
+        DocumentStoreScopeResolver.Resolve(unit, access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
+
+    private static StorageScopePolicy ScopePolicy(StorageUnit unit) =>
+        unit.Tenancy.Kind == TenancyKind.Scoped
+            ? StorageScopePolicy.Scoped
+            : StorageScopePolicy.Global;
+
     private static bool TryGetIndexValue(JsonElement root, IndexDeclaration index, out string value) =>
         RelationalIndexValues.TryGetIndexValue(root, index.Fields, out value);
 
     private static DocumentEnvelope ReadEnvelope(DbDataReader reader) =>
         new(
             reader.GetString(0),
-            reader.GetString(1),
             reader.GetString(2),
-            reader.GetInt64(3),
-            reader.GetString(4),
-            DateTimeOffset.Parse(reader.GetString(5)),
-            DateTimeOffset.Parse(reader.GetString(6)));
+            reader.GetString(3),
+            reader.GetInt64(4),
+            reader.GetString(5),
+            DateTimeOffset.Parse(reader.GetString(6)),
+            DateTimeOffset.Parse(reader.GetString(7)))
+        {
+            Scope = DocumentStoreScopeResolver.ReadScope(reader.GetString(1))
+        };
 
     private static DocumentStoreWriteResult WriteMissResult(long? expectedVersion) =>
         expectedVersion is null
@@ -531,22 +593,25 @@ public class RelationalDocumentStore : IDocumentStore
         {
             EnsureActive();
             var unit = store.GetUnit(request.DocumentKind);
-            return await ExecuteAsync((currentTransaction, ct) => store.SaveCoreAsync(request, unit, currentTransaction, ct), cancellationToken);
+            var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
+            return await ExecuteAsync((currentTransaction, ct) => store.SaveCoreAsync(request, unit, scope, currentTransaction, ct), cancellationToken);
         }
 
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
             var unit = store.GetUnit(request.DocumentKind);
-            return await ExecuteAsync((currentTransaction, ct) => store.DeleteCoreAsync(request, unit, currentTransaction, ct), cancellationToken);
+            var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
+            return await ExecuteAsync((currentTransaction, ct) => store.DeleteCoreAsync(request, unit, scope, currentTransaction, ct), cancellationToken);
         }
 
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            _ = store.GetUnit(documentKind);
+            var unit = store.GetUnit(documentKind);
+            var scope = store.ResolveScope(unit, StorageScopeOperation.Load);
             return await ExecuteAsync(
-                (currentTransaction, ct) => store.LoadCoreAsync(currentTransaction.Connection!, documentKind, id, currentTransaction, ct),
+                (currentTransaction, ct) => store.LoadCoreAsync(currentTransaction.Connection!, documentKind, id, scope, currentTransaction, ct),
                 cancellationToken);
         }
 

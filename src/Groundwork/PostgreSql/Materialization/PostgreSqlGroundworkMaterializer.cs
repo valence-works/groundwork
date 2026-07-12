@@ -27,11 +27,12 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
             $"""
             CREATE TABLE IF NOT EXISTS {table} (
                 document_kind TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
                 document_id TEXT NOT NULL,
                 document_version BIGINT NOT NULL{(fields.Count == 0 ? "" : $",\n    {columns}")},
-                PRIMARY KEY (document_kind, document_id),
-                FOREIGN KEY (document_kind, document_id)
-                    REFERENCES groundwork_documents(document_kind, id)
+                PRIMARY KEY (document_kind, storage_scope, document_id),
+                FOREIGN KEY (document_kind, storage_scope, document_id)
+                    REFERENCES groundwork_documents(document_kind, storage_scope, id)
                     ON DELETE CASCADE
             );
             """
@@ -44,7 +45,7 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
             var unique = field.IsUnique ? "UNIQUE " : "";
             return $"""
                 CREATE {unique}INDEX IF NOT EXISTS {indexName}
-                ON {table}({column})
+                ON {table}(storage_scope, {column})
                 WHERE {column} IS NOT NULL;
                 """;
         }));
@@ -55,31 +56,33 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
     private const string DocumentTableSql = """
         CREATE TABLE IF NOT EXISTS groundwork_documents (
             document_kind TEXT NOT NULL,
+            storage_scope TEXT NOT NULL,
             id TEXT NOT NULL,
             schema_version TEXT NOT NULL,
             version BIGINT NOT NULL,
             content_json TEXT NOT NULL,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            PRIMARY KEY (document_kind, id)
+            PRIMARY KEY (document_kind, storage_scope, id)
         );
         """;
 
     private const string IndexTableSql = """
         CREATE TABLE IF NOT EXISTS groundwork_document_indexes (
             document_kind TEXT NOT NULL,
+            storage_scope TEXT NOT NULL,
             index_name TEXT NOT NULL,
             index_value TEXT NOT NULL,
             document_id TEXT NOT NULL,
             is_unique INTEGER NOT NULL,
-            PRIMARY KEY (document_kind, index_name, index_value, document_id),
-            FOREIGN KEY (document_kind, document_id)
-                REFERENCES groundwork_documents(document_kind, id)
+            PRIMARY KEY (document_kind, storage_scope, index_name, index_value, document_id),
+            FOREIGN KEY (document_kind, storage_scope, document_id)
+                REFERENCES groundwork_documents(document_kind, storage_scope, id)
                 ON DELETE CASCADE
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_document_indexes_unique
-        ON groundwork_document_indexes(document_kind, index_name, index_value)
+        ON groundwork_document_indexes(document_kind, storage_scope, index_name, index_value)
         WHERE is_unique = 1;
         """;
 

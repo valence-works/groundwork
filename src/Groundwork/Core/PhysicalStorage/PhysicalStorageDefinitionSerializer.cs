@@ -31,6 +31,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteStartObject();
             writer.WriteString("storageUnit", resolved.StorageUnit.Value);
             writer.WriteString("provisioningMode", resolved.ProvisioningMode.ToString());
+            writer.WriteString("scopePolicy", resolved.ScopePolicy.ToString());
             WriteDefinition(writer, resolved.Definition);
             if (resolved.SharedStorageDefinition is not null)
                 WriteSharedStorageDefinition(writer, resolved.SharedStorageDefinition);
@@ -99,7 +100,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteStartObject();
             writer.WriteString("id", definition.Envelope.IdColumn);
             writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-            writer.WriteString("tenantId", definition.Envelope.TenantIdColumn);
+            writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
             writer.WriteString("version", definition.Envelope.VersionColumn);
             writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
             writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
@@ -164,7 +165,7 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteStartObject();
         writer.WriteString("id", definition.Envelope.IdColumn);
         writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-        writer.WriteString("tenantId", definition.Envelope.TenantIdColumn);
+        writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
         writer.WriteString("version", definition.Envelope.VersionColumn);
         writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
         writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);

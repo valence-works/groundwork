@@ -165,12 +165,10 @@ public static class LegacyPhysicalStorageBridge
         IndexDeclaration index)
     {
         var columns = new List<PhysicalIndexColumnDefinition>();
-        if (unit.Tenancy.Kind == TenancyKind.TenantPartition &&
-            index.IsUnique &&
-            index.Fields.All(field => field.Path != "tenantId"))
+        if (unit.Tenancy.Kind == TenancyKind.Scoped)
         {
             columns.Add(new PhysicalIndexColumnDefinition(
-                new DocumentEnvelopeDefinition().TenantIdColumn,
+                new DocumentEnvelopeDefinition().StorageScopeColumn,
                 columns.Count));
         }
 

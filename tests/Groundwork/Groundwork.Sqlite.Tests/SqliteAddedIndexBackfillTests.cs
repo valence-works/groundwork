@@ -18,7 +18,7 @@ public sealed class SqliteAddedIndexBackfillTests
         // Add the "by-category" index to a unit that already holds documents (same manifest version).
         var withCategory = WithIndexes(SqliteTestManifests.MetadataManifest(), "by-key", "by-category");
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(withCategory, SqliteTestManifests.Provider);
-        var store = new SqliteDocumentStore(connection, withCategory);
+        var store = new SqliteDocumentStore(connection, withCategory, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await AssertBackfilledAsync(store);
     }
@@ -35,7 +35,7 @@ public sealed class SqliteAddedIndexBackfillTests
             Version = new StorageManifestVersion("1.1.0")
         };
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(bumped, SqliteTestManifests.Provider);
-        var store = new SqliteDocumentStore(connection, bumped);
+        var store = new SqliteDocumentStore(connection, bumped, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await AssertBackfilledAsync(store);
     }
@@ -49,7 +49,7 @@ public sealed class SqliteAddedIndexBackfillTests
         var withCategory = WithIndexes(SqliteTestManifests.MetadataManifest(), "by-key", "by-category");
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(withCategory, SqliteTestManifests.Provider);
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(withCategory, SqliteTestManifests.Provider);
-        var store = new SqliteDocumentStore(connection, withCategory);
+        var store = new SqliteDocumentStore(connection, withCategory, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await AssertBackfilledAsync(store);
         Assert.Equal(2, await CountIndexRowsAsync(connection, "by-category", "system"));
@@ -59,7 +59,7 @@ public sealed class SqliteAddedIndexBackfillTests
     {
         var byKeyOnly = WithIndexes(SqliteTestManifests.MetadataManifest(), "by-key");
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(byKeyOnly, SqliteTestManifests.Provider);
-        var store = new SqliteDocumentStore(connection, byKeyOnly);
+        var store = new SqliteDocumentStore(connection, byKeyOnly, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await store.SaveAsync(new SaveDocumentRequest("configurationDocument", "doc-1", "1.0.0", """{"key":"alpha","category":"system"}"""));
         await store.SaveAsync(new SaveDocumentRequest("configurationDocument", "doc-2", "1.0.0", """{"key":"beta","category":"system"}"""));

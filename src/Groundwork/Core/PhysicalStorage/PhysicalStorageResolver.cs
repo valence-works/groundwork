@@ -2,6 +2,7 @@ using System.Text;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
+using Groundwork.Core.Scoping;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -14,6 +15,8 @@ public sealed record ResolvedPhysicalTableDefinition(
     IReadOnlyList<ScaleBearingPathDemand> ScaleBearingDemand,
     IReadOnlyList<ResolvedPhysicalObjectName> Names)
 {
+    public StorageScopePolicy ScopePolicy { get; init; }
+
     public ResolvedPhysicalObjectName PrimaryName =>
         Names.Single(x => x.ObjectKind == PhysicalObjectKind.PrimaryStorage);
 
@@ -24,7 +27,8 @@ public sealed record ResolvedPhysicalTableDefinition(
         Definition.Equals(other.Definition) &&
         Equals(SharedStorageDefinition, other.SharedStorageDefinition) &&
         ScaleBearingDemand.SequenceEqual(other.ScaleBearingDemand) &&
-        Names.SequenceEqual(other.Names);
+        Names.SequenceEqual(other.Names) &&
+        ScopePolicy == other.ScopePolicy;
 
     public override int GetHashCode()
     {
@@ -37,6 +41,7 @@ public sealed record ResolvedPhysicalTableDefinition(
             hash.Add(demand);
         foreach (var name in Names)
             hash.Add(name);
+        hash.Add(ScopePolicy);
         return hash.ToHashCode();
     }
 }
@@ -123,6 +128,9 @@ public static class PhysicalStorageResolver
                 continue;
             }
 
+            if (!TryResolveScopePolicy(unit, diagnostics, out var scopePolicy))
+                continue;
+
             if (!ValidateDeclarations(unit, diagnostics))
                 continue;
 
@@ -168,7 +176,10 @@ public static class PhysicalStorageResolver
                 definition,
                 sharedStorageDefinition,
                 demand.ToArray(),
-                names.ToArray());
+                names.ToArray())
+            {
+                ScopePolicy = scopePolicy
+            };
             var providerNames = NormalizeNames(
                 resolved,
                 providerNameNormalizer,
@@ -191,6 +202,29 @@ public static class PhysicalStorageResolver
 
         AddProviderNameCollisions(definitions, diagnostics);
         return new PhysicalStorageResolutionResult(definitions.ToArray(), diagnostics.ToArray());
+    }
+
+    private static bool TryResolveScopePolicy(
+        StorageUnit unit,
+        List<GroundworkDiagnostic> diagnostics,
+        out StorageScopePolicy scopePolicy)
+    {
+        switch (unit.Tenancy.Kind)
+        {
+            case TenancyKind.Global:
+                scopePolicy = StorageScopePolicy.Global;
+                return true;
+            case TenancyKind.Scoped:
+                scopePolicy = StorageScopePolicy.Scoped;
+                return true;
+            default:
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-030",
+                    $"Storage unit '{unit.Identity.Value}' uses unsupported tenancy kind '{unit.Tenancy.Kind}' and cannot resolve physical storage.",
+                    $"storageUnits.{unit.Identity.Value}.tenancy"));
+                scopePolicy = default;
+                return false;
+        }
     }
 
     private static bool ValidateDeclarations(
@@ -457,10 +491,10 @@ public static class PhysicalStorageResolver
 
             var sortDirections = ResolveCanonicalSortDirections(queryGroup, logicalIndex);
             var columns = new List<PhysicalIndexColumnDefinition>();
-            if (RequiresTenantScope(unit, logicalIndex))
+            if (RequiresStorageScope(unit, logicalIndex))
             {
                 columns.Add(new PhysicalIndexColumnDefinition(
-                    envelope.TenantIdColumn,
+                    envelope.StorageScopeColumn,
                     columns.Count));
             }
 
@@ -636,7 +670,7 @@ public static class PhysicalStorageResolver
                 [
                     envelope.IdColumn,
                     envelope.DocumentKindColumn,
-                    envelope.TenantIdColumn,
+                    envelope.StorageScopeColumn,
                     envelope.VersionColumn,
                     envelope.SchemaVersionColumn,
                     envelope.CanonicalJsonColumn
@@ -675,14 +709,13 @@ public static class PhysicalStorageResolver
                 valid = false;
             }
 
-            if (unit.Tenancy.Kind == TenancyKind.TenantPartition &&
-                index.IsUnique &&
+            if (unit.Tenancy.Kind == TenancyKind.Scoped &&
                 envelope is not null &&
-                index.Columns.All(x => x.ColumnLogicalName != envelope.TenantIdColumn))
+                index.Columns.All(x => x.ColumnLogicalName != envelope.StorageScopeColumn))
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-026",
-                    $"Tenant-partitioned unique index '{index.LogicalName}' must include envelope column '{envelope.TenantIdColumn}'.",
+                    $"Scoped index '{index.LogicalName}' must include envelope scope column '{envelope.StorageScopeColumn}'.",
                     $"{target}.indexes.{index.LogicalName}.columns"));
                 valid = false;
             }
@@ -718,7 +751,7 @@ public static class PhysicalStorageResolver
                 PhysicalIndexFulfills(
                     physicalIndex.Columns,
                     expectedColumns,
-                    RequiresTenantScope(unit, logicalIndex)))
+                    RequiresStorageScope(unit, logicalIndex)))
             {
                 continue;
             }
@@ -752,7 +785,7 @@ public static class PhysicalStorageResolver
     private static bool HasCanonicalEnvelope(DocumentEnvelopeDefinition envelope) =>
         !string.IsNullOrWhiteSpace(envelope.IdColumn) &&
         !string.IsNullOrWhiteSpace(envelope.DocumentKindColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.TenantIdColumn) &&
+        !string.IsNullOrWhiteSpace(envelope.StorageScopeColumn) &&
         !string.IsNullOrWhiteSpace(envelope.VersionColumn) &&
         !string.IsNullOrWhiteSpace(envelope.SchemaVersionColumn) &&
         !string.IsNullOrWhiteSpace(envelope.CanonicalJsonColumn);
@@ -1038,12 +1071,11 @@ public static class PhysicalStorageResolver
     }
 
     private static bool IsEnvelopePath(string path) => path is
-        "id" or "documentKind" or "tenantId" or "version" or "schemaVersion";
+        "id" or "documentKind" or "storageScope" or "version" or "schemaVersion";
 
-    private static bool RequiresTenantScope(StorageUnit unit, LogicalIndexDeclaration index) =>
-        unit.Tenancy.Kind == TenancyKind.TenantPartition &&
-        index.IsUnique &&
-        index.Fields.All(field => field.Path != "tenantId");
+    private static bool RequiresStorageScope(StorageUnit unit, LogicalIndexDeclaration index) =>
+        unit.Tenancy.Kind == TenancyKind.Scoped &&
+        index.Fields.All(field => field.Path != "storageScope");
 
     private static IReadOnlyList<PhysicalSortDirection> ResolveSortDirections(
         BoundedQueryDeclaration query,
@@ -1089,7 +1121,7 @@ public static class PhysicalStorageResolver
     private static bool PhysicalIndexFulfills(
         IReadOnlyList<PhysicalIndexColumnDefinition> actual,
         IReadOnlyList<PhysicalIndexColumnDefinition> expected,
-        bool hasTenantPrefix)
+        bool hasScopePrefix)
     {
         if (actual.Count != expected.Count ||
             !actual.Select(x => (x.ColumnLogicalName, x.Order))
@@ -1098,7 +1130,7 @@ public static class PhysicalStorageResolver
             return false;
         }
 
-        var offset = hasTenantPrefix ? 1 : 0;
+        var offset = hasScopePrefix ? 1 : 0;
         var actualDirections = actual.Skip(offset).Select(x => x.Direction).ToArray();
         var expectedDirections = expected.Skip(offset).Select(x => x.Direction).ToArray();
         return actualDirections.SequenceEqual(expectedDirections) ||
@@ -1121,8 +1153,8 @@ public static class PhysicalStorageResolver
             x => x.LogicalName,
             StringComparer.Ordinal);
         var result = new List<PhysicalIndexColumnDefinition>();
-        if (RequiresTenantScope(unit, logicalIndex))
-            result.Add(new PhysicalIndexColumnDefinition(envelope.TenantIdColumn, result.Count));
+        if (RequiresStorageScope(unit, logicalIndex))
+            result.Add(new PhysicalIndexColumnDefinition(envelope.StorageScopeColumn, result.Count));
 
         var sortDirections = ResolveSortDirections(query, logicalIndex);
         foreach (var (field, fieldOrder) in logicalIndex.Fields.Select((field, order) => (field, order)))
@@ -1150,7 +1182,7 @@ public static class PhysicalStorageResolver
     {
         "id" => envelope.IdColumn,
         "documentKind" => envelope.DocumentKindColumn,
-        "tenantId" => envelope.TenantIdColumn,
+        "storageScope" => envelope.StorageScopeColumn,
         "version" => envelope.VersionColumn,
         "schemaVersion" => envelope.SchemaVersionColumn,
         _ => throw new ArgumentOutOfRangeException(nameof(path), path, null)

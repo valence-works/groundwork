@@ -94,7 +94,7 @@ public sealed class RelationalSessionFactoryTests
                 connections.Add(connection);
                 return connection;
             });
-            IDocumentStore store = new SqliteDocumentStore(sessions, manifest);
+            IDocumentStore store = new SqliteDocumentStore(sessions, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             var saved = await store.SaveAsync(new SaveDocumentRequest(
                 "widget", "w1", "1.0.0", """{"name":"w1","category":"tools","sortKey":"001"}"""));
@@ -409,7 +409,7 @@ public sealed class RelationalSessionFactoryTests
     public void StatelessSqliteStoreRejectsPrivateInMemoryDatabase()
     {
         var exception = Assert.Throws<ArgumentException>(() =>
-            new SqliteDocumentStore("Data Source=:memory:", ClosedQueryManifests.WidgetManifest()));
+            new SqliteDocumentStore("Data Source=:memory:", ClosedQueryManifests.WidgetManifest(), Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
         Assert.Contains("direct-connection constructor", exception.Message);
     }

@@ -27,11 +27,12 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             $"""
             CREATE TABLE IF NOT EXISTS {table} (
                 document_kind TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
                 document_id TEXT NOT NULL,
                 document_version INTEGER NOT NULL{(fields.Count == 0 ? "" : $",\n    {columns}")},
-                PRIMARY KEY (document_kind, document_id),
-                FOREIGN KEY (document_kind, document_id)
-                    REFERENCES groundwork_documents(document_kind, id)
+                PRIMARY KEY (document_kind, storage_scope, document_id),
+                FOREIGN KEY (document_kind, storage_scope, document_id)
+                    REFERENCES groundwork_documents(document_kind, storage_scope, id)
                     ON DELETE CASCADE
             );
             """
@@ -44,7 +45,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             var unique = field.IsUnique ? "UNIQUE " : "";
             return $"""
                 CREATE {unique}INDEX IF NOT EXISTS {indexName}
-                ON {table}({column})
+                ON {table}(storage_scope, {column})
                 WHERE {column} IS NOT NULL;
                 """;
         }));
@@ -64,11 +65,12 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             $"""
             CREATE TABLE IF NOT EXISTS {table} (
                 document_kind TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
                 document_id TEXT NOT NULL,
                 document_version INTEGER NOT NULL{(fields.Count == 0 ? "" : $",\n    {columns}")},
-                PRIMARY KEY (document_kind, document_id),
-                FOREIGN KEY (document_kind, document_id)
-                    REFERENCES groundwork_documents(document_kind, id)
+                PRIMARY KEY (document_kind, storage_scope, document_id),
+                FOREIGN KEY (document_kind, storage_scope, document_id)
+                    REFERENCES groundwork_documents(document_kind, storage_scope, id)
                     ON DELETE CASCADE
             );
             """,
@@ -91,7 +93,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             await ExecuteAsync(
                 $"""
                 CREATE {unique}INDEX IF NOT EXISTS {indexName}
-                ON {table}({column})
+                ON {table}(storage_scope, {column})
                 WHERE {column} IS NOT NULL;
                 """,
                 transaction,
@@ -126,29 +128,29 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         var columnNames = fields.Select(RelationalPhysicalizationNames.ColumnName).ToList();
         foreach (var document in documents)
         {
-            await DeletePhysicalizedAsync(table, unitIdentity, document.Id, transaction, cancellationToken);
+            await DeletePhysicalizedAsync(table, unitIdentity, document.StorageScope, document.Id, transaction, cancellationToken);
             await InsertPhysicalizedAsync(table, columnNames, fields, unitIdentity, document, transaction, cancellationToken);
         }
     }
 
-    private async Task<IReadOnlyList<(string Id, long Version, string ContentJson)>> LoadDocumentsAsync(
+    private async Task<IReadOnlyList<(string StorageScope, string Id, long Version, string ContentJson)>> LoadDocumentsAsync(
         string unitIdentity,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(
             """
-            SELECT id, version, content_json
+            SELECT storage_scope, id, version, content_json
             FROM groundwork_documents
             WHERE document_kind = @kind;
             """,
             transaction);
         AddParameter(command, "kind", unitIdentity);
 
-        var documents = new List<(string Id, long Version, string ContentJson)>();
+        var documents = new List<(string StorageScope, string Id, long Version, string ContentJson)>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
-            documents.Add((reader.GetString(0), reader.GetInt64(1), reader.GetString(2)));
+            documents.Add((reader.GetString(0), reader.GetString(1), reader.GetInt64(2), reader.GetString(3)));
 
         return documents;
     }
@@ -156,6 +158,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
     private async Task DeletePhysicalizedAsync(
         string table,
         string documentKind,
+        string storageScope,
         string documentId,
         DbTransaction transaction,
         CancellationToken cancellationToken)
@@ -163,10 +166,11 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         await using var command = CreateCommand(
             $"""
             DELETE FROM {table}
-            WHERE document_kind = @kind AND document_id = @id;
+            WHERE document_kind = @kind AND storage_scope = @scope AND document_id = @id;
             """,
             transaction);
         AddParameter(command, "kind", documentKind);
+        AddParameter(command, "scope", storageScope);
         AddParameter(command, "id", documentId);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -176,7 +180,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         IReadOnlyList<string> columnNames,
         IReadOnlyList<PhysicalizedFieldPlan> fields,
         string documentKind,
-        (string Id, long Version, string ContentJson) document,
+        (string StorageScope, string Id, long Version, string ContentJson) document,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -185,11 +189,12 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         await using var command = CreateCommand(
             $"""
             INSERT INTO {table}
-            (document_kind, document_id, document_version{(columnNames.Count == 0 ? "" : $", {columns}")})
-            VALUES (@kind, @id, @version{(columnNames.Count == 0 ? "" : $", {parameters}")});
+            (document_kind, storage_scope, document_id, document_version{(columnNames.Count == 0 ? "" : $", {columns}")})
+            VALUES (@kind, @scope, @id, @version{(columnNames.Count == 0 ? "" : $", {parameters}")});
             """,
             transaction);
         AddParameter(command, "kind", documentKind);
+        AddParameter(command, "scope", document.StorageScope);
         AddParameter(command, "id", document.Id);
         AddParameter(command, "version", document.Version);
 
@@ -207,31 +212,33 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
     private const string DocumentTableSql = """
         CREATE TABLE IF NOT EXISTS groundwork_documents (
             document_kind TEXT NOT NULL,
+            storage_scope TEXT NOT NULL,
             id TEXT NOT NULL,
             schema_version TEXT NOT NULL,
             version INTEGER NOT NULL,
             content_json TEXT NOT NULL,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            PRIMARY KEY (document_kind, id)
+            PRIMARY KEY (document_kind, storage_scope, id)
         );
         """;
 
     private const string IndexTableSql = """
         CREATE TABLE IF NOT EXISTS groundwork_document_indexes (
             document_kind TEXT NOT NULL,
+            storage_scope TEXT NOT NULL,
             index_name TEXT NOT NULL,
             index_value TEXT NOT NULL,
             document_id TEXT NOT NULL,
             is_unique INTEGER NOT NULL,
-            PRIMARY KEY (document_kind, index_name, index_value, document_id),
-            FOREIGN KEY (document_kind, document_id)
-                REFERENCES groundwork_documents(document_kind, id)
+            PRIMARY KEY (document_kind, storage_scope, index_name, index_value, document_id),
+            FOREIGN KEY (document_kind, storage_scope, document_id)
+                REFERENCES groundwork_documents(document_kind, storage_scope, id)
                 ON DELETE CASCADE
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_document_indexes_unique
-        ON groundwork_document_indexes(document_kind, index_name, index_value)
+        ON groundwork_document_indexes(document_kind, storage_scope, index_name, index_value)
         WHERE is_unique = 1;
         """;
 

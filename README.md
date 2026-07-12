@@ -6,6 +6,11 @@ Groundwork is a provider-neutral persistence foundation for .NET applications. M
 
 This repository contains the standalone Groundwork library.
 
+Document stores require explicit `DocumentStoreAccess`: `Scoped(StorageScope)` for scoped units or
+`Global` for deliberately global units. Privileged scoped/global/cross-scope sessions require a
+separate `PrivilegedStorageAccess` capability and emit acquisition evidence. Scope is enforced by
+the storage boundary and is never read from document JSON.
+
 ## Projects
 
 - `Groundwork.Core`: manifests, storage intent, provider capability checks, validation, materialization concepts, and physicalization projection rules.
@@ -85,7 +90,7 @@ var manifest = new StorageManifest(
             StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
-            TenancyPolicy.None,
+            TenancyPolicy.Global,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
             [
@@ -237,6 +242,7 @@ Configure SQLite by materializing the manifest, then create an `IDocumentStore` 
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Validation;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.Scoping;
 using Groundwork.Materialization;
 using Groundwork.Sqlite;
 using Groundwork.Sqlite.Documents;
@@ -252,7 +258,7 @@ var plan = new MaterializationPlanner(new StorageManifestValidator(), new Provid
 
 await new SqliteGroundworkMaterializer(connection).MaterializeAsync(plan);
 
-IDocumentStore store = new SqliteDocumentStore(connection, manifest);
+IDocumentStore store = new SqliteDocumentStore(connection, manifest, DocumentStoreAccess.Global);
 ```
 
 Configure MongoDB with the same manifest:
@@ -261,6 +267,7 @@ Configure MongoDB with the same manifest:
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Validation;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.Scoping;
 using Groundwork.Materialization;
 using Groundwork.MongoDb;
 using Groundwork.MongoDb.Documents;
@@ -277,7 +284,7 @@ var plan = new MaterializationPlanner(new StorageManifestValidator(), new Provid
 
 await new MongoDbGroundworkMaterializer(database).MaterializeAsync(plan);
 
-IDocumentStore store = new MongoDbDocumentStore(database, manifest);
+IDocumentStore store = new MongoDbDocumentStore(database, manifest, DocumentStoreAccess.Global);
 ```
 
 Create, load, query, update, and delete support-ticket documents through the portable document-store contract. For quick scripts or tests, an anonymous object is enough because `IDocumentStore` stores JSON envelopes:
@@ -345,7 +352,7 @@ var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
 
 ### Closed portable queries
 
-For provider-neutral reads that go beyond a single equality, `IDocumentStore` also accepts a closed `PortableDocumentQuery`: an `AND` of `OR`-groups of single-field comparisons (`Equal`, `In`, `Contains`), with at most one ordering, optional offset paging, a total count, and a tenant-scope flag. Comparisons address a declared index by identity, and each operator must be declared on that index. The same query shape executes server-side on every provider (SQLite, SQL Server, PostgreSQL, MongoDB).
+For provider-neutral reads that go beyond a single equality, `IDocumentStore` also accepts a closed `PortableDocumentQuery`: an `AND` of `OR`-groups of single-field comparisons (`Equal`, `In`, `Contains`), with at most one ordering, optional offset paging, and a total count. Comparisons address a declared index by identity, and each operator must be declared on that index. The same query shape executes server-side on every provider (SQLite, SQL Server, PostgreSQL, MongoDB). Scope comes only from the store session, not from the query.
 
 ```csharp
 using Groundwork.Documents.Store;
@@ -369,7 +376,7 @@ DocumentEnvelope? first = await store.FirstOrDefaultAsync(query);
 bool any = await store.AnyAsync(query);
 ```
 
-Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `QueryClause` (`QueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Queries are tenant-aware by default — pass `QueryTenantScope.TenantAgnostic` to bypass ambient tenant filtering, which is supplied to the store via an optional ambient-tenant accessor.
+Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `QueryClause` (`QueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Scoped stores always apply their bound scope. Cross-scope reads require a separately acquired privileged session; there is no query flag that disables isolation.
 
 #### Declaring and detecting closed-query support
 

@@ -61,6 +61,11 @@ public sealed class StorageManifestValidator
 
         if (unit.Tenancy is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-011", "Storage unit tenancy policy is required.", $"{target}.tenancy"));
+        else if (unit.Tenancy.Kind is not TenancyKind.Global and not TenancyKind.Scoped)
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-UNIT-012",
+                $"Tenancy policy '{unit.Tenancy.Kind}' has no executable storage-scope handler.",
+                $"{target}.tenancy"));
 
         if (unit.Concurrency is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-008", "Storage unit concurrency policy is required.", $"{target}.concurrency"));

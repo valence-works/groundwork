@@ -23,7 +23,7 @@ public sealed record DocumentStoragePlan(
 public sealed record DocumentEnvelopePlan(
     string IdentityField,
     string? ConcurrencyField,
-    string? PartitionField,
+    string? StorageScopeField,
     string? SchemaField);
 
 public sealed record DocumentIndexPlan(

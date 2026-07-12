@@ -16,6 +16,34 @@ namespace Groundwork.Sqlite.Tests;
 public sealed class SqliteDocumentStoreTests
 {
     [Fact]
+    public async Task FactoryRejectsInvalidManifestBeforeCreatingAnyConnection()
+    {
+        var materializationConnections = 0;
+        var operationConnections = 0;
+        var manifest = SqliteTestManifests.MetadataManifest() with { StorageUnits = [] };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            SqliteDocumentStoreFactory.CreateAsync(
+                "Data Source=never-opened.db",
+                manifest,
+                SqliteTestManifests.Provider,
+                () =>
+                {
+                    materializationConnections++;
+                    return new SqliteConnection("Data Source=never-opened.db");
+                },
+                () =>
+                {
+                    operationConnections++;
+                    return new SqliteConnection("Data Source=never-opened.db");
+                },
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
+
+        Assert.Equal(0, materializationConnections);
+        Assert.Equal(0, operationConnections);
+    }
+
+    [Fact]
     public async Task SaveLoadUpdateQueryAndDeleteMaintainIndexes()
     {
         await using var harness = await SqliteDocumentStoreHarness.Create();
@@ -97,7 +125,8 @@ public sealed class SqliteDocumentStoreTests
             var store = await SqliteDocumentStoreFactory.CreateAsync(
                 $"Data Source={databasePath};Pooling=False",
                 manifest,
-                SqliteTestManifests.Provider);
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             var saved = await store.SaveAsync(new SaveDocumentRequest(
                 "configurationDocument",
@@ -123,7 +152,8 @@ public sealed class SqliteDocumentStoreTests
             SqliteDocumentStoreFactory.CreateAsync(
                 connectionString,
                 SqliteTestManifests.MetadataManifest(),
-                SqliteTestManifests.Provider));
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
         Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
     }
@@ -137,7 +167,8 @@ public sealed class SqliteDocumentStoreTests
             SqliteDocumentStoreFactory.CreateAsync(
                 connectionString,
                 SqliteTestManifests.MetadataManifest(),
-                SqliteTestManifests.Provider));
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
         Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
     }
@@ -151,7 +182,8 @@ public sealed class SqliteDocumentStoreTests
             SqliteDocumentStoreFactory.CreateAsync(
                 connectionString,
                 SqliteTestManifests.MetadataManifest(),
-                SqliteTestManifests.Provider));
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
         Assert.Equal("connectionString", exception.ParamName);
     }
@@ -170,7 +202,8 @@ public sealed class SqliteDocumentStoreTests
             var store = await SqliteDocumentStoreFactory.CreateAsync(
                 connectionString,
                 SqliteTestManifests.MetadataManifest(),
-                SqliteTestManifests.Provider);
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             var saved = await store.SaveAsync(new SaveDocumentRequest(
                 "configurationDocument",
@@ -193,7 +226,8 @@ public sealed class SqliteDocumentStoreTests
             SqliteDocumentStoreFactory.CreateAsync(
                 "Data Source=file:groundwork?cache=shared&MoDe=MeMoRy",
                 SqliteTestManifests.MetadataManifest(),
-                SqliteTestManifests.Provider));
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
         Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
     }
@@ -210,7 +244,8 @@ public sealed class SqliteDocumentStoreTests
                 connectionString,
                 SqliteTestManifests.MetadataManifest(),
                 SqliteTestManifests.Provider,
-                () => materializationConnection = new SqliteConnection(connectionString));
+                () => materializationConnection = new SqliteConnection(connectionString),
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             Assert.NotNull(materializationConnection);
             Assert.Equal(ConnectionState.Closed, materializationConnection.State);
@@ -246,6 +281,7 @@ public sealed class SqliteDocumentStoreTests
                     SqliteTestManifests.MetadataManifest(),
                     SqliteTestManifests.Provider,
                     () => materializationConnection = new SqliteConnection(connectionString),
+                    Groundwork.Documents.Scoping.DocumentStoreAccess.Global,
                     cancellationToken: cancellation.Token));
 
             Assert.Null(materializationConnection);
@@ -261,15 +297,17 @@ public sealed class SqliteDocumentStoreTests
     {
         var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-failure-{Guid.NewGuid():N}.db");
         var connectionString = $"Data Source={databasePath};Pooling=False";
+        var inaccessibleConnectionString = $"Data Source={Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "missing.db")};Pooling=False";
         SqliteConnection? materializationConnection = null;
         try
         {
-            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            await Assert.ThrowsAsync<SqliteException>(() =>
                 SqliteDocumentStoreFactory.CreateAsync(
                     connectionString,
-                    WithCompoundIndex(SqliteTestManifests.MetadataManifest()),
+                    SqliteTestManifests.MetadataManifest(),
                     SqliteTestManifests.Provider,
-                    () => materializationConnection = new SqliteConnection(connectionString)));
+                    () => materializationConnection = new SqliteConnection(inaccessibleConnectionString),
+                    Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
 
             Assert.NotNull(materializationConnection);
             Assert.Equal(ConnectionState.Closed, materializationConnection.State);
@@ -306,7 +344,8 @@ public sealed class SqliteDocumentStoreTests
                     });
                     operationConnections.Add(connection);
                     return connection;
-                });
+                },
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             await using (var connection = new SqliteConnection(connectionString))
             {
@@ -425,7 +464,7 @@ public sealed class SqliteDocumentStoreTests
     public async Task MissingRowDuringUnguardedUpdateReturnsNotFound()
     {
         await using var harness = await SqliteDocumentStoreHarness.Create();
-        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new MissingUpdateDialect());
+        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new MissingUpdateDialect(), Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument",
@@ -448,7 +487,7 @@ public sealed class SqliteDocumentStoreTests
     public async Task MissingRowDuringUnguardedDeleteReturnsNotFound()
     {
         await using var harness = await SqliteDocumentStoreHarness.Create();
-        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new MissingDeleteDialect());
+        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new MissingDeleteDialect(), Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await harness.Store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument",
@@ -467,7 +506,7 @@ public sealed class SqliteDocumentStoreTests
     public async Task DependencyFailureDuringIndexRefreshReturnsNotFoundAndRollsBack()
     {
         await using var harness = await SqliteDocumentStoreHarness.Create();
-        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new DependencyFailureDialect());
+        var store = new RelationalDocumentStore(harness.Connection, SqliteTestManifests.MetadataManifest(), new DependencyFailureDialect(), Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         var result = await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument",
@@ -602,7 +641,7 @@ public sealed class SqliteDocumentStoreTests
             var connection = new SqliteConnection("Data Source=:memory:");
             var manifest = SqliteTestManifests.MetadataManifest();
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
-            return new SqliteDocumentStoreHarness(connection, new SqliteDocumentStore(connection, manifest));
+            return new SqliteDocumentStoreHarness(connection, new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
         }
 
         public async ValueTask DisposeAsync() => await Connection.DisposeAsync();

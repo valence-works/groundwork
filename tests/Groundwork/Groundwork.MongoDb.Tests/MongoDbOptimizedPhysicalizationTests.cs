@@ -116,7 +116,7 @@ public sealed class MongoDbOptimizedPhysicalizationTests : IAsyncLifetime
             var unit = manifest.StorageUnits.Single() with { Physicalization = PhysicalizationPolicy.Optimized };
             manifest = manifest with { StorageUnits = [unit] };
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, MongoDbTestManifests.Provider);
-            return new MongoDbOptimizedHarness(client, database, new MongoDbDocumentStore(database, manifest), unit);
+            return new MongoDbOptimizedHarness(client, database, new MongoDbDocumentStore(database, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global), unit);
         }
 
         public string PhysicalizedPath(string indexName)
@@ -135,7 +135,7 @@ public sealed class MongoDbOptimizedPhysicalizationTests : IAsyncLifetime
         public async Task<(string Key, string Category, long Version)> LoadPhysicalizedAsync(string id)
         {
             var document = await Collection
-                .Find(Builders<BsonDocument>.Filter.Eq("_id", id))
+                .Find(Builders<BsonDocument>.Filter.Eq("_id.id", id))
                 .SingleAsync();
             var physicalized = document.GetValue("physicalized").AsBsonDocument;
             var fields = PhysicalizationProjection.EligibleFields(Unit).ToDictionary(field => field.Name, StringComparer.Ordinal);

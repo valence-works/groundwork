@@ -7,11 +7,11 @@ namespace Groundwork.Relational.Documents;
 /// <summary>
 /// Translates a <see cref="PortableDocumentQuery"/> into a parameterized SQL predicate over the
 /// generic <c>groundwork_document_indexes</c> table using EXISTS sub-queries, honouring the closed
-/// contract's operator, composition, ordering, paging, and tenant-scope semantics.
+/// contract's operator, composition, ordering, paging, and bound storage-scope semantics.
 /// </summary>
 internal sealed class RelationalClosedQueryTranslator
 {
-    private const string Columns = "d.document_kind, d.id, d.schema_version, d.version, d.content_json, d.created_utc, d.updated_utc";
+    private const string Columns = "d.document_kind, d.storage_scope, d.id, d.schema_version, d.version, d.content_json, d.created_utc, d.updated_utc";
     private const string IndexTable = "groundwork_document_indexes";
 
     private readonly RelationalDocumentStoreDialect dialect;
@@ -33,14 +33,14 @@ internal sealed class RelationalClosedQueryTranslator
         StorageUnit unit,
         PortableDocumentQuery query,
         RelationalDocumentStoreDialect dialect,
-        string? ambientTenantId,
+        string? storageScope,
         out string whereSql,
         out string orderSql)
     {
         var translator = new RelationalClosedQueryTranslator(dialect);
-        whereSql = translator.BuildWhere(unit, query, ambientTenantId);
+        whereSql = translator.BuildWhere(unit, query, storageScope);
         translator.whereParameterCount = translator.parameterCounter;
-        orderSql = translator.BuildOrder(unit, query);
+        orderSql = translator.BuildOrder(unit, query, acrossScopes: storageScope is null);
         return translator;
     }
 
@@ -60,17 +60,16 @@ internal sealed class RelationalClosedQueryTranslator
     public string CountSql(string whereSql) =>
         $"SELECT COUNT(*) FROM groundwork_documents d WHERE {whereSql};";
 
-    private string BuildWhere(StorageUnit unit, PortableDocumentQuery query, string? ambientTenantId)
+    private string BuildWhere(StorageUnit unit, PortableDocumentQuery query, string? storageScope)
     {
         var builder = new StringBuilder();
-        builder.Append("d.document_kind = ").Append(AddParameter(unit.Identity.Value));
+        builder.Append(dialect.ExactEqualityPredicate("d.document_kind", AddParameter(unit.Identity.Value)));
 
         foreach (var clause in query.Clauses)
             builder.Append(" AND ").Append(BuildClause(unit, clause));
 
-        var tenantPredicate = BuildTenantPredicate(unit, query, ambientTenantId);
-        if (tenantPredicate is not null)
-            builder.Append(" AND ").Append(tenantPredicate);
+        if (storageScope is not null)
+            builder.Append(" AND ").Append(dialect.ExactEqualityPredicate("d.storage_scope", AddParameter(storageScope)));
 
         return builder.ToString();
     }
@@ -103,7 +102,7 @@ internal sealed class RelationalClosedQueryTranslator
         var value = comparison.Values.Count > 0 ? comparison.Values[0] : null;
         return value is null
             ? NotExists(indexParameter)
-            : $"({Exists(indexParameter, $"{Alias()}.index_value = {AddParameter(value)}")})";
+            : $"({Exists(indexParameter, dialect.ExactEqualityPredicate($"{Alias()}.index_value", AddParameter(value)))})";
     }
 
     private string BuildIn(QueryComparison comparison, string indexParameter)
@@ -115,8 +114,8 @@ internal sealed class RelationalClosedQueryTranslator
             return hasNull ? NotExists(indexParameter) : "(1 = 0)";
 
         var alias = aliasCounter; // capture alias used by the next Exists call
-        var inList = string.Join(", ", nonNull.Select(AddParameter));
-        var membership = $"({Exists(indexParameter, $"x{alias}.index_value IN ({inList})")})";
+        var valueParameters = nonNull.Select(AddParameter).ToArray();
+        var membership = $"({Exists(indexParameter, dialect.ExactInPredicate($"x{alias}.index_value", valueParameters))})";
 
         return hasNull ? $"({membership} OR {NotExists(indexParameter)})" : membership;
     }
@@ -133,31 +132,23 @@ internal sealed class RelationalClosedQueryTranslator
         return $"({Exists(indexParameter, predicate)})";
     }
 
-    private string? BuildTenantPredicate(StorageUnit unit, PortableDocumentQuery query, string? ambientTenantId)
-    {
-        if (query.TenantScope == QueryTenantScope.TenantAgnostic || ambientTenantId is null)
-            return null;
-
-        var tenantIndex = ClosedQueryIndexResolver.ResolveTenantIndex(unit);
-        if (tenantIndex is null)
-            return null;
-
-        var indexParameter = AddParameter(tenantIndex.Identity);
-        return $"({Exists(indexParameter, $"{Alias()}.index_value = {AddParameter(ambientTenantId)}")})";
-    }
-
-    private string BuildOrder(StorageUnit unit, PortableDocumentQuery query)
+    private string BuildOrder(StorageUnit unit, PortableDocumentQuery query, bool acrossScopes)
     {
         if (query.Order is null)
-            return "ORDER BY d.id";
+            return acrossScopes ? "ORDER BY d.storage_scope, d.id" : "ORDER BY d.id";
 
         var index = ClosedQueryIndexResolver.ResolveOrderIndex(unit, query.Order.IndexName);
         var indexParameter = AddParameter(index.Identity);
         var direction = query.Order.Descending ? "DESC" : "ASC";
         var subquery =
             $"(SELECT xo.index_value FROM {IndexTable} xo " +
-            $"WHERE xo.document_kind = d.document_kind AND xo.document_id = d.id AND xo.index_name = {indexParameter})";
-        return $"ORDER BY {subquery} {direction}, d.id";
+            $"WHERE {dialect.ExactJoinPredicate("xo.document_kind", "d.document_kind")} " +
+            $"AND {dialect.ExactJoinPredicate("xo.storage_scope", "d.storage_scope")} " +
+            $"AND {dialect.ExactJoinPredicate("xo.document_id", "d.id")} " +
+            $"AND {dialect.ExactEqualityPredicate("xo.index_name", indexParameter)})";
+        return acrossScopes
+            ? $"ORDER BY {subquery} {direction}, d.storage_scope, d.id"
+            : $"ORDER BY {subquery} {direction}, d.id";
     }
 
     private string Exists(string indexParameter, string valuePredicate)
@@ -165,8 +156,10 @@ internal sealed class RelationalClosedQueryTranslator
         var alias = $"x{aliasCounter++}";
         return
             $"EXISTS (SELECT 1 FROM {IndexTable} {alias} " +
-            $"WHERE {alias}.document_kind = d.document_kind AND {alias}.document_id = d.id " +
-            $"AND {alias}.index_name = {indexParameter} AND {valuePredicate})";
+            $"WHERE {dialect.ExactJoinPredicate($"{alias}.document_kind", "d.document_kind")} " +
+            $"AND {dialect.ExactJoinPredicate($"{alias}.storage_scope", "d.storage_scope")} " +
+            $"AND {dialect.ExactJoinPredicate($"{alias}.document_id", "d.id")} " +
+            $"AND {dialect.ExactEqualityPredicate($"{alias}.index_name", indexParameter)} AND {valuePredicate})";
     }
 
     private string NotExists(string indexParameter)
@@ -174,8 +167,10 @@ internal sealed class RelationalClosedQueryTranslator
         var alias = $"x{aliasCounter++}";
         return
             $"NOT EXISTS (SELECT 1 FROM {IndexTable} {alias} " +
-            $"WHERE {alias}.document_kind = d.document_kind AND {alias}.document_id = d.id " +
-            $"AND {alias}.index_name = {indexParameter})";
+            $"WHERE {dialect.ExactJoinPredicate($"{alias}.document_kind", "d.document_kind")} " +
+            $"AND {dialect.ExactJoinPredicate($"{alias}.storage_scope", "d.storage_scope")} " +
+            $"AND {dialect.ExactJoinPredicate($"{alias}.document_id", "d.id")} " +
+            $"AND {dialect.ExactEqualityPredicate($"{alias}.index_name", indexParameter)})";
     }
 
     private string Alias() => $"x{aliasCounter}";

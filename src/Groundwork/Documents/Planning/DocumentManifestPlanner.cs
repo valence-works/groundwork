@@ -22,7 +22,7 @@ public sealed class DocumentManifestPlanner(MaterializationPlanner materializati
                 new DocumentEnvelopePlan(
                     unit.IdentityPolicy.FieldName,
                     unit.Concurrency.TokenField,
-                    unit.Tenancy.PartitionField,
+                    "storage_scope",
                     unit.Serialization.SchemaField),
                 unit.Indexes
                     .Select(index => new DocumentIndexPlan(

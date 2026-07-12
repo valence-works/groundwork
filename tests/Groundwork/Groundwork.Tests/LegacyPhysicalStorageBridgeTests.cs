@@ -116,7 +116,7 @@ public sealed class LegacyPhysicalStorageBridgeTests
         Assert.True(physicalIndex.IsUnique);
         Assert.Collection(
             physicalIndex.Columns,
-            column => Assert.Equal("tenant_id", column.ColumnLogicalName),
+            column => Assert.Equal("storage_scope", column.ColumnLogicalName),
             column => Assert.Equal("by-key", column.ColumnLogicalName));
     }
 

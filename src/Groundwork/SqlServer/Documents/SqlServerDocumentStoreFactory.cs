@@ -3,6 +3,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.Provider.Relational;
+using Groundwork.Documents.Scoping;
 using Groundwork.SqlServer.Materialization;
 using Microsoft.Data.SqlClient;
 
@@ -14,7 +15,8 @@ public static class SqlServerDocumentStoreFactory
         string connectionString,
         StorageManifest manifest,
         ProviderIdentity provider,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default) =>
         CreateAsync(
             connectionString,
@@ -22,7 +24,8 @@ public static class SqlServerDocumentStoreFactory
             provider,
             () => new SqlConnection(connectionString),
             () => new SqlConnection(connectionString),
-            ambientTenantId,
+            access,
+            scopeObserver,
             cancellationToken);
 
     internal static async Task<SqlServerDocumentStore> CreateAsync(
@@ -31,7 +34,8 @@ public static class SqlServerDocumentStoreFactory
         ProviderIdentity provider,
         Func<SqlConnection> createMaterializationConnection,
         Func<SqlConnection> createOperationConnection,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
@@ -40,15 +44,18 @@ public static class SqlServerDocumentStoreFactory
         ArgumentNullException.ThrowIfNull(createMaterializationConnection);
         ArgumentNullException.ThrowIfNull(createOperationConnection);
 
+        var plan = CreateMaterializationPlan(manifest, provider).RequirePlannable();
+
         var store = new SqlServerDocumentStore(
             RelationalSessionFactory.Concurrent(createOperationConnection),
             manifest,
-            ambientTenantId);
+            access,
+            scopeObserver);
         var materializationSessions = RelationalSessionFactory.Concurrent(createMaterializationConnection);
         await materializationSessions.ExecuteAsync(async (connection, ct) =>
         {
             await new SqlServerGroundworkMaterializer((SqlConnection)connection).MaterializeAsync(
-                CreateMaterializationPlan(manifest, provider),
+                plan,
                 ct);
             return true;
         }, cancellationToken);

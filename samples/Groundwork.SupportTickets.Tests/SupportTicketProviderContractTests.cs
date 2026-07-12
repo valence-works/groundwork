@@ -247,7 +247,7 @@ internal sealed class MongoDbSupportTicketProviderHarness(
         var unit = manifest.StorageUnits.Single(unit => unit.Identity.Value == documentKind);
         var document = await database
             .GetCollection<BsonDocument>(MongoDbGroundworkNames.CollectionName(unit))
-            .Find(Builders<BsonDocument>.Filter.Eq("_id", documentId))
+            .Find(Builders<BsonDocument>.Filter.Eq("_id.id", documentId))
             .SingleAsync();
 
         Assert.True(document.TryGetValue("physicalized", out var physicalized));

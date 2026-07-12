@@ -20,7 +20,7 @@ internal static class SqliteTestManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.None,
+                    TenancyPolicy.Global,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [

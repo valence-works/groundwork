@@ -28,7 +28,7 @@ public static class SupportTicketExternalModuleManifest
                         InboxCapabilities.IdempotentConsumer),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.None,
+                    TenancyPolicy.Global,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [],

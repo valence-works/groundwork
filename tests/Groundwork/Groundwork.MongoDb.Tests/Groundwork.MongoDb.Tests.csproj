@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <Compile Include="..\TestInfrastructure\RepositoryRootLocator.cs" Link="TestInfrastructure\RepositoryRootLocator.cs" />
+    <Compile Include="..\TestInfrastructure\StorageScopeDocumentStoreConformance.cs" Link="TestInfrastructure\StorageScopeDocumentStoreConformance.cs" />
   </ItemGroup>
 
   <ItemGroup>

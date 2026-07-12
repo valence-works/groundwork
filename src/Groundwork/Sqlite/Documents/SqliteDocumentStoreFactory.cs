@@ -3,6 +3,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.Provider.Relational;
+using Groundwork.Documents.Scoping;
 using Groundwork.Sqlite.Materialization;
 using Microsoft.Data.Sqlite;
 
@@ -14,7 +15,8 @@ public static class SqliteDocumentStoreFactory
         string connectionString,
         StorageManifest manifest,
         ProviderIdentity provider,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default) =>
         CreateAsync(
             connectionString,
@@ -22,7 +24,8 @@ public static class SqliteDocumentStoreFactory
             provider,
             () => new SqliteConnection(connectionString),
             () => new SqliteConnection(connectionString),
-            ambientTenantId,
+            access,
+            scopeObserver,
             cancellationToken);
 
     internal static Task<SqliteDocumentStore> CreateAsync(
@@ -30,7 +33,8 @@ public static class SqliteDocumentStoreFactory
         StorageManifest manifest,
         ProviderIdentity provider,
         Func<SqliteConnection> createMaterializationConnection,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default) =>
         CreateAsync(
             connectionString,
@@ -38,7 +42,8 @@ public static class SqliteDocumentStoreFactory
             provider,
             createMaterializationConnection,
             () => new SqliteConnection(connectionString),
-            ambientTenantId,
+            access,
+            scopeObserver,
             cancellationToken);
 
     internal static async Task<SqliteDocumentStore> CreateAsync(
@@ -47,7 +52,8 @@ public static class SqliteDocumentStoreFactory
         ProviderIdentity provider,
         Func<SqliteConnection> createMaterializationConnection,
         Func<SqliteConnection> createOperationConnection,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
@@ -57,15 +63,18 @@ public static class SqliteDocumentStoreFactory
         ArgumentNullException.ThrowIfNull(createOperationConnection);
         SqliteRelationalSessions.ValidateStatelessConnectionString(connectionString);
 
+        var plan = CreateMaterializationPlan(manifest, provider).RequirePlannable();
+
         var store = new SqliteDocumentStore(
             RelationalSessionFactory.Serialized(createOperationConnection),
             manifest,
-            ambientTenantId);
+            access,
+            scopeObserver);
         var materializationSessions = RelationalSessionFactory.Concurrent(createMaterializationConnection);
         await materializationSessions.ExecuteAsync(async (connection, ct) =>
         {
             await new SqliteGroundworkMaterializer((SqliteConnection)connection).MaterializeAsync(
-                CreateMaterializationPlan(manifest, provider),
+                plan,
                 ct);
             return true;
         }, cancellationToken);
