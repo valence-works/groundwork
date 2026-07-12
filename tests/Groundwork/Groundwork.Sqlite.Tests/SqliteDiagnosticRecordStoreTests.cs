@@ -43,7 +43,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
     }
 
     [Fact]
-    public void Latest_per_key_sql_uses_an_ordinary_join_and_sargable_snapshot_predicate()
+    public void Latest_per_key_sql_avoids_a_redundant_record_join_and_keeps_the_snapshot_sargable()
     {
         var store = new SqliteDiagnosticRecordStore(
             new SqliteConnectionStringBuilder { DataSource = Path.Combine(Path.GetTempPath(), $"groundwork-sql-{Guid.NewGuid():N}.db") }.ToString(),
@@ -59,8 +59,8 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
         Assert.DoesNotContain("CROSS JOIN", sql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("INDEXED BY", sql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("cursor + 0", sql, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("lr.cursor <= @snapshot", sql, StringComparison.Ordinal);
-        Assert.Contains("groundwork_diagnostic_fields lfield\n    JOIN groundwork_diagnostic_records lr", sql, StringComparison.Ordinal);
+        Assert.Contains("lfield.cursor <= @snapshot", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("groundwork_diagnostic_records lr", sql, StringComparison.Ordinal);
     }
 
     [Theory]

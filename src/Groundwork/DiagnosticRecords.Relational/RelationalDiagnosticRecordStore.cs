@@ -76,10 +76,46 @@ public sealed class RelationalDiagnosticRecordStore :
         DiagnosticRecordRequestValidator.Validate(batch, definition);
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendBeforeCommit, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
+        await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendBeforeStreamLock, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
 
-        var execution = await writeSessions.AutonomousExecutor.ExecuteAsync(
-            async (connection, transaction, ct) => await AppendInTransactionAsync(connection, transaction, batch, ct),
-            cancellationToken);
+        OperationExecution<DiagnosticAppendResult> execution;
+        try
+        {
+            if (dialect.UsesSessionScopedStreamLock)
+            {
+                execution = await ExecuteSessionLockedWriteAsync(
+                    batch.Scope,
+                    batch.Stream,
+                    (connection, transaction, providerNow, ct) => AppendInTransactionAsync(
+                        connection,
+                        transaction,
+                        batch,
+                        providerNow,
+                        streamLockHeld: true,
+                        ct,
+                        cancellationToken),
+                    cancellationToken);
+            }
+            else
+            {
+                var providerNow = await AdvanceProviderClockAsync(cancellationToken);
+                execution = await writeSessions.AutonomousExecutor.ExecuteAsync(
+                    (connection, transaction, ct) => AppendInTransactionAsync(
+                        connection,
+                        transaction,
+                        batch,
+                        providerNow,
+                        streamLockHeld: false,
+                        ct,
+                        cancellationToken),
+                    cancellationToken);
+            }
+        }
+        catch (Exception exception) when (cancellationToken.IsCancellationRequested && exception is not OperationCanceledException)
+        {
+            throw new OperationCanceledException("The relational diagnostic append was canceled by the caller.", exception, cancellationToken);
+        }
         execution.ThrowIfFailed();
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendAfterCommitBeforeAcknowledgement, cancellationToken);
         return execution.Value!;
@@ -152,16 +188,53 @@ public sealed class RelationalDiagnosticRecordStore :
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.TrimBeforeCommit, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var execution = await writeSessions.AutonomousExecutor.ExecuteAsync(
-            async (connection, transaction, ct) => await TrimInTransactionAsync(connection, transaction, request, ct),
-            cancellationToken);
+        OperationExecution<DiagnosticTrimResult> execution;
+        try
+        {
+            if (dialect.UsesSessionScopedStreamLock)
+            {
+                execution = await ExecuteSessionLockedWriteAsync(
+                    request.Scope,
+                    request.Stream,
+                    (connection, transaction, providerNow, ct) => TrimInTransactionAsync(
+                        connection,
+                        transaction,
+                        request,
+                        providerNow,
+                        streamLockHeld: true,
+                        ct,
+                        cancellationToken),
+                    cancellationToken);
+            }
+            else
+            {
+                var providerNow = await AdvanceProviderClockAsync(cancellationToken);
+                execution = await writeSessions.AutonomousExecutor.ExecuteAsync(
+                    (connection, transaction, ct) => TrimInTransactionAsync(
+                        connection,
+                        transaction,
+                        request,
+                        providerNow,
+                        streamLockHeld: false,
+                        ct,
+                        cancellationToken),
+                    cancellationToken);
+            }
+        }
+        catch (Exception exception) when (cancellationToken.IsCancellationRequested && exception is not OperationCanceledException)
+        {
+            throw new OperationCanceledException("The relational diagnostic trim was canceled by the caller.", exception, cancellationToken);
+        }
         execution.ThrowIfFailed();
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.TrimAfterCommitBeforeAcknowledgement, cancellationToken);
         return execution.Value!;
     }
 
-    internal RelationalDiagnosticCommand BuildQueryCommand(DiagnosticRecordQuery query, long snapshotHighWater) =>
-        new RelationalDiagnosticQueryBuilder(definition, dialect).Build(query, snapshotHighWater);
+    internal RelationalDiagnosticCommand BuildQueryCommand(DiagnosticRecordQuery query, long snapshotHighWater)
+    {
+        var command = new RelationalDiagnosticQueryBuilder(definition, dialect).Build(query, snapshotHighWater);
+        return command with { CommandText = dialect.PrepareCommandText(command.CommandText) };
+    }
 
     internal RelationalDiagnosticCommand BuildTrimSelectionCommand(DiagnosticTrimRequest request)
     {
@@ -175,16 +248,23 @@ public sealed class RelationalDiagnosticRecordStore :
               AND stream_id = {dialect.Parameter("stream")}
             ORDER BY cursor DESC
             """;
-        return new(dialect.ApplyLimit(sql, "keep"), parameters);
+        return new(dialect.PrepareCommandText(dialect.ApplyLimit(sql, "keep")), parameters);
     }
 
     private async Task<OperationExecution<DiagnosticAppendResult>> AppendInTransactionAsync(
         DbConnection connection,
         DbTransaction transaction,
         DiagnosticRecordBatch batch,
-        CancellationToken cancellationToken)
+        DateTimeOffset providerNow,
+        bool streamLockHeld,
+        CancellationToken cancellationToken,
+        CancellationToken observerCancellationToken)
     {
-        var providerNow = await AdvanceProviderClockAsync(connection, transaction, cancellationToken);
+        if (!streamLockHeld)
+            await AcquireStreamLockAsync(connection, transaction, batch.Scope, batch.Stream, cancellationToken);
+        // Once the stream writer boundary is held, finish or roll back at the staged hook instead
+        // of interrupting an arbitrary command halfway through the atomic mutation.
+        cancellationToken = CancellationToken.None;
         await CleanupExpiredOperationsAsync(connection, transaction, providerNow, cancellationToken);
         var prior = await ReadOperationAsync(connection, transaction, RelationalDiagnosticRecordSchema.AppendOperationsTable, batch.Scope, batch.Stream, batch.OperationId, cancellationToken);
         if (prior is not null)
@@ -227,8 +307,8 @@ public sealed class RelationalDiagnosticRecordStore :
             var cursor = firstCursor + index;
             await InsertRecordAsync(connection, transaction, batch.Scope, batch.Stream, cursor, input, cancellationToken);
             records.Add(new(input.RecordId, input.OccurredAt, input.Payload, new(cursor.ToString(CultureInfo.InvariantCulture)), input.Fields));
-            await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendAfterRecordStagedBeforeCommit, cancellationToken);
-            cancellationToken.ThrowIfCancellationRequested();
+            await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendAfterRecordStagedBeforeCommit, observerCancellationToken);
+            observerCancellationToken.ThrowIfCancellationRequested();
         }
 
         var logicalHighWater = await UpdateLogicalHighWaterAsync(connection, transaction, batch.Scope, batch.Stream, records, cancellationToken);
@@ -248,9 +328,16 @@ public sealed class RelationalDiagnosticRecordStore :
         DbConnection connection,
         DbTransaction transaction,
         DiagnosticTrimRequest request,
-        CancellationToken cancellationToken)
+        DateTimeOffset providerNow,
+        bool streamLockHeld,
+        CancellationToken cancellationToken,
+        CancellationToken observerCancellationToken)
     {
-        var providerNow = await AdvanceProviderClockAsync(connection, transaction, cancellationToken);
+        if (!streamLockHeld)
+            await AcquireStreamLockAsync(connection, transaction, request.Scope, request.Stream, cancellationToken);
+        // Once the stream writer boundary is held, finish or roll back at the staged hook instead
+        // of interrupting an arbitrary command halfway through the atomic mutation.
+        cancellationToken = CancellationToken.None;
         await CleanupExpiredOperationsAsync(connection, transaction, providerNow, cancellationToken);
         var prior = await ReadOperationAsync(connection, transaction, RelationalDiagnosticRecordSchema.TrimOperationsTable, request.Scope, request.Stream, request.OperationId, cancellationToken);
         if (prior is not null)
@@ -296,8 +383,8 @@ public sealed class RelationalDiagnosticRecordStore :
             };
             await ExecuteNonQueryAsync(connection, transaction, fieldDelete, cancellationToken);
             await ExecuteNonQueryAsync(connection, transaction, recordDelete, cancellationToken);
-            await interceptAsync(RelationalDiagnosticRecordExecutionPoint.TrimAfterRecordDeletedBeforeCommit, cancellationToken);
-            cancellationToken.ThrowIfCancellationRequested();
+            await interceptAsync(RelationalDiagnosticRecordExecutionPoint.TrimAfterRecordDeletedBeforeCommit, observerCancellationToken);
+            observerCancellationToken.ThrowIfCancellationRequested();
         }
 
         var statistics = await ReadStatisticsAsync(connection, transaction, request.Scope, request.Stream, cancellationToken);
@@ -313,21 +400,125 @@ public sealed class RelationalDiagnosticRecordStore :
         return OperationExecution<DiagnosticTrimResult>.Success(result);
     }
 
+    private Task<DateTimeOffset> AdvanceProviderClockAsync(CancellationToken cancellationToken) =>
+        writeSessions.AutonomousExecutor.ExecuteAsync(
+            (connection, transaction, ct) => AdvanceProviderClockInTransactionAsync(connection, transaction, ct),
+            cancellationToken);
+
     private async Task<DateTimeOffset> AdvanceProviderClockAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var providerNow = await AdvanceProviderClockInTransactionAsync(connection, transaction, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return providerNow;
+    }
+
+    private async Task<DateTimeOffset> AdvanceProviderClockInTransactionAsync(
         DbConnection connection,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
         var current = timeProvider.GetUtcNow().UtcTicks;
-        var existing = await ExecuteScalarNullableInt64Async(connection, transaction,
-            new($"SELECT clock_high_water_ticks FROM {RelationalDiagnosticRecordSchema.ProviderStateTable} WHERE id = 1;", EmptyParameters),
-            cancellationToken) ?? current;
-        var highWater = Math.Max(current, existing);
-        await ExecuteNonQueryAsync(connection, transaction,
-            new($"UPDATE {RelationalDiagnosticRecordSchema.ProviderStateTable} SET clock_high_water_ticks = {dialect.Parameter("clock")} WHERE id = 1;",
-                new Dictionary<string, object> { ["clock"] = highWater }),
+        var highWater = await ExecuteScalarInt64Async(
+            connection,
+            transaction,
+            new(
+                dialect.BuildProviderClockAdvance(RelationalDiagnosticRecordSchema.ProviderStateTable, "clock"),
+                new Dictionary<string, object> { ["clock"] = current }),
             cancellationToken);
         return new DateTimeOffset(highWater, TimeSpan.Zero);
+    }
+
+    private Task<T> ExecuteSessionLockedWriteAsync<T>(
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream,
+        Func<DbConnection, DbTransaction, DateTimeOffset, CancellationToken, Task<T>> writeAsync,
+        CancellationToken cancellationToken) =>
+        writeSessions.ExecuteAsync(async (connection, ct) =>
+        {
+            Exception? primaryFailure = null;
+            try
+            {
+                await ExecuteSessionStreamLockCommandAsync(connection, dialect.BuildStreamLock(), scope, stream, ct);
+                var providerNow = await AdvanceProviderClockAsync(connection, ct);
+                await using var transaction = await connection.BeginTransactionAsync(ct);
+                var result = await writeAsync(connection, transaction, providerNow, ct);
+                await transaction.CommitAsync(ct);
+                return result;
+            }
+            catch (Exception exception)
+            {
+                primaryFailure = exception;
+                throw;
+            }
+            finally
+            {
+                try
+                {
+                    await ReleaseSessionStreamLockAsync(
+                        connection,
+                        scope,
+                        stream,
+                        CancellationToken.None);
+                }
+                catch (Exception cleanupFailure)
+                {
+                    try
+                    {
+                        dialect.InvalidateConnectionPool(connection);
+                    }
+                    catch (Exception invalidationFailure)
+                    {
+                        cleanupFailure.Data["Groundwork.DiagnosticRecords.PoolInvalidationFailure"] = invalidationFailure;
+                    }
+
+                    if (primaryFailure is null)
+                        throw;
+                    primaryFailure.Data["Groundwork.DiagnosticRecords.StreamUnlockFailure"] = cleanupFailure;
+                }
+            }
+        }, cancellationToken);
+
+    private async Task ReleaseSessionStreamLockAsync(
+        DbConnection connection,
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream,
+        CancellationToken cancellationToken)
+    {
+        var result = await ExecuteScalarAsync(
+            connection,
+            transaction: null,
+            new(dialect.BuildStreamUnlock(), ScopeParameters(scope, stream)),
+            cancellationToken);
+        dialect.ValidateStreamUnlockResult(result);
+    }
+
+    private Task<int> ExecuteSessionStreamLockCommandAsync(
+        DbConnection connection,
+        string commandText,
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream,
+        CancellationToken cancellationToken) =>
+        ExecuteNonQueryAsync(
+            connection,
+            transaction: null,
+            new(commandText, ScopeParameters(scope, stream)),
+            cancellationToken);
+
+    private Task AcquireStreamLockAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            new(dialect.BuildStreamLock(), ScopeParameters(scope, stream)),
+            cancellationToken);
     }
 
     private async Task CleanupExpiredOperationsAsync(
@@ -471,20 +662,23 @@ public sealed class RelationalDiagnosticRecordStore :
 
     private async Task<IReadOnlyList<string>> FindExistingRecordIdsAsync(DbConnection connection, DbTransaction transaction, DiagnosticRecordBatch batch, CancellationToken cancellationToken)
     {
-        var parameters = ScopeParameters(batch.Scope, batch.Stream);
-        var ids = new List<string>();
-        for (var index = 0; index < batch.Records.Count; index++)
-        {
-            var name = $"record{index}";
-            parameters.Add(name, batch.Records[index].RecordId);
-            ids.Add(dialect.Parameter(name));
-        }
-        await using var command = CreateCommand(connection, transaction,
-            new($"SELECT record_id FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()} AND record_id IN ({string.Join(", ", ids)});", parameters));
         var conflicts = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-            conflicts.Add(reader.GetString(0));
+        foreach (var chunk in batch.Records.Chunk(Math.Max(1, dialect.MaxParametersPerCommand - 3)))
+        {
+            var parameters = ScopeParameters(batch.Scope, batch.Stream);
+            var ids = new List<string>(chunk.Length);
+            for (var index = 0; index < chunk.Length; index++)
+            {
+                var name = $"record{index}";
+                parameters.Add(name, chunk[index].RecordId);
+                ids.Add(dialect.Parameter(name));
+            }
+            await using var command = CreateCommand(connection, transaction,
+                new($"SELECT record_id FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()} AND record_id IN ({string.Join(", ", ids)});", parameters));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                conflicts.Add(reader.GetString(0));
+        }
         return conflicts;
     }
 
@@ -606,21 +800,22 @@ public sealed class RelationalDiagnosticRecordStore :
     {
         if (rows.Count == 0)
             return [];
-        var cursors = rows.Select((row, index) => (row.Cursor, Name: $"cursor{index}")).ToArray();
-        var parameters = new Dictionary<string, object>(StringComparer.Ordinal)
-        {
-            ["tenant"] = rows[0].TenantId,
-            ["scope"] = rows[0].ScopeId,
-            ["stream"] = rows[0].StreamId
-        };
-        foreach (var cursor in cursors)
-            parameters.Add(cursor.Name, cursor.Cursor);
-        await using var command = CreateCommand(connection, transaction,
-            new($"SELECT cursor, field_name, value_ordinal, field_type, canonical_value FROM {RelationalDiagnosticRecordSchema.FieldsTable} WHERE cursor IN ({string.Join(", ", cursors.Select(cursor => dialect.Parameter(cursor.Name)))}) AND tenant_id = {dialect.Parameter("tenant")} AND scope_id = {dialect.Parameter("scope")} AND stream_id = {dialect.Parameter("stream")} ORDER BY cursor, field_name, value_ordinal;",
-                parameters));
         var fieldsByCursor = new Dictionary<long, Dictionary<string, List<(int Ordinal, DiagnosticFieldValue Value)>>>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        foreach (var chunk in rows.Chunk(Math.Max(1, dialect.MaxParametersPerCommand - 3)))
         {
+            var cursors = chunk.Select((row, index) => (row.Cursor, Name: $"cursor{index}")).ToArray();
+            var parameters = new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                ["tenant"] = rows[0].TenantId,
+                ["scope"] = rows[0].ScopeId,
+                ["stream"] = rows[0].StreamId
+            };
+            foreach (var cursor in cursors)
+                parameters.Add(cursor.Name, cursor.Cursor);
+            await using var command = CreateCommand(connection, transaction,
+                new($"SELECT cursor, field_name, value_ordinal, field_type, canonical_value FROM {RelationalDiagnosticRecordSchema.FieldsTable} WHERE cursor IN ({string.Join(", ", cursors.Select(cursor => dialect.Parameter(cursor.Name)))}) AND tenant_id = {dialect.Parameter("tenant")} AND scope_id = {dialect.Parameter("scope")} AND stream_id = {dialect.Parameter("stream")} ORDER BY cursor, field_name, value_ordinal;",
+                    parameters));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
                 var cursor = reader.GetInt64(0);
@@ -690,40 +885,41 @@ public sealed class RelationalDiagnosticRecordStore :
     private string ScopeWhere() => $"tenant_id = {dialect.Parameter("tenant")} AND scope_id = {dialect.Parameter("scope")} AND stream_id = {dialect.Parameter("stream")}";
     private string OperationWhere() => $"{ScopeWhere()} AND issued_at_ticks = {dialect.Parameter("issued")} AND nonce = {dialect.Parameter("nonce")}";
 
-    private static DbCommand CreateCommand(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand commandDefinition)
+    private DbCommand CreateCommand(DbConnection connection, DbTransaction? transaction, RelationalDiagnosticCommand commandDefinition)
     {
         var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = commandDefinition.CommandText;
+        command.CommandText = dialect.PrepareCommandText(commandDefinition.CommandText);
         foreach (var parameter in commandDefinition.Parameters)
             AddParameter(command, parameter.Key, parameter.Value);
         return command;
     }
 
-    private static void AddParameter(DbCommand command, string name, object value)
+    private void AddParameter(DbCommand command, string name, object value)
     {
         var parameter = command.CreateParameter();
         parameter.ParameterName = $"@{name}";
         parameter.Value = value;
+        dialect.ConfigureParameter(parameter, value);
         command.Parameters.Add(parameter);
     }
 
-    private static async Task<int> ExecuteNonQueryAsync(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
+    private async Task<int> ExecuteNonQueryAsync(DbConnection connection, DbTransaction? transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
     {
         await using var dbCommand = CreateCommand(connection, transaction, command);
         return await dbCommand.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task<long> ExecuteScalarInt64Async(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken) =>
+    private async Task<long> ExecuteScalarInt64Async(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken) =>
         Convert.ToInt64(await ExecuteScalarAsync(connection, transaction, command, cancellationToken), CultureInfo.InvariantCulture);
 
-    private static async Task<long?> ExecuteScalarNullableInt64Async(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
+    private async Task<long?> ExecuteScalarNullableInt64Async(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
     {
         var result = await ExecuteScalarAsync(connection, transaction, command, cancellationToken);
         return result is null or DBNull ? null : Convert.ToInt64(result, CultureInfo.InvariantCulture);
     }
 
-    private static async Task<object?> ExecuteScalarAsync(DbConnection connection, DbTransaction transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
+    private async Task<object?> ExecuteScalarAsync(DbConnection connection, DbTransaction? transaction, RelationalDiagnosticCommand command, CancellationToken cancellationToken)
     {
         await using var dbCommand = CreateCommand(connection, transaction, command);
         return await dbCommand.ExecuteScalarAsync(cancellationToken);

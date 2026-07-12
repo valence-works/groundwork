@@ -59,6 +59,12 @@ public abstract class DiagnosticRecordContractTests
         Assert.Throws<ArgumentException>(() => new DiagnosticFieldValue(DiagnosticFieldType.Timestamp, "2026-07-12T12:00:00"));
         Assert.True(DiagnosticFieldValue.Decimal(0.0000000000000000000000000001m)
             .CompareTo(DiagnosticFieldValue.Decimal(0.0000000000000000000000000002m), DiagnosticStringCasePolicy.Ordinal) < 0);
+        var supplementary = DiagnosticFieldValue.String("\U00010000");
+        var bmp = DiagnosticFieldValue.String("\uE000");
+        Assert.True(supplementary.CompareTo(bmp, DiagnosticStringCasePolicy.Ordinal) < 0);
+        Assert.Equal("D800DC00", DiagnosticStringComparisonKey.CreateOrdinal(supplementary.CanonicalValue));
+        Assert.Throws<ArgumentException>(() => DiagnosticFieldValue.String("\uD800"));
+        Assert.Throws<ArgumentException>(() => DiagnosticFieldValue.String("contains\0nul"));
     }
 
     [Theory]
@@ -119,6 +125,23 @@ public abstract class DiagnosticRecordContractTests
             DiagnosticRecordQueryValidator.Validate(query, definition, handler));
 
         Assert.Contains(exception.Errors, x => x.Code == "query.predicate.range_reversed");
+        definition = Definition() with { Limits = new(MaxPredicateValues: 2) };
+        handler = new StubQueryHandler(new(
+            Enum.GetValues<DiagnosticPredicateOperator>().ToHashSet(), true, true, true, true, true));
+        query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.In(
+                "message",
+                DiagnosticFieldValue.String("one"),
+                DiagnosticFieldValue.String("two"),
+                DiagnosticFieldValue.String("three")));
+
+        exception = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(query, definition, handler));
+
+        Assert.Contains(exception.Errors, x => x.Code == "query.predicate.values.too_many");
     }
 
     [Fact]
