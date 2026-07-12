@@ -92,6 +92,15 @@ public static class PhysicalStorageDefinitionSerializer
         WriteNullableString(writer, "sharedStorage", definition.SharedStorage?.Value);
         if (definition.LinkedProjectionLogicalName is not null)
             writer.WriteString("linkedProjectionLogicalName", definition.LinkedProjectionLogicalName);
+        if (definition.LinkedKey is not null)
+        {
+            writer.WritePropertyName("linkedKey");
+            writer.WriteStartObject();
+            writer.WriteString("documentId", definition.LinkedKey.DocumentIdColumn);
+            writer.WriteString("documentKind", definition.LinkedKey.DocumentKindColumn);
+            writer.WriteString("storageScope", definition.LinkedKey.StorageScopeColumn);
+            writer.WriteEndObject();
+        }
         writer.WriteNumber("schemaVersion", definition.SchemaVersion);
         WriteEvolution(writer, definition.Evolution);
         if (definition.Envelope is not null)
@@ -133,6 +142,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteStartObject();
             writer.WriteString("logicalName", index.LogicalName);
             writer.WriteBoolean("unique", index.IsUnique);
+            writer.WriteString("target", index.Target.ToString());
             writer.WriteNumber("schemaVersion", index.SchemaVersion);
             WriteEvolution(writer, index.Evolution);
             writer.WritePropertyName("columns");

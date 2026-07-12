@@ -29,7 +29,8 @@ _Avoid_: Portable mode, optimized mode
 The provider-neutral structural definition for one storage unit: its selected form, envelope and
 canonical JSON columns or shared-storage binding, projected columns, physical indexes, schema
 version, and evolution metadata. Shared or dedicated document storage may name an auxiliary linked
-projected/index table; physical-entity projections are stored in-primary.
+projected/index table with explicit relationship fields; physical-entity projections are stored
+in-primary.
 _Avoid_: Provider DDL, materialization plan
 
 **Resolved Physical Definition**:
@@ -41,6 +42,13 @@ _Avoid_: Provider physical definition, raw manifest
 A resolved physical definition with final provider identifiers and a deterministic fingerprint.
 It contains no provider SDK types and is the common input for later provider execution work.
 _Avoid_: Hand-authored provider schema
+
+**Executable Storage Route**:
+An immutable provider-neutral mapping compiled from one provider physical definition. It fixes the
+primary and linked objects, envelope fields, linked relationship fields, projected fields,
+scope/discriminator/identity keys, maintenance targets, candidate bounded-query paths, capability
+requirements, resolved names, and fingerprints consumed by later provider execution.
+_Avoid_: Provider query translation, inferred workload route, raw DDL plan
 
 **Schema History**:
 Durable evidence of the resolved definition, names, fingerprint, and operations applied to a

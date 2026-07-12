@@ -69,6 +69,12 @@ SQLite serialization/private-memory rejection and relational concurrency/pool pr
 completes the factory-registration portion of objective 4; session/pool observability remains part
 of objectives 7 and 9.
 
+Executable-route progress: [issue #43](https://github.com/valence-works/Groundwork/issues/43)
+compiles provider physical definitions into one immutable Core mapping for primary/linked objects,
+resolved envelope/relationship/projected fields, target-aware collision scopes, keys, maintenance
+targets, candidate query paths, capability requirements, and deterministic fingerprints. Provider
+DDL and runtime consumers remain subsequent work units.
+
 ## Readiness Gates
 
 - Canonical JSON remains authoritative in every document and physical entity row; projected columns are atomically maintained and rebuildable.

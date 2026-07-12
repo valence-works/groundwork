@@ -1,6 +1,6 @@
 # Groundwork Core
 
-Groundwork Core defines provider-neutral persistence intent: manifests, storage units, storage intent, logical indexes, bounded queries, physical table definitions, deterministic name resolution, provider capabilities, materialization plan concepts, schema-history records, migration contracts, and validation diagnostics.
+Groundwork Core defines provider-neutral persistence intent: manifests, storage units, storage intent, logical indexes, bounded queries, physical table definitions, deterministic name resolution, executable storage routes, provider capabilities, materialization plan concepts, schema-history records, migration contracts, and validation diagnostics.
 
 This package is generic infrastructure. It does not reference host-specific packages or provider-specific database libraries.
 
@@ -8,8 +8,9 @@ This package is generic infrastructure. It does not reference host-specific pack
 
 - Storage manifests describe durable intent.
 - A manifest/composition owns shared document-storage definitions; units reference them by stable binding.
-- `PhysicalTableDefinition` describes shared, dedicated-document, or physical-entity structure without provider SDK types or DDL.
+- `PhysicalTableDefinition` describes shared, dedicated-document, or physical-entity structure without provider SDK types or DDL; declared indexes carry explicit primary/linked placement when a dedicated form uses both objects.
 - `PhysicalStorageResolver` applies declared defaults, host naming, per-unit overrides, provider normalization, collision validation, and deterministic fingerprints.
+- `ExecutableStorageRouteCompiler` freezes primary/linked objects, envelope/relationship/projected fields, keys, maintenance, query paths, capability requirements, resolved names, and fingerprints into one immutable provider input. See [`docs/executable-storage-routes.md`](../../../docs/executable-storage-routes.md).
 - Storage intent declares whether a unit is a portable document, benchmark-gated, or provider-specialized.
 - Provider capability reports describe what a provider can materialize.
 - Validators return structured diagnostics for preview and startup checks.
