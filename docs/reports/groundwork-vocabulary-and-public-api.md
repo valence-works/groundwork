@@ -107,6 +107,7 @@ The following terms are normative for new work.
 | **Document query** | The one runtime request model for a declared bounded document query. | Portable query vs optimized query. |
 | **Physical query plan** | A provider-selected execution choice over shared indexes, a dedicated table, or entity columns. It is diagnostic/provider output, not a caller request. | Document query. |
 | **Logical name** | A feature-owned default database-object name before host policy. | Quoted SQL identifier. |
+| **Physical object kind** | A provider-neutral naming category: `PrimaryStorage`, `LinkedIndexStorage`, `ProjectedField`, `PhysicalIndex`, or `SchemaHistory`. Providers map these categories to engine objects such as tables, collections, columns, fields, and indexes. | Raw provider object-type strings in host policy. |
 | **Resolved physical name** | The logical name after host policy and explicit per-unit override. | Provider-normalized identifier. |
 | **Provider identifier** | The final quoted/cased/length-bounded engine identifier after provider normalization and collision checking. | Business naming policy. |
 
@@ -141,7 +142,7 @@ The resolution pipeline is:
 
 `StorageManifest -> storage defaults -> PhysicalTableDefinition -> IPhysicalNamePolicy -> explicit per-unit override -> ResolvedPhysicalTableDefinition -> provider normalization -> ProviderPhysicalTableDefinition + fingerprint`
 
-- `IPhysicalNamePolicy` is provider-agnostic and receives storage-unit identity, object kind, and feature-default logical name. A function adapter may support simple prefix/suffix cases.
+- `IPhysicalNamePolicy` is provider-agnostic and receives storage-unit identity, a `PhysicalObjectKind`, and the feature-default logical name. A function adapter may support simple prefix/suffix cases.
 - An explicit per-unit override wins over the general host policy.
 - A provider-owned identifier policy handles only quoting, casing behavior, reserved words, maximum lengths, deterministic truncation, and collision detection.
 - The host-resolved model should be explicit—recommended name `ResolvedPhysicalTableDefinition`—and remain provider-neutral.
@@ -250,8 +251,10 @@ Each slice must keep canonical JSON authoritative, preserve caller-independent p
 | `PhysicalTableDefinition` | Adopt as the provider-neutral structural definition for the selected form. |
 | Active `Groundwork.Materialization` types | Keep and extend as the only preparation/evolution plan. |
 | Duplicate `Groundwork.Core.Materialization` types | Deprecate, then remove. |
+| `DocumentPlan` / `RelationalPlan` | Internalize as diagnostics/read models or replace with one resolved-storage plan; do not grow competing execution plans. |
 | `GroundworkMigration` structural operations | Converge into materialization diffs; retain explicit semantic migrations only. |
 | `PortableQueryDeclaration` | Evolve to `BoundedQueryDeclaration`. |
 | `PortableDocumentQuery` | Evolve to the single `DocumentQuery`. |
 | `DocumentStoreQuery` | Compatibility wrapper only, then remove. |
+| `ClosedQueryCapabilityModel` / `ClosedQueryNativeSupport` | Rename around bounded-query support and make production fallback an explicit validation policy. |
 | Provider naming helpers | Internal mechanics behind host policy and provider normalization. |
