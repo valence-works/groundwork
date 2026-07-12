@@ -1,0 +1,1432 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Queries;
+using Groundwork.Core.SchemaEvolution;
+using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
+using Groundwork.MongoDb.Documents;
+using Groundwork.MongoDb.Materialization;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using MongoDB.Driver.Core.Events;
+using Testcontainers.MongoDb;
+using Xunit;
+
+namespace Groundwork.MongoDb.Tests;
+
+public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
+{
+    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24")
+        .WithReplicaSet("groundwork-rs")
+        .Build();
+
+    public Task InitializeAsync() => container.StartAsync();
+
+    public Task DisposeAsync() => container.DisposeAsync().AsTask();
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Forms_route_crud_occ_query_count_page_order_and_canonical_json(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        await materializer.MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        var first = await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open","rank":2}"""));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "2", "1", """{"status":"open","rank":1}"""));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "3", "1", """{"status":"closed","rank":3}"""));
+        var conflict = await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "1", "1", """{"status":"closed","rank":2}""", ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, first.Status);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, conflict.Status);
+        Assert.Equal("""{"status":"open","rank":2}""", (await store.LoadAsync("workItem", "1"))!.ContentJson);
+
+        var query = new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))],
+            order: [new DocumentQueryOrder("status")],
+            skip: 1,
+            take: 1);
+        var page = await store.QueryAsync(query);
+        Assert.Equal(2, page.TotalCount);
+        Assert.Single(page.Documents);
+        Assert.Equal(2, await store.CountAsync(query.Select(BoundedQueryResultOperation.Count)));
+        Assert.True(await store.AnyAsync(query.Select(BoundedQueryResultOperation.Any)));
+        Assert.NotNull(await store.FirstOrDefaultAsync(query.Select(BoundedQueryResultOperation.First)));
+
+        var route = Assert.Single(model.Routes);
+        var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, "1"))
+            .SingleAsync();
+        Assert.Equal("""{"status":"open","rank":2}""", primary[route.Envelope.CanonicalJson.Identifier].AsString);
+        if (form == PhysicalStorageForm.PhysicalEntityTable)
+            Assert.Equal("open", primary[route.ProjectedColumns.Single().Column.Identifier].AsString);
+        else
+            Assert.Equal("open", (await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+                .Find(Builders<BsonDocument>.Filter.Empty).FirstAsync())[route.ProjectedColumns.Single().Column.Identifier].AsString);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Concurrent_same_identity_creates_converge_to_one_saved_result_without_provider_errors(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var saves = Enumerable.Range(0, 16).Select(async index =>
+        {
+            await start.Task;
+            return await store.SaveAsync(new SaveDocumentRequest(
+                "workItem",
+                "same-id",
+                "1",
+                $$"""{"status":"open","rank":{{index}}}""",
+                ExpectedVersion: 0));
+        }).ToArray();
+
+        start.SetResult();
+        var results = await Task.WhenAll(saves);
+
+        Assert.Single(results, result => result.Status == DocumentStoreWriteStatus.Saved);
+        Assert.Equal(15, results.Count(result => result.Status == DocumentStoreWriteStatus.ConcurrencyConflict));
+        Assert.NotNull(await store.LoadAsync("workItem", "same-id"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Unit_of_work_conflict_is_terminal_and_rolls_back_prior_writes(PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("workItem"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "one", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "one", "1", """{"status":"closed","rank":2}""", ExpectedVersion: 0))).Status);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        Assert.Contains("completed", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(await store.LoadAsync("workItem", "one"));
+    }
+
+    [Fact]
+    public async Task Unit_of_work_unique_write_error_returns_a_structured_conflict_and_is_terminal()
+    {
+        var database = Database();
+        var model = EntityEvolutionModel(includeStatus: true, uniqueStatus: true);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":1,"status":"alpha"}""", ExpectedVersion: 0))).Status);
+
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("workItem"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "staged-before-conflict", "1", """{"rank":3,"status":"beta"}""", ExpectedVersion: 0))).Status);
+        var conflict = await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "conflicting", "1", """{"rank":2,"status":"alpha"}""", ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, conflict.Status);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.RollbackAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.LoadAsync("workItem", "existing"));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "after-terminal", "1", """{"rank":4,"status":"gamma"}""")));
+        Assert.Null(await store.LoadAsync("workItem", "conflicting"));
+        Assert.Null(await store.LoadAsync("workItem", "staged-before-conflict"));
+    }
+
+    [Fact]
+    public async Task Applied_state_is_restart_safe_and_rejects_an_out_of_band_index_conflict()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, (await materializer.MaterializeAsync(model)).Outcome);
+
+        var route = Assert.Single(model.Routes);
+        var collection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
+        var index = Assert.Single(route.Indexes);
+        await collection.Indexes.DropOneAsync(index.Name.Identifier);
+        await collection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            Builders<BsonDocument>.IndexKeys.Ascending(route.Envelope.Id.Identifier),
+            new CreateIndexOptions { Name = index.Name.Identifier }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+        Assert.Contains("conflicts with durable applied route state", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Applied_state_rejects_a_missing_primary_collection_even_when_indexes_are_linked()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.SharedDocuments);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+
+        var route = Assert.Single(model.Routes);
+        await database.DropCollectionAsync(route.PrimaryStorage.Name.Identifier);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+        Assert.Contains(route.PrimaryStorage.Name.Identifier, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("durable applied route state", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Applied_state_rejects_missing_backfill_completion_evidence()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+
+        var ledger = database.GetCollection<BsonDocument>("groundwork_physical_schema_operations");
+        var removed = await ledger.DeleteOneAsync(Builders<BsonDocument>.Filter.Eq(
+            "kind",
+            PhysicalSchemaOperationKind.BackfillCanonicalJson.ToString()));
+        Assert.Equal(1, removed.DeletedCount);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+        Assert.Contains("backfill-canonical-json", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("durable applied route state evidence", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Applied_state_does_not_trust_index_evidence_redirected_to_a_decoy_collection()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        var route = Assert.Single(model.Routes);
+        var index = Assert.Single(route.Indexes);
+        var keys = new BsonDocument();
+        foreach (var column in index.Columns.OrderBy(column => column.Order))
+            keys[column.Column.Identifier] = column.Direction == PhysicalSortDirection.Ascending ? 1 : -1;
+        const string decoy = "decoy_indexes";
+        await database.CreateCollectionAsync(decoy, new CreateCollectionOptions { Collation = new Collation("simple") });
+        await database.GetCollection<BsonDocument>(decoy).Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            new BsonDocumentIndexKeysDefinition<BsonDocument>(keys),
+            new CreateIndexOptions { Name = index.Name.Identifier, Unique = index.IsUnique }));
+        await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier).Indexes.DropOneAsync(index.Name.Identifier);
+        await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations").UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("kind", PhysicalSchemaOperationKind.CreatePhysicalIndex.ToString()),
+            Builders<BsonDocument>.Update.Set("collection", decoy));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+        Assert.Contains("evidence conflicts with durable applied route state", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Concurrent_materializers_converge_and_units_of_work_commit_or_roll_back_atomically()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.DedicatedDocumentTable);
+        await Task.WhenAll(Enumerable.Range(0, 6)
+            .Select(_ => new MongoDbGroundworkMaterializer(database).MaterializeAsync(model)));
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await using (var rollback = await store.BeginAsync(DocumentCommitScope.Of("workItem")))
+        {
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await rollback.SaveAsync(
+                new SaveDocumentRequest("workItem", "rolled-back", "1", """{"status":"open"}"""))).Status);
+            await rollback.RollbackAsync();
+        }
+        Assert.Null(await store.LoadAsync("workItem", "rolled-back"));
+
+        await using (var commit = await store.BeginAsync(DocumentCommitScope.Of("workItem")))
+        {
+            await commit.SaveAsync(new SaveDocumentRequest("workItem", "committed-a", "1", """{"status":"open"}"""));
+            await commit.SaveAsync(new SaveDocumentRequest("workItem", "committed-b", "1", """{"status":"closed"}"""));
+            await commit.CommitAsync();
+        }
+        Assert.NotNull(await store.LoadAsync("workItem", "committed-a"));
+        Assert.NotNull(await store.LoadAsync("workItem", "committed-b"));
+    }
+
+    [Fact]
+    public async Task Operation_evidence_is_isolated_by_manifest_provider_target()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var otherTarget = new PhysicalSchemaTarget(
+            new StorageManifestIdentity("mongo.other-manifest"),
+            model.Target.ManifestVersion,
+            model.Provider,
+            model.Routes);
+        var executor = new MongoDbPhysicalSchemaExecutor(database);
+
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(model.Target, executor)).Outcome);
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(otherTarget, executor)).Outcome);
+
+        var evidence = await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations")
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .ToListAsync();
+        var byTarget = evidence.GroupBy(document => document["target_id"].AsString).ToArray();
+        Assert.Equal(2, byTarget.Length);
+        Assert.Equal(byTarget[0].Count(), byTarget[1].Count());
+        Assert.NotEmpty(evidence
+            .GroupBy(document => document["operation_id"].AsString)
+            .Where(operation => operation.Count() == 2));
+        Assert.Equal(evidence.Count, evidence.Select(document => document["_id"]).Distinct().Count());
+    }
+
+    [Fact]
+    public async Task Lost_materialization_lease_cancels_in_flight_work_and_never_records_target_state()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var executor = new LeaseLossBlockingExecutor(
+            new MongoDbPhysicalSchemaExecutor(
+                database,
+                leaseDuration: MongoDbPhysicalSchemaExecutor.MinimumLeaseDuration));
+
+        var application = PhysicalSchemaApplication.ApplyAsync(model.Target, executor);
+        await executor.OperationStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await database.GetCollection<BsonDocument>("groundwork_physical_schema_locks").UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", model.Target.Identity.ToString()),
+            Builders<BsonDocument>.Update.Set("owner", "stolen-owner"));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => application);
+        Assert.True(executor.OperationObservedLeaseLoss);
+        Assert.Equal(0, await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty));
+    }
+
+    [Fact]
+    public async Task Minimum_and_default_schema_leases_renew_and_preserve_monotonic_fencing()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var renewedExpiryObserved = new TaskCompletionSource<DateTimeOffset>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var minimumExecutor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: MongoDbPhysicalSchemaExecutor.MinimumLeaseDuration,
+            beforeBackfillWrite: null,
+            afterLeaseRenewal: expiry => renewedExpiryObserved.TrySetResult(expiry));
+        var locks = database.GetCollection<BsonDocument>("groundwork_physical_schema_locks");
+
+        long firstFence;
+        var minimumAcquisitionStarted = DateTime.UtcNow;
+        await using (var lease = await minimumExecutor.AcquireApplicationLockAsync(model.Target.Identity, CancellationToken.None))
+        {
+            var minimumAcquisitionCompleted = DateTime.UtcNow;
+            var initial = await locks.Find(Builders<BsonDocument>.Filter.Eq("_id", model.Target.Identity.ToString())).SingleAsync();
+            firstFence = initial["fence"].ToInt64();
+            var initialExpiry = initial["expires_at"].ToUniversalTime();
+            Assert.InRange(
+                initialExpiry,
+                minimumAcquisitionStarted + MongoDbPhysicalSchemaExecutor.MinimumLeaseDuration - TimeSpan.FromMilliseconds(1),
+                minimumAcquisitionCompleted + MongoDbPhysicalSchemaExecutor.MinimumLeaseDuration);
+            var observedRenewedExpiry = await renewedExpiryObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var renewed = await locks.Find(Builders<BsonDocument>.Filter.Eq("_id", model.Target.Identity.ToString())).SingleAsync();
+            var storedRenewedExpiry = renewed["expires_at"].ToUniversalTime();
+            Assert.True(storedRenewedExpiry > initialExpiry);
+            Assert.InRange(
+                storedRenewedExpiry,
+                observedRenewedExpiry.UtcDateTime - TimeSpan.FromMilliseconds(1),
+                observedRenewedExpiry.UtcDateTime);
+        }
+
+        var defaultExecutor = new MongoDbPhysicalSchemaExecutor(database);
+        var defaultAcquisitionStarted = DateTime.UtcNow;
+        await using var defaultLease = await defaultExecutor.AcquireApplicationLockAsync(model.Target.Identity, CancellationToken.None);
+        var defaultAcquisitionCompleted = DateTime.UtcNow;
+        var reacquired = await locks.Find(Builders<BsonDocument>.Filter.Eq("_id", model.Target.Identity.ToString())).SingleAsync();
+        Assert.True(reacquired["fence"].ToInt64() > firstFence);
+        Assert.InRange(
+            reacquired["expires_at"].ToUniversalTime(),
+            defaultAcquisitionStarted + MongoDbPhysicalSchemaExecutor.DefaultLeaseDuration - TimeSpan.FromMilliseconds(1),
+            defaultAcquisitionCompleted + MongoDbPhysicalSchemaExecutor.DefaultLeaseDuration);
+    }
+
+    [Fact]
+    public async Task Lease_stolen_after_operation_execution_cannot_record_operation_evidence()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var reachedEvidence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueEvidence = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: TimeSpan.FromMinutes(1),
+            beforeBackfillWrite: null,
+            beforeOperationEvidenceWrite: async cancellationToken =>
+            {
+                reachedEvidence.TrySetResult();
+                await continueEvidence.Task.WaitAsync(cancellationToken);
+            });
+
+        var application = PhysicalSchemaApplication.ApplyAsync(model.Target, executor);
+        await reachedEvidence.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await StealLeaseAsync(database, model.Target.Identity);
+        continueEvidence.TrySetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => application);
+        Assert.Equal(0, await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty));
+        Assert.Equal(0, await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty));
+    }
+
+    [Fact]
+    public async Task Lease_stolen_before_applied_state_compare_and_swap_cannot_publish_target_state()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var reachedState = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueState = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: TimeSpan.FromMinutes(1),
+            beforeBackfillWrite: null,
+            beforeOperationEvidenceWrite: null,
+            beforeAppliedStateWrite: async cancellationToken =>
+            {
+                reachedState.TrySetResult();
+                await continueState.Task.WaitAsync(cancellationToken);
+            });
+
+        var application = PhysicalSchemaApplication.ApplyAsync(model.Target, executor);
+        await reachedState.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await StealLeaseAsync(database, model.Target.Identity);
+        continueState.TrySetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => application);
+        Assert.True(await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty) > 0);
+        Assert.Equal(0, await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty));
+    }
+
+    [Fact]
+    public async Task Schema_evidence_and_document_transactions_pin_majority_durability_and_snapshot_reads()
+    {
+        var commands = new ConcurrentQueue<BsonDocument>();
+        var settings = MongoClientSettings.FromConnectionString(container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(started =>
+            commands.Enqueue(started.Command.DeepClone().AsBsonDocument));
+        using var client = new MongoClient(settings);
+        var database = client.GetDatabase($"groundwork_durability_{Guid.NewGuid():N}");
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open"}"""));
+
+        Assert.Contains(commands, command => command.ElementCount > 0 && command.GetElement(0).Name == "findAndModify" &&
+            command.TryGetValue("writeConcern", out var concern) && concern["w"] == "majority");
+        Assert.Contains(commands, command => command.ElementCount > 0 && command.GetElement(0).Name == "commitTransaction" &&
+            command.TryGetValue("writeConcern", out var concern) && concern["w"] == "majority");
+        Assert.Contains(commands, command => command.GetValue("startTransaction", false).ToBoolean() &&
+            command.TryGetValue("readConcern", out var concern) && concern["level"] == "snapshot");
+    }
+
+    [Fact]
+    public async Task Same_version_addition_backfills_existing_documents_and_restart_is_a_no_op()
+    {
+        var database = Database();
+        var initial = EntityEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":7,"status":"open"}"""));
+
+        var changed = EntityEvolutionModel(includeStatus: true);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, (await materializer.MaterializeAsync(changed)).Outcome);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, (await materializer.MaterializeAsync(changed)).Outcome);
+
+        var route = Assert.Single(changed.Routes);
+        var status = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        var persisted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, "existing"))
+            .SingleAsync();
+        Assert.Equal("open", persisted[status.Column.Identifier].AsString);
+        var store = new MongoDbPhysicalDocumentStore(database, changed, DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Single((await store.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]))).Documents);
+    }
+
+    [Fact]
+    public async Task Unique_index_creation_checks_fully_backfilled_existing_documents_before_state_is_published()
+    {
+        var database = Database();
+        var initial = EntityEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var store = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "one", "1", """{"rank":1,"status":"same"}"""));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "two", "1", """{"rank":2,"status":"same"}"""));
+
+        var changed = EntityEvolutionModel(includeStatus: true, uniqueStatus: true);
+        await Assert.ThrowsAnyAsync<MongoException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(changed));
+
+        var route = Assert.Single(changed.Routes);
+        var status = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        var persisted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .ToListAsync();
+        Assert.Equal(2, persisted.Count);
+        Assert.All(persisted, document => Assert.Equal("same", document[status.Column.Identifier].AsString));
+        var appliedState = await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(initial.Target.Fingerprint, appliedState["target_fingerprint"].AsString);
+        Assert.NotEqual(changed.Target.Fingerprint, appliedState["target_fingerprint"].AsString);
+    }
+
+    [Fact]
+    public async Task Failed_unique_index_attempt_revalidates_backfill_before_a_fresh_client_publishes_target_state()
+    {
+        var database = Database();
+        var initial = EntityEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "one", "1", """{"rank":1,"status":"same"}""", ExpectedVersion: 0));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "two", "1", """{"rank":2,"status":"same"}""", ExpectedVersion: 0));
+
+        var changed = EntityEvolutionModel(includeStatus: true, uniqueStatus: true);
+        await Assert.ThrowsAnyAsync<MongoException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(changed));
+        var stateCollection = database.GetCollection<BsonDocument>("groundwork_physical_schema_state");
+        var stateAfterFailure = await stateCollection.Find(
+                Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(initial.Target.Fingerprint, stateAfterFailure["target_fingerprint"].AsString);
+        var historyAfterFailure = PhysicalSchemaAppliedStateSerializer.Deserialize(stateAfterFailure["state"].AsString);
+        var retryPlan = PhysicalSchemaDiffPlanner.Plan(
+            changed.Target,
+            PhysicalSchemaHistoryState.FromApplied(historyAfterFailure),
+            DateTimeOffset.UtcNow);
+        var unpublishedBackfill = Assert.Single(retryPlan.Operations.OfType<BackfillCanonicalJsonOperation>(), operation =>
+            operation.SourcePaths.Contains("status", StringComparer.Ordinal));
+        var retainedEvidence = await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations")
+            .Find(
+                Builders<BsonDocument>.Filter.Eq("target_id", changed.Target.Identity.ToString()) &
+                Builders<BsonDocument>.Filter.Eq("operation_id", unpublishedBackfill.Identity))
+            .SingleAsync();
+        Assert.Equal(unpublishedBackfill.Fingerprint, retainedEvidence["fingerprint"].AsString);
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "one", "1", """{"rank":3,"status":"alpha"}""", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await initialStore.DeleteAsync(new DeleteDocumentRequest(
+            "workItem", "two", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "two", "1", """{"rank":4,"status":"beta"}""", ExpectedVersion: 0))).Status);
+        var stateBeforeRetry = await stateCollection.Find(
+                Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(initial.Target.Fingerprint, stateBeforeRetry["target_fingerprint"].AsString);
+
+        using var restartedClient = new MongoClient(container.GetConnectionString());
+        var restartedDatabase = restartedClient.GetDatabase(database.DatabaseNamespace.DatabaseName);
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await new MongoDbGroundworkMaterializer(restartedDatabase).MaterializeAsync(changed)).Outcome);
+
+        var stateAfterSuccess = await restartedDatabase.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(changed.Target.Fingerprint, stateAfterSuccess["target_fingerprint"].AsString);
+        var changedStore = new MongoDbPhysicalDocumentStore(
+            restartedDatabase,
+            changed,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal("one", Assert.Single((await changedStore.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "alpha"))]))).Documents).Id);
+        Assert.Equal("two", Assert.Single((await changedStore.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "beta"))]))).Documents).Id);
+
+        var route = Assert.Single(changed.Routes);
+        var expectedIndex = Assert.Single(route.Indexes);
+        var actualIndex = (await (await restartedDatabase
+                .GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+                .Indexes.ListAsync())
+            .ToListAsync()).Single(index => index["name"].AsString == expectedIndex.Name.Identifier);
+        var expectedKeys = new BsonDocument();
+        foreach (var column in expectedIndex.Columns.OrderBy(column => column.Order))
+            expectedKeys[column.Column.Identifier] = column.Direction == PhysicalSortDirection.Ascending ? 1 : -1;
+        Assert.Equal(expectedKeys, actualIndex["key"].AsBsonDocument);
+        Assert.True(actualIndex["unique"].ToBoolean());
+    }
+
+    [Fact]
+    public async Task Primary_backfill_cannot_overwrite_a_deleted_and_recreated_document_incarnation()
+    {
+        var database = Database();
+        var initial = EntityEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":7,"status":"open"}"""));
+
+        var changed = EntityEvolutionModel(includeStatus: true);
+        var backfillRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueBackfill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            async cancellationToken =>
+            {
+                backfillRead.TrySetResult();
+                await continueBackfill.Task.WaitAsync(cancellationToken);
+            });
+        var application = PhysicalSchemaApplication.ApplyAsync(changed.Target, executor);
+        await backfillRead.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var changedStore = new MongoDbPhysicalDocumentStore(database, changed, DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await changedStore.DeleteAsync(
+            new DeleteDocumentRequest("workItem", "existing", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await changedStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":8,"status":"closed"}"""))).Status);
+        continueBackfill.TrySetResult();
+
+        await application;
+
+        var route = Assert.Single(changed.Routes);
+        var status = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        var persisted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, "existing"))
+            .SingleAsync();
+        Assert.Equal(1, persisted[route.Envelope.Version.Identifier].ToInt64());
+        Assert.Equal("closed", persisted[status.Column.Identifier].AsString);
+    }
+
+    [Fact]
+    public async Task Linked_backfill_cannot_overwrite_a_newer_concurrent_store_projection()
+    {
+        var database = Database();
+        var initial = SharedProjectionEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":7,"status":"open"}"""));
+
+        var changed = SharedProjectionEvolutionModel(includeStatus: true);
+        var backfillRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueBackfill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            async cancellationToken =>
+            {
+                backfillRead.TrySetResult();
+                await continueBackfill.Task.WaitAsync(cancellationToken);
+            });
+        var application = PhysicalSchemaApplication.ApplyAsync(changed.Target, executor);
+        await backfillRead.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var changedStore = new MongoDbPhysicalDocumentStore(database, changed, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var saved = await changedStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":7,"status":"closed"}""", ExpectedVersion: 1));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        continueBackfill.TrySetResult();
+
+        await application;
+
+        var route = Assert.Single(changed.Routes);
+        var linked = await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .SingleAsync();
+        var status = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        Assert.Equal("closed", linked[status.Column.Identifier].AsString);
+        Assert.Equal(2, linked[MongoDbPhysicalStorageFields.LinkedPrimaryVersion].ToInt64());
+    }
+
+    [Fact]
+    public async Task Linked_backfill_cannot_resurrect_a_deleted_document_or_overwrite_its_recreated_incarnation()
+    {
+        var database = Database();
+        var initial = SharedProjectionEvolutionModel(includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":7,"status":"open"}"""));
+
+        var changed = SharedProjectionEvolutionModel(includeStatus: true);
+        var backfillRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueBackfill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            async cancellationToken =>
+            {
+                backfillRead.TrySetResult();
+                await continueBackfill.Task.WaitAsync(cancellationToken);
+            });
+        var application = PhysicalSchemaApplication.ApplyAsync(changed.Target, executor);
+        await backfillRead.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var changedStore = new MongoDbPhysicalDocumentStore(database, changed, DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await changedStore.DeleteAsync(
+            new DeleteDocumentRequest("workItem", "existing", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await changedStore.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"rank":8,"status":"closed"}"""))).Status);
+        continueBackfill.TrySetResult();
+
+        await application;
+
+        var route = Assert.Single(changed.Routes);
+        var linked = await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .SingleAsync();
+        var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, "existing"))
+            .SingleAsync();
+        var status = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        Assert.Equal("closed", linked[status.Column.Identifier].AsString);
+        Assert.Equal(primary[MongoDbPhysicalStorageFields.Incarnation], linked[MongoDbPhysicalStorageFields.Incarnation]);
+    }
+
+    [Fact]
+    public async Task Linked_backfill_surfaces_true_unique_collision_and_retains_old_applied_state()
+    {
+        var database = Database();
+        var initial = SharedUniqueBackfillModel(includeCategory: false);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(initial);
+        var store = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "existing", "1", """{"status":"alpha","category":"one"}"""));
+        var route = Assert.Single(initial.Routes);
+        var primaryCollection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
+        var collision = (await primaryCollection.Find(Builders<BsonDocument>.Filter.Eq(
+                route.Envelope.Id.Identifier,
+                "existing")).SingleAsync()).DeepClone().AsBsonDocument;
+        collision[route.Envelope.Id.Identifier] = "collision";
+        collision[MongoDbPhysicalStorageFields.Incarnation] = Guid.NewGuid().ToString("N");
+        collision[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.PrimaryKey, collision);
+        await primaryCollection.InsertOneAsync(collision);
+        var changed = SharedUniqueBackfillModel(includeCategory: true);
+
+        await Assert.ThrowsAnyAsync<MongoException>(() => materializer.MaterializeAsync(changed));
+
+        var state = await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(initial.Target.Fingerprint, state["target_fingerprint"].AsString);
+    }
+
+    [Theory]
+    [InlineData("collation")]
+    [InlineData("partial-omitted")]
+    [InlineData("partial-scope")]
+    [InlineData("sparse")]
+    [InlineData("hidden")]
+    public async Task Applied_state_rejects_provider_significant_index_option_conflicts(string option)
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        var route = Assert.Single(model.Routes);
+        var index = Assert.Single(route.Indexes);
+        var collection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
+        await collection.Indexes.DropOneAsync(index.Name.Identifier);
+        var options = new CreateIndexOptions<BsonDocument>
+        {
+            Name = index.Name.Identifier,
+            Unique = index.IsUnique,
+            Collation = option == "collation" ? new Collation("en") : Collation.Simple,
+            PartialFilterExpression = option switch
+            {
+                "partial-omitted" or "sparse" => null,
+                "partial-scope" => Builders<BsonDocument>.Filter.Exists(index.Columns[0].Column.Identifier) &
+                                   Builders<BsonDocument>.Filter.Exists(index.Columns.Last().Column.Identifier),
+                _ => Builders<BsonDocument>.Filter.Exists(index.Columns.Last().Column.Identifier)
+            },
+            Sparse = option == "sparse",
+            Hidden = option == "hidden"
+        };
+        var keys = new BsonDocument();
+        foreach (var column in index.Columns.OrderBy(column => column.Order))
+            keys[column.Column.Identifier] = column.Direction == PhysicalSortDirection.Ascending ? 1 : -1;
+        await collection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            new BsonDocumentIndexKeysDefinition<BsonDocument>(keys),
+            options));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+        Assert.Contains("conflicts with durable applied route state", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Applied_state_rejects_tampered_partial_filter_evidence()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        var route = Assert.Single(model.Routes);
+        var index = Assert.Single(route.Indexes);
+        await database.GetCollection<BsonDocument>("groundwork_physical_schema_operations").UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("kind", PhysicalSchemaOperationKind.CreatePhysicalIndex.ToString()),
+            Builders<BsonDocument>.Update.Set(
+                "partial_filter_expression",
+                new BsonDocument
+                {
+                    [index.Columns[0].Column.Identifier] = new BsonDocument("$exists", true),
+                    [index.Columns[^1].Column.Identifier] = new BsonDocument("$exists", true)
+                }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+
+        Assert.Contains("evidence conflicts", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Explain_rejects_the_same_invalid_runtime_shape_as_normal_query_execution()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var invalid = new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.GreaterThan("status", "open"))]);
+
+        var normal = await Assert.ThrowsAsync<InvalidOperationException>(() => store.QueryAsync(invalid));
+        var explain = await Assert.ThrowsAsync<InvalidOperationException>(() => store.ExplainAsync(invalid));
+
+        Assert.Equal(normal.Message, explain.Message);
+    }
+
+    [Fact]
+    public async Task Explain_proves_the_resolved_collection_and_native_index_are_selected()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open"}"""));
+        var query = new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
+
+        var explain = await store.ExplainAsync(query);
+        var route = Assert.Single(model.Routes);
+        Assert.Contains(route.PrimaryStorage.Name.Identifier, explain.ToJson(), StringComparison.Ordinal);
+        Assert.Contains(route.Indexes.Single().Name.Identifier, explain.ToJson(), StringComparison.Ordinal);
+        Assert.Contains("IXSCAN", explain.ToJson(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Scale_bearing_case_insensitive_substring_query_is_rejected_before_traffic()
+    {
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            BoundedQueryExecutionClass.ScaleBearing);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new MongoDbPhysicalDocumentStore(
+            Database(),
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Contains("Contains", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("indexed", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Ordinary_case_insensitive_substring_query_remains_server_side()
+    {
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            BoundedQueryExecutionClass.Ordinary);
+
+        var store = new MongoDbPhysicalDocumentStore(
+            Database(),
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        Assert.NotNull(store);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task DateTime_projection_preserves_ticks_offsets_ranges_and_unique_instants(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(
+            form,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan
+            },
+            projectedType: PortablePhysicalType.DateTime,
+            valueKind: IndexValueKind.DateTime,
+            path: "occurredAt",
+            isUnique: true);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "tick-zero", "1", """{"occurredAt":"2026-01-01T00:00:00.0000000Z"}"""))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "tick-one", "1", """{"occurredAt":"2026-01-01T00:00:00.0000001Z"}"""))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "hundred-microseconds", "1", """{"occurredAt":"2026-01-01T00:00:00.0001000Z"}"""))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "same-instant", "1", """{"occurredAt":"2025-12-31T19:00:00.0000000-05:00"}"""))).Status);
+        await Assert.ThrowsAsync<InvalidDataException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "sub-tick", "1", """{"occurredAt":"2026-01-01T00:00:00.00000001Z"}""")));
+
+        var result = await store.QueryAsync(new DocumentQuery(
+            "workItem",
+            "list-by-occurredAt",
+            [DocumentQueryClause.Of(DocumentQueryComparison.GreaterThan(
+                "occurredAt",
+                "2025-12-31T19:00:00.0000000-05:00"))]));
+
+        Assert.Equal(["tick-one", "hundred-microseconds"], result.Documents.Select(document => document.Id));
+        var route = Assert.Single(model.Routes);
+        var projection = route.ProjectedColumns.Single(column => column.Definition.Path == "occurredAt");
+        var collection = database.GetCollection<BsonDocument>(
+            projection.Target == ExecutableStorageObjectRole.PrimaryStorage
+                ? route.PrimaryStorage.Name.Identifier
+                : route.LinkedIndexStorage!.Name.Identifier);
+        var values = await collection.Find(Builders<BsonDocument>.Filter.Empty).ToListAsync();
+        Assert.All(values, document => Assert.Equal(BsonType.Int64, document[projection.Column.Identifier].BsonType));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Required_projection_rejects_absent_and_explicit_null_before_live_mutation(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "absent", "1", """{"rank":1}""", ExpectedVersion: 0)));
+        await Assert.ThrowsAsync<InvalidDataException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "null", "1", """{"status":null,"rank":1}""", ExpectedVersion: 0)));
+
+        Assert.Null(await store.LoadAsync("workItem", "absent"));
+        Assert.Null(await store.LoadAsync("workItem", "null"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Typed_default_is_identical_for_live_write_and_backfill(PhysicalStorageForm form)
+    {
+        var database = Database();
+        var initial = ProjectionEvolutionModel(form, includeStatus: false);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest("workItem", "backfilled", "1", """{"rank":1}"""));
+
+        var changed = ProjectionEvolutionModel(form, includeStatus: true, defaultValue: "pending");
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(changed);
+        var store = new MongoDbPhysicalDocumentStore(database, changed, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "live", "1", """{"rank":2}"""));
+
+        var result = await store.QueryAsync(new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "pending"))]));
+        Assert.Equal(["backfilled", "live"], result.Documents.Select(document => document.Id).Order());
+        var route = Assert.Single(changed.Routes);
+        var projection = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+        var collection = database.GetCollection<BsonDocument>(
+            projection.Target == ExecutableStorageObjectRole.PrimaryStorage
+                ? route.PrimaryStorage.Name.Identifier
+                : route.LinkedIndexStorage!.Name.Identifier);
+        var values = await collection.Find(Builders<BsonDocument>.Filter.Empty).ToListAsync();
+        Assert.All(values, document => Assert.Equal("pending", document[projection.Column.Identifier].AsString));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Required_missing_backfill_cannot_publish_target_state(PhysicalStorageForm form)
+    {
+        var database = Database();
+        var initial = ProjectionEvolutionModel(form, includeStatus: false);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(initial);
+        var initialStore = new MongoDbPhysicalDocumentStore(database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await initialStore.SaveAsync(new SaveDocumentRequest("workItem", "missing", "1", """{"rank":1}"""));
+        var changed = ProjectionEvolutionModel(form, includeStatus: true);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => materializer.MaterializeAsync(changed));
+
+        var state = await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", changed.Target.Identity.ToString()))
+            .SingleAsync();
+        Assert.Equal(initial.Target.Fingerprint, state["target_fingerprint"].AsString);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Excluded_unique_index_distinguishes_missing_from_explicit_null(PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(
+            form,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.NotEqual
+            },
+            isNullable: true,
+            isUnique: true);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "missing-a", "1", """{"rank":1}""", ExpectedVersion: 0))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "missing-b", "1", """{"rank":2}""", ExpectedVersion: 0))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "null-a", "1", """{"status":null,"rank":3}""", ExpectedVersion: 0))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "null-b", "1", """{"status":null,"rank":4}""", ExpectedVersion: 0))).Status);
+
+        var equalNull = await store.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", null))]));
+        var notNull = await store.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.NotEqual("status", null))]));
+        Assert.Equal(["null-a"], equalNull.Documents.Select(document => document.Id));
+        Assert.DoesNotContain(notNull.Documents, document => document.Id.StartsWith("missing-", StringComparison.Ordinal));
+
+        var route = Assert.Single(model.Routes);
+        var index = Assert.Single(route.Indexes);
+        var collection = database.GetCollection<BsonDocument>(
+            index.Target == ExecutableStorageObjectRole.PrimaryStorage
+                ? route.PrimaryStorage.Name.Identifier
+                : route.LinkedIndexStorage!.Name.Identifier);
+        var actual = (await (await collection.Indexes.ListAsync()).ToListAsync())
+            .Single(document => document["name"].AsString == index.Name.Identifier);
+        Assert.Equal(
+            new BsonDocument(index.Columns.Last().Column.Identifier, new BsonDocument("$exists", true)),
+            actual["partialFilterExpression"].AsBsonDocument);
+    }
+
+    [Fact]
+    public async Task Included_as_null_omits_partial_membership_and_collapses_missing_with_null()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            isNullable: true,
+            missingValueBehavior: MissingValueBehavior.IncludedAsNull);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "missing", "1", """{"rank":1}"""));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "null", "1", """{"status":null,"rank":2}"""));
+
+        var result = await store.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", null))]));
+        Assert.Equal(["missing", "null"], result.Documents.Select(document => document.Id).Order());
+        var route = Assert.Single(model.Routes);
+        var index = Assert.Single(route.Indexes);
+        var actual = (await (await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+                .Indexes.ListAsync()).ToListAsync())
+            .Single(document => document["name"].AsString == index.Name.Identifier);
+        Assert.False(actual.Contains("partialFilterExpression"));
+    }
+
+    private IMongoDatabase Database() =>
+        new MongoClient(container.GetConnectionString()).GetDatabase($"groundwork_{Guid.NewGuid():N}");
+
+    private static Task StealLeaseAsync(IMongoDatabase database, PhysicalSchemaTargetIdentity target) =>
+        database.GetCollection<BsonDocument>("groundwork_physical_schema_locks").UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", target.ToString()),
+            Builders<BsonDocument>.Update
+                .Set("owner", "stolen-owner")
+                .Inc("fence", 1L));
+
+    internal static MongoDbPhysicalStorageModel Model(
+        PhysicalStorageForm form,
+        IReadOnlySet<PortableQueryOperation>? operations = null,
+        BoundedQueryExecutionClass executionClass = BoundedQueryExecutionClass.ScaleBearing,
+        PortablePhysicalType projectedType = PortablePhysicalType.String,
+        IndexValueKind valueKind = IndexValueKind.Keyword,
+        string path = "status",
+        bool isNullable = false,
+        string? defaultValue = null,
+        bool isUnique = false,
+        MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var projected = new ProjectedColumnDefinition(
+            path,
+            path,
+            projectedType,
+            Precision: projectedType == PortablePhysicalType.Decimal ? 18 : null,
+            Scale: projectedType == PortablePhysicalType.Decimal ? 4 : null,
+            IsNullable: isNullable,
+            DefaultValue: defaultValue);
+        var indexIdentity = $"by-{path}";
+        var physicalIndex = new PhysicalIndexDefinition(
+            indexIdentity,
+            [
+                new PhysicalIndexColumnDefinition("storage_scope", 0),
+                new PhysicalIndexColumnDefinition(path, 1)
+            ],
+            isUnique,
+            missingValueBehavior: missingValueBehavior);
+        var definition = form switch
+        {
+            PhysicalStorageForm.SharedDocuments => PhysicalTableDefinition.SharedDocuments(
+                binding, [projected], [physicalIndex], linkedProjectionLogicalName: "work_items_lookup"),
+            PhysicalStorageForm.DedicatedDocumentTable => PhysicalTableDefinition.DedicatedDocumentTable(
+                "work_items", indexes: [physicalIndex], linkedProjectedColumns: [projected], linkedProjectionLogicalName: "work_items_lookup"),
+            PhysicalStorageForm.PhysicalEntityTable => PhysicalTableDefinition.PhysicalEntityTable(
+                "work_items", [projected], indexes: [physicalIndex]),
+            _ => throw new ArgumentOutOfRangeException(nameof(form), form, null)
+        };
+        var logical = new LogicalIndexDeclaration(
+            indexIdentity, [new IndexField(path)], valueKind, isUnique, missingValueBehavior);
+        var query = new BoundedQueryDeclaration(
+            $"list-by-{path}",
+            logical.Identity,
+            operations ?? new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Offset,
+            executionClass,
+            supportsTotalCount: true);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"),
+            "Work item",
+            StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable,
+            IdentityPolicy.StringId(),
+            TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(),
+            SerializationPolicy.Json(),
+            [],
+            [],
+            PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logical],
+                [query])
+        };
+        var manifest = new StorageManifest(
+            new StorageManifestIdentity($"mongo.{form}"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages = form == PhysicalStorageForm.SharedDocuments
+                ? [new SharedDocumentStorageDefinition(binding, "documents", new DocumentEnvelopeDefinition())]
+                : []
+        };
+        return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel ProjectionEvolutionModel(
+        PhysicalStorageForm form,
+        bool includeStatus,
+        bool isNullable = false,
+        string? defaultValue = null)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var status = new ProjectedColumnDefinition(
+            "status",
+            "status",
+            PortablePhysicalType.String,
+            IsNullable: isNullable,
+            DefaultValue: defaultValue);
+        var rank = new ProjectedColumnDefinition(
+            "rank",
+            "rank",
+            PortablePhysicalType.Int32,
+            IsNullable: false);
+        var projections = includeStatus ? new[] { rank, status } : [rank];
+        var indexes = includeStatus
+            ? new[]
+            {
+                new PhysicalIndexDefinition("by-status", [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("status", 1)])
+            }
+            : [];
+        var definition = form switch
+        {
+            PhysicalStorageForm.SharedDocuments => PhysicalTableDefinition.SharedDocuments(
+                binding,
+                projections,
+                indexes,
+                linkedProjectionLogicalName: "projection_items_lookup"),
+            PhysicalStorageForm.DedicatedDocumentTable => PhysicalTableDefinition.DedicatedDocumentTable(
+                "projection_items",
+                indexes: indexes,
+                linkedProjectedColumns: projections,
+                linkedProjectionLogicalName: "projection_items_lookup"),
+            PhysicalStorageForm.PhysicalEntityTable => PhysicalTableDefinition.PhysicalEntityTable(
+                "projection_items",
+                projections,
+                indexes: indexes),
+            _ => throw new ArgumentOutOfRangeException(nameof(form), form, null)
+        };
+        var logical = new LogicalIndexDeclaration(
+            "by-status",
+            [new IndexField("status")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-status",
+            logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"), "Work item", StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable, IdentityPolicy.StringId(), TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(), SerializationPolicy.Json(), [], [], PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                includeStatus ? [logical] : [],
+                includeStatus ? [query] : [])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity($"mongo.projection.{form}"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages = form == PhysicalStorageForm.SharedDocuments
+                ? [new SharedDocumentStorageDefinition(binding, "projection_documents", new DocumentEnvelopeDefinition())]
+                : []
+        });
+    }
+
+    private static MongoDbPhysicalStorageModel EntityEvolutionModel(bool includeStatus, bool uniqueStatus = false)
+    {
+        var rank = new ProjectedColumnDefinition("rank", "rank", PortablePhysicalType.Int32, IsNullable: false);
+        var status = new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false);
+        var projections = includeStatus ? new[] { rank, status } : [rank];
+        var indexes = includeStatus
+            ? new[]
+            {
+                new PhysicalIndexDefinition("by-status", [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("status", 1)],
+                    isUnique: uniqueStatus)
+            }
+            : [];
+        var logical = new LogicalIndexDeclaration(
+            "by-status", [new IndexField("status")], IndexValueKind.Keyword, uniqueStatus, MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-status", logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None, QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"), "Work item", StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable, IdentityPolicy.StringId(), TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(), SerializationPolicy.Json(), [], [], PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(PhysicalTableDefinition.PhysicalEntityTable(
+                    "evolution_items", projections, indexes: indexes)),
+                includeStatus ? [logical] : [],
+                includeStatus ? [query] : [])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.entity.evolution"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
+
+    private static MongoDbPhysicalStorageModel SharedProjectionEvolutionModel(bool includeStatus)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var rank = new ProjectedColumnDefinition("rank", "rank", PortablePhysicalType.Int32, IsNullable: false);
+        var status = new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false);
+        var definition = PhysicalTableDefinition.SharedDocuments(
+            binding,
+            includeStatus ? [rank, status] : [rank],
+            linkedProjectionLogicalName: "evolution_items_lookup");
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"), "Work item", StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable, IdentityPolicy.StringId(), TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(), SerializationPolicy.Json(), [], [], PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition))
+        };
+        var manifest = new StorageManifest(
+            new StorageManifestIdentity("mongo.shared.evolution"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages =
+            [new SharedDocumentStorageDefinition(binding, "evolution_documents", new DocumentEnvelopeDefinition())]
+        };
+        return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel SharedUniqueBackfillModel(bool includeCategory)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var status = new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false);
+        var category = new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String, IsNullable: false);
+        var physicalIndex = new PhysicalIndexDefinition(
+            "by-status",
+            [
+                new PhysicalIndexColumnDefinition("storage_scope", 0),
+                new PhysicalIndexColumnDefinition("status", 1)
+            ],
+            isUnique: true);
+        var definition = PhysicalTableDefinition.SharedDocuments(
+            binding,
+            includeCategory ? [status, category] : [status],
+            [physicalIndex],
+            linkedProjectionLogicalName: "unique_backfill_lookup");
+        var logical = new LogicalIndexDeclaration(
+            "by-status",
+            [new IndexField("status")],
+            IndexValueKind.Keyword,
+            true,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-status",
+            logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"), "Work item", StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable, IdentityPolicy.StringId(), TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(), SerializationPolicy.Json(), [], [], PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logical],
+                [query])
+        };
+        var manifest = new StorageManifest(
+            new StorageManifestIdentity("mongo.shared.unique-backfill"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages =
+            [new SharedDocumentStorageDefinition(binding, "unique_backfill_documents", new DocumentEnvelopeDefinition())]
+        };
+        return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private sealed class LeaseLossBlockingExecutor(IPhysicalSchemaExecutor inner) : IPhysicalSchemaExecutor
+    {
+        public TaskCompletionSource OperationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool OperationObservedLeaseLoss { get; private set; }
+
+        public ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
+            PhysicalSchemaTargetIdentity target,
+            CancellationToken cancellationToken) =>
+            inner.AcquireApplicationLockAsync(target, cancellationToken);
+
+        public ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
+            PhysicalSchemaTargetIdentity target,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken) =>
+            inner.ReadHistoryAsync(target, applicationLock, cancellationToken);
+
+        public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
+            PhysicalSchemaTargetIdentity target,
+            PhysicalSchemaOperation operation,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken)
+        {
+            OperationStarted.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                throw new UnreachableException();
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                OperationObservedLeaseLoss = true;
+                throw;
+            }
+        }
+
+        public ValueTask RecordAppliedStateAsync(
+            PhysicalSchemaAppliedState state,
+            string? expectedAppliedTargetFingerprint,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken) =>
+            inner.RecordAppliedStateAsync(state, expectedAppliedTargetFingerprint, applicationLock, cancellationToken);
+    }
+}

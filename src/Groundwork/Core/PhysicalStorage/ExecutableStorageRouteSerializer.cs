@@ -158,6 +158,7 @@ public static class ExecutableStorageRouteSerializer
                 WriteName(writer, "name", index.Name);
                 writer.WriteString("target", index.Target.ToString());
                 writer.WriteBoolean("unique", index.IsUnique);
+                writer.WriteString("missingValueBehavior", index.MissingValueBehavior.ToString());
                 writer.WriteString("declaredTarget", index.Definition.Target.ToString());
                 writer.WriteNumber("schemaVersion", index.Definition.SchemaVersion);
                 WriteEvolution(writer, index.Definition.Evolution);

@@ -22,6 +22,7 @@ public interface IPhysicalSchemaExecutor
     /// <summary>Reads durable state while the matching application lock is held.</summary>
     ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
         PhysicalSchemaTargetIdentity target,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -31,6 +32,7 @@ public interface IPhysicalSchemaExecutor
     ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
         PhysicalSchemaTargetIdentity target,
         PhysicalSchemaOperation operation,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -41,12 +43,20 @@ public interface IPhysicalSchemaExecutor
     ValueTask RecordAppliedStateAsync(
         PhysicalSchemaAppliedState state,
         string? expectedAppliedTargetFingerprint,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken);
 }
 
 public interface IPhysicalSchemaApplicationLock : IAsyncDisposable
 {
     PhysicalSchemaTargetIdentity Target { get; }
+
+    /// <summary>
+    /// Signals that the provider can no longer guarantee exclusive application ownership. The
+    /// coordinator binds all history, operation, validation, and state-recording work to this
+    /// token so a lost renewable lease cannot continue applying or publish target state.
+    /// </summary>
+    CancellationToken OwnershipLost { get; }
 }
 
 public enum PhysicalSchemaApplicationOutcome
@@ -85,7 +95,13 @@ public static class PhysicalSchemaApplication
                 $"Executor returned lock '{applicationLock.Target}' for requested target '{target.Identity}'.");
         }
 
-        var history = await executor.ReadHistoryAsync(target.Identity, cancellationToken);
+        using var applicationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            applicationLock.OwnershipLost);
+        var applicationToken = applicationCancellation.Token;
+        applicationToken.ThrowIfCancellationRequested();
+
+        var history = await executor.ReadHistoryAsync(target.Identity, applicationLock, applicationToken);
         var plan = PhysicalSchemaDiffPlanner.Plan(
             target,
             history,
@@ -105,8 +121,13 @@ public static class PhysicalSchemaApplication
             if (operation is RecordPhysicalSchemaAppliedStateOperation)
                 continue;
 
-            cancellationToken.ThrowIfCancellationRequested();
-            var acknowledgement = await executor.ApplyOperationAsync(target.Identity, operation, cancellationToken);
+            applicationToken.ThrowIfCancellationRequested();
+            var acknowledgement = await executor.ApplyOperationAsync(
+                target.Identity,
+                operation,
+                applicationLock,
+                applicationToken);
+            applicationToken.ThrowIfCancellationRequested();
             if (acknowledgement.Identity != operation.Identity)
             {
                 throw new InvalidOperationException(
@@ -122,12 +143,14 @@ public static class PhysicalSchemaApplication
             acknowledgements.Add(acknowledgement);
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
+        applicationToken.ThrowIfCancellationRequested();
         var appliedState = plan.Complete(acknowledgements, timeProvider.GetUtcNow());
         await executor.RecordAppliedStateAsync(
             appliedState,
             plan.ExpectedAppliedTargetFingerprint,
-            cancellationToken);
+            applicationLock,
+            applicationToken);
+        applicationToken.ThrowIfCancellationRequested();
         return new PhysicalSchemaApplicationResult(
             PhysicalSchemaApplicationOutcome.Applied,
             plan,

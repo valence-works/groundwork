@@ -5,8 +5,37 @@ transactional diagnostic-record provider.
 
 ## Current Scope
 
-- Creates one MongoDB collection per storage unit.
-- Creates native MongoDB indexes for declared one-field indexes.
+- Compiles host naming and provider-neutral definitions into immutable MongoDB physical routes.
+- Maps shared documents to a discriminator-bearing shared collection plus optional unit-owned linked
+  projection collection, dedicated documents to unit-owned collections, and physical entities to
+  unit-owned collections with in-document projected fields.
+- Preserves the exact canonical JSON string as the authority in every primary document; native BSON
+  content and projected fields are rebuildable copies.
+- Converts projected numeric values from their original JSON lexemes before BSON can round them,
+  enforces declared Decimal precision/scale, and stores projected DateTime instants as UTC tick
+  integers so equality, uniqueness, and ranges preserve the portable 100ns contract. Native
+  Number/DateTime query paths without an exact typed projection are refused before traffic.
+- Creates scoped, compound, unique, and direction-aware native indexes from resolved physical routes.
+- Applies additive schema changes through a renewable, generation-fenced manifest/provider lease;
+  operation evidence and the applied-state compare-and-swap are atomically fenced, while durable
+  document-incarnation tokens make canonical-JSON backfills safe across delete/recreate races.
+  Evidence is target-qualified, and an attempt that did not publish its target never skips later
+  backfill or validation. Required-field finalization is durably acknowledged after its canonical
+  backfill even though MongoDB needs no collection-level nullability alteration.
+- Requires MongoDB physical-schema leases to be at least one second so BSON millisecond timestamp
+  precision and renewal scheduling jitter cannot make an accepted lease expire at acquisition.
+  The default remains five minutes and renewal runs at one third of the configured duration.
+- Detects same-version definition changes through route fingerprints and rejects out-of-band native
+  index key, uniqueness, collation, partial, sparse, hidden, TTL, and wildcard-option conflicts
+  against durable applied evidence.
+- Executes route-aware CRUD, optimistic concurrency, linked projection maintenance, and replica-set
+  units of work atomically. Configurable attempt and elapsed-time budgets bound fresh-session body
+  retries and same-session commit-only retries. Exhausted ambiguous commits raise provider-neutral
+  acknowledgement-uncertain evidence instead of being misreported as conflicts. A non-successful or
+  failed explicit unit-of-work write aborts that unit and makes it terminal.
+- Compiles `DocumentQuery` declarations through exact handler certifications; linked lookups and
+  native primary/entity lookups execute filtering, count, ordering, and paging in MongoDB.
+- Exposes native `explain` evidence for the resolved collection and selected physical index.
 - Saves, loads, updates, deletes, and queries JSON document envelopes.
 - Supports equality, set-membership (`$in`), and case-insensitive `Contains` (regex) query operations over declared indexes.
 - Supports declared-index ordering and skip/limit pagination.
@@ -37,8 +66,14 @@ defaults.
 
 ## Deliberate Limits
 
-- One-field indexes only.
-- JSON content is stored as native BSON under a `content` field.
+- The compatibility materializer/store retain their pre-route one-field API. New three-form work
+  uses `MongoDbPhysicalStorageModel`, the physical materializer overload, and
+  `MongoDbPhysicalDocumentStore` (or `CreatePhysicalAsync`).
+- Physical bounded handlers currently certify offset paging, not keyset continuation or
+  latest-per-key selection; declarations requiring either fail during store construction.
+- Canonical JSON is stored as a string while a provider-owned native BSON copy supports ordinary
+  server-side document-path evaluation and rebuildable projections.
 - No Entity Framework dependency.
 - No host-specific dependency.
-- Standalone MongoDB deployments cannot serve the diagnostic-record contract.
+- Standalone MongoDB deployments cannot serve atomic multi-object physical writes or the
+  diagnostic-record contract; use a replica set or sharded cluster.

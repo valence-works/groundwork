@@ -10,6 +10,26 @@ namespace Groundwork.Tests;
 public sealed class PhysicalSchemaApplicationTests
 {
     [Fact]
+    public void Plan_backfills_existing_canonical_documents_before_creating_physical_indexes()
+    {
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            CreateTarget(includeSecondProjection: true),
+            PhysicalSchemaHistoryState.Empty,
+            DateTimeOffset.UtcNow);
+
+        var lastBackfill = plan.Operations
+            .Select((operation, index) => (operation, index))
+            .Where(item => item.operation.Kind == PhysicalSchemaOperationKind.BackfillCanonicalJson)
+            .Max(item => item.index);
+        var firstIndex = plan.Operations
+            .Select((operation, index) => (operation, index))
+            .Where(item => item.operation.Kind == PhysicalSchemaOperationKind.CreatePhysicalIndex)
+            .Min(item => item.index);
+
+        Assert.True(lastBackfill < firstIndex);
+    }
+
+    [Fact]
     public async Task ApplyIsIdempotentAcrossRestart()
     {
         var target = CreateTarget(includeSecondProjection: false);
@@ -112,6 +132,20 @@ public sealed class PhysicalSchemaApplicationTests
     }
 
     [Fact]
+    public async Task LeaseLossCancelsInFlightOperationAndNeverRecordsTargetState()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor { LoseLeaseDuringOperationNumber = 1 };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, executor));
+
+        Assert.True(executor.OperationObservedLeaseLoss);
+        Assert.Null(executor.AppliedState);
+        Assert.Equal(0, executor.RecordedStateCount);
+    }
+
+    [Fact]
     public async Task ConcurrentApplicationsAreExcludedByProviderManifestLock()
     {
         var target = CreateTarget(includeSecondProjection: false);
@@ -192,6 +226,7 @@ public sealed class PhysicalSchemaApplicationTests
 
         public int? FailBeforeOperationNumber { get; set; }
         public int? CancelBeforeOperationNumber { get; set; }
+        public int? LoseLeaseDuringOperationNumber { get; set; }
         public CancellationTokenSource? Cancellation { get; set; }
         public bool LoseNextOperationAcknowledgement { get; set; }
         public bool LoseNextStateAcknowledgement { get; set; }
@@ -202,6 +237,8 @@ public sealed class PhysicalSchemaApplicationTests
         public int MaximumConcurrentLockHolders => maximumConcurrentLockHolders;
         public int LockAcquisitionCount => lockAcquisitionCount;
         public int RecordedStateCount => recordedStateCount;
+        public bool OperationObservedLeaseLoss { get; private set; }
+        private CancellationTokenSource? leaseLoss;
 
         public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
             PhysicalSchemaTargetIdentity target,
@@ -211,7 +248,8 @@ public sealed class PhysicalSchemaApplicationTests
             Interlocked.Increment(ref lockAcquisitionCount);
             var holders = Interlocked.Increment(ref currentLockHolders);
             maximumConcurrentLockHolders = Math.Max(maximumConcurrentLockHolders, holders);
-            return new LockLease(target, () =>
+            leaseLoss = new CancellationTokenSource();
+            return new LockLease(target, leaseLoss, () =>
             {
                 Interlocked.Decrement(ref currentLockHolders);
                 applicationLock.Release();
@@ -220,6 +258,7 @@ public sealed class PhysicalSchemaApplicationTests
 
         public ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
             PhysicalSchemaTargetIdentity target,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken)
         {
             AssertLockHeld();
@@ -231,10 +270,28 @@ public sealed class PhysicalSchemaApplicationTests
         public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
             PhysicalSchemaTargetIdentity target,
             PhysicalSchemaOperation operation,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken)
         {
             AssertLockHeld();
             var number = Interlocked.Increment(ref operationNumber);
+            if (LoseLeaseDuringOperationNumber == number)
+            {
+                leaseLoss!.Cancel();
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).WaitAsync(TimeSpan.FromMilliseconds(250));
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    OperationObservedLeaseLoss = true;
+                    throw;
+                }
+                catch (TimeoutException)
+                {
+                    // The coordinator failed to bind the in-flight operation to lease ownership.
+                }
+            }
             if (CancelBeforeOperationNumber == number)
             {
                 Cancellation!.Cancel();
@@ -268,6 +325,7 @@ public sealed class PhysicalSchemaApplicationTests
         public ValueTask RecordAppliedStateAsync(
             PhysicalSchemaAppliedState state,
             string? expectedAppliedTargetFingerprint,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken)
         {
             AssertLockHeld();
@@ -289,12 +347,18 @@ public sealed class PhysicalSchemaApplicationTests
 
         private void AssertLockHeld() => Assert.True(Volatile.Read(ref currentLockHolders) == 1);
 
-        private sealed class LockLease(PhysicalSchemaTargetIdentity target, Action release) : IPhysicalSchemaApplicationLock
+        private sealed class LockLease(
+            PhysicalSchemaTargetIdentity target,
+            CancellationTokenSource leaseLoss,
+            Action release) : IPhysicalSchemaApplicationLock
         {
             public PhysicalSchemaTargetIdentity Target { get; } = target;
 
+            public CancellationToken OwnershipLost => leaseLoss.Token;
+
             public ValueTask DisposeAsync()
             {
+                leaseLoss.Dispose();
                 release();
                 return ValueTask.CompletedTask;
             }

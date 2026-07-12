@@ -112,3 +112,13 @@ An explicitly acquired document-store session carrying a distinct capability for
 global storage, or cross-scope queries. Acquisition emits audit evidence and never results from a
 missing ordinary scope.
 _Avoid_: Tenant-agnostic query flag, absent tenant fallback, authorization bypass
+
+## Provider implementation status
+
+MongoDB consumes executable storage routes directly for shared, dedicated, and physical-entity
+documents. Generation-fenced leases atomically protect operation evidence and applied state, while
+document-incarnation tokens keep restart backfill safe across delete/recreate races. Exact
+linked/native handler certifications bind bounded queries to resolved collections, fields, and
+indexes. Typed numeric projections validate their original JSON lexemes and declared shape;
+DateTime projections use exact UTC ticks. Native Number/DateTime paths without a typed projection
+and unsupported keyset/latest query declarations fail before traffic.

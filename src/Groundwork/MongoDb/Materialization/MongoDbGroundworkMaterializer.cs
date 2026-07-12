@@ -13,6 +13,17 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
     private const int IndexKeySpecsConflictErrorCode = 86;
     private const int NamespaceExistsErrorCode = 48;
 
+    public Task<PhysicalSchemaApplicationResult> MaterializeAsync(
+        MongoDbPhysicalStorageModel model,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new MongoDbPhysicalSchemaExecutor(database),
+            cancellationToken: cancellationToken);
+    }
+
     public async Task MaterializeAsync(MaterializationPlan plan, CancellationToken cancellationToken = default)
     {
         if (!plan.IsPlannable)

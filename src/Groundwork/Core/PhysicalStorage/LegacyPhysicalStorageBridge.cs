@@ -76,7 +76,8 @@ public static class LegacyPhysicalStorageBridge
             .Select(index => new PhysicalIndexDefinition(
                 index.Identity,
                 CreateLegacyPhysicalIndexColumns(unit, index),
-                index.IsUnique))
+                index.IsUnique,
+                missingValueBehavior: index.MissingValueBehavior))
             .ToArray();
 
         var definition = PhysicalTableDefinition.SharedDocuments(

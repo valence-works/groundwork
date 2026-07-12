@@ -64,7 +64,11 @@ public interface IDocumentUnitOfWork : IAsyncDisposable
     /// <summary>Reads a document through the unit of work (sees this unit of work's uncommitted writes).</summary>
     Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default);
 
-    /// <summary>Atomically commits every staged operation. Throws if the commit cannot be honoured.</summary>
+    /// <summary>
+    /// Atomically commits every staged operation. Throws if the commit cannot be honoured. A
+    /// <see cref="DocumentCommitAcknowledgementUncertainException"/> means the commit may be durable
+    /// and callers must reconcile rather than repeat the transaction blindly.
+    /// </summary>
     Task CommitAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Discards every staged operation.</summary>

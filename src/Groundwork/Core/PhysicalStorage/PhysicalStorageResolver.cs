@@ -528,7 +528,8 @@ public static class PhysicalStorageResolver
             physicalIndexes.Add(new PhysicalIndexDefinition(
                 logicalIndex.Identity,
                 columns,
-                logicalIndex.IsUnique));
+                logicalIndex.IsUnique,
+                missingValueBehavior: logicalIndex.MissingValueBehavior));
         }
 
         return physicalIndexes;
@@ -828,6 +829,7 @@ public static class PhysicalStorageResolver
             if (expectedColumns is not null &&
                 physicalIndex is not null &&
                 physicalIndex.IsUnique == logicalIndex.IsUnique &&
+                physicalIndex.MissingValueBehavior == logicalIndex.MissingValueBehavior &&
                 PhysicalIndexFulfills(
                     physicalIndex.Columns,
                     expectedColumns,
