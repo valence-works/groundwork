@@ -10,12 +10,18 @@ namespace Groundwork.Provider.Relational;
 public sealed class RelationalSessionFactory
 {
     private readonly Func<DbConnection> createConnection;
+    private readonly Func<DbConnection, CancellationToken, Task<DbTransaction>> beginTransaction;
     private readonly SemaphoreSlim? serializationGate;
 
-    private RelationalSessionFactory(Func<DbConnection> createConnection, bool serialize)
+    private RelationalSessionFactory(
+        Func<DbConnection> createConnection,
+        bool serialize,
+        Func<DbConnection, CancellationToken, Task<DbTransaction>>? beginTransaction = null)
     {
         ArgumentNullException.ThrowIfNull(createConnection);
         this.createConnection = createConnection;
+        this.beginTransaction = beginTransaction ?? ((connection, cancellationToken) =>
+            connection.BeginTransactionAsync(cancellationToken).AsTask());
         serializationGate = serialize ? new SemaphoreSlim(1, 1) : null;
     }
 
@@ -24,6 +30,18 @@ public sealed class RelationalSessionFactory
 
     /// <summary>Creates sessions one at a time for providers that require serialized access.</summary>
     public static RelationalSessionFactory Serialized(Func<DbConnection> createConnection) => new(createConnection, true);
+
+    /// <summary>
+    /// Creates serialized sessions with a provider-owned transaction boundary. Providers use this
+    /// when the write lock must be acquired before the first read in a transaction.
+    /// </summary>
+    public static RelationalSessionFactory Serialized(
+        Func<DbConnection> createConnection,
+        Func<DbConnection, CancellationToken, Task<DbTransaction>> beginTransaction)
+    {
+        ArgumentNullException.ThrowIfNull(beginTransaction);
+        return new(createConnection, true, beginTransaction);
+    }
 
     /// <summary>An executor whose calls own and commit independent sessions.</summary>
     public RelationalExecutor AutonomousExecutor => new SessionRelationalExecutor(this);
@@ -66,7 +84,7 @@ public sealed class RelationalSessionFactory
         var session = await OpenAsync(cancellationToken);
         try
         {
-            var transaction = await session.Connection.BeginTransactionAsync(cancellationToken);
+            var transaction = await beginTransaction(session.Connection, cancellationToken);
             return new RelationalUnitOfWork(session.Connection, transaction, session);
         }
         catch

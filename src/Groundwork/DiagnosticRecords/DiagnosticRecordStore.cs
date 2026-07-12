@@ -79,7 +79,33 @@ internal static class DiagnosticFieldCollectionSnapshot
                 ? null!
                 : (IReadOnlyList<DiagnosticFieldValue>)Array.AsReadOnly(x.Value.ToArray()),
             StringComparer.Ordinal);
-        return new System.Collections.ObjectModel.ReadOnlyDictionary<string, IReadOnlyList<DiagnosticFieldValue>>(snapshot);
+        return new DiagnosticFieldSnapshotDictionary(snapshot);
+    }
+
+    private sealed class DiagnosticFieldSnapshotDictionary(
+        IDictionary<string, IReadOnlyList<DiagnosticFieldValue>> dictionary)
+        : System.Collections.ObjectModel.ReadOnlyDictionary<string, IReadOnlyList<DiagnosticFieldValue>>(dictionary)
+    {
+        public override bool Equals(object? obj)
+        {
+            if (ReferenceEquals(this, obj))
+                return true;
+            if (obj is not IReadOnlyDictionary<string, IReadOnlyList<DiagnosticFieldValue>> other || Count != other.Count)
+                return false;
+            return this.All(entry => other.TryGetValue(entry.Key, out var values) && entry.Value.SequenceEqual(values));
+        }
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            foreach (var entry in this.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+            {
+                hash.Add(entry.Key, StringComparer.Ordinal);
+                foreach (var value in entry.Value)
+                    hash.Add(value);
+            }
+            return hash.ToHashCode();
+        }
     }
 }
 

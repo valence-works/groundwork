@@ -11,6 +11,7 @@
     <Project Path="src/Groundwork/Core/Groundwork.Core.csproj" />
     <Project Path="src/Groundwork/Documents/Groundwork.Documents.csproj" />
     <Project Path="src/Groundwork/DiagnosticRecords/Groundwork.DiagnosticRecords.csproj" />
+    <Project Path="src/Groundwork/DiagnosticRecords.Relational/Groundwork.DiagnosticRecords.Relational.csproj" />
     <Project Path="src/Groundwork/Materialization/Groundwork.Materialization.csproj" />
     <Project Path="src/Groundwork/MongoDb/Groundwork.MongoDb.csproj" />
     <Project Path="src/Groundwork/Operational/Groundwork.Operational.csproj" />
