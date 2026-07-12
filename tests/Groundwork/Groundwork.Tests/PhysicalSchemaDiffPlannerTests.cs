@@ -32,6 +32,7 @@ public sealed class PhysicalSchemaDiffPlannerTests
         Assert.Contains(first.Operations, operation => operation is AddProjectedColumnOperation);
         Assert.Contains(first.Operations, operation => operation is CreatePhysicalIndexOperation);
         Assert.Contains(first.Operations, operation => operation is BackfillCanonicalJsonOperation);
+        Assert.Contains(first.Operations, operation => operation is FinalizeProjectedColumnOperation);
         Assert.IsType<ValidatePhysicalSchemaOperation>(first.Operations[^2]);
         Assert.IsType<RecordPhysicalSchemaAppliedStateOperation>(first.Operations[^1]);
         Assert.Equal(
@@ -144,6 +145,23 @@ public sealed class PhysicalSchemaDiffPlannerTests
         Assert.Equal("by-priority", index.Index.Identity);
         Assert.Contains(changedPlan.Operations, operation => operation is BackfillCanonicalJsonOperation backfill && backfill.SubjectIdentity == "priority");
         Assert.IsType<RecordPhysicalSchemaAppliedStateOperation>(changedPlan.Operations[^1]);
+    }
+
+    [Fact]
+    public void RequiredProjectionIsStagedBackfilledAndFinalizedBeforeItsIndex()
+    {
+        var target = CreateTarget(PhysicalStorageForm.PhysicalEntityTable, includeSecondProjection: false);
+
+        var operations = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, PlannedAt).Operations.ToList();
+        var add = Assert.Single(operations.OfType<AddProjectedColumnOperation>());
+        var backfill = Assert.Single(operations.OfType<BackfillCanonicalJsonOperation>(), operation =>
+            operation.SubjectKind == CanonicalJsonBackfillSubjectKind.ProjectedColumn);
+        var finalize = Assert.Single(operations.OfType<FinalizeProjectedColumnOperation>());
+        var index = Assert.Single(operations.OfType<CreatePhysicalIndexOperation>());
+
+        Assert.True(operations.IndexOf(add) < operations.IndexOf(backfill));
+        Assert.True(operations.IndexOf(backfill) < operations.IndexOf(finalize));
+        Assert.True(operations.IndexOf(finalize) < operations.IndexOf(index));
     }
 
     [Fact]

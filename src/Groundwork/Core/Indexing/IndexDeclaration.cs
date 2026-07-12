@@ -13,7 +13,11 @@ public sealed record IndexDeclaration(
     IReadOnlySet<PortableQueryOperation> SupportedOperations,
     IndexPhysicalizationPolicy Physicalization = IndexPhysicalizationPolicy.Default);
 
-public sealed record IndexField(string Path);
+/// <summary>
+/// One stable serialized index path. <see cref="ValueKind"/> overrides the declaration default for
+/// heterogeneous compound indexes; homogeneous declarations can omit it.
+/// </summary>
+public sealed record IndexField(string Path, IndexValueKind? ValueKind = null);
 
 public enum IndexValueKind
 {

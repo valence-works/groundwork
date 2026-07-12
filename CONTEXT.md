@@ -59,7 +59,8 @@ _Avoid_: Migration class list
 **Physical Schema Diff**:
 A deterministic additive comparison between desired executable storage routes and durable applied
 provider state. It emits semantic create, projection, index, canonical-JSON backfill, validation,
-and recording operations without provider DDL.
+and recording operations without provider DDL. Provider executors acknowledge those exact
+operations durably and record canonical applied state only after validation.
 _Avoid_: Provider migration script, manifest-version comparison
 
 **Semantic Migration**:
@@ -79,7 +80,9 @@ _Avoid_: IQueryable, arbitrary LINQ
 Immutable provider output describing the selected linked+primary, primary envelope/JSON, entity
 projection, or provider-native field route for a bounded document query. It always carries the
 mandatory storage scope and deterministic identity tie-break; unsupported declarations produce no
-client-fallback plan. Callers do not submit physical query plans.
+client-fallback plan. Provider handlers certify and execute the exact provider, route, object,
+index, and field mapping before the store can serve traffic. Callers do not submit physical query
+plans.
 _Avoid_: Document query
 
 **Diagnostic Record Store**:

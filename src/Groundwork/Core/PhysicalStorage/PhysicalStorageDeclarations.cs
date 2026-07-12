@@ -138,6 +138,15 @@ public sealed class LogicalIndexDeclaration : IEquatable<LogicalIndexDeclaration
 
     public MissingValueBehavior MissingValueBehavior { get; }
 
+    public IndexValueKind GetValueKind(IndexField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return field.ValueKind ?? ValueKind;
+    }
+
+    public IndexValueKind GetValueKind(string path) =>
+        GetValueKind(Fields.Single(field => field.Path == path));
+
     public bool Equals(LogicalIndexDeclaration? other) =>
         other is not null &&
         Identity == other.Identity &&

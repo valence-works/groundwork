@@ -236,6 +236,41 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
+    public void DeclaredDefaultCannotInventDecimalPrecisionAndScaleForNumericDemand()
+    {
+        var physicalStorage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Default(),
+            [
+                new LogicalIndexDeclaration(
+                    "by-value",
+                    [new IndexField("value")],
+                    IndexValueKind.Number,
+                    false,
+                    MissingValueBehavior.Excluded)
+            ],
+            [
+                new BoundedQueryDeclaration(
+                    "list-by-value",
+                    "by-value",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.None,
+                    QueryPagingSupport.Offset,
+                    BoundedQueryExecutionClass.ScaleBearing)
+            ]);
+        var manifest = WithPhysicalStorage(SampleManifests.MetadataManifest(), physicalStorage);
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-018");
+    }
+
+    [Fact]
     public void ScaleBearingCompoundDemandSynthesizesOrderedPhysicalIndex()
     {
         var physicalStorage = new StorageUnitPhysicalStorage(

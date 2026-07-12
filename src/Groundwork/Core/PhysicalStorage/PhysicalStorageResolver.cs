@@ -384,7 +384,7 @@ public static class PhysicalStorageResolver
                     query.IndexIdentity,
                     field.Path,
                     sortDirections[order],
-                    matching[0].ValueKind,
+                    matching[0].GetValueKind(field),
                     matching[0].MissingValueBehavior,
                     Array.AsReadOnly(query.Operations.Order().ToArray()),
                     query.SortSupport,
@@ -702,13 +702,46 @@ public static class PhysicalStorageResolver
                 column.Precision is <= 0 ||
                 column.Scale is < 0 ||
                 (column.Scale is not null && column.Precision is null) ||
-                (column.Scale is not null && column.Precision is not null && column.Scale > column.Precision))
+                (column.Scale is not null && column.Precision is not null && column.Scale > column.Precision) ||
+                (column.Type == PortablePhysicalType.Decimal &&
+                 (column.Precision is null or > 28 || column.Scale is null)) ||
+                (column.Type != PortablePhysicalType.Decimal && column.Scale is not null))
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-018",
                     $"Projected column '{column.LogicalName}' has invalid portable metadata.",
                     $"{target}.projectedColumns"));
                 valid = false;
+            }
+        }
+
+        if (!duplicatePaths)
+        {
+            var projectedByPath = definition.ProjectedColumns.ToDictionary(
+                column => column.Path,
+                StringComparer.Ordinal);
+            foreach (var logicalIndex in unit.PhysicalStorage!.LogicalIndexes)
+            {
+                var physicalIndex = definition.Indexes.FirstOrDefault(index =>
+                    index.LogicalName == logicalIndex.Identity);
+                if (physicalIndex is null)
+                    continue;
+                foreach (var field in logicalIndex.Fields)
+                {
+                    if (!projectedByPath.TryGetValue(field.Path, out var projection) ||
+                        physicalIndex.Columns.All(column => column.ColumnLogicalName != projection.LogicalName) ||
+                        PortableQueryOperationCompatibility.Supports(logicalIndex.GetValueKind(field), projection.Type))
+                    {
+                        continue;
+                    }
+
+                    diagnostics.Add(GroundworkDiagnostic.Error(
+                        "GW-PHYSICAL-031",
+                        $"Logical index '{logicalIndex.Identity}' value kind '{logicalIndex.GetValueKind(field)}' cannot use " +
+                        $"projected path '{field.Path}' with physical type '{projection.Type}' without changing query semantics.",
+                        $"{target}.projectedColumns.{projection.LogicalName}"));
+                    valid = false;
+                }
             }
         }
 

@@ -47,7 +47,11 @@ public sealed record PhysicalEvolutionMetadata(
     bool IsDestructive = false,
     string? SemanticMigrationIdentity = null);
 
-/// <summary>A rebuildable provider-native projection of one stable serialized path.</summary>
+/// <summary>
+/// A rebuildable provider-native projection of one stable serialized path. Decimal projections
+/// require explicit total <see cref="Precision"/> and fractional <see cref="Scale"/>. DateTime
+/// projections represent explicitly offset UTC instants at 100ns tick precision.
+/// </summary>
 public sealed record ProjectedColumnDefinition(
     string LogicalName,
     string Path,
@@ -295,22 +299,22 @@ internal static class PhysicalIndexStorageTargetResolver
     public static PhysicalIndexStorageTarget Resolve(
         PhysicalTableDefinition definition,
         PhysicalIndexDefinition index) => index.Target switch
-    {
-        PhysicalIndexStorageTarget.FormDefault =>
-            definition.Form == PhysicalStorageForm.SharedDocuments || definition.LinkedProjectionLogicalName is not null
-                ? PhysicalIndexStorageTarget.LinkedIndexStorage
-                : PhysicalIndexStorageTarget.PrimaryStorage,
-        _ => index.Target
-    };
+        {
+            PhysicalIndexStorageTarget.FormDefault =>
+                definition.Form == PhysicalStorageForm.SharedDocuments || definition.LinkedProjectionLogicalName is not null
+                    ? PhysicalIndexStorageTarget.LinkedIndexStorage
+                    : PhysicalIndexStorageTarget.PrimaryStorage,
+            _ => index.Target
+        };
 
     public static bool IsValid(
         PhysicalTableDefinition definition,
         PhysicalIndexDefinition index) => Resolve(definition, index) switch
-    {
-        PhysicalIndexStorageTarget.PrimaryStorage => definition.Form != PhysicalStorageForm.SharedDocuments,
-        PhysicalIndexStorageTarget.LinkedIndexStorage =>
-            definition.Form != PhysicalStorageForm.PhysicalEntityTable &&
-            !string.IsNullOrWhiteSpace(definition.LinkedProjectionLogicalName),
-        _ => false
-    };
+        {
+            PhysicalIndexStorageTarget.PrimaryStorage => definition.Form != PhysicalStorageForm.SharedDocuments,
+            PhysicalIndexStorageTarget.LinkedIndexStorage =>
+                definition.Form != PhysicalStorageForm.PhysicalEntityTable &&
+                !string.IsNullOrWhiteSpace(definition.LinkedProjectionLogicalName),
+            _ => false
+        };
 }

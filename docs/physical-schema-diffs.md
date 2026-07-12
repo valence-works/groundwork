@@ -35,8 +35,9 @@ canonical-JSON extraction for an explicitly required semantic transform.
 
 The compatibility `Groundwork.Materialization` planner now schedules the same Core
 `BackfillCanonicalJsonOperation` used by route-native diffs after `CreateIndexOperation`; there is
-no second compatibility backfill operation type. Relational providers
-execute the existing rebuild at that stage; MongoDB acknowledges it as a native-index no-op because
+no second compatibility backfill operation type. Route-native required projected columns are staged
+nullable, backfilled, and then enforced by `FinalizeProjectedColumnOperation` before their indexes
+are created. Relational providers execute the existing compatibility rebuild at its stage; MongoDB acknowledges it as a native-index no-op because
 new native indexes cover existing documents. This removes the hidden rebuild inside index creation
 and preserves one create-then-backfill semantic sequence while route-native provider execution is
 implemented by issues #46–#48.
@@ -73,6 +74,8 @@ history, planning, applying, validating, or recording. Manifest version is inten
 from the lock key so same-version changes and version bumps cannot race. Provider package version is
 also excluded: rolling provider upgrades operate on the same physical schema and must share the lock;
 the version remains durable evidence and a version change produces validation/recording work.
+The immutable target identity is also passed to every executor operation; implementations must not
+infer durable ledger ownership from mutable ambient executor state.
 
 An executor must apply `(operation identity, fingerprint)` idempotently. The same identity with a
 different fingerprint is a conflict. An acknowledgement means the operation is durably observable;
@@ -92,5 +95,7 @@ applied snapshot are rejected deterministically (`GW-SCHEMA-001`); Groundwork do
 adopt, or migrate them. Operators must remove such rows before applying the new target. There is no
 compatibility-upgrade policy in #44.
 
-Provider DDL translation and durable provider ledgers are implemented with the physical-form
-runtimes in #46–#48. The migration CLI is #49.
+SQLite DDL translation, canonical-JSON rebuilds, validation, the durable operation ledger, and
+typed applied-state compare-and-swap are implemented by the
+[relational physical storage runtime](relational-physical-storage-runtime.md) in #46. SQL Server and
+PostgreSQL provider execution remain #47. MongoDB provider execution is #48. The migration CLI is #49.

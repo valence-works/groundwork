@@ -229,6 +229,7 @@ public sealed class PhysicalSchemaApplicationTests
         }
 
         public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
+            PhysicalSchemaTargetIdentity target,
             PhysicalSchemaOperation operation,
             CancellationToken cancellationToken)
         {

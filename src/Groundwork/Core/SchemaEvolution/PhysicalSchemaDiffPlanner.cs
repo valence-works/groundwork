@@ -115,6 +115,8 @@ public static class PhysicalSchemaDiffPlanner
                         [column.Definition.Path],
                         addColumn.Fingerprint));
                 }
+                if (!column.Definition.IsNullable)
+                    operations.Add(new FinalizeProjectedColumnOperation(route, column));
             }
 
             foreach (var index in route.Indexes)
@@ -259,9 +261,13 @@ public static class PhysicalSchemaDiffPlanner
         PhysicalSchemaOperationKind.CreatePhysicalEntityStorage => 0,
         PhysicalSchemaOperationKind.CreateLinkedStorage => 1,
         PhysicalSchemaOperationKind.AddProjectedColumn => 2,
-        PhysicalSchemaOperationKind.CreatePhysicalIndex => 3,
-        PhysicalSchemaOperationKind.BackfillCanonicalJson => 4,
-        _ => 5
+        PhysicalSchemaOperationKind.BackfillCanonicalJson => operation is BackfillCanonicalJsonOperation
+        {
+            SubjectKind: CanonicalJsonBackfillSubjectKind.ProjectedColumn
+        } ? 3 : 6,
+        PhysicalSchemaOperationKind.FinalizeProjectedColumn => 4,
+        PhysicalSchemaOperationKind.CreatePhysicalIndex => 5,
+        _ => 7
     };
 
 }

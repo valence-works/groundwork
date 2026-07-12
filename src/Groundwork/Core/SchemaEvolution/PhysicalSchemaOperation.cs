@@ -14,6 +14,7 @@ public enum PhysicalSchemaOperationKind
     CreateLinkedStorage,
     CreatePhysicalEntityStorage,
     AddProjectedColumn,
+    FinalizeProjectedColumn,
     CreatePhysicalIndex,
     BackfillCanonicalJson,
     ValidatePhysicalSchema,
@@ -155,6 +156,30 @@ public sealed class AddProjectedColumnOperation : PhysicalSchemaOperation
     internal AddProjectedColumnOperation(ExecutableStorageRoute route, ExecutableProjectedColumnRoute column)
         : base(
             PhysicalSchemaOperationKind.AddProjectedColumn,
+            route.StorageUnit,
+            column.Definition.LogicalName,
+            PhysicalSchemaOperationCanonicalizer.ProjectedColumn(column))
+    {
+        Route = route;
+        Column = column;
+    }
+
+    public ExecutableStorageRoute Route { get; }
+
+    public ExecutableProjectedColumnRoute Column { get; }
+
+    public ExecutableStorageObjectRoute Storage => PhysicalSchemaOperationStorage.Resolve(Route, Column.Target);
+}
+
+/// <summary>
+/// Makes a staged projected column enforce its declared nullability after canonical JSON has been
+/// backfilled. Providers may implement this as an ALTER or as an atomic table rebuild.
+/// </summary>
+public sealed class FinalizeProjectedColumnOperation : PhysicalSchemaOperation
+{
+    internal FinalizeProjectedColumnOperation(ExecutableStorageRoute route, ExecutableProjectedColumnRoute column)
+        : base(
+            PhysicalSchemaOperationKind.FinalizeProjectedColumn,
             route.StorageUnit,
             column.Definition.LogicalName,
             PhysicalSchemaOperationCanonicalizer.ProjectedColumn(column))
