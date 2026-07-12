@@ -1,6 +1,8 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Materialization;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Materialization;
@@ -62,7 +64,7 @@ public sealed class MaterializationPlanner
     }
 
     private static void ValidateMaterializationCapabilities(
-        IReadOnlyList<MaterializationOperation> operations,
+        IReadOnlyList<IProviderMaterializationOperation> operations,
         MaterializationCapabilityReport capabilities,
         List<GroundworkDiagnostic> diagnostics)
     {
@@ -88,9 +90,9 @@ public sealed class MaterializationPlanner
         }
     }
 
-    private static IReadOnlyList<MaterializationOperation> DeriveOperations(StorageManifest manifest)
+    private static IReadOnlyList<IProviderMaterializationOperation> DeriveOperations(StorageManifest manifest)
     {
-        var operations = new List<MaterializationOperation>();
+        var operations = new List<IProviderMaterializationOperation>();
 
         foreach (var unit in manifest.StorageUnits)
         {
@@ -102,15 +104,19 @@ public sealed class MaterializationPlanner
                     "storage_scope",
                     unit.Serialization.SchemaField)));
 
-            operations.AddRange(unit.Indexes.Select(index => new CreateIndexOperation(
-                new MaterializedIndex(
+            foreach (var index in unit.Indexes)
+            {
+                var materializedIndex = new MaterializedIndex(
                     unit.Identity.Value,
                     index.Identity,
                     index.Fields.Select(field => field.Path).ToList(),
                     index.ValueKind,
                     index.IsUnique,
                     index.IsSortable,
-                    index.MissingValueBehavior))));
+                    index.MissingValueBehavior);
+                operations.Add(new CreateIndexOperation(materializedIndex));
+                operations.Add(BackfillCanonicalJsonOperation.ForLogicalIndex(unit.Identity, index));
+            }
 
             var projectionFields = PhysicalizationProjection.EligibleFields(unit);
             if (projectionFields.Count != 0)
@@ -132,7 +138,7 @@ public sealed class MaterializationPlanner
     private static SchemaHistoryEntry CreateSchemaHistory(
         StorageManifest manifest,
         ProviderIdentity provider,
-        IReadOnlyList<MaterializationOperation> operations) =>
+        IReadOnlyList<IProviderMaterializationOperation> operations) =>
         new(
             manifest.Identity,
             manifest.Version,

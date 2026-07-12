@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Materialization;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Materialization;
@@ -8,7 +9,7 @@ public sealed record MaterializationPlan(
     ProviderIdentity Provider,
     StorageManifestIdentity ManifestIdentity,
     StorageManifestVersion ManifestVersion,
-    IReadOnlyList<MaterializationOperation> Operations,
+    IReadOnlyList<IProviderMaterializationOperation> Operations,
     SchemaHistoryEntry SchemaHistory,
     IReadOnlyList<GroundworkDiagnostic> Diagnostics)
 {

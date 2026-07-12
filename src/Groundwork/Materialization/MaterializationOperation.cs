@@ -1,9 +1,10 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Materialization;
 using Groundwork.Core.Physicalization;
 
 namespace Groundwork.Materialization;
 
-public abstract record MaterializationOperation
+public abstract record MaterializationOperation : IProviderMaterializationOperation
 {
     public abstract MaterializationOperationKind Kind { get; }
     public abstract string Target { get; }
@@ -52,11 +53,3 @@ public sealed record MaterializedIndex(
 public sealed record MaterializedProjection(
     string UnitIdentity,
     IReadOnlyList<PhysicalizedFieldPlan> Fields);
-
-public enum MaterializationOperationKind
-{
-    CreateStorageUnit,
-    CreateIndex,
-    CreateOptimizedProjection,
-    RecordSchemaHistory
-}

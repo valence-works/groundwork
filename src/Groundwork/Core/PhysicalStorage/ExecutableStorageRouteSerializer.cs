@@ -16,6 +16,51 @@ public static class ExecutableStorageRouteSerializer
     internal static string CreateFingerprint(ExecutableStorageRoute route) =>
         Convert.ToHexString(SHA256.HashData(SerializeCore(route, includeFingerprint: false))).ToLowerInvariant();
 
+    internal static void ValidateCanonicalSnapshot(
+        string canonicalJson,
+        string expectedDefinitionFingerprint,
+        string expectedRouteFingerprint)
+    {
+        using var document = JsonDocument.Parse(canonicalJson);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object ||
+            root.GetProperty("definitionFingerprint").GetString() != expectedDefinitionFingerprint ||
+            root.GetProperty("fingerprint").GetString() != expectedRouteFingerprint)
+        {
+            throw new InvalidOperationException("Applied route snapshot fingerprints do not match its canonical route.");
+        }
+
+        using var canonicalStream = new MemoryStream();
+        using var fingerprintStream = new MemoryStream();
+        using (var canonicalWriter = new Utf8JsonWriter(canonicalStream))
+        using (var fingerprintWriter = new Utf8JsonWriter(fingerprintStream))
+        {
+            canonicalWriter.WriteStartObject();
+            fingerprintWriter.WriteStartObject();
+            foreach (var property in root.EnumerateObject())
+            {
+                canonicalWriter.WritePropertyName(property.Name);
+                property.Value.WriteTo(canonicalWriter);
+                if (property.NameEquals("fingerprint"))
+                    continue;
+                fingerprintWriter.WritePropertyName(property.Name);
+                property.Value.WriteTo(fingerprintWriter);
+            }
+            canonicalWriter.WriteEndObject();
+            fingerprintWriter.WriteEndObject();
+        }
+
+        var normalized = Encoding.UTF8.GetString(canonicalStream.ToArray());
+        var actualFingerprint = Convert.ToHexString(
+                SHA256.HashData(fingerprintStream.ToArray()))
+            .ToLowerInvariant();
+        if (!string.Equals(normalized, canonicalJson, StringComparison.Ordinal) ||
+            !string.Equals(actualFingerprint, expectedRouteFingerprint, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Applied route snapshot is non-canonical or has an invalid fingerprint.");
+        }
+    }
+
     private static byte[] SerializeCore(ExecutableStorageRoute route, bool includeFingerprint)
     {
         using var stream = new MemoryStream();

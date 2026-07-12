@@ -2,6 +2,7 @@ using System.Data;
 using System.Data.Common;
 using System.Text.Json;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Materialization;
 using Groundwork.Relational.Physicalization;
 
@@ -37,8 +38,10 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
             {
                 case CreateStorageUnitOperation:
                     break;
-                case CreateIndexOperation index:
-                    await BackfillIndexAsync(index.Index, transaction, cancellationToken);
+                case CreateIndexOperation:
+                    break;
+                case BackfillCanonicalJsonOperation backfill:
+                    await BackfillIndexAsync(ToLegacyMaterializedIndex(backfill), transaction, cancellationToken);
                     break;
                 case CreateOptimizedProjectionOperation projection:
                     await MaterializeOptimizedProjectionAsync(projection.Projection, transaction, cancellationToken);
@@ -52,6 +55,27 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         }
 
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static MaterializedIndex ToLegacyMaterializedIndex(BackfillCanonicalJsonOperation backfill)
+    {
+        if (backfill.SubjectKind != CanonicalJsonBackfillSubjectKind.LogicalIndex ||
+            backfill.LogicalIndex is null ||
+            backfill.StorageUnit is null)
+        {
+            throw new InvalidOperationException(
+                $"Legacy relational materialization cannot execute physical backfill '{backfill.Identity}'.");
+        }
+
+        var index = backfill.LogicalIndex;
+        return new MaterializedIndex(
+            backfill.StorageUnit.Value,
+            index.Identity,
+            index.Fields.Select(field => field.Path).ToArray(),
+            index.ValueKind,
+            index.IsUnique,
+            index.IsSortable,
+            index.MissingValueBehavior);
     }
 
     private async Task RecordSchemaHistoryAsync(

@@ -2,6 +2,8 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Materialization;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Queries;
 using Groundwork.Core.Validation;
 using Xunit;
@@ -32,7 +34,9 @@ public sealed class MaterializationPlannerTests
             plan.Operations,
             operation => Assert.IsType<CreateStorageUnitOperation>(operation),
             operation => Assert.IsType<CreateIndexOperation>(operation),
+            operation => Assert.IsType<BackfillCanonicalJsonOperation>(operation),
             operation => Assert.IsType<CreateIndexOperation>(operation),
+            operation => Assert.IsType<BackfillCanonicalJsonOperation>(operation),
             operation => Assert.IsType<CreateOptimizedProjectionOperation>(operation),
             operation => Assert.IsType<RecordSchemaHistoryOperation>(operation));
 
@@ -42,8 +46,29 @@ public sealed class MaterializationPlannerTests
         Assert.Equal(manifest.Identity, plan.SchemaHistory.ManifestIdentity);
         Assert.Equal(manifest.Version, plan.SchemaHistory.ManifestVersion);
         Assert.Equal(
-            ["configurationDocument", "configurationDocument.by-key", "configurationDocument.by-category", "configurationDocument.optimized-projection"],
+            [
+                "configurationDocument",
+                "configurationDocument.by-key",
+                "configurationDocument.by-key.backfill-canonical-json",
+                "configurationDocument.by-category",
+                "configurationDocument.by-category.backfill-canonical-json",
+                "configurationDocument.optimized-projection"
+            ],
             plan.SchemaHistory.AppliedOperationTargets);
+        var backfills = plan.Operations
+            .OfType<Groundwork.Core.SchemaEvolution.BackfillCanonicalJsonOperation>()
+            .ToArray();
+        Assert.Equal(2, backfills.Length);
+        Assert.All(backfills, backfill =>
+        {
+            Assert.Equal(CanonicalJsonBackfillSubjectKind.LogicalIndex, backfill.SubjectKind);
+            Assert.NotNull(backfill.LogicalIndex);
+            Assert.Null(backfill.Route);
+        });
+        Assert.DoesNotContain(
+            plan.Operations,
+            operation => operation.GetType().Namespace == "Groundwork.Materialization" &&
+                         operation.GetType().Name == "BackfillCanonicalJsonOperation");
     }
 
     [Fact]

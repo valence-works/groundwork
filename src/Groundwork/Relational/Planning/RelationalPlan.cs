@@ -7,7 +7,8 @@ public sealed record RelationalPlan(
     IReadOnlyList<RelationalTablePlan> Tables,
     MaterializationPlan MaterializationPlan)
 {
-    public IReadOnlyList<MaterializationOperation> Operations => MaterializationPlan.Operations;
+    public IReadOnlyList<Groundwork.Core.Materialization.IProviderMaterializationOperation> Operations =>
+        MaterializationPlan.Operations;
     public SchemaHistoryEntry SchemaHistory => MaterializationPlan.SchemaHistory;
     public IReadOnlyList<GroundworkDiagnostic> Diagnostics => MaterializationPlan.Diagnostics;
     public bool IsPlannable => MaterializationPlan.IsPlannable;
