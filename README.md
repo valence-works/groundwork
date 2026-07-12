@@ -11,8 +11,9 @@ This repository contains the standalone Groundwork library.
 - `Groundwork.Core`: manifests, storage intent, provider capability checks, validation, materialization concepts, and physicalization projection rules.
 - `Groundwork.Documents`: portable document-store contracts and document planning.
 - `Groundwork.DiagnosticRecords`: bounded append/query/inspection/retention contracts for immutable diagnostic streams.
+- `Groundwork.DiagnosticRecords.Relational`: shared relational schema, transactional ledger/retention kernel, and bounded SQL query translation for diagnostic streams.
 - `Groundwork.Relational`: relational planning and shared relational document-store infrastructure.
-- `Groundwork.Sqlite`: SQLite materialization and document-store provider.
+- `Groundwork.Sqlite`: SQLite materialization plus document-store and diagnostic-record providers.
 - `Groundwork.SqlServer`: SQL Server materialization and document-store provider.
 - `Groundwork.PostgreSql`: PostgreSQL materialization and document-store provider.
 - `Groundwork.MongoDb`: MongoDB materialization and document-store provider.

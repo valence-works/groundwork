@@ -3,7 +3,7 @@ using Xunit;
 
 namespace Groundwork.DiagnosticRecords.Tests;
 
-public sealed class DiagnosticRecordContractTests
+public abstract class DiagnosticRecordContractTests
 {
     [Fact]
     public void Scale_bearing_query_rejects_an_operator_the_executable_handler_cannot_run()

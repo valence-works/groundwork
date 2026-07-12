@@ -12,6 +12,41 @@ internal static class SqliteRelationalSessions
         return RelationalSessionFactory.Serialized(() => new SqliteConnection(connectionString));
     }
 
+    public static RelationalSessionFactory CreateSerializedImmediate(string connectionString) =>
+        CreateSerializedImmediate(connectionString, null);
+
+    internal static RelationalSessionFactory CreateSerializedImmediate(
+        string connectionString,
+        SqliteImmediateTransactionObserver? observer)
+    {
+        ValidateStatelessConnectionString(connectionString);
+
+        return RelationalSessionFactory.Serialized(
+            () => new SqliteConnection(connectionString),
+            (connection, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                observer?.BeforeBegin();
+                var transaction = ((SqliteConnection)connection).BeginTransaction(deferred: false);
+                observer?.AfterBegin();
+                return Task.FromResult<System.Data.Common.DbTransaction>(transaction);
+            });
+    }
+
+    public static RelationalSessionFactory CreateSerializedDeferred(string connectionString)
+    {
+        ValidateStatelessConnectionString(connectionString);
+
+        return RelationalSessionFactory.Serialized(
+            () => new SqliteConnection(connectionString),
+            (connection, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return Task.FromResult<System.Data.Common.DbTransaction>(
+                    ((SqliteConnection)connection).BeginTransaction(deferred: true));
+            });
+    }
+
     internal static void ValidateStatelessConnectionString(string connectionString)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
@@ -61,3 +96,7 @@ internal static class SqliteRelationalSessions
         return false;
     }
 }
+
+internal sealed record SqliteImmediateTransactionObserver(
+    Action BeforeBegin,
+    Action AfterBegin);

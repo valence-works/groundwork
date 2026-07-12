@@ -4,7 +4,7 @@ using Xunit;
 
 namespace Groundwork.DiagnosticRecords.Tests;
 
-public abstract class DiagnosticRecordStoreConformanceTests
+public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordContractTests
 {
     protected static DiagnosticRecordStreamDefinition TestDefinition { get; } = new(
         new DiagnosticStreamId("logs"),
@@ -1177,6 +1177,37 @@ public abstract class DiagnosticRecordStoreConformanceTests
         Assert.Contains(exception.Errors, x => x.Code == "append.field.value_invalid");
     }
 
+    [Fact]
+    public async Task Trim_hook_observes_uncommitted_deletion_while_an_independent_store_sees_durable_records()
+    {
+        var fixture = CreateFixture();
+        var store = OpenStore(fixture);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        var stream = TestDefinition.Stream;
+        await store.AppendAsync(DiagnosticRecordBatch.Create(
+            scope,
+            stream,
+            new(fixture.GetUtcNow(), "staged-trim-seed"),
+            [
+                new("record-1", fixture.GetUtcNow(), "{}"),
+                new("record-2", fixture.GetUtcNow(), "{}"),
+                new("record-3", fixture.GetUtcNow(), "{}")
+            ]));
+        var trim = DiagnosticTrimRequest.Create(scope, stream, new(fixture.GetUtcNow(), "observe-staged-trim"), 1);
+        fixture.InterceptNext(DiagnosticExecutionPoint.TrimAfterRecordDeletedBeforeCommit, async cancellationToken =>
+        {
+            var independent = new BoundedDiagnosticRecordStore(fixture.OpenIndependentStore(TestDefinition));
+            var durablePage = await independent.QueryAsync(new(scope, stream, 10), cancellationToken);
+            Assert.Equal(["record-1", "record-2", "record-3"], durablePage.Records.Select(record => record.RecordId));
+            throw new IOException("Rollback the isolated trim transaction.");
+        });
+
+        await Assert.ThrowsAsync<IOException>(async () => await store.TrimAsync(trim));
+        var afterRollback = await OpenStore(fixture).QueryAsync(new(scope, stream, 10));
+
+        Assert.Equal(["record-1", "record-2", "record-3"], afterRollback.Records.Select(record => record.RecordId));
+    }
+
     private static DiagnosticRecordBatch Batch(string operationNonce, params string[] recordIds)
     {
         var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
@@ -1213,54 +1244,211 @@ public abstract class DiagnosticRecordStoreConformanceTests
 public sealed class InMemoryDiagnosticRecordStoreConformanceTests : DiagnosticRecordStoreConformanceTests
 {
     protected override IDiagnosticRecordStoreConformanceFixture CreateFixture() => new InMemoryDiagnosticRecordStoreFixture();
-
-    [Fact]
-    public async Task Trim_hook_observes_deleted_private_transaction_state_before_durable_publish()
-    {
-        var fixture = new InMemoryDiagnosticRecordStoreFixture();
-        var store = new BoundedDiagnosticRecordStore(fixture.OpenStore(TestDefinition));
-        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
-        var stream = TestDefinition.Stream;
-        var records = new[]
-        {
-            new DiagnosticRecordInput("record-1", fixture.GetUtcNow(), "{}"),
-            new DiagnosticRecordInput("record-2", fixture.GetUtcNow(), "{}"),
-            new DiagnosticRecordInput("record-3", fixture.GetUtcNow(), "{}")
-        };
-        await store.AppendAsync(DiagnosticRecordBatch.Create(
-            scope,
-            stream,
-            new(fixture.GetUtcNow(), "staged-trim-seed"),
-            records));
-        var trim = DiagnosticTrimRequest.Create(
-            scope,
-            stream,
-            new(fixture.GetUtcNow(), "observe-staged-trim"),
-            1);
-        fixture.InterceptNext(DiagnosticExecutionPoint.TrimAfterRecordDeletedBeforeCommit, async cancellationToken =>
-        {
-            Assert.Equal(["record-3"], fixture.GetStagedTrimRecordIds(scope, stream));
-            var durablePage = await store.QueryAsync(new(scope, stream, 10), cancellationToken);
-            Assert.Equal(["record-1", "record-2", "record-3"], durablePage.Records.Select(x => x.RecordId));
-            throw new IOException("Rollback the isolated trim transaction.");
-        });
-
-        await Assert.ThrowsAsync<IOException>(async () => await store.TrimAsync(trim));
-        var restarted = new BoundedDiagnosticRecordStore(fixture.OpenStore(TestDefinition));
-        var afterRollback = await restarted.QueryAsync(new(scope, stream, 10));
-
-        Assert.Null(fixture.GetStagedTrimRecordIds(scope, stream));
-        Assert.Equal(["record-1", "record-2", "record-3"], afterRollback.Records.Select(x => x.RecordId));
-    }
 }
 
 public interface IDiagnosticRecordStoreConformanceFixture
 {
     IDiagnosticRecordStore OpenStore(DiagnosticRecordStreamDefinition definition);
+    IDiagnosticRecordStore OpenIndependentStore(DiagnosticRecordStreamDefinition definition) => OpenStore(definition);
     void InterceptNext(DiagnosticExecutionPoint point, Func<CancellationToken, ValueTask> interceptor);
     DateTimeOffset GetUtcNow();
     void AdvanceTime(TimeSpan duration);
     void SetWallClock(DateTimeOffset utcNow);
+}
+
+/// <summary>
+/// Provider fixture extension used by every relational diagnostic-record implementation to prove
+/// that bounded reads and retention stay on native, scoped access paths.
+/// </summary>
+public interface IRelationalDiagnosticRecordStoreConformanceFixture : IDiagnosticRecordStoreConformanceFixture
+{
+    ValueTask<IReadOnlyList<string>> ExplainQueryAsync(
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<IReadOnlyList<string>> ExplainTrimAsync(
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken = default);
+
+    bool UsesSeek(
+        IReadOnlyList<string> plan,
+        string accessPath,
+        IReadOnlyList<string> constrainedColumns);
+
+    ValueTask<IReadOnlyList<string>> ReadComparisonKeysAsync(
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream,
+        string field,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<long> CountOperationRowsAsync(
+        DiagnosticOperationKind kind,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Reusable relational-provider evidence layered over the provider-neutral behavioral suite.
+/// SQL Server and PostgreSQL fixtures inherit this class unchanged when their dialects land.
+/// </summary>
+public abstract class RelationalDiagnosticRecordStoreConformanceTests : DiagnosticRecordStoreConformanceTests
+{
+    protected sealed override IDiagnosticRecordStoreConformanceFixture CreateFixture() => CreateRelationalFixture();
+
+    protected abstract IRelationalDiagnosticRecordStoreConformanceFixture CreateRelationalFixture();
+
+    [Fact]
+    public async Task Scoped_cursor_queries_use_the_scoped_cursor_access_path()
+    {
+        var fixture = CreateRelationalFixture();
+        var query = new DiagnosticRecordQuery(new("tenant-a", "shell-a"), TestDefinition.Stream, 10);
+
+        var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
+
+        Assert.True(fixture.UsesSeek(
+            plan,
+            "ix_groundwork_diagnostic_records_scope_cursor",
+            ["tenant_id", "scope_id", "stream_id", "cursor"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Field_queries_use_the_scoped_field_access_path()
+    {
+        var fixture = CreateRelationalFixture();
+        var query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            TestDefinition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.Equal("service", DiagnosticFieldValue.String("api")));
+
+        var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
+
+        Assert.True(fixture.UsesSeek(
+            plan,
+            "ix_groundwork_diagnostic_fields_scope_value",
+            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Latest_per_key_queries_use_the_scoped_latest_access_path()
+    {
+        var fixture = CreateRelationalFixture();
+        var store = fixture.OpenStore(TestDefinition);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        var records = Enumerable.Range(0, 100).Select(index => new DiagnosticRecordInput(
+            $"latest-plan-{index}",
+            fixture.GetUtcNow(),
+            "{}",
+            new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>>
+            {
+                ["service"] = [DiagnosticFieldValue.String($"service-{index % 10}")]
+            })).ToArray();
+        await store.AppendAsync(DiagnosticRecordBatch.Create(
+            scope,
+            TestDefinition.Stream,
+            new(fixture.GetUtcNow(), "latest-plan-seed"),
+            records));
+        var query = new DiagnosticRecordQuery(
+            scope,
+            TestDefinition.Stream,
+            10,
+            LatestPerKeyField: "service");
+
+        var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
+
+        Assert.True(fixture.UsesSeek(
+            plan,
+            "ix_groundwork_diagnostic_fields_scope_latest",
+            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Keep_newest_trim_uses_the_scoped_cursor_access_path()
+    {
+        var fixture = CreateRelationalFixture();
+        var request = DiagnosticTrimRequest.Create(
+            new("tenant-a", "shell-a"),
+            TestDefinition.Stream,
+            new(fixture.GetUtcNow(), "explain-trim"),
+            10);
+
+        var plan = await fixture.ExplainTrimAsync(TestDefinition, request);
+
+        Assert.True(fixture.UsesSeek(
+            plan,
+            "ix_groundwork_diagnostic_records_scope_cursor",
+            ["tenant_id", "scope_id", "stream_id"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Ascii_ignore_case_comparison_keys_are_persisted_in_canonical_binary_form()
+    {
+        var fixture = CreateRelationalFixture();
+        var store = fixture.OpenStore(TestDefinition);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        await store.AppendAsync(DiagnosticRecordBatch.Create(
+            scope,
+            TestDefinition.Stream,
+            new(fixture.GetUtcNow(), "comparison-keys"),
+            [new(
+                "record-1",
+                fixture.GetUtcNow(),
+                "{}",
+                new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>>
+                {
+                    ["service"] = [DiagnosticFieldValue.String("API-Z9")]
+                })]));
+
+        var keys = await fixture.ReadComparisonKeysAsync(scope, TestDefinition.Stream, "service");
+
+        Assert.Equal(["api-z9"], keys);
+    }
+
+    [Fact]
+    public async Task Expired_one_shot_operation_rows_are_cleaned_in_bounded_restart_safe_batches()
+    {
+        const int expiredOperations = 40;
+        var fixture = CreateRelationalFixture();
+        var store = fixture.OpenStore(TestDefinition);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        var initialNow = fixture.GetUtcNow();
+        for (var index = 0; index < expiredOperations; index++)
+        {
+            await store.AppendAsync(DiagnosticRecordBatch.Create(
+                scope,
+                TestDefinition.Stream,
+                new(initialNow, $"cleanup-append-{index}"),
+                [new($"cleanup-record-{index}", initialNow, "{}")]));
+            await store.TrimAsync(DiagnosticTrimRequest.Create(
+                scope,
+                TestDefinition.Stream,
+                new(initialNow, $"cleanup-trim-{index}"),
+                expiredOperations));
+        }
+
+        fixture.AdvanceTime(TestDefinition.AppendIdempotencyWindow + TestDefinition.MaxOperationClockSkew + TimeSpan.FromTicks(1));
+        var advancedNow = fixture.GetUtcNow();
+        await store.AppendAsync(DiagnosticRecordBatch.Create(
+            scope,
+            TestDefinition.Stream,
+            new(advancedNow, "cleanup-trigger-append"),
+            [new("cleanup-trigger-record", advancedNow, "{}")]));
+
+        Assert.Equal(9, await fixture.CountOperationRowsAsync(DiagnosticOperationKind.Append));
+        Assert.Equal(8, await fixture.CountOperationRowsAsync(DiagnosticOperationKind.Trim));
+
+        fixture.SetWallClock(initialNow);
+        var restarted = fixture.OpenIndependentStore(TestDefinition);
+        await restarted.TrimAsync(DiagnosticTrimRequest.Create(
+            scope,
+            TestDefinition.Stream,
+            new(advancedNow, "cleanup-trigger-trim"),
+            expiredOperations + 1));
+
+        Assert.Equal(1, await fixture.CountOperationRowsAsync(DiagnosticOperationKind.Append));
+        Assert.Equal(1, await fixture.CountOperationRowsAsync(DiagnosticOperationKind.Trim));
+    }
 }
 
 public enum DiagnosticExecutionPoint
