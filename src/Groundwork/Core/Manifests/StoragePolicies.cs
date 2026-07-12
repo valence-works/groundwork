@@ -26,16 +26,16 @@ public enum StorageIdentityKind
     Composite
 }
 
-public sealed record TenancyPolicy(TenancyKind Kind, string? PartitionField = null)
+public sealed record TenancyPolicy(TenancyKind Kind)
 {
-    public static TenancyPolicy None { get; } = new(TenancyKind.None);
-    public static TenancyPolicy TenantPartition(string fieldName = "tenantId") => new(TenancyKind.TenantPartition, fieldName);
+    public static TenancyPolicy Global { get; } = new(TenancyKind.Global);
+    public static TenancyPolicy Scoped { get; } = new(TenancyKind.Scoped);
 }
 
 public enum TenancyKind
 {
-    None,
-    TenantPartition,
+    Global,
+    Scoped,
     CustomPartition
 }
 

@@ -172,7 +172,7 @@ public sealed class MaterializationPlannerTests
                     intent ?? StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.TenantPartition(),
+                    TenancyPolicy.Scoped,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [

@@ -15,6 +15,9 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
 
     protected abstract string InsertSchemaHistorySql { get; }
 
+    protected virtual string ExactEqualityPredicate(string columnExpression, string parameterReference) =>
+        $"{columnExpression} = {parameterReference}";
+
     protected abstract IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection);
 
     public async Task MaterializeAsync(MaterializationPlan plan, CancellationToken cancellationToken = default)
@@ -94,13 +97,13 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         await DeleteIndexRowsAsync(index.UnitIdentity, index.Identity, transaction, cancellationToken);
 
         var documents = await LoadDocumentsForIndexAsync(index.UnitIdentity, transaction, cancellationToken);
-        foreach (var (documentId, contentJson) in documents)
+        foreach (var (storageScope, documentId, contentJson) in documents)
         {
             using var document = JsonDocument.Parse(contentJson);
             if (!RelationalIndexValues.TryGetIndexValue(document.RootElement, index.FieldPaths, out var value))
                 continue;
 
-            await InsertIndexRowAsync(index, documentId, value, transaction, cancellationToken);
+            await InsertIndexRowAsync(index, storageScope, documentId, value, transaction, cancellationToken);
         }
     }
 
@@ -111,9 +114,10 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(
-            """
+            $"""
             DELETE FROM groundwork_document_indexes
-            WHERE document_kind = @kind AND index_name = @index;
+            WHERE {ExactEqualityPredicate("document_kind", "@kind")}
+              AND {ExactEqualityPredicate("index_name", "@index")};
             """,
             transaction);
         AddParameter(command, "kind", documentKind);
@@ -121,30 +125,31 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private async Task<IReadOnlyList<(string DocumentId, string ContentJson)>> LoadDocumentsForIndexAsync(
+    private async Task<IReadOnlyList<(string StorageScope, string DocumentId, string ContentJson)>> LoadDocumentsForIndexAsync(
         string documentKind,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
         await using var command = CreateCommand(
-            """
-            SELECT id, content_json
+            $"""
+            SELECT storage_scope, id, content_json
             FROM groundwork_documents
-            WHERE document_kind = @kind;
+            WHERE {ExactEqualityPredicate("document_kind", "@kind")};
             """,
             transaction);
         AddParameter(command, "kind", documentKind);
 
-        var documents = new List<(string DocumentId, string ContentJson)>();
+        var documents = new List<(string StorageScope, string DocumentId, string ContentJson)>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
-            documents.Add((reader.GetString(0), reader.GetString(1)));
+            documents.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2)));
 
         return documents;
     }
 
     private async Task InsertIndexRowAsync(
         MaterializedIndex index,
+        string storageScope,
         string documentId,
         string value,
         DbTransaction transaction,
@@ -157,11 +162,12 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         await using var command = CreateCommand(
             $"""
             INSERT INTO groundwork_document_indexes
-            (document_kind, index_name, index_value, document_id, is_unique)
-            VALUES (@kind, @index, @value, @documentId, {isUnique});
+            (document_kind, storage_scope, index_name, index_value, document_id, is_unique)
+            VALUES (@kind, @scope, @index, @value, @documentId, {isUnique});
             """,
             transaction);
         AddParameter(command, "kind", index.UnitIdentity);
+        AddParameter(command, "scope", storageScope);
         AddParameter(command, "index", index.Identity);
         AddParameter(command, "value", value);
         AddParameter(command, "documentId", documentId);

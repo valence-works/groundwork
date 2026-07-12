@@ -17,7 +17,7 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         if (!plan.IsPlannable)
             throw new InvalidOperationException("Cannot execute an unplannable materialization plan.");
 
-        var collections = await GetCollectionNamesAsync(cancellationToken);
+        var collections = await GetCollectionsAsync(cancellationToken);
         var physicalizedFields = plan.Operations
             .OfType<CreateOptimizedProjectionOperation>()
             .SelectMany(operation => operation.Projection.Fields.Select(field => new
@@ -52,28 +52,66 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         }
     }
 
-    private async Task<HashSet<string>> GetCollectionNamesAsync(CancellationToken cancellationToken)
+    private async Task<Dictionary<string, BsonDocument>> GetCollectionsAsync(CancellationToken cancellationToken)
     {
-        var cursor = await database.ListCollectionNamesAsync(cancellationToken: cancellationToken);
-        var names = await cursor.ToListAsync(cancellationToken);
-        return names.ToHashSet(StringComparer.Ordinal);
+        using var cursor = await database.ListCollectionsAsync(cancellationToken: cancellationToken);
+        var collections = await cursor.ToListAsync(cancellationToken);
+        return collections.ToDictionary(
+            collection => collection["name"].AsString,
+            collection => collection,
+            StringComparer.Ordinal);
     }
 
-    private async Task EnsureCollectionAsync(HashSet<string> collections, string collectionName, CancellationToken cancellationToken)
+    private async Task EnsureCollectionAsync(
+        Dictionary<string, BsonDocument> collections,
+        string collectionName,
+        CancellationToken cancellationToken)
     {
-        if (collections.Contains(collectionName))
+        if (collections.TryGetValue(collectionName, out var existing))
+        {
+            ValidateSimpleBinaryCollation(collectionName, existing);
             return;
+        }
 
         try
         {
-            await database.CreateCollectionAsync(collectionName, cancellationToken: cancellationToken);
+            await database.CreateCollectionAsync(
+                collectionName,
+                new CreateCollectionOptions { Collation = new Collation("simple") },
+                cancellationToken);
         }
         catch (MongoCommandException ex) when (ex.Code == NamespaceExistsErrorCode)
         {
             // NamespaceExists means another materializer created the collection after our initial snapshot.
         }
 
-        collections.Add(collectionName);
+        var created = await GetCollectionAsync(collectionName, cancellationToken);
+        ValidateSimpleBinaryCollation(collectionName, created);
+        collections.Add(collectionName, created);
+    }
+
+    private async Task<BsonDocument> GetCollectionAsync(string collectionName, CancellationToken cancellationToken)
+    {
+        using var cursor = await database.ListCollectionsAsync(
+            new ListCollectionsOptions
+            {
+                Filter = Builders<BsonDocument>.Filter.Eq("name", collectionName)
+            },
+            cancellationToken);
+        return (await cursor.ToListAsync(cancellationToken)).Single();
+    }
+
+    private static void ValidateSimpleBinaryCollation(string collectionName, BsonDocument collection)
+    {
+        var options = collection.GetValue("options", new BsonDocument()).AsBsonDocument;
+        if (!options.TryGetValue("collation", out var collation) ||
+            collation.AsBsonDocument.GetValue("locale", "simple").AsString == "simple")
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"MongoDB collection '{collectionName}' must use the simple binary collation for exact Groundwork key and storage-scope semantics.");
     }
 
     private async Task EnsureSchemaHistoryIndexAsync(CancellationToken cancellationToken)
@@ -104,12 +142,14 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         var path = !physicalizedFields.TryGetValue((index.UnitIdentity, index.Identity), out var physicalizedField)
             ? $"content.{index.FieldPaths[0]}"
             : $"physicalized.{MongoDbGroundworkNames.PhysicalizedFieldName(physicalizedField)}";
-        var keys = Builders<BsonDocument>.IndexKeys.Ascending(path);
-        var options = new CreateIndexOptions
+        var keys = Builders<BsonDocument>.IndexKeys.Ascending("storage_scope").Ascending(path);
+        var options = new CreateIndexOptions<BsonDocument>
         {
             Name = index.Identity,
             Unique = index.IsUnique,
-            Sparse = index.MissingValueBehavior == MissingValueBehavior.Excluded
+            PartialFilterExpression = index.MissingValueBehavior == MissingValueBehavior.Excluded
+                ? new BsonDocument(path, new BsonDocument("$exists", true))
+                : null
         };
         await CreateIndexWithAdvisoryAsync(collection, new CreateIndexModel<BsonDocument>(keys, options), index.Identity, cancellationToken);
     }

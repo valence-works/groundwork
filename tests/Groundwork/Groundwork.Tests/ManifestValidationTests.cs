@@ -54,6 +54,19 @@ public sealed class ManifestValidationTests
     }
 
     [Fact]
+    public void CustomPartitionFailsUntilItHasAnExecutableScopeHandler()
+    {
+        var manifest = WithSingleUnit(unit => unit with
+        {
+            Tenancy = new TenancyPolicy(TenancyKind.CustomPartition)
+        });
+
+        var result = _validator.Validate(manifest);
+
+        Assert.Contains(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-012");
+    }
+
+    [Fact]
     public void MissingSchemaVersionFails()
     {
         var result = _validator.Validate(SampleManifests.MetadataManifest() with { Version = new StorageManifestVersion("") });

@@ -20,7 +20,7 @@ internal static class MongoDbTestManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.None,
+                    TenancyPolicy.Global,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
@@ -82,18 +82,10 @@ internal static class MongoDbTestManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.TenantPartition("tenantId"),
+                    TenancyPolicy.Scoped,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
-                        new IndexDeclaration(
-                            "by-tenant",
-                            [new IndexField("tenantId")],
-                            IndexValueKind.String,
-                            false,
-                            false,
-                            MissingValueBehavior.Excluded,
-                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
                         new IndexDeclaration(
                             "by-name",
                             [new IndexField("name")],

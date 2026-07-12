@@ -3,6 +3,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.MongoDb.Materialization;
+using Groundwork.Documents.Scoping;
 using MongoDB.Driver;
 
 namespace Groundwork.MongoDb.Documents;
@@ -14,13 +15,15 @@ public static class MongoDbDocumentStoreFactory
         string databaseName,
         StorageManifest manifest,
         ProviderIdentity provider,
-        Func<string?>? ambientTenantId = null,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
         ArgumentNullException.ThrowIfNull(manifest);
         ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
 
         var client = new MongoClient(connectionString);
         var disposableClient = (object)client as IDisposable;
@@ -30,7 +33,7 @@ public static class MongoDbDocumentStoreFactory
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
                 CreateMaterializationPlan(manifest, provider),
                 cancellationToken);
-            return new MongoDbDocumentStoreHandle(disposableClient, new MongoDbDocumentStore(database, manifest, ambientTenantId));
+            return new MongoDbDocumentStoreHandle(disposableClient, new MongoDbDocumentStore(database, manifest, access, scopeObserver));
         }
         catch
         {

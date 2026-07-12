@@ -3,12 +3,102 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Core.Scoping;
 using Xunit;
 
 namespace Groundwork.Tests;
 
 public sealed class PhysicalStorageResolutionTests
 {
+    [Fact]
+    public void UnsupportedTenancyDoesNotResolveOrFingerprintAsGlobal()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var manifest = WithPhysicalStorage(template with
+        {
+            StorageUnits =
+            [
+                template.StorageUnits.Single() with
+                {
+                    Tenancy = new TenancyPolicy(TenancyKind.CustomPartition)
+                }
+            ]
+        }, new StorageUnitPhysicalStorage(StorageUnitProvisioningMode.Declared, PhysicalStoragePolicy.Default()));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-030");
+    }
+
+    [Fact]
+    public void TenantIdIsAPayloadPathRatherThanAStorageScopeAlias()
+    {
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Default(),
+            [
+                new LogicalIndexDeclaration(
+                    "by-tenant-id",
+                    [new IndexField("tenantId")],
+                    IndexValueKind.Keyword,
+                    false,
+                    MissingValueBehavior.Excluded)
+            ],
+            [
+                new BoundedQueryDeclaration(
+                    "by-tenant-id",
+                    "by-tenant-id",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.None,
+                    QueryPagingSupport.Offset,
+                    BoundedQueryExecutionClass.ScaleBearing)
+            ]);
+        var manifest = WithPhysicalStorage(SampleManifests.MetadataManifest(), storage);
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        var definition = Assert.Single(result.Definitions).Definition;
+        Assert.Equal("tenantId", Assert.Single(definition.ProjectedColumns).Path);
+        Assert.Collection(
+            Assert.Single(definition.Indexes).Columns,
+            column => Assert.Equal("storage_scope", column.ColumnLogicalName),
+            column => Assert.Equal("tenantId", column.ColumnLogicalName));
+    }
+
+    [Fact]
+    public void ScopePolicyParticipatesInResolvedDefinitionAndFingerprint()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var global = WithPhysicalStorage(template with
+        {
+            StorageUnits = [template.StorageUnits.Single() with { Tenancy = TenancyPolicy.Global }]
+        }, new StorageUnitPhysicalStorage(StorageUnitProvisioningMode.Declared, PhysicalStoragePolicy.Default()));
+        var scoped = global with
+        {
+            StorageUnits =
+            [
+                global.StorageUnits.Single() with { Tenancy = TenancyPolicy.Scoped }
+            ]
+        };
+
+        var globalDefinition = Assert.Single(PhysicalStorageResolver.Resolve(
+            global, PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity).Definitions);
+        var scopedDefinition = Assert.Single(PhysicalStorageResolver.Resolve(
+            scoped, PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity).Definitions);
+
+        Assert.Equal(StorageScopePolicy.Global, globalDefinition.Resolved.ScopePolicy);
+        Assert.Equal(StorageScopePolicy.Scoped, scopedDefinition.Resolved.ScopePolicy);
+        Assert.NotEqual(globalDefinition.Fingerprint, scopedDefinition.Fingerprint);
+    }
+
     [Fact]
     public void DeclaredDefaultWithoutScaleBearingDemandResolvesToDedicatedDocumentTable()
     {
@@ -66,7 +156,10 @@ public sealed class PhysicalStorageResolutionTests
         Assert.Empty(definition.ProjectedColumns);
         var index = Assert.Single(definition.Indexes);
         Assert.Equal("by-document-kind", index.LogicalName);
-        Assert.Equal("document_kind", Assert.Single(index.Columns).ColumnLogicalName);
+        Assert.Collection(
+            index.Columns,
+            column => Assert.Equal("storage_scope", column.ColumnLogicalName),
+            column => Assert.Equal("document_kind", column.ColumnLogicalName));
     }
 
     [Fact]
@@ -180,7 +273,7 @@ public sealed class PhysicalStorageResolutionTests
             index.Columns,
             column =>
             {
-                Assert.Equal("tenant_id", column.ColumnLogicalName);
+                Assert.Equal("storage_scope", column.ColumnLogicalName);
                 Assert.Equal(0, column.Order);
                 Assert.Equal(PhysicalSortDirection.Ascending, column.Direction);
             },
@@ -237,6 +330,7 @@ public sealed class PhysicalStorageResolutionTests
         var columns = Assert.Single(Assert.Single(result.Definitions).Definition.Indexes).Columns;
         Assert.Collection(
             columns,
+            column => Assert.Equal(PhysicalSortDirection.Ascending, column.Direction),
             column => Assert.Equal(PhysicalSortDirection.Ascending, column.Direction),
             column => Assert.Equal(PhysicalSortDirection.Descending, column.Direction));
     }
@@ -303,7 +397,7 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
-    public void TenantPartitionedUniqueDemandIncludesTenantEnvelopeColumnInPhysicalIndex()
+    public void ScopedUniqueDemandIncludesScopeEnvelopeColumnInPhysicalIndex()
     {
         var physicalStorage = new StorageUnitPhysicalStorage(
             StorageUnitProvisioningMode.Declared,
@@ -332,7 +426,7 @@ public sealed class PhysicalStorageResolutionTests
             [
                 template.StorageUnits.Single() with
                 {
-                    Tenancy = TenancyPolicy.TenantPartition()
+                    Tenancy = TenancyPolicy.Scoped
                 }
             ]
         };
@@ -350,7 +444,7 @@ public sealed class PhysicalStorageResolutionTests
             index.Columns,
             column =>
             {
-                Assert.Equal("tenant_id", column.ColumnLogicalName);
+                Assert.Equal("storage_scope", column.ColumnLogicalName);
                 Assert.Equal(0, column.Order);
             },
             column =>
@@ -432,7 +526,10 @@ public sealed class PhysicalStorageResolutionTests
         Assert.Equal("category", Assert.Single(definition.ProjectedColumns).Path);
         var physicalIndex = Assert.Single(definition.Indexes);
         Assert.Equal("by-category", physicalIndex.LogicalName);
-        Assert.Equal("category", Assert.Single(physicalIndex.Columns).ColumnLogicalName);
+        Assert.Collection(
+            physicalIndex.Columns,
+            column => Assert.Equal("storage_scope", column.ColumnLogicalName),
+            column => Assert.Equal("category", column.ColumnLogicalName));
     }
 
     [Fact]
@@ -848,7 +945,7 @@ public sealed class PhysicalStorageResolutionTests
         var snapshot = PhysicalStorageDefinitionSerializer.Serialize(definition);
 
         Assert.Equal(
-            "{\"storageUnit\":\"configurationDocument\",\"provisioningMode\":\"Declared\",\"definition\":{\"form\":\"DedicatedDocumentTable\",\"featureDefaultLogicalName\":\"configurationDocument\",\"sharedStorage\":null,\"schemaVersion\":1,\"envelope\":{\"id\":\"id\",\"documentKind\":\"document_kind\",\"tenantId\":\"tenant_id\",\"version\":\"version\",\"schemaVersion\":\"schema_version\",\"canonicalJson\":\"document\"},\"projectedColumns\":[],\"indexes\":[]},\"scaleBearingDemand\":[],\"names\":[{\"kind\":\"PrimaryStorage\",\"featureDefault\":\"configurationDocument\",\"logical\":\"configurationDocument\",\"identifier\":\"configurationDocument\",\"collisionScope\":\"primary-storage\",\"namingOwner\":\"configurationDocument\"}]}",
+            "{\"storageUnit\":\"configurationDocument\",\"provisioningMode\":\"Declared\",\"scopePolicy\":\"Scoped\",\"definition\":{\"form\":\"DedicatedDocumentTable\",\"featureDefaultLogicalName\":\"configurationDocument\",\"sharedStorage\":null,\"schemaVersion\":1,\"envelope\":{\"id\":\"id\",\"documentKind\":\"document_kind\",\"storageScope\":\"storage_scope\",\"version\":\"version\",\"schemaVersion\":\"schema_version\",\"canonicalJson\":\"document\"},\"projectedColumns\":[],\"indexes\":[]},\"scaleBearingDemand\":[],\"names\":[{\"kind\":\"PrimaryStorage\",\"featureDefault\":\"configurationDocument\",\"logical\":\"configurationDocument\",\"identifier\":\"configurationDocument\",\"collisionScope\":\"primary-storage\",\"namingOwner\":\"configurationDocument\"}]}",
             snapshot);
     }
 
@@ -900,7 +997,10 @@ public sealed class PhysicalStorageResolutionTests
             [
                 new PhysicalIndexDefinition(
                     "by-category",
-                    [new PhysicalIndexColumnDefinition("category", 0)])
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("category", 1)
+                    ])
             ]);
         var ordinary = new BoundedQueryDeclaration(
             "list-by-category",
@@ -1049,7 +1149,7 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
-    public void ExplicitTenantScopedUniqueIndexRequiresTenantEnvelopeColumn()
+    public void ExplicitScopedUniqueIndexRequiresScopeEnvelopeColumn()
     {
         var logicalIndex = new LogicalIndexDeclaration(
             "by-customer",
@@ -1081,7 +1181,7 @@ public sealed class PhysicalStorageResolutionTests
             [
                 template.StorageUnits.Single() with
                 {
-                    Tenancy = TenancyPolicy.TenantPartition()
+                    Tenancy = TenancyPolicy.Scoped
                 }
             ]
         };
@@ -1104,7 +1204,7 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
-    public void TenantPartitionedExplicitUniqueIndexCannotOmitTenantEnvelopeColumn()
+    public void ScopedExplicitUniqueIndexCannotOmitScopeEnvelopeColumn()
     {
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             "configurationDocument",
@@ -1123,7 +1223,7 @@ public sealed class PhysicalStorageResolutionTests
             [
                 template.StorageUnits.Single() with
                 {
-                    Tenancy = TenancyPolicy.TenantPartition()
+                    Tenancy = TenancyPolicy.Scoped
                 }
             ]
         };
@@ -1144,7 +1244,7 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
-    public void ExplicitTenantScopedUniqueIndexUsesConfiguredTenantEnvelopeColumn()
+    public void ExplicitScopedUniqueIndexUsesConfiguredScopeEnvelopeColumn()
     {
         var logicalIndex = new LogicalIndexDeclaration(
             "by-customer",
@@ -1162,7 +1262,7 @@ public sealed class PhysicalStorageResolutionTests
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             "configurationDocument",
             [new ProjectedColumnDefinition("customerId", "customerId", PortablePhysicalType.String)],
-            envelope: new DocumentEnvelopeDefinition(TenantIdColumn: "tenant_scope"),
+            envelope: new DocumentEnvelopeDefinition(StorageScopeColumn: "tenant_scope"),
             indexes:
             [
                 new PhysicalIndexDefinition(
@@ -1180,7 +1280,7 @@ public sealed class PhysicalStorageResolutionTests
             [
                 template.StorageUnits.Single() with
                 {
-                    Tenancy = TenancyPolicy.TenantPartition()
+                    Tenancy = TenancyPolicy.Scoped
                 }
             ]
         };
@@ -1270,7 +1370,10 @@ public sealed class PhysicalStorageResolutionTests
             [
                 new PhysicalIndexDefinition(
                     "by-category",
-                    [new PhysicalIndexColumnDefinition("category", 0)])
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("category", 1)
+                    ])
             ],
             linkedProjectedColumns:
             [new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String)],

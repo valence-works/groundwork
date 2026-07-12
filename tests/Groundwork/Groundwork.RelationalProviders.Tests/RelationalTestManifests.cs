@@ -20,7 +20,7 @@ internal static class RelationalTestManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.None,
+                    TenancyPolicy.Global,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
@@ -70,6 +70,23 @@ internal static class RelationalTestManifests
 
     public static ProviderIdentity SqlServerProvider { get; } = new("groundwork-sqlserver", "1.0.0");
     public static ProviderIdentity PostgreSqlProvider { get; } = new("groundwork-postgresql", "1.0.0");
+
+    public static StorageManifest ScopedManifest()
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            Identity = new StorageManifestIdentity("scoped.configuration.documents"),
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    Tenancy = TenancyPolicy.Scoped,
+                    Physicalization = PhysicalizationPolicy.Optimized
+                }
+            ]
+        };
+    }
 
     public static StorageManifest WithoutIndex(string indexIdentity)
     {

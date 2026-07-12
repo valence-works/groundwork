@@ -99,7 +99,7 @@ public sealed class MaterializationPlanner
                     unit.Identity.Value,
                     unit.IdentityPolicy.FieldName,
                     unit.Concurrency.TokenField,
-                    unit.Tenancy.PartitionField,
+                    "storage_scope",
                     unit.Serialization.SchemaField)));
 
             operations.AddRange(unit.Indexes.Select(index => new CreateIndexOperation(

@@ -27,6 +27,14 @@ because a stateless store has no single connection to expose or dispose.
 ## Deliberate Limits
 
 - JSON content is stored as text.
-- Document kinds, document ids, declared index names, declared index values, and physicalized projection values are constrained to `NVARCHAR(450)` because they participate in SQL Server keys or indexes. Keep portable identifiers and indexed values within that limit, or add validation before writing.
+- Document kinds, document ids, declared index names, declared index values, and physicalized
+  projection values are retained exactly in binary-collated `NVARCHAR(450)` columns. They do not
+  participate directly in native composite keys. Persisted SHA-256 shadow columns provide bounded
+  `BINARY(32)` primary, foreign, and unique-index keys, keeping every declared key below SQL
+  Server's 900-byte limit even when every original value is at its 450-code-unit maximum.
+- Queries compare both retained original values and their scope boundary semantics; the digest is
+  only a bounded native key. A hypothetical digest collision cannot overwrite or disclose another
+  original identity: the native constraint rejects the colliding write and original-value
+  predicates never treat the values as equal.
 - No Entity Framework dependency.
 - No host-specific dependency.

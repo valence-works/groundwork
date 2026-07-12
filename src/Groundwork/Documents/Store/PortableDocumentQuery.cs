@@ -82,20 +82,10 @@ public sealed record QueryClause
 /// <summary>Single-field ordering over a declared sortable index.</summary>
 public sealed record QueryOrder(string IndexName, bool Descending = false);
 
-/// <summary>Whether a query is filtered by the ambient tenant or bypasses tenant filtering.</summary>
-public enum QueryTenantScope
-{
-    /// <summary>Apply ambient tenant filtering (the default).</summary>
-    TenantAware,
-
-    /// <summary>Bypass ambient tenant filtering for this query.</summary>
-    TenantAgnostic
-}
-
 /// <summary>
 /// The closed, provider-neutral document query: an <c>AND</c> of <c>OR</c>-groups of single-field
-/// comparisons, with at most one ordering, optional offset paging, and a tenant-scope flag. Zero
-/// clauses match all documents of the kind.
+/// comparisons, with at most one ordering and optional offset paging. Scope is always inherited
+/// from the document-store session. Zero clauses match all documents of the kind.
 /// </summary>
 public sealed record PortableDocumentQuery
 {
@@ -104,8 +94,7 @@ public sealed record PortableDocumentQuery
         IReadOnlyList<QueryClause>? clauses = null,
         QueryOrder? order = null,
         int? skip = null,
-        int? take = null,
-        QueryTenantScope tenantScope = QueryTenantScope.TenantAware)
+        int? take = null)
     {
         if (string.IsNullOrWhiteSpace(documentKind))
             throw new ArgumentException("Document kind must be provided.", nameof(documentKind));
@@ -115,7 +104,6 @@ public sealed record PortableDocumentQuery
         Order = order;
         Skip = skip;
         Take = take;
-        TenantScope = tenantScope;
     }
 
     public string DocumentKind { get; }
@@ -146,8 +134,6 @@ public sealed record PortableDocumentQuery
         }
     }
 
-    public QueryTenantScope TenantScope { get; init; }
-
     public PortableDocumentQuery Where(QueryClause clause) =>
         this with { Clauses = new List<QueryClause>(Clauses) { clause } };
 
@@ -155,7 +141,6 @@ public sealed record PortableDocumentQuery
 
     public PortableDocumentQuery Page(int? skip, int? take) => this with { Skip = skip, Take = take };
 
-    public PortableDocumentQuery WithTenantScope(QueryTenantScope scope) => this with { TenantScope = scope };
 }
 
 /// <summary>The result of a paged portable query: the page window plus the total predicate count.</summary>

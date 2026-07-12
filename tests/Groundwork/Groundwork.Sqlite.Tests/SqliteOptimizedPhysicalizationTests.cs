@@ -71,7 +71,7 @@ public sealed class SqliteOptimizedPhysicalizationTests
         var firstManifest = WithPhysicalizedIndexes(SqliteTestManifests.MetadataManifest(), "by-key");
         var firstUnit = firstManifest.StorageUnits.Single();
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(firstManifest, SqliteTestManifests.Provider);
-        var firstStore = new SqliteDocumentStore(connection, firstManifest);
+        var firstStore = new SqliteDocumentStore(connection, firstManifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
         await firstStore.SaveAsync(new SaveDocumentRequest(
             "configurationDocument",
@@ -82,7 +82,7 @@ public sealed class SqliteOptimizedPhysicalizationTests
         var secondManifest = WithPhysicalizedIndexes(SqliteTestManifests.MetadataManifest(), "by-key", "by-category");
         var secondUnit = secondManifest.StorageUnits.Single();
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(secondManifest, SqliteTestManifests.Provider);
-        var secondStore = new SqliteDocumentStore(connection, secondManifest);
+        var secondStore = new SqliteDocumentStore(connection, secondManifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
         var categoryField = PhysicalizationProjection.EligibleFields(secondUnit).Single(field => field.Name == "by-category");
         var categoryColumn = RelationalPhysicalizationNames.ColumnName(categoryField);
 
@@ -111,7 +111,7 @@ public sealed class SqliteOptimizedPhysicalizationTests
             var unit = manifest.StorageUnits.Single() with { Physicalization = PhysicalizationPolicy.Optimized };
             manifest = manifest with { StorageUnits = [unit] };
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
-            return new SqliteOptimizedHarness(connection, new SqliteDocumentStore(connection, manifest), unit);
+            return new SqliteOptimizedHarness(connection, new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global), unit);
         }
 
         public async Task<bool> TableExistsAsync(string tableName)

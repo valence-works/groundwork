@@ -13,4 +13,13 @@ public sealed record MaterializationPlan(
     IReadOnlyList<GroundworkDiagnostic> Diagnostics)
 {
     public bool IsPlannable => Diagnostics.All(diagnostic => !diagnostic.IsError);
+
+    public MaterializationPlan RequirePlannable()
+    {
+        if (IsPlannable)
+            return this;
+
+        throw new InvalidOperationException(
+            $"Cannot execute an unplannable materialization plan: {string.Join("; ", Diagnostics.Where(x => x.IsError).Select(x => $"{x.Code}: {x.Message}"))}");
+    }
 }

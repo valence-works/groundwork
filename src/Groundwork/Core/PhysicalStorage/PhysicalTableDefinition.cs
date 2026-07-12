@@ -30,7 +30,7 @@ public enum PhysicalSortDirection
 public sealed record DocumentEnvelopeDefinition(
     string IdColumn = "id",
     string DocumentKindColumn = "document_kind",
-    string TenantIdColumn = "tenant_id",
+    string StorageScopeColumn = "storage_scope",
     string VersionColumn = "version",
     string SchemaVersionColumn = "schema_version",
     string CanonicalJsonColumn = "document");

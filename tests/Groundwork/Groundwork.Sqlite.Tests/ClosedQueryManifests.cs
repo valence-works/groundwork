@@ -21,7 +21,7 @@ internal static class ClosedQueryManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.None,
+                    TenancyPolicy.Global,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
@@ -48,11 +48,10 @@ internal static class ClosedQueryManifests
                     StorageIntent.PortableDocument(),
                     LifecyclePolicy.Mutable,
                     IdentityPolicy.StringId(),
-                    TenancyPolicy.TenantPartition("tenantId"),
+                    TenancyPolicy.Scoped,
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
-                        Index("by-tenant", "tenantId", sortable: false, PortableQueryOperation.Equal),
                         Index("by-name", "name", sortable: true, PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains)
                     ],
                     [],

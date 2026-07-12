@@ -21,7 +21,7 @@ public sealed class ClosedQueryCapabilityTests
             StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
             IdentityPolicy.StringId(),
-            TenancyPolicy.None,
+            TenancyPolicy.Global,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
             [

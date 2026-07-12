@@ -37,7 +37,7 @@ public sealed record MaterializedStorageUnit(
     string Identity,
     string IdentityField,
     string? ConcurrencyField,
-    string? TenantField,
+    string? StorageScopeField,
     string? SchemaField);
 
 public sealed record MaterializedIndex(

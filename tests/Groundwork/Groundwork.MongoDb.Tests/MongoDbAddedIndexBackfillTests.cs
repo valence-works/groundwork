@@ -42,7 +42,7 @@ public sealed class MongoDbAddedIndexBackfillTests : IAsyncLifetime
             // Phase 1: materialize a manifest whose unit has no "by-category" index and save documents.
             var withoutCategory = WithoutIndex(withCategory, "by-category");
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(withoutCategory, MongoDbTestManifests.Provider);
-            var initialStore = new MongoDbDocumentStore(database, withoutCategory);
+            var initialStore = new MongoDbDocumentStore(database, withoutCategory, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             var systemA = NewId();
             var systemB = NewId();
@@ -53,7 +53,7 @@ public sealed class MongoDbAddedIndexBackfillTests : IAsyncLifetime
 
             // Phase 2: add the "by-category" index (a server-side index over content) to the populated unit.
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(withCategory, MongoDbTestManifests.Provider);
-            var store = new MongoDbDocumentStore(database, withCategory);
+            var store = new MongoDbDocumentStore(database, withCategory, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             var system = await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-category", "system"));
             Assert.Equal(new[] { systemA, systemB }.OrderBy(id => id), system.Select(document => document.Id).OrderBy(id => id));

@@ -130,7 +130,10 @@ public sealed class PhysicalTableDefinitionTests
             [
                 new PhysicalIndexDefinition(
                     "by-category",
-                    [new PhysicalIndexColumnDefinition("category", 0)])
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("category", 1)
+                    ])
             ],
             linkedProjectedColumns:
             [new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String)],

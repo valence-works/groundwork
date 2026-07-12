@@ -29,17 +29,6 @@ public static class ClosedQueryIndexResolver
         return index;
     }
 
-    /// <summary>Resolves the single-field index covering the tenant partition field, or <see langword="null"/> if none.</summary>
-    public static IndexDeclaration? ResolveTenantIndex(StorageUnit unit)
-    {
-        if (unit.Tenancy.Kind == TenancyKind.None || string.IsNullOrEmpty(unit.Tenancy.PartitionField))
-            return null;
-
-        return unit.Indexes.FirstOrDefault(index =>
-            index.Fields.Count == 1 &&
-            string.Equals(index.Fields[0].Path, unit.Tenancy.PartitionField, StringComparison.Ordinal));
-    }
-
     private static IndexDeclaration ResolveSingleFieldIndex(StorageUnit unit, string indexName)
     {
         var index = unit.Indexes.SingleOrDefault(index => index.Identity == indexName)

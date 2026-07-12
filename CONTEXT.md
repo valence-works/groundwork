@@ -78,3 +78,15 @@ _Avoid_: Application sequence, occurrence timestamp, cross-stream global sequenc
 A query-shape-bound keyset value carrying the first page's committed cursor high-water and the last
 ordered key/cursor. It provides a stable traversal that excludes later and backdated appends.
 _Avoid_: Offset, live-view page token
+
+**Storage Scope**:
+A provider-neutral, opaque partition identity bound to a document-store session and explicit unit
+of work. Groundwork stamps it into envelope and dependent physical keys; it is never inferred from
+document payload data and does not represent an application authorization decision.
+_Avoid_: Ambient tenant filter, payload tenant field, implicit wildcard
+
+**Privileged Storage Session**:
+An explicitly acquired document-store session carrying a distinct capability for one target scope,
+global storage, or cross-scope queries. Acquisition emits audit evidence and never results from a
+missing ordinary scope.
+_Avoid_: Tenant-agnostic query flag, absent tenant fallback, authorization bypass

@@ -42,8 +42,7 @@ public sealed class RelationalManifestPlanner(MaterializationPlanner materializa
         if (unit.Concurrency.TokenField is not null)
             columns.Add(new RelationalColumnPlan(unit.Concurrency.TokenField, "Concurrency"));
 
-        if (unit.Tenancy.PartitionField is not null)
-            columns.Add(new RelationalColumnPlan(unit.Tenancy.PartitionField, "Partition"));
+        columns.Add(new RelationalColumnPlan("storage_scope", "StorageScope"));
 
         columns.AddRange(unit.Indexes.SelectMany(index => index.Fields).Select(field => new RelationalColumnPlan(field.Path, "Index")));
         return columns.DistinctBy(column => column.Name).ToList();

@@ -272,7 +272,8 @@ public sealed class SqliteDocumentUnitOfWorkTests
             var store = await SqliteDocumentStoreFactory.CreateAsync(
                 $"Data Source={databasePath};Pooling=False",
                 manifest,
-                ClosedQueryManifests.Provider);
+                ClosedQueryManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
             return new TxHarness(databasePath, store);
         }
 

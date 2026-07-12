@@ -236,21 +236,19 @@ public sealed class SqliteClosedQueryTests
     }
 
     [Fact]
-    public async Task TenantAwareQueriesFilterByAmbientTenantAndAgnosticBypasses()
+    public async Task ScopedQueriesUseTheBoundScopeAndPrivilegedSessionCanCrossScopes()
     {
         await using var harness = await TenantHarness.Create("tenant-a");
 
         await Save(harness.Store, "s1", """{"tenantId":"tenant-a","name":"A1"}""");
-        await Save(harness.Store, "s2", """{"tenantId":"tenant-b","name":"B1"}""");
+        await Save(harness.OtherScopeStore, "s2", """{"tenantId":"tenant-a","name":"B1"}""");
         await Save(harness.Store, "s3", """{"tenantId":"tenant-a","name":"A2"}""");
 
         var aware = await harness.Store.QueryAsync(new PortableDocumentQuery("scopedDocument"));
         Assert.Equal(new[] { "s1", "s3" }, aware.Documents.Select(d => d.Id).OrderBy(id => id));
         Assert.Equal(2, aware.TotalCount);
 
-        var agnostic = await harness.Store.QueryAsync(new PortableDocumentQuery(
-            "scopedDocument",
-            tenantScope: QueryTenantScope.TenantAgnostic));
+        var agnostic = await harness.PrivilegedStore.QueryAsync(new PortableDocumentQuery("scopedDocument"));
         Assert.Equal(3, agnostic.TotalCount);
     }
 
@@ -260,7 +258,7 @@ public sealed class SqliteClosedQueryTests
         await using var harness = await TenantHarness.Create("tenant-a");
 
         await Save(harness.Store, "s1", """{"tenantId":"tenant-a","name":"Apple"}""");
-        await Save(harness.Store, "s2", """{"tenantId":"tenant-b","name":"Apple"}""");
+        await Save(harness.OtherScopeStore, "s2", """{"tenantId":"tenant-a","name":"Apple"}""");
         await Save(harness.Store, "s3", """{"tenantId":"tenant-a","name":"Banana"}""");
 
         var result = await harness.Store.QueryAsync(new PortableDocumentQuery(
@@ -296,7 +294,7 @@ public sealed class SqliteClosedQueryTests
             var connection = new SqliteConnection("Data Source=:memory:");
             var manifest = ClosedQueryManifests.WidgetManifest();
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, ClosedQueryManifests.Provider);
-            var store = new SqliteDocumentStore(connection, manifest);
+            var store = new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
 
             await store.SaveAsync(new SaveDocumentRequest("widget", "w1", "1.0.0", """{"name":"Alpha Widget","category":"tools","color":"red","sortKey":"003"}"""));
             await store.SaveAsync(new SaveDocumentRequest("widget", "w2", "1.0.0", """{"name":"Beta Widget","category":"tools","color":"blue","sortKey":"001"}"""));
@@ -312,22 +310,42 @@ public sealed class SqliteClosedQueryTests
 
     private sealed class TenantHarness : IAsyncDisposable
     {
-        private TenantHarness(SqliteConnection connection, IDocumentStore store)
+        private TenantHarness(
+            SqliteConnection connection,
+            IDocumentStore store,
+            IDocumentStore otherScopeStore,
+            IDocumentStore privilegedStore)
         {
             this.connection = connection;
             Store = store;
+            OtherScopeStore = otherScopeStore;
+            PrivilegedStore = privilegedStore;
         }
 
         private readonly SqliteConnection connection;
         public IDocumentStore Store { get; }
+        public IDocumentStore OtherScopeStore { get; }
+        public IDocumentStore PrivilegedStore { get; }
 
-        public static async Task<TenantHarness> Create(string ambientTenantId)
+        public static async Task<TenantHarness> Create(string storageScope)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             var manifest = ClosedQueryManifests.TenantManifest();
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, ClosedQueryManifests.Provider);
-            var store = new SqliteDocumentStore(connection, manifest, () => ambientTenantId);
-            return new TenantHarness(connection, store);
+            var store = new SqliteDocumentStore(
+                connection,
+                manifest,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Scoped(new Groundwork.Core.Scoping.StorageScope(storageScope)));
+            var otherScopeStore = new SqliteDocumentStore(
+                connection,
+                manifest,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Scoped(new Groundwork.Core.Scoping.StorageScope("tenant-b")));
+            var privilegedStore = new SqliteDocumentStore(
+                connection,
+                manifest,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.PrivilegedAcrossScopes(
+                    new Groundwork.Documents.Scoping.PrivilegedStorageAccess("closed-query conformance")));
+            return new TenantHarness(connection, store, otherScopeStore, privilegedStore);
         }
 
         public async ValueTask DisposeAsync() => await connection.DisposeAsync();

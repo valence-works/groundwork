@@ -1,3 +1,5 @@
+using Groundwork.Core.Scoping;
+
 namespace Groundwork.Documents.Store;
 
 public sealed record DocumentEnvelope(
@@ -7,4 +9,8 @@ public sealed record DocumentEnvelope(
     long Version,
     string ContentJson,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt)
+{
+    /// <summary>The storage-boundary scope. Null identifies a deliberately global unit.</summary>
+    public StorageScope? Scope { get; init; }
+}

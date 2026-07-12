@@ -76,7 +76,7 @@ of objectives 7 and 9.
 - Required production queries execute server-side or validation fails before serving traffic.
 - Resolved physical names are deterministic, collision-checked, fingerprinted, and recorded in schema history.
 - Additive and backfill changes can be planned and safely applied across all four providers; destructive operations require explicit authorization.
-- Tenant-aware storage cannot read or mutate another tenant's data through missing ambient filters.
+- Scoped storage cannot read or mutate another scope's data; there is no missing-session fallback or ambient filter.
 - Provider capability reports cannot claim behavior that lacks an executable handler and a conformance test.
 - Operators can observe provider health, migration/materialization progress and failures, query-plan selection, session/pool pressure, retries, and dropped or rejected work through stable logs, traces, metrics, health checks, and diagnostics.
 - Performance evidence is collected only after the session lifecycle and query-routing baselines are correct.
