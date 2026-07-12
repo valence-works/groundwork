@@ -350,53 +350,60 @@ var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
     ExpectedVersion: updated.Document!.Version));
 ```
 
-### Closed portable queries
+### Bounded document queries
 
-For provider-neutral reads that go beyond a single equality, `IDocumentStore` also accepts a closed `PortableDocumentQuery`: an `AND` of `OR`-groups of single-field comparisons (`Equal`, `In`, `Contains`), with at most one ordering, optional offset paging, and a total count. Comparisons address a declared index by identity, and each operator must be declared on that index. The same query shape executes server-side on every provider (SQLite, SQL Server, PostgreSQL, MongoDB). Scope comes only from the store session, not from the query.
+`IBoundedDocumentStore` accepts one closed `DocumentQuery` runtime model bound to a
+`BoundedQueryDeclaration` identity. The compatibility execution surface supports an `AND` of
+`OR`-groups of declared comparisons with ordering, offset paging, and total count. Physical query
+planning additionally validates membership, declared substring/prefix, ranges, compound
+predicates/order, keyset paging, count/any/first, and latest selection against provider handlers.
+Scope comes only from the store session and is mandatory in every physical plan.
 
 ```csharp
 using Groundwork.Documents.Store;
 
 // status IN ('open','assigned') AND subject contains 'invoice' (case-insensitive),
 // newest first, second page of 25, with the full predicate count.
-var query = new PortableDocumentQuery(
+var query = new DocumentQuery(
     "supportTicket",
+    "search-open-invoices",
     [
-        QueryClause.Of(QueryComparison.In("by-status", ["open", "assigned"])),
-        QueryClause.Of(QueryComparison.Contains("by-subject", "invoice"))
+        DocumentQueryClause.Of(DocumentQueryComparison.In("status", ["open", "assigned"])),
+        DocumentQueryClause.Of(DocumentQueryComparison.Contains("subject", "invoice"))
     ],
-    order: new QueryOrder("by-opened-at", Descending: true),
+    order: [new DocumentQueryOrder("openedAt", PhysicalSortDirection.Descending)],
     skip: 25,
     take: 25);
 
-DocumentQueryResult page = await store.QueryAsync(query);
+DocumentQueryResult page = await boundedStore.QueryAsync(query);
 long total = page.TotalCount;
 
-DocumentEnvelope? first = await store.FirstOrDefaultAsync(query);
-bool any = await store.AnyAsync(query);
+DocumentEnvelope? first = await boundedStore.FirstOrDefaultAsync(
+    query.Select(BoundedQueryResultOperation.First));
+bool any = await boundedStore.AnyAsync(query.Select(BoundedQueryResultOperation.Any));
 ```
 
-Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `QueryClause` (`QueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Scoped stores always apply their bound scope. Cross-scope reads require a separately acquired privileged session; there is no query flag that disables isolation.
+Operator semantics match EF Core exactly: `Equal` with a `null` value matches documents whose field is null/absent; `In` over an empty set matches nothing; `Contains` is case-insensitive and a null field yields no match (never throws); an empty `DocumentQueryClause` (`DocumentQueryClause.MatchNone`) is a constant-false sentinel; and zero clauses match all documents of the kind. Scoped stores always apply their bound scope. Cross-scope reads require a separately acquired privileged session; there is no query flag that disables isolation.
 
-#### Declaring and detecting closed-query support
+#### Declaring and planning bounded-query support
 
-A `StorageUnit` declares which closed-query capabilities it supports through `PortableQueryDeclaration` entries on the manifest: the comparison `Operations` (`Equal`/`In`/`Contains`, validated against the index's `SupportedOperations`), `SortSupport` (single-field ordering, validated against the index's `IsSortable`), `PagingSupport` (offset paging), and the `SupportsDisjunction` (OR within a clause) and `SupportsTotalCount` flags. Adapters that want to skip an in-memory fallback can detect native support without trial execution:
+A storage unit declares `BoundedQueryDeclaration` values over logical indexes. Providers compile
+them against the same executable storage route used for CRUD and materialization. Unsupported
+server-side shapes fail startup compilation; Groundwork does not produce an unbounded in-memory
+fallback:
 
 ```csharp
-using Groundwork.Core.Queries;
-using Groundwork.Documents.Store;
+using Groundwork.Core.PhysicalStorage;
 
-// Manifest-level profile: which operators/sort/paging a unit natively supports.
-StorageUnitClosedQuerySupport support = ClosedQueryCapabilityModel.Describe(unit);
-bool canContainsByName = support.SupportsOperator("by-name", PortableQueryOperation.Contains);
-
-// Whole-query check: is this exact query shape executable server-side?
-ClosedQuerySupportResult result = ClosedQueryNativeSupport.Evaluate(unit, query);
-if (result.IsNativelySupported)
-    await store.QueryAsync(query);     // native push-down
-else
-    /* fall back */;                   // result.Reasons explains why
+IBoundedDocumentStore boundedStore = new PhysicalQueryDocumentStore(
+    executableRoute,
+    unit.PhysicalStorage!,
+    providerQueryCapabilities,
+    providerQueryHandlers);
 ```
+
+See [bounded physical query plans](docs/bounded-physical-query-plans.md) for source selection,
+compound-prefix rules, plan diagnostics, and the `GW0004` compatibility bridge.
 
 #### Multi-document transactions
 

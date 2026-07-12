@@ -210,34 +210,16 @@ public sealed class MongoDbDocumentStore : IDocumentStore
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {
-        var unit = GetUnit(query.DocumentKind);
-        var scope = DocumentStoreScopeResolver.Resolve(
-            unit, access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
-        var index = unit.Indexes.SingleOrDefault(index => index.Identity == query.IndexName)
-            ?? throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
-
-        if (index.Fields.Count != 1 || !index.SupportedOperations.Contains(PortableQueryOperation.Equal))
-            throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
-
-        if (query.Take == 0)
-            return [];
-
-        var collection = GetCollection(unit);
-        var physicalizedField = PhysicalizationProjection.EligibleFields(unit).SingleOrDefault(field => field.Name == query.IndexName);
-        var path = physicalizedField is null
-            ? $"content.{index.Fields[0].Path}"
-            : $"physicalized.{MongoDbGroundworkNames.PhysicalizedFieldName(physicalizedField)}";
-        var filter = Builders<BsonDocument>.Filter.Eq(path, ToBsonValue(index.ValueKind, query.Value));
-        if (scope.StorageKey is not null)
-            filter &= Builders<BsonDocument>.Filter.Eq("storage_scope", scope.StorageKey);
-        var documents = await collection
-            .Find(filter)
-            .Sort(Builders<BsonDocument>.Sort.Ascending("_id"))
-            .Skip(query.Skip ?? 0)
-            .Limit(query.Take ?? 100)
-            .ToListAsync(cancellationToken);
-
-        return documents.Select(document => ReadEnvelope(unit, document)).ToList();
+#pragma warning disable GW0004
+        var result = await QueryAsync(
+            new PortableDocumentQuery(
+                query.DocumentKind,
+                [QueryClause.Of(QueryComparison.Equal(query.IndexName, query.Value))],
+                skip: query.Skip,
+                take: query.Take ?? 100),
+            cancellationToken);
+#pragma warning restore GW0004
+        return result.Documents;
     }
 
     public async Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)

@@ -59,6 +59,32 @@ public static class JsonDocumentStoreExtensions
     }
 
     public static async Task<DocumentJsonQueryResult<TDocument>> QueryJsonAsync<TDocument>(
+        this IBoundedDocumentStore store,
+        DocumentQuery query,
+        JsonSerializerOptions? jsonOptions = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+
+        var result = await store.QueryAsync(query, cancellationToken);
+        var documents = result.Documents.Select(envelope => envelope.DeserializeJson<TDocument>(jsonOptions)).ToList();
+        return new DocumentJsonQueryResult<TDocument>(documents, result.TotalCount);
+    }
+
+    public static async Task<TDocument?> FirstOrDefaultJsonAsync<TDocument>(
+        this IBoundedDocumentStore store,
+        DocumentQuery query,
+        JsonSerializerOptions? jsonOptions = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+
+        var envelope = await store.FirstOrDefaultAsync(query, cancellationToken);
+        return envelope is null ? default : envelope.DeserializeJson<TDocument>(jsonOptions);
+    }
+
+#pragma warning disable GW0004
+    public static async Task<DocumentJsonQueryResult<TDocument>> QueryJsonAsync<TDocument>(
         this IDocumentStore store,
         PortableDocumentQuery query,
         JsonSerializerOptions? jsonOptions = null,
@@ -82,6 +108,7 @@ public static class JsonDocumentStoreExtensions
         var envelope = await store.FirstOrDefaultAsync(query, cancellationToken);
         return envelope is null ? default : envelope.DeserializeJson<TDocument>(jsonOptions);
     }
+#pragma warning restore GW0004
 
     public static TDocument DeserializeJson<TDocument>(
         this DocumentEnvelope envelope,

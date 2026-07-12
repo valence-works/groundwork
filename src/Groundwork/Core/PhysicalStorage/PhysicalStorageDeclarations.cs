@@ -1,6 +1,7 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
+using System.Collections.Frozen;
 
 namespace Groundwork.Core.PhysicalStorage;
 
@@ -172,6 +173,46 @@ public sealed record BoundedQuerySortField(
     string Path,
     PhysicalSortDirection Direction);
 
+/// <summary>Declares the operators allowed for one stable predicate path.</summary>
+public sealed class BoundedQueryPredicateField : IEquatable<BoundedQueryPredicateField>
+{
+    public BoundedQueryPredicateField(string path, IReadOnlySet<PortableQueryOperation> operations)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            throw new ArgumentException("A stable predicate path is required.", nameof(path));
+
+        Path = path;
+        Operations = (operations ?? throw new ArgumentNullException(nameof(operations))).ToFrozenSet();
+    }
+
+    public string Path { get; }
+
+    public IReadOnlySet<PortableQueryOperation> Operations { get; }
+
+    public bool Equals(BoundedQueryPredicateField? other) =>
+        other is not null && Path == other.Path && Operations.SetEquals(other.Operations);
+
+    public override bool Equals(object? obj) => Equals(obj as BoundedQueryPredicateField);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Path, StringComparer.Ordinal);
+        foreach (var operation in Operations.Order())
+            hash.Add(operation);
+        return hash.ToHashCode();
+    }
+}
+
+/// <summary>The closed terminal operations a bounded document query may expose.</summary>
+public enum BoundedQueryResultOperation
+{
+    Documents,
+    Count,
+    Any,
+    First
+}
+
 /// <summary>
 /// Declares a bounded query and references the logical index from which stable path demand is
 /// resolved. Runtime query planning remains outside this declaration-only slice.
@@ -187,17 +228,23 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         BoundedQueryExecutionClass executionClass = BoundedQueryExecutionClass.Ordinary,
         bool supportsDisjunction = false,
         bool supportsTotalCount = false,
-        IReadOnlyList<BoundedQuerySortField>? sortFields = null)
+        IReadOnlyList<BoundedQuerySortField>? sortFields = null,
+        IReadOnlyList<BoundedQueryPredicateField>? predicateFields = null,
+        IReadOnlySet<BoundedQueryResultOperation>? resultOperations = null,
+        string? latestPerKeyPath = null)
     {
         Identity = identity;
         IndexIdentity = indexIdentity;
-        Operations = operations?.ToHashSet() ?? throw new ArgumentNullException(nameof(operations));
+        Operations = operations?.ToFrozenSet() ?? throw new ArgumentNullException(nameof(operations));
         SortSupport = sortSupport;
         PagingSupport = pagingSupport;
         ExecutionClass = executionClass;
         SupportsDisjunction = supportsDisjunction;
         SupportsTotalCount = supportsTotalCount;
-        SortFields = sortFields?.ToArray() ?? [];
+        SortFields = Array.AsReadOnly(sortFields?.ToArray() ?? []);
+        PredicateFields = Array.AsReadOnly(predicateFields?.ToArray() ?? []);
+        ResultOperations = (resultOperations ?? DefaultResultOperations(supportsTotalCount)).ToFrozenSet();
+        LatestPerKeyPath = latestPerKeyPath;
     }
 
     public string Identity { get; }
@@ -218,6 +265,16 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
 
     public IReadOnlyList<BoundedQuerySortField> SortFields { get; }
 
+    /// <summary>
+    /// Stable predicate paths and their allowed operations. An empty collection preserves the
+    /// compatibility convention that the first field of the referenced logical index is filtered.
+    /// </summary>
+    public IReadOnlyList<BoundedQueryPredicateField> PredicateFields { get; }
+
+    public IReadOnlySet<BoundedQueryResultOperation> ResultOperations { get; }
+
+    public string? LatestPerKeyPath { get; }
+
     public bool Equals(BoundedQueryDeclaration? other) =>
         other is not null &&
         Identity == other.Identity &&
@@ -228,7 +285,10 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         ExecutionClass == other.ExecutionClass &&
         SupportsDisjunction == other.SupportsDisjunction &&
         SupportsTotalCount == other.SupportsTotalCount &&
-        SortFields.SequenceEqual(other.SortFields);
+        SortFields.SequenceEqual(other.SortFields) &&
+        PredicateFields.SequenceEqual(other.PredicateFields) &&
+        ResultOperations.SetEquals(other.ResultOperations) &&
+        LatestPerKeyPath == other.LatestPerKeyPath;
 
     public override bool Equals(object? obj) => Equals(obj as BoundedQueryDeclaration);
 
@@ -246,7 +306,25 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         hash.Add(SupportsTotalCount);
         foreach (var sortField in SortFields)
             hash.Add(sortField);
+        foreach (var predicateField in PredicateFields)
+            hash.Add(predicateField);
+        foreach (var operation in ResultOperations.Order())
+            hash.Add(operation);
+        hash.Add(LatestPerKeyPath, StringComparer.Ordinal);
         return hash.ToHashCode();
+    }
+
+    private static IReadOnlySet<BoundedQueryResultOperation> DefaultResultOperations(bool supportsTotalCount)
+    {
+        var operations = new HashSet<BoundedQueryResultOperation>
+        {
+            BoundedQueryResultOperation.Documents,
+            BoundedQueryResultOperation.Any,
+            BoundedQueryResultOperation.First
+        };
+        if (supportsTotalCount)
+            operations.Add(BoundedQueryResultOperation.Count);
+        return operations;
     }
 }
 
@@ -262,7 +340,10 @@ public sealed record ScaleBearingPathDemand(
     QuerySortSupport SortSupport,
     QueryPagingSupport PagingSupport,
     bool SupportsDisjunction,
-    bool SupportsTotalCount)
+    bool SupportsTotalCount,
+    IReadOnlyList<BoundedQueryPredicateField> PredicateFields,
+    IReadOnlyList<BoundedQueryResultOperation> ResultOperations,
+    string? LatestPerKeyPath)
 {
     public bool Equals(ScaleBearingPathDemand? other) =>
         other is not null &&
@@ -277,7 +358,11 @@ public sealed record ScaleBearingPathDemand(
         SortSupport == other.SortSupport &&
         PagingSupport == other.PagingSupport &&
         SupportsDisjunction == other.SupportsDisjunction &&
-        SupportsTotalCount == other.SupportsTotalCount;
+        SupportsTotalCount == other.SupportsTotalCount &&
+        PredicateFields.SequenceEqual(other.PredicateFields) &&
+        ResultOperations.Count == other.ResultOperations.Count &&
+        ResultOperations.ToHashSet().SetEquals(other.ResultOperations) &&
+        LatestPerKeyPath == other.LatestPerKeyPath;
 
     public override int GetHashCode()
     {
@@ -294,6 +379,11 @@ public sealed record ScaleBearingPathDemand(
         hash.Add(PagingSupport);
         hash.Add(SupportsDisjunction);
         hash.Add(SupportsTotalCount);
+        foreach (var predicateField in PredicateFields)
+            hash.Add(predicateField);
+        foreach (var operation in ResultOperations.Order())
+            hash.Add(operation);
+        hash.Add(LatestPerKeyPath, StringComparer.Ordinal);
         return hash.ToHashCode();
     }
 }

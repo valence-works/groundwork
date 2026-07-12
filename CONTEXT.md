@@ -68,14 +68,18 @@ cannot infer the change.
 _Avoid_: General structural migration pipeline
 
 **Bounded Query**:
-A declared, closed set of query operations and ordering/paging behavior. A scale-bearing bounded
-query makes its referenced stable index paths binding physical projection demand. Compound ordering
-uses stable per-field paths and directions rather than one inferred direction for every field.
+A declared, closed set of predicate paths/operators, compound ordering, paging, result operations,
+and optional latest selection. A scale-bearing bounded query makes its referenced stable index
+paths binding physical projection and indexed server-side-plan demand. Equality predicate prefixes
+may be followed by ordered suffixes; every ordered physical plan adds identity as its total-order
+tie-breaker.
 _Avoid_: IQueryable, arbitrary LINQ
 
 **Physical Query Plan**:
-Provider output describing the selected table/index/field route for a bounded document query.
-Callers do not submit physical query plans.
+Immutable provider output describing the selected linked+primary, primary envelope/JSON, entity
+projection, or provider-native field route for a bounded document query. It always carries the
+mandatory storage scope and deterministic identity tie-break; unsupported declarations produce no
+client-fallback plan. Callers do not submit physical query plans.
 _Avoid_: Document query
 
 **Diagnostic Record Store**:

@@ -7,6 +7,9 @@ physical definition and later provider execution. Providers consume it for mater
 projection/index maintenance, and bounded-query planning. They do not select a storage form from a
 workload descriptor, recompute names, or infer where projected fields live.
 
+Bounded query declarations are compiled against these routes as described in
+[Bounded physical query plans](bounded-physical-query-plans.md).
+
 ## Compilation boundary
 
 `ExecutableStorageRouteCompiler` accepts one or more `ProviderPhysicalTableDefinition` values. A

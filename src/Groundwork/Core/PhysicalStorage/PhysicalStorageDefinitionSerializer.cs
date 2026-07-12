@@ -58,6 +58,26 @@ public static class PhysicalStorageDefinitionSerializer
                 writer.WriteString("pagingSupport", demand.PagingSupport.ToString());
                 writer.WriteBoolean("supportsDisjunction", demand.SupportsDisjunction);
                 writer.WriteBoolean("supportsTotalCount", demand.SupportsTotalCount);
+                writer.WritePropertyName("predicateFields");
+                writer.WriteStartArray();
+                foreach (var predicate in demand.PredicateFields)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("path", predicate.Path);
+                    writer.WritePropertyName("operations");
+                    writer.WriteStartArray();
+                    foreach (var operation in predicate.Operations.Order())
+                        writer.WriteStringValue(operation.ToString());
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+                writer.WritePropertyName("resultOperations");
+                writer.WriteStartArray();
+                foreach (var operation in demand.ResultOperations.Order())
+                    writer.WriteStringValue(operation.ToString());
+                writer.WriteEndArray();
+                WriteNullableString(writer, "latestPerKeyPath", demand.LatestPerKeyPath);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
