@@ -50,8 +50,10 @@ public sealed class RelationalSession(DbConnection connection)
 public sealed class RelationalUnitOfWork : IAsyncDisposable
 {
     private readonly DbTransaction transaction;
-    private readonly SemaphoreSlim gate;
-    private bool completed;
+    private readonly SemaphoreSlim? gate;
+    private readonly IAsyncDisposable? sessionOwner;
+    private readonly object completionLock = new();
+    private Task? completionTask;
 
     internal RelationalUnitOfWork(DbConnection connection, DbTransaction transaction, SemaphoreSlim gate)
     {
@@ -60,46 +62,105 @@ public sealed class RelationalUnitOfWork : IAsyncDisposable
         Executor = new EnlistedRelationalExecutor(connection, transaction);
     }
 
+    internal RelationalUnitOfWork(DbConnection connection, DbTransaction transaction, IAsyncDisposable sessionOwner)
+    {
+        this.transaction = transaction;
+        this.sessionOwner = sessionOwner;
+        Executor = new EnlistedRelationalExecutor(connection, transaction);
+    }
+
     /// <summary>Executor that enlists operations in this unit of work's transaction.</summary>
     public EnlistedRelationalExecutor Executor { get; }
 
-    public async Task CommitAsync(CancellationToken cancellationToken = default)
-    {
-        if (completed)
-            return;
+    public Task CommitAsync(CancellationToken cancellationToken = default) =>
+        CompleteOnceAsync(() => transaction.CommitAsync(cancellationToken), suppressExistingFailure: false);
 
-        completed = true;
-        try
+    public Task RollbackAsync(CancellationToken cancellationToken = default) =>
+        CompleteOnceAsync(() => transaction.RollbackAsync(cancellationToken), suppressExistingFailure: false);
+
+    public ValueTask DisposeAsync() => new(CompleteOnceAsync(() => transaction.RollbackAsync(), suppressExistingFailure: true));
+
+    private Task CompleteOnceAsync(Func<Task> terminalAction, bool suppressExistingFailure)
+    {
+        lock (completionLock)
         {
-            await transaction.CommitAsync(cancellationToken);
-        }
-        finally
-        {
-            await transaction.DisposeAsync();
-            gate.Release();
+            if (completionTask is null)
+            {
+                completionTask = CompleteCoreAsync(terminalAction);
+                return completionTask;
+            }
+
+            return suppressExistingFailure ? AwaitExistingCompletionAsync(completionTask) : completionTask;
         }
     }
 
-    public async Task RollbackAsync(CancellationToken cancellationToken = default)
+    private async Task CompleteCoreAsync(Func<Task> terminalAction)
     {
-        if (completed)
-            return;
-
-        completed = true;
+        Exception? primaryFailure = null;
         try
         {
-            await transaction.RollbackAsync(cancellationToken);
+            await terminalAction();
         }
-        finally
+        catch (Exception exception)
         {
-            await transaction.DisposeAsync();
-            gate.Release();
+            primaryFailure = exception;
+        }
+
+        primaryFailure = await CaptureCleanupFailureAsync(primaryFailure, () => transaction.DisposeAsync());
+        primaryFailure = sessionOwner is not null
+            ? await CaptureCleanupFailureAsync(primaryFailure, () => sessionOwner.DisposeAsync())
+            : CaptureCleanupFailure(primaryFailure, () => gate!.Release());
+
+        if (primaryFailure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+    }
+
+    private static async Task AwaitExistingCompletionAsync(Task existingCompletion)
+    {
+        try
+        {
+            await existingCompletion;
+        }
+        catch
+        {
+            // The caller that won the terminal transition observes the failure. Later completion
+            // calls remain idempotent and only wait for cleanup to finish.
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private static async Task<Exception?> CaptureCleanupFailureAsync(
+        Exception? primaryFailure,
+        Func<ValueTask> cleanup)
     {
-        if (!completed)
-            await RollbackAsync();
+        try
+        {
+            await cleanup();
+        }
+        catch (Exception cleanupFailure)
+        {
+            if (primaryFailure is null)
+                return cleanupFailure;
+
+            RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+        }
+
+        return primaryFailure;
+    }
+
+    private static Exception? CaptureCleanupFailure(Exception? primaryFailure, Action cleanup)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception cleanupFailure)
+        {
+            if (primaryFailure is null)
+                return cleanupFailure;
+
+            RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+        }
+
+        return primaryFailure;
     }
 }

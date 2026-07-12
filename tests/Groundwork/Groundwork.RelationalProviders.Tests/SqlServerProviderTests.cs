@@ -16,15 +16,27 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
 
     public async Task DisposeAsync() => await container.DisposeAsync();
 
+    [Fact]
+    public async Task IndependentOperationsUseTheProviderPoolWithoutGlobalSerialization()
+    {
+        var builder = new SqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 2 };
+        await RelationalSessionPoolPressure.AssertTwoOperationsRunWhileThirdWaitsForProviderPoolAsync(
+            () => new SqlConnection(builder.ConnectionString));
+    }
+
     protected override Task<IRelationalProviderHarness> CreateHarnessAsync()
     {
         var connection = new SqlConnection(container.GetConnectionString());
         var manifest = RelationalTestManifests.MetadataManifest();
-        var store = new SqlServerDocumentStore(connection, manifest);
-        return Task.FromResult<IRelationalProviderHarness>(new SqlServerProviderHarness(connection, store, manifest));
+        var store = new SqlServerDocumentStore(container.GetConnectionString(), manifest);
+        return Task.FromResult<IRelationalProviderHarness>(new SqlServerProviderHarness(connection, store, manifest, container.GetConnectionString()));
     }
 
-    private sealed class SqlServerProviderHarness(SqlConnection connection, IDocumentStore store, Groundwork.Core.Manifests.StorageManifest manifest)
+    private sealed class SqlServerProviderHarness(
+        SqlConnection connection,
+        IDocumentStore store,
+        Groundwork.Core.Manifests.StorageManifest manifest,
+        string connectionString)
         : IRelationalProviderHarness
     {
         public IDocumentStore Store { get; } = store;
@@ -35,7 +47,7 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
         public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
         {
             await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.SqlServerProvider);
-            return new SqlServerDocumentStore(connection, targetManifest);
+            return new SqlServerDocumentStore(connectionString, targetManifest);
         }
 
         public async Task<long> CountSchemaHistoryRowsAsync()

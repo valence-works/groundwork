@@ -19,15 +19,27 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
 
     public async Task DisposeAsync() => await container.DisposeAsync();
 
+    [Fact]
+    public async Task IndependentOperationsUseTheProviderPoolWithoutGlobalSerialization()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 2 };
+        await RelationalSessionPoolPressure.AssertTwoOperationsRunWhileThirdWaitsForProviderPoolAsync(
+            () => new NpgsqlConnection(builder.ConnectionString));
+    }
+
     protected override Task<IRelationalProviderHarness> CreateHarnessAsync()
     {
         var connection = new NpgsqlConnection(container.GetConnectionString());
         var manifest = RelationalTestManifests.MetadataManifest();
-        var store = new PostgreSqlDocumentStore(connection, manifest);
-        return Task.FromResult<IRelationalProviderHarness>(new PostgreSqlProviderHarness(connection, store, manifest));
+        var store = new PostgreSqlDocumentStore(container.GetConnectionString(), manifest);
+        return Task.FromResult<IRelationalProviderHarness>(new PostgreSqlProviderHarness(connection, store, manifest, container.GetConnectionString()));
     }
 
-    private sealed class PostgreSqlProviderHarness(NpgsqlConnection connection, IDocumentStore store, Groundwork.Core.Manifests.StorageManifest manifest)
+    private sealed class PostgreSqlProviderHarness(
+        NpgsqlConnection connection,
+        IDocumentStore store,
+        Groundwork.Core.Manifests.StorageManifest manifest,
+        string connectionString)
         : IRelationalProviderHarness
     {
         public IDocumentStore Store { get; } = store;
@@ -38,7 +50,7 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
         public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
         {
             await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.PostgreSqlProvider);
-            return new PostgreSqlDocumentStore(connection, targetManifest);
+            return new PostgreSqlDocumentStore(connectionString, targetManifest);
         }
 
         public async Task<long> CountSchemaHistoryRowsAsync()
