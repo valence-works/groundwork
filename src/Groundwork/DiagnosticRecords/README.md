@@ -61,6 +61,76 @@ operation id with a different fingerprint is a conflict, and an expired operatio
 of being treated as new work. `DiagnosticAcknowledgementLostException` explicitly reports the
 uncertain-acknowledgement case so a caller can inspect or safely retry.
 
+## Telemetry contract
+
+Every shipped provider routes its public store and all four entries in
+`DiagnosticRecordStoreHandlers` through `InstrumentedDiagnosticRecordStore`. The decorator accepts
+an immutable, bounded `DiagnosticRecordTelemetryIdentity`; provider and store values contain at most
+64 lowercase ASCII letters, digits, periods, underscores, or hyphens. Application-owned handlers can
+use the same decorator without adding provider-specific instrumentation. When neither its activity
+source nor relevant instruments have listeners, each public method returns the underlying handler's
+original `ValueTask` without an async state machine. With telemetry enabled, the non-async boundary
+also preserves synchronous request-validation and provider throws. A completed faulted or canceled
+`ValueTask` remains awaitable instead of becoming a synchronous throw; only incomplete provider
+operations continue through an async helper. The boundary restores the caller's ambient activity
+before every return while the incomplete operation retains its own span context.
+
+The OpenTelemetry-compatible contract version is `1.0.0`. `DiagnosticRecordTelemetry` exposes every
+name below as a public constant. The `ActivitySource` and `Meter` are both named
+`Groundwork.DiagnosticRecords` and carry the contract version. Changing the meaning or value domain
+of an existing name is a breaking telemetry-contract change and requires a new contract version;
+additive instruments or tags must remain bounded and non-sensitive.
+
+| Operation | Activity name | Successful outcomes |
+|---|---|---|
+| append | `groundwork.diagnostic_records.append` | `committed`, `replayed` |
+| query | `groundwork.diagnostic_records.query` | `success` |
+| inspect | `groundwork.diagnostic_records.inspect` | `success` |
+| trim | `groundwork.diagnostic_records.trim` | `completed`, `replayed` |
+
+Every activity carries `groundwork.diagnostic_records.operation`, `.provider`, `.store`, `.outcome`,
+`.classification`, `.scope.kind`, and `.scope.present`; a non-null request also supplies `.stream`.
+Scope kind is the fixed value `tenant_scope`; scope presence is a boolean. Operation-specific
+activity tags expose only bounded shape: append batch size; query limit plus exact-count,
+latest-per-key, and continuation booleans; and trim keep-newest. Tenant id, storage-scope id, payload,
+record id, operation nonce, fingerprint, exception message, and other request values are never
+recorded. Stream is intentionally present on activities for trace diagnosis but absent from metrics
+to prevent unbounded metric cardinality. A null request is passed unchanged to the underlying
+handler so its synchronous-throw versus faulted-`ValueTask` contract cannot change when telemetry is
+enabled; request-derived tags are omitted and scope presence is `false` on that rejected span.
+
+Failure outcomes and classifications are deterministic:
+
+| Condition | Outcome | Classification | Activity status |
+|---|---|---|---|
+| operation-id conflict | `conflict` | `conflict` | error |
+| validation, fingerprint mismatch, expiry, or clock skew | `rejected` | `rejection` | error |
+| caller/provider cancellation | `cancelled` | `cancellation` | error |
+| uncertain acknowledgement | `acknowledgement_lost` | `acknowledgement_loss` | error |
+| any other provider exception | `provider_failure` | `provider_failure` | error |
+
+Metrics use only operation, provider, store, outcome, classification, and disposition tags:
+
+| Instrument | Type/unit | Meaning |
+|---|---|---|
+| `groundwork.diagnostic_records.operation.duration` | histogram, seconds | provider-boundary latency for all four operations |
+| `groundwork.diagnostic_records.operation.outcomes` | counter, operations | success, replay, conflict, rejection, cancellation, acknowledgement loss, or provider failure |
+| `groundwork.diagnostic_records.append.batches` | counter, batches | `accepted`, definitely `rejected`, or `indeterminate` disposition |
+| `groundwork.diagnostic_records.append.records` | counter, records | records committed; replay never increments it |
+| `groundwork.diagnostic_records.query.exact_count.requests` | counter, requests | exact-count usage |
+| `groundwork.diagnostic_records.query.latest_per_key.requests` | counter, requests | latest-per-key usage |
+| `groundwork.diagnostic_records.trim.records.examined` | counter, records | records examined by non-replayed completed trims |
+| `groundwork.diagnostic_records.trim.records.deleted` | counter, records | records deleted by non-replayed completed trims |
+| `groundwork.diagnostic_records.retained_records` | histogram, records | retained count from inspect and non-replayed completed trim |
+
+Replay is the boundary-observable retry outcome; acknowledgement loss identifies work that may need
+a safe retry. Cancellation, acknowledgement loss, and provider failure use an `indeterminate` append
+disposition because the shared seam cannot prove whether the provider committed. The decorator does
+not invent counts for internal provider retry attempts or operation-ledger cleanup because neither
+is observable through `IDiagnosticRecordStore`. Those signals should
+be added only if a future provider-neutral contract exposes truthful results. Groundwork configures no
+exporter, sampling policy, dashboard, or host pipeline.
+
 ## Stream definitions and bounded queries
 
 `DiagnosticRecordStreamDefinition` declares:
@@ -118,9 +188,9 @@ trim ledger roll back together on failure or cancellation.
 The suite covers atomic and concurrent append, duplicate and fingerprint conflicts, expiration,
 tenant isolation, scalar/multi-value predicates, case policy, inclusive boundaries, both ordering
 forms, snapshot continuation, latest-per-key, exact counts, retention boundaries, restart,
-cancellation, and uncertain acknowledgement. Database-provider implementations remain follow-up
-work and must also assert native server-side plans; the in-memory fixture is not a production
-provider or an authorization to perform client evaluation.
+cancellation, and uncertain acknowledgement. SQLite, SQL Server, PostgreSQL, and MongoDB run the
+same suite and assert native server-side plans; the in-memory fixture is not a production provider
+or an authorization to perform client evaluation.
 
 Capture channels, batch sizing, retry/backoff, overload shedding, graceful drain, redaction, live
 subscriptions, and application drop accounting remain consumer policy. Mutable diagnostic catalogs

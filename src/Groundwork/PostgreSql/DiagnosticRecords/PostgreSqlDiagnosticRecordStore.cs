@@ -8,6 +8,7 @@ namespace Groundwork.PostgreSql.DiagnosticRecords;
 public sealed class PostgreSqlDiagnosticRecordStore : IDiagnosticRecordStore
 {
     private readonly RelationalDiagnosticRecordStore inner;
+    private readonly InstrumentedDiagnosticRecordStore instrumented;
 
     public PostgreSqlDiagnosticRecordStore(
         string connectionString,
@@ -30,29 +31,30 @@ public sealed class PostgreSqlDiagnosticRecordStore : IDiagnosticRecordStore
     {
         PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         inner = new(sessions, sessions, definition, new PostgreSqlDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        instrumented = new(inner, new("postgresql", "diagnostic-records"));
     }
 
-    public DiagnosticRecordStoreHandlers Handlers => inner.Handlers;
+    public DiagnosticRecordStoreHandlers Handlers => instrumented.Handlers;
 
     public ValueTask<DiagnosticAppendResult> AppendAsync(
         DiagnosticRecordBatch batch,
         CancellationToken cancellationToken = default) =>
-        inner.AppendAsync(batch, cancellationToken);
+        instrumented.AppendAsync(batch, cancellationToken);
 
     public ValueTask<DiagnosticRecordPage> QueryAsync(
         DiagnosticRecordQuery query,
         CancellationToken cancellationToken = default) =>
-        inner.QueryAsync(query, cancellationToken);
+        instrumented.QueryAsync(query, cancellationToken);
 
     public ValueTask<DiagnosticStreamStatistics> InspectAsync(
         DiagnosticStreamInspectionRequest request,
         CancellationToken cancellationToken = default) =>
-        inner.InspectAsync(request, cancellationToken);
+        instrumented.InspectAsync(request, cancellationToken);
 
     public ValueTask<DiagnosticTrimResult> TrimAsync(
         DiagnosticTrimRequest request,
         CancellationToken cancellationToken = default) =>
-        inner.TrimAsync(request, cancellationToken);
+        instrumented.TrimAsync(request, cancellationToken);
 
     internal RelationalDiagnosticRecordStore Inner => inner;
 }

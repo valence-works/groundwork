@@ -38,6 +38,7 @@ public sealed class MongoDbDiagnosticRecordStore :
     private readonly DiagnosticRecordStreamDefinition _definition;
     private readonly TimeProvider _timeProvider;
     private readonly Func<MongoDbDiagnosticRecordExecutionPoint, CancellationToken, ValueTask> _interceptAsync;
+    private readonly InstrumentedDiagnosticRecordStore _instrumented;
 
     internal MongoDbDiagnosticRecordStore(
         IMongoDatabase database,
@@ -51,13 +52,37 @@ public sealed class MongoDbDiagnosticRecordStore :
         _database = database;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _interceptAsync = interceptor ?? ((_, _) => ValueTask.CompletedTask);
-        Handlers = new(this, this, this, this);
+        var core = new CoreHandlers(this);
+        _instrumented = new(
+            new DiagnosticRecordStoreHandlers(core, core, core, core),
+            new("mongodb", "diagnostic-records"));
+        Handlers = _instrumented.Handlers;
     }
 
     public bool RequiresMultiDocumentTransactions => true;
     public DiagnosticRecordStoreHandlers Handlers { get; }
     public DiagnosticQueryHandlerCapabilities Capabilities { get; } = new(
         Enum.GetValues<DiagnosticPredicateOperator>().ToFrozenSet(), true, true, true, true, true);
+
+    public ValueTask<DiagnosticAppendResult> AppendAsync(
+        DiagnosticRecordBatch batch,
+        CancellationToken cancellationToken = default) =>
+        _instrumented.AppendAsync(batch, cancellationToken);
+
+    public ValueTask<DiagnosticRecordPage> QueryAsync(
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken = default) =>
+        _instrumented.QueryAsync(query, cancellationToken);
+
+    public ValueTask<DiagnosticStreamStatistics> InspectAsync(
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken = default) =>
+        _instrumented.InspectAsync(request, cancellationToken);
+
+    public ValueTask<DiagnosticTrimResult> TrimAsync(
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken = default) =>
+        _instrumented.TrimAsync(request, cancellationToken);
 
     private IMongoCollection<BsonDocument> Collection(string name) =>
         _database.GetCollection<BsonDocument>(name).WithWriteConcern(WriteConcern.WMajority);
@@ -69,7 +94,36 @@ public sealed class MongoDbDiagnosticRecordStore :
     private IMongoCollection<BsonDocument> TrimOperations => Collection(MongoDbDiagnosticRecordNames.TrimOperations);
     private IMongoCollection<BsonDocument> ProviderState => Collection(MongoDbDiagnosticRecordNames.ProviderState);
 
-    public async ValueTask<DiagnosticAppendResult> AppendAsync(
+    private sealed class CoreHandlers(MongoDbDiagnosticRecordStore owner) :
+        IDiagnosticAppendHandler,
+        IDiagnosticQueryHandler,
+        IDiagnosticInspectHandler,
+        IDiagnosticTrimHandler
+    {
+        public DiagnosticQueryHandlerCapabilities Capabilities => owner.Capabilities;
+
+        public ValueTask<DiagnosticAppendResult> AppendAsync(
+            DiagnosticRecordBatch batch,
+            CancellationToken cancellationToken = default) =>
+            owner.AppendCoreAsync(batch, cancellationToken);
+
+        public ValueTask<DiagnosticRecordPage> QueryAsync(
+            DiagnosticRecordQuery query,
+            CancellationToken cancellationToken = default) =>
+            owner.QueryCoreAsync(query, cancellationToken);
+
+        public ValueTask<DiagnosticStreamStatistics> InspectAsync(
+            DiagnosticStreamInspectionRequest request,
+            CancellationToken cancellationToken = default) =>
+            owner.InspectCoreAsync(request, cancellationToken);
+
+        public ValueTask<DiagnosticTrimResult> TrimAsync(
+            DiagnosticTrimRequest request,
+            CancellationToken cancellationToken = default) =>
+            owner.TrimCoreAsync(request, cancellationToken);
+    }
+
+    private async ValueTask<DiagnosticAppendResult> AppendCoreAsync(
         DiagnosticRecordBatch batch,
         CancellationToken cancellationToken = default)
     {
@@ -154,7 +208,7 @@ public sealed class MongoDbDiagnosticRecordStore :
         return result;
     }
 
-    public async ValueTask<DiagnosticRecordPage> QueryAsync(
+    private async ValueTask<DiagnosticRecordPage> QueryCoreAsync(
         DiagnosticRecordQuery query,
         CancellationToken cancellationToken = default)
     {
@@ -242,7 +296,7 @@ public sealed class MongoDbDiagnosticRecordStore :
         await (kind == DiagnosticOperationKind.Append ? AppendOperations : TrimOperations)
             .CountDocumentsAsync(ScopeFilter(scope, stream), cancellationToken: cancellationToken);
 
-    public async ValueTask<DiagnosticStreamStatistics> InspectAsync(
+    private async ValueTask<DiagnosticStreamStatistics> InspectCoreAsync(
         DiagnosticStreamInspectionRequest request,
         CancellationToken cancellationToken = default)
     {
@@ -254,7 +308,7 @@ public sealed class MongoDbDiagnosticRecordStore :
             cancellationToken);
     }
 
-    public async ValueTask<DiagnosticTrimResult> TrimAsync(
+    private async ValueTask<DiagnosticTrimResult> TrimCoreAsync(
         DiagnosticTrimRequest request,
         CancellationToken cancellationToken = default)
     {

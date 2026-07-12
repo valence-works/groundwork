@@ -90,6 +90,14 @@ scale-bearing fail-fast are binding. The `DocumentQuery` compatibility bridge is
 SQL/BSON execution and native explain assertions remain subsequent work units, so #24 is not yet
 superseded.
 
+Diagnostic-record observability progress: [issue #57](https://github.com/valence-works/Groundwork/issues/57)
+defines one versioned provider-neutral trace and metric boundary around append, query, inspect, and
+trim and wires it into SQLite, SQL Server, PostgreSQL, and MongoDB. The contract records bounded
+operation shape and deterministic outcomes without tenant, scope, payload, record, or idempotency
+values. Internal provider retries and ledger cleanup remain intentionally unreported until a shared
+contract can expose truthful counts. This advances objective 9 for diagnostic records; the broader
+storage, session, materialization, migration, and provider-health signals remain open.
+
 ## Readiness Gates
 
 - Canonical JSON remains authoritative in every document and physical entity row; projected columns are atomically maintained and rebuildable.
