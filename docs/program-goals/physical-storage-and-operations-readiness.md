@@ -22,7 +22,7 @@ This bucket succeeds the completed [Groundwork Persistence Readiness](groundwork
 - provider-neutral schema evolution and an operations CLI;
 - pooled sessions, executable capability claims, and provider conformance.
 
-Implementation specs and issues must link to that ADR and must not silently reopen its decisions. Vocabulary and public API names remain a deliberate follow-up review before the first broad API implementation.
+Implementation specs and issues must link to that ADR and must not silently reopen its decisions. Vocabulary and public API names are reconciled by the [Groundwork vocabulary and public API review](../reports/groundwork-vocabulary-and-public-api.md) and should be implemented through its staged compatibility strategy.
 
 ## In Scope
 
@@ -82,6 +82,7 @@ Implementation specs and issues must link to that ADR and must not silently reop
 - [ADR 0001: Separate runtime provider and materialization capabilities](../adr/0001-separate-runtime-provider-and-materialization-capabilities.md)
 - [ADR 0002: Additive-index backfill lives in the declarative materializer](../adr/0002-additive-index-backfill-in-materializer.md)
 - [ADR 0003: Adopt three physical storage forms](../adr/0003-adopt-three-physical-storage-forms.md)
+- [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md)
 - [Groundwork Physicalization and Performance specification](../../specs/019-groundwork-physicalization-performance/spec.md)
 - [Groundwork Runtime Evaluation and Hardening report](../reports/groundwork-runtime-evaluation.md)
 - [Groundwork Automatic Migrations specification](../../specs/021-groundwork-automatic-migrations/spec.md)
