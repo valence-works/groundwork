@@ -84,6 +84,7 @@ Implementation specs and issues must link to that ADR and must not silently reop
 - [ADR 0003: Adopt three physical storage forms](../adr/0003-adopt-three-physical-storage-forms.md)
 - [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md)
 - [Relational session lifecycle prototype](../reports/relational-session-lifecycle-prototype.md)
+- [Diagnostic record-store contract](../../src/Groundwork/DiagnosticRecords/README.md) ([issue #30](https://github.com/valence-works/Groundwork/issues/30))
 - [Groundwork Physicalization and Performance specification](../../specs/019-groundwork-physicalization-performance/spec.md)
 - [Groundwork Runtime Evaluation and Hardening report](../reports/groundwork-runtime-evaluation.md)
 - [Groundwork Automatic Migrations specification](../../specs/021-groundwork-automatic-migrations/spec.md)
