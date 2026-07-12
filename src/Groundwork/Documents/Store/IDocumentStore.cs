@@ -14,6 +14,7 @@ public interface IDocumentStore : IDocumentSessionFactory
     Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default);
 
     /// <summary>Executes a closed portable query, returning the page window plus the total predicate count.</summary>
+#pragma warning disable GW0004
     Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default);
 
     /// <summary>Returns the first matching document (honouring ordering), or <see langword="null"/>.</summary>
@@ -21,4 +22,5 @@ public interface IDocumentStore : IDocumentSessionFactory
 
     /// <summary>Returns whether any document matches the query.</summary>
     Task<bool> AnyAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default);
+#pragma warning restore GW0004
 }

@@ -1,5 +1,8 @@
 namespace Groundwork.Documents.Store;
 
+[Obsolete(
+    "Use DocumentQuery. This equality convenience bridges to a single-clause bounded request.",
+    DiagnosticId = "GW0004")]
 public sealed record DocumentStoreQuery
 {
     public DocumentStoreQuery(string documentKind, string indexName, string value, int? skip = null, int? take = null)
@@ -22,4 +25,12 @@ public sealed record DocumentStoreQuery
     public string Value { get; }
     public int? Skip { get; }
     public int? Take { get; }
+
+    public DocumentQuery ToDocumentQuery(string queryIdentity, string path) =>
+        new(
+            DocumentKind,
+            queryIdentity,
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal(path, Value))],
+            skip: Skip,
+            take: Take);
 }

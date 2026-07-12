@@ -282,14 +282,11 @@ public static class PhysicalStorageResolver
                     $"{target}.boundedQueries.{query.Identity}.indexIdentity"));
                 valid = false;
             }
-            else if (query.SortFields.Count != 0 &&
-                     (query.SortSupport == QuerySortSupport.None ||
-                      query.SortFields.Count != matching[0].Fields.Count ||
-                      !query.SortFields.Select(x => x.Path).SequenceEqual(matching[0].Fields.Select(x => x.Path))))
+            else if (!HasCompatiblePredicateAndSortPrefix(query, matching[0]))
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-027",
-                    $"Bounded query '{query.Identity}' sort fields must match its logical index paths in compound order and require declared sort support.",
+                    $"Bounded query '{query.Identity}' predicate and sort fields must form a compatible logical-index prefix and require declared sort support.",
                     $"{target}.boundedQueries.{query.Identity}.sortFields"));
                 valid = false;
             }
@@ -300,6 +297,26 @@ public static class PhysicalStorageResolver
                     "GW-PHYSICAL-021",
                     $"Bounded query '{query.Identity}' must declare at least one allowed operation.",
                     $"{target}.boundedQueries.{query.Identity}.operations"));
+                valid = false;
+            }
+
+            if (query.PredicateFields.Select(field => field.Path).Distinct(StringComparer.Ordinal).Count() !=
+                query.PredicateFields.Count)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-028",
+                    $"Bounded query '{query.Identity}' predicate paths must be unique.",
+                    $"{target}.boundedQueries.{query.Identity}.predicateFields"));
+                valid = false;
+            }
+
+            if (query.ResultOperations.Count == 0 ||
+                query.SupportsTotalCount != query.ResultOperations.Contains(BoundedQueryResultOperation.Count))
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-029",
+                    $"Bounded query '{query.Identity}' requires at least one result operation and consistent total-count declaration.",
+                    $"{target}.boundedQueries.{query.Identity}.resultOperations"));
                 valid = false;
             }
         }
@@ -369,11 +386,14 @@ public static class PhysicalStorageResolver
                     sortDirections[order],
                     matching[0].ValueKind,
                     matching[0].MissingValueBehavior,
-                    query.Operations.Order().ToArray(),
+                    Array.AsReadOnly(query.Operations.Order().ToArray()),
                     query.SortSupport,
                     query.PagingSupport,
                     query.SupportsDisjunction,
-                    query.SupportsTotalCount));
+                    query.SupportsTotalCount,
+                    Array.AsReadOnly(query.PredicateFields.ToArray()),
+                    Array.AsReadOnly(query.ResultOperations.Order().ToArray()),
+                    query.LatestPerKeyPath));
             }
         }
 
@@ -1146,12 +1166,51 @@ public static class PhysicalStorageResolver
         LogicalIndexDeclaration index)
     {
         if (query.SortFields.Count != 0)
-            return query.SortFields.Select(x => x.Direction).ToArray();
+        {
+            var explicitDirections = query.SortFields.ToDictionary(x => x.Path, x => x.Direction, StringComparer.Ordinal);
+            return index.Fields
+                .Select(field => explicitDirections.GetValueOrDefault(field.Path, PhysicalSortDirection.Ascending))
+                .ToArray();
+        }
 
         var direction = query.SortSupport == QuerySortSupport.Descending
             ? PhysicalSortDirection.Descending
             : PhysicalSortDirection.Ascending;
         return Enumerable.Repeat(direction, index.Fields.Count).ToArray();
+    }
+
+    private static bool HasCompatiblePredicateAndSortPrefix(
+        BoundedQueryDeclaration query,
+        LogicalIndexDeclaration index)
+    {
+        var indexPaths = index.Fields.Select(field => field.Path).ToArray();
+        var predicatePaths = query.PredicateFields.Count == 0
+            ? indexPaths.Take(1).ToArray()
+            : query.PredicateFields.Select(field => field.Path).ToArray();
+        if (!indexPaths.Take(predicatePaths.Length).SequenceEqual(predicatePaths))
+            return false;
+
+        if (query.PredicateFields.Any(field =>
+                field.Operations.Count == 0 ||
+                !field.Operations.IsSubsetOf(query.Operations)))
+        {
+            return false;
+        }
+
+        if (query.LatestPerKeyPath is not null &&
+            !indexPaths.Contains(query.LatestPerKeyPath, StringComparer.Ordinal))
+        {
+            return false;
+        }
+
+        if (query.SortFields.Count == 0)
+            return true;
+        if (query.SortSupport == QuerySortSupport.None)
+            return false;
+
+        var sortPaths = query.SortFields.Select(field => field.Path).ToArray();
+        return indexPaths.Take(sortPaths.Length).SequenceEqual(sortPaths) ||
+               indexPaths.Skip(predicatePaths.Length).Take(sortPaths.Length).SequenceEqual(sortPaths);
     }
 
     private static IReadOnlyList<PhysicalSortDirection> ResolveCanonicalSortDirections(

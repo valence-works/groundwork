@@ -224,37 +224,16 @@ public class RelationalDocumentStore : IDocumentStore
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {
-        var unit = GetUnit(query.DocumentKind);
-        var scope = DocumentStoreScopeResolver.Resolve(
-            unit, access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
-        var (skip, take) = NormalizePaging(query);
-        var index = unit.Indexes.SingleOrDefault(index => index.Identity == query.IndexName)
-            ?? throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
-
-        if (!index.SupportedOperations.Contains(PortableQueryOperation.Equal))
-            throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
-
-        if (index.Fields.Count != 1)
-            throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
-
-        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
-        {
-            await using var command = CreateQueryCommand(currentConnection, unit, query, scope.AcrossScopes);
-            AddParameter(command, "kind", query.DocumentKind);
-            if (scope.StorageKey is not null)
-                AddParameter(command, "scope", scope.StorageKey);
-            AddParameter(command, "index", query.IndexName);
-            AddParameter(command, "value", query.Value);
-            AddParameter(command, "take", take);
-            AddParameter(command, "skip", skip);
-
-            var documents = new List<DocumentEnvelope>();
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                documents.Add(ReadEnvelope(reader));
-
-            return documents;
-        }, cancellationToken);
+#pragma warning disable GW0004
+        var result = await QueryAsync(
+            new PortableDocumentQuery(
+                query.DocumentKind,
+                [QueryClause.Of(QueryComparison.Equal(query.IndexName, query.Value))],
+                skip: query.Skip,
+                take: query.Take ?? 100),
+            cancellationToken);
+#pragma warning restore GW0004
+        return result.Documents;
     }
 
     public async Task<DocumentQueryResult> QueryAsync(PortableDocumentQuery query, CancellationToken cancellationToken = default)
@@ -320,21 +299,6 @@ public class RelationalDocumentStore : IDocumentStore
     {
         foreach (var (name, value) in values)
             AddParameter(command, name, value);
-    }
-
-    private DbCommand CreateQueryCommand(DbConnection currentConnection, StorageUnit unit, DocumentStoreQuery query, bool acrossScopes)
-    {
-        var physicalizedField = PhysicalizationProjection.EligibleFields(unit).SingleOrDefault(field => field.Name == query.IndexName);
-        if (physicalizedField is null)
-            return CreateCommand(currentConnection, acrossScopes ? dialect.QueryByIndexAcrossScopesSql : dialect.QueryByIndexSql);
-
-        var table = RelationalPhysicalizationNames.TableName(unit);
-        var column = RelationalPhysicalizationNames.ColumnName(physicalizedField);
-        return CreateCommand(
-            currentConnection,
-            acrossScopes
-                ? dialect.QueryByPhysicalizedAcrossScopesSql(table, column)
-                : dialect.QueryByPhysicalizedSql(table, column));
     }
 
     private async Task InsertDocumentAsync(
@@ -530,20 +494,6 @@ public class RelationalDocumentStore : IDocumentStore
         expectedVersion is null
             ? DocumentStoreWriteResult.NotFound
             : DocumentStoreWriteResult.ConcurrencyConflict;
-
-    private static (int Skip, int Take) NormalizePaging(DocumentStoreQuery query)
-    {
-        var skip = query.Skip ?? 0;
-        var take = query.Take ?? 100;
-
-        if (skip < 0)
-            throw new ArgumentOutOfRangeException(nameof(DocumentStoreQuery.Skip), skip, "Skip must be greater than or equal to 0.");
-
-        if (take < 0)
-            throw new ArgumentOutOfRangeException(nameof(DocumentStoreQuery.Take), take, "Take must be greater than or equal to 0.");
-
-        return (skip, take);
-    }
 
     private async Task EnsureOpenAsync(CancellationToken cancellationToken)
     {

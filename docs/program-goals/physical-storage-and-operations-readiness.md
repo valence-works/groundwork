@@ -82,6 +82,14 @@ canonical state serialization, provider/manifest exclusion and compare-and-swap 
 failure/acknowledgement-loss recovery proven by a fake executor. The greenfield policy rejects
 legacy history without an applied snapshot. Provider ledgers and DDL translation remain #46–#48.
 
+Bounded-query-plan progress: [issue #45](https://github.com/valence-works/Groundwork/issues/45)
+compiles one closed declaration family against executable routes and provider handler profiles.
+Plans cover linked+primary, primary envelope/JSON, entity projections, and provider-native fields;
+scope, compound prefix/direction, identity tie-breaking, paging/results, latest/keyset behavior, and
+scale-bearing fail-fast are binding. The `DocumentQuery` compatibility bridge is in place. Provider
+SQL/BSON execution and native explain assertions remain subsequent work units, so #24 is not yet
+superseded.
+
 ## Readiness Gates
 
 - Canonical JSON remains authoritative in every document and physical entity row; projected columns are atomically maintained and rebuildable.
@@ -104,6 +112,7 @@ legacy history without an applied snapshot. Provider ledgers and DDL translation
 - [ADR 0003: Adopt three physical storage forms](../adr/0003-adopt-three-physical-storage-forms.md)
 - [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md)
 - [Physical schema diffs and durable applied state](../physical-schema-diffs.md)
+- [Bounded physical query plans](../bounded-physical-query-plans.md)
 - [Relational session lifecycle prototype](../reports/relational-session-lifecycle-prototype.md)
 - [Diagnostic record-store contract](../../src/Groundwork/DiagnosticRecords/README.md) ([issue #30](https://github.com/valence-works/Groundwork/issues/30))
 - [Stateless relational document-store factory migration](https://github.com/valence-works/Groundwork/issues/34)
