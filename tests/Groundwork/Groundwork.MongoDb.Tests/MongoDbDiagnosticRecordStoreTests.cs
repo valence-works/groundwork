@@ -10,16 +10,31 @@ using Xunit;
 
 namespace Groundwork.MongoDb.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class MongoDbDiagnosticRecordApiCollection
+{
+    public const string Name = "MongoDB diagnostic record API";
+}
+
+[Collection(MongoDbDiagnosticRecordApiCollection.Name)]
 public sealed class MongoDbDiagnosticRecordStoreContractTests
 {
     [Fact]
-    public void Store_reports_that_atomic_diagnostics_require_transaction_capable_mongodb()
+    public async Task Store_reports_that_atomic_diagnostics_require_transaction_capable_mongodb()
     {
         var database = new MongoClient("mongodb://localhost:27017").GetDatabase("groundwork_contract");
 
         var store = new MongoDbDiagnosticRecordStore(database, Definition);
 
         Assert.True(store.RequiresMultiDocumentTransactions);
+        await DiagnosticRecordInstrumentationAssertions.AssertProviderRoutesAsync(
+            store,
+            "mongodb",
+            new(
+                request => store.AppendAsync(request),
+                request => store.QueryAsync(request),
+                request => store.InspectAsync(request),
+                request => store.TrimAsync(request)));
     }
 
     private static DiagnosticRecordStreamDefinition Definition { get; } = new(

@@ -10,6 +10,7 @@ namespace Groundwork.SqlServer.DiagnosticRecords;
 public sealed class SqlServerDiagnosticRecordStore : IDiagnosticRecordStore
 {
     private readonly RelationalDiagnosticRecordStore inner;
+    private readonly InstrumentedDiagnosticRecordStore instrumented;
 
     public SqlServerDiagnosticRecordStore(
         string connectionString,
@@ -32,43 +33,76 @@ public sealed class SqlServerDiagnosticRecordStore : IDiagnosticRecordStore
     {
         SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         inner = new(sessions, sessions, definition, new SqlServerDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        var core = new CoreHandlers(inner);
+        instrumented = new(
+            new DiagnosticRecordStoreHandlers(core, core, core, core),
+            new("sqlserver", "diagnostic-records"));
     }
 
-    public DiagnosticRecordStoreHandlers Handlers => inner.Handlers;
+    public DiagnosticRecordStoreHandlers Handlers => instrumented.Handlers;
 
     public ValueTask<DiagnosticAppendResult> AppendAsync(
         DiagnosticRecordBatch batch,
-        CancellationToken cancellationToken = default)
-    {
-        SqlServerDiagnosticRecordValidator.ValidateAppendAndThrow(batch);
-        return inner.AppendAsync(batch, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        instrumented.AppendAsync(batch, cancellationToken);
 
     public ValueTask<DiagnosticRecordPage> QueryAsync(
         DiagnosticRecordQuery query,
-        CancellationToken cancellationToken = default)
-    {
-        SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(query.Scope, query.Stream);
-        return inner.QueryAsync(query, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        instrumented.QueryAsync(query, cancellationToken);
 
     public ValueTask<DiagnosticStreamStatistics> InspectAsync(
         DiagnosticStreamInspectionRequest request,
-        CancellationToken cancellationToken = default)
-    {
-        SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(request.Scope, request.Stream);
-        return inner.InspectAsync(request, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        instrumented.InspectAsync(request, cancellationToken);
 
     public ValueTask<DiagnosticTrimResult> TrimAsync(
         DiagnosticTrimRequest request,
-        CancellationToken cancellationToken = default)
-    {
-        SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
-        return inner.TrimAsync(request, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        instrumented.TrimAsync(request, cancellationToken);
 
     internal RelationalDiagnosticRecordStore Inner => inner;
+
+    private sealed class CoreHandlers(RelationalDiagnosticRecordStore inner) :
+        IDiagnosticAppendHandler,
+        IDiagnosticQueryHandler,
+        IDiagnosticInspectHandler,
+        IDiagnosticTrimHandler
+    {
+        public DiagnosticQueryHandlerCapabilities Capabilities => inner.Capabilities;
+
+        public ValueTask<DiagnosticAppendResult> AppendAsync(
+            DiagnosticRecordBatch batch,
+            CancellationToken cancellationToken = default)
+        {
+            SqlServerDiagnosticRecordValidator.ValidateAppendAndThrow(batch);
+            return inner.AppendAsync(batch, cancellationToken);
+        }
+
+        public ValueTask<DiagnosticRecordPage> QueryAsync(
+            DiagnosticRecordQuery query,
+            CancellationToken cancellationToken = default)
+        {
+            SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(query.Scope, query.Stream);
+            return inner.QueryAsync(query, cancellationToken);
+        }
+
+        public ValueTask<DiagnosticStreamStatistics> InspectAsync(
+            DiagnosticStreamInspectionRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(request.Scope, request.Stream);
+            return inner.InspectAsync(request, cancellationToken);
+        }
+
+        public ValueTask<DiagnosticTrimResult> TrimAsync(
+            DiagnosticTrimRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
+            return inner.TrimAsync(request, cancellationToken);
+        }
+    }
 }
 
 internal sealed class SqlServerDiagnosticRecordDialect : RelationalDiagnosticRecordDialect

@@ -1,10 +1,18 @@
 using Groundwork.DiagnosticRecords;
+using Groundwork.DiagnosticRecords.Tests;
 using Groundwork.PostgreSql.DiagnosticRecords;
 using Groundwork.SqlServer.DiagnosticRecords;
 using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class DiagnosticRecordProviderApiCollection
+{
+    public const string Name = "Diagnostic record provider API";
+}
+
+[Collection(DiagnosticRecordProviderApiCollection.Name)]
 public sealed class DiagnosticRecordProviderApiTests
 {
     private static readonly DiagnosticRecordStreamDefinition Definition = new(
@@ -82,6 +90,40 @@ public sealed class DiagnosticRecordProviderApiTests
             "Host=localhost;Database=groundwork;Username=groundwork;Password=not-real",
             overBudget));
         Assert.Contains(exception.Errors, error => error.Code == "provider.postgresql.parameter_budget.exceeded");
+    }
+
+    [Fact]
+    public async Task Sql_server_uses_shared_instrumentation_once_on_every_public_route()
+    {
+        var store = new SqlServerDiagnosticRecordStore(
+            "Server=localhost;Database=groundwork;User ID=sa;Password=NotARealPassword1!;TrustServerCertificate=True",
+            Definition);
+
+        await DiagnosticRecordInstrumentationAssertions.AssertProviderRoutesAsync(
+            store,
+            "sqlserver",
+            new(
+                request => store.AppendAsync(request),
+                request => store.QueryAsync(request),
+                request => store.InspectAsync(request),
+                request => store.TrimAsync(request)));
+    }
+
+    [Fact]
+    public async Task Postgre_sql_uses_shared_instrumentation_once_on_every_public_route()
+    {
+        var store = new PostgreSqlDiagnosticRecordStore(
+            "Host=localhost;Database=groundwork;Username=groundwork;Password=not-real",
+            Definition);
+
+        await DiagnosticRecordInstrumentationAssertions.AssertProviderRoutesAsync(
+            store,
+            "postgresql",
+            new(
+                request => store.AppendAsync(request),
+                request => store.QueryAsync(request),
+                request => store.InspectAsync(request),
+                request => store.TrimAsync(request)));
     }
 
 }

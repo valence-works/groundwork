@@ -25,6 +25,23 @@ public sealed class SqliteDiagnosticRecordStoreTests : RelationalDiagnosticRecor
 public sealed class SqliteDiagnosticRecordMaterializerTests
 {
     [Fact]
+    public async Task Store_uses_the_shared_diagnostic_record_instrumentation()
+    {
+        var store = new SqliteDiagnosticRecordStore(
+            new SqliteConnectionStringBuilder { DataSource = Path.Combine(Path.GetTempPath(), $"groundwork-wiring-{Guid.NewGuid():N}.db") }.ToString(),
+            SqliteDiagnosticRecordStoreFixture.Definition);
+
+        await DiagnosticRecordInstrumentationAssertions.AssertProviderRoutesAsync(
+            store,
+            "sqlite",
+            new(
+                request => store.AppendAsync(request),
+                request => store.QueryAsync(request),
+                request => store.InspectAsync(request),
+                request => store.TrimAsync(request)));
+    }
+
+    [Fact]
     public void Portable_occurrence_order_uses_native_ticks_without_a_text_cast()
     {
         var store = new SqliteDiagnosticRecordStore(

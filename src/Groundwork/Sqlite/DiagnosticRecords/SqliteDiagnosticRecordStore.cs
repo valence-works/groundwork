@@ -7,6 +7,7 @@ namespace Groundwork.Sqlite.DiagnosticRecords;
 public sealed class SqliteDiagnosticRecordStore : IDiagnosticRecordStore
 {
     private readonly RelationalDiagnosticRecordStore inner;
+    private readonly InstrumentedDiagnosticRecordStore instrumented;
 
     public SqliteDiagnosticRecordStore(
         string connectionString,
@@ -29,29 +30,30 @@ public sealed class SqliteDiagnosticRecordStore : IDiagnosticRecordStore
         Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync)
     {
         inner = new(readSessions, writeSessions, definition, new SqliteDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        instrumented = new(inner, new("sqlite", "diagnostic-records"));
     }
 
-    public DiagnosticRecordStoreHandlers Handlers => inner.Handlers;
+    public DiagnosticRecordStoreHandlers Handlers => instrumented.Handlers;
 
     public ValueTask<DiagnosticAppendResult> AppendAsync(
         DiagnosticRecordBatch batch,
         CancellationToken cancellationToken = default) =>
-        inner.AppendAsync(batch, cancellationToken);
+        instrumented.AppendAsync(batch, cancellationToken);
 
     public ValueTask<DiagnosticRecordPage> QueryAsync(
         DiagnosticRecordQuery query,
         CancellationToken cancellationToken = default) =>
-        inner.QueryAsync(query, cancellationToken);
+        instrumented.QueryAsync(query, cancellationToken);
 
     public ValueTask<DiagnosticStreamStatistics> InspectAsync(
         DiagnosticStreamInspectionRequest request,
         CancellationToken cancellationToken = default) =>
-        inner.InspectAsync(request, cancellationToken);
+        instrumented.InspectAsync(request, cancellationToken);
 
     public ValueTask<DiagnosticTrimResult> TrimAsync(
         DiagnosticTrimRequest request,
         CancellationToken cancellationToken = default) =>
-        inner.TrimAsync(request, cancellationToken);
+        instrumented.TrimAsync(request, cancellationToken);
 
     internal RelationalDiagnosticRecordStore Inner => inner;
 }
