@@ -1,9 +1,9 @@
 # Relational session lifecycle prototype
 
 Program goal state: [Physical Storage and Operations Readiness](../program-goals/physical-storage-and-operations-readiness.md).
-Tracking: [Issue #27](https://github.com/valence-works/Groundwork/issues/27), [ADR 0003](../adr/0003-adopt-three-physical-storage-forms.md).
+Tracking: [Issue #27](https://github.com/valence-works/Groundwork/issues/27), [factory migration issue #34](https://github.com/valence-works/Groundwork/issues/34), [ADR 0003](../adr/0003-adopt-three-physical-storage-forms.md).
 
-Status: prototype implemented and exercised through the public document and operational interfaces.
+Status: production factory migration implemented and exercised through the public document and operational interfaces.
 
 ## Decision summary
 
@@ -34,6 +34,12 @@ This made SQL Server and PostgreSQL concurrency measurements unrepresentative an
 
 The relational document facade now has a session-factory constructor while retaining the direct-connection constructor as a compatibility path. SQLite, SQL Server, and PostgreSQL expose connection-string constructors that select the correct policy. The relational operational facade and SQLite operational adapter expose the same stateless path.
 
+The conventional SQLite, SQL Server, and PostgreSQL document-store factories now use that lifecycle
+as well. Each factory materializes through a short-lived owned connection, disposes it before
+returning, and returns the concrete stateless store directly. SQL Server and PostgreSQL factories
+select concurrent sessions; SQLite selects serialized sessions and rejects private in-memory
+connection strings before materialization.
+
 Lifecycle tests prove:
 
 - an independent operation observes an open connection and leaves it disposed;
@@ -47,6 +53,8 @@ Lifecycle tests prove:
 - concurrent policy permits two operations to overlap;
 - serialized policy prevents a second SQLite operation from entering until the first releases its session;
 - SQL Server and PostgreSQL permit two operations to occupy a two-connection pool concurrently while a third waits at provider pool pressure and can be cancelled;
+- the same overlap and pool-pressure behavior is proven through the SQL Server and PostgreSQL factory paths while an independent database lock holds both operations at the server;
+- SQLite factory tests prove that the materialization connection is closed before return, factory-created operations serialize, cancellation creates no connection, failure cleans up, and private memory is rejected;
 - the established SQLite document and operational UoW suites pass through the stateless path, preserving document OCC, atomic write, commit, rollback, and read-your-writes semantics.
 
 The broad relational-provider suite is container-startup bound rather than lifecycle-deadlocked. xUnit creates a provider test-class instance per test case, and each instance currently starts and disposes a fresh Testcontainers database. A diagnostic run with a 90-second per-test hang threshold completed all 26 cases in 4 minutes 1 second; its log showed each completed case dispose its container before the next instance started. Future test-infrastructure work may share provider containers to shorten the suite, but that is independent of the production session lifecycle.
@@ -64,21 +72,27 @@ Provider-facing registration should eventually accept an async connection/sessio
 
 ## Compatibility and migration impact
 
-The prototype retains existing direct-connection constructors and the existing `RelationalSession` implementation so current callers continue to compile. Those paths remain single-connection and serialized. Migration is opt-in through the new factory or connection-string constructors.
+The production factory migration deliberately removes `SqliteDocumentStoreHandle`,
+`SqlServerDocumentStoreHandle`, and `PostgreSqlDocumentStoreHandle`. Their `Connection` properties
+claimed that one retained materialization connection owned store lifetime, which is false for a
+stateless facade. `CreateAsync` now returns the concrete provider store directly, so callers remove
+`.Store`, `await using`, and handle disposal. This is an intentional pre-1.0 source break; a
+source-compatible connection property could only expose a closed or unrelated connection.
 
-Before declaring the production migration complete:
-
-1. Change SQL Server and PostgreSQL DI/factory registrations to construct stateless facades by default.
-2. Change file-backed SQLite registrations to the serialized stateless path; keep the direct-connection path only for explicit private in-memory usage.
-3. Decide whether existing document-store handles should stop exposing an owned connection. Keeping a materialization connection alive solely for a handle would consume pool capacity and confuse ownership.
-4. Add provider-native async source adapters where useful, then obsolete the retained-connection relational constructors in a separately reviewed compatibility change.
-5. Add session/pool diagnostics required by ADR 0003 before final provider conformance.
+Direct-connection constructors remain available as an explicit retained compatibility path and for
+private SQLite in-memory tests/development. They remain single-connection and serialized. Future
+work may add provider-native async sources and separately obsolete retained relational
+constructors. Session/pool diagnostics required by ADR 0003 also remain a provider-conformance
+follow-up.
 
 No consuming `IDocumentStore`, `IDocumentUnitOfWork`, `IOperationalSessionFactory`, or operational-store interface changes are required.
 
 ## Benchmark prerequisites
 
-Performance comparisons are meaningful only after the benchmark host uses the stateless constructors or factory registrations. Record at minimum:
+Performance comparisons are meaningful only when the benchmark host uses the conventional
+`*DocumentStoreFactory.CreateAsync` path (or an equivalent verified stateless registration). A
+factory-created SQL Server/PostgreSQL store must demonstrate that its materialization connection no
+longer occupies the pool before a run is admissible. Record at minimum:
 
 - connection string and provider pool limits;
 - active/idle connections, pool wait time, pool timeouts, and cancellation count;

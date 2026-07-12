@@ -12,6 +12,11 @@ public sealed class SqlServerDocumentStore : RelationalDocumentStore
     {
     }
 
+    internal SqlServerDocumentStore(RelationalSessionFactory sessions, StorageManifest manifest, Func<string?>? ambientTenantId = null)
+        : base(sessions, manifest, new SqlServerDocumentStoreDialect(), ambientTenantId)
+    {
+    }
+
     public SqlServerDocumentStore(string connectionString, StorageManifest manifest, Func<string?>? ambientTenantId = null)
         : base(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),

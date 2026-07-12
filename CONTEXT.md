@@ -62,3 +62,19 @@ _Avoid_: IQueryable, arbitrary LINQ
 Provider output describing the selected table/index/field route for a bounded document query.
 Callers do not submit physical query plans.
 _Avoid_: Document query
+
+**Diagnostic Record Store**:
+A specialized, provider-neutral append/query/inspection/retention contract for immutable,
+time-ordered, tenant-scoped diagnostic streams. It is separate from ordinary document storage and
+from destructive queue/outbox semantics.
+_Avoid_: Document physical-storage form, event store, outbox, arbitrary query engine
+
+**Diagnostic Cursor**:
+An opaque, provider-assigned monotonic position within one tenant, storage scope, and diagnostic
+stream. It is the total-order tie-breaker and survives record trim through stream metadata.
+_Avoid_: Application sequence, occurrence timestamp, cross-stream global sequence
+
+**Diagnostic Continuation**:
+A query-shape-bound keyset value carrying the first page's committed cursor high-water and the last
+ordered key/cursor. It provides a stable traversal that excludes later and backdated appends.
+_Avoid_: Offset, live-view page token

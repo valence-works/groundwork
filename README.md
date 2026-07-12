@@ -10,6 +10,7 @@ This repository contains the standalone Groundwork library.
 
 - `Groundwork.Core`: manifests, storage intent, provider capability checks, validation, materialization concepts, and physicalization projection rules.
 - `Groundwork.Documents`: portable document-store contracts and document planning.
+- `Groundwork.DiagnosticRecords`: bounded append/query/inspection/retention contracts for immutable diagnostic streams.
 - `Groundwork.Relational`: relational planning and shared relational document-store infrastructure.
 - `Groundwork.Sqlite`: SQLite materialization and document-store provider.
 - `Groundwork.SqlServer`: SQL Server materialization and document-store provider.
@@ -26,6 +27,7 @@ This repository contains the standalone Groundwork library.
 
 ```bash
 dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
+dotnet test tests/Groundwork/Groundwork.DiagnosticRecords.Tests/Groundwork.DiagnosticRecords.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
 dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj
 npm --prefix samples/Groundwork.SupportTickets/Client run build

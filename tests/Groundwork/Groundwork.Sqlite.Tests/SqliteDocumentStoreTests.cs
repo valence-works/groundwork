@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Data;
 using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
@@ -89,19 +91,256 @@ public sealed class SqliteDocumentStoreTests
     public async Task FactoryMaterializesAndReturnsUsableStore()
     {
         var manifest = SqliteTestManifests.MetadataManifest();
-        await using var handle = await SqliteDocumentStoreFactory.CreateAsync(
-            "Data Source=:memory:",
-            manifest,
-            SqliteTestManifests.Provider);
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-{Guid.NewGuid():N}.db");
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                $"Data Source={databasePath};Pooling=False",
+                manifest,
+                SqliteTestManifests.Provider);
 
-        var saved = await handle.Store.SaveAsync(new SaveDocumentRequest(
-            "configurationDocument",
-            "doc-1",
-            "1.0.0",
-            """{"key":"alpha","category":"system"}"""));
+            var saved = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                "doc-1",
+                "1.0.0",
+                """{"key":"alpha","category":"system"}"""));
 
-        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
-        Assert.NotNull(await handle.Store.LoadAsync("configurationDocument", "doc-1"));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+            Assert.NotNull(await store.LoadAsync("configurationDocument", "doc-1"));
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Theory]
+    [InlineData("Data Source=:memory:")]
+    [InlineData("Data Source=groundwork;Mode=Memory")]
+    public async Task FactoryRejectsPrivateInMemoryDatabase(string connectionString)
+    {
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("Data Source=file::memory:")]
+    [InlineData("Data Source=file::memory:?cache=shared")]
+    public async Task FactoryRejectsSqliteMemoryUri(string connectionString)
+    {
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("Mode=ReadWriteCreate")]
+    [InlineData("Data Source=   ")]
+    public async Task FactoryRejectsEmptyOrWhitespaceDataSource(string connectionString)
+    {
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider));
+
+        Assert.Equal("connectionString", exception.ParamName);
+    }
+
+    [Fact]
+    public async Task FactoryAcceptsFilePathContainingMemoryModeText()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-mode=memory-{Guid.NewGuid():N}.db");
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Pooling = false
+        }.ToString();
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider);
+
+            var saved = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                "doc-1",
+                "1.0.0",
+                """{"key":"alpha","category":"system"}"""));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task FactoryRejectsSqliteUriMemoryModeCaseInsensitively()
+    {
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
+            SqliteDocumentStoreFactory.CreateAsync(
+                "Data Source=file:groundwork?cache=shared&MoDe=MeMoRy",
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("direct-connection constructor", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FactoryDisposesMaterializationConnectionBeforeReturningStore()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-lifetime-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Pooling=False";
+        SqliteConnection? materializationConnection = null;
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider,
+                () => materializationConnection = new SqliteConnection(connectionString));
+
+            Assert.NotNull(materializationConnection);
+            Assert.Equal(ConnectionState.Closed, materializationConnection.State);
+
+            var saved = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                "doc-1",
+                "1.0.0",
+                """{"key":"alpha","category":"system"}"""));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+            Assert.Equal(ConnectionState.Closed, materializationConnection.State);
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task FactoryCancellationDoesNotCreateMaterializationConnection()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-cancel-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Pooling=False";
+        SqliteConnection? materializationConnection = null;
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                SqliteDocumentStoreFactory.CreateAsync(
+                    connectionString,
+                    SqliteTestManifests.MetadataManifest(),
+                    SqliteTestManifests.Provider,
+                    () => materializationConnection = new SqliteConnection(connectionString),
+                    cancellationToken: cancellation.Token));
+
+            Assert.Null(materializationConnection);
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task FactoryFailureDisposesMaterializationConnectionAndReturnsNoStore()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-failure-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Pooling=False";
+        SqliteConnection? materializationConnection = null;
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                SqliteDocumentStoreFactory.CreateAsync(
+                    connectionString,
+                    WithCompoundIndex(SqliteTestManifests.MetadataManifest()),
+                    SqliteTestManifests.Provider,
+                    () => materializationConnection = new SqliteConnection(connectionString)));
+
+            Assert.NotNull(materializationConnection);
+            Assert.Equal(ConnectionState.Closed, materializationConnection.State);
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task FactorySerializesFileBackedStoreOperations()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-factory-serialized-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Pooling=False";
+        var operationConnections = new ConcurrentBag<SqliteConnection>();
+        var firstWriteEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseFirstWrite = new ManualResetEventSlim();
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                connectionString,
+                SqliteTestManifests.MetadataManifest(),
+                SqliteTestManifests.Provider,
+                () => new SqliteConnection(connectionString),
+                () =>
+                {
+                    var connection = new SqliteConnection(connectionString);
+                    connection.CreateFunction("groundwork_test_wait", () =>
+                    {
+                        firstWriteEntered.TrySetResult();
+                        releaseFirstWrite.Wait(TimeSpan.FromSeconds(10));
+                        return 0;
+                    });
+                    operationConnections.Add(connection);
+                    return connection;
+                });
+
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = """
+                    CREATE TRIGGER groundwork_test_wait_before_insert
+                    BEFORE INSERT ON groundwork_documents
+                    BEGIN
+                        SELECT groundwork_test_wait();
+                    END;
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var first = Task.Run(() => store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "doc-1", "1.0.0", """{"key":"alpha","category":"system"}""")));
+            await firstWriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var second = Task.Run(() => store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "doc-2", "1.0.0", """{"key":"beta","category":"system"}""")));
+            await Task.Delay(250);
+
+            Assert.Single(operationConnections);
+            releaseFirstWrite.Set();
+            var results = await Task.WhenAll(first, second);
+            Assert.All(results, result => Assert.Equal(DocumentStoreWriteStatus.Saved, result.Status));
+            Assert.Equal(2, operationConnections.Count);
+        }
+        finally
+        {
+            releaseFirstWrite.Set();
+            File.Delete(databasePath);
+        }
     }
 
     [Fact]
