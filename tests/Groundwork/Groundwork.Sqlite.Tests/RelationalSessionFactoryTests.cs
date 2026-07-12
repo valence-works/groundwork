@@ -145,6 +145,25 @@ public sealed class RelationalSessionFactoryTests
     }
 
     [Fact]
+    public async Task FailedOperationPreservesPrimaryFailureWhenConnectionDisposalFails()
+    {
+        var connection = new CompletionTrackingConnection
+        {
+            ConnectionDisposeFailure = new InvalidOperationException("connection dispose failed")
+        };
+        var sessions = RelationalSessionFactory.Concurrent(() => connection);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => sessions.ExecuteAsync<bool>(
+            (_, _) => throw new InvalidOperationException("operation failed")));
+
+        Assert.Equal("operation failed", exception.Message);
+        var cleanupFailures = Assert.IsAssignableFrom<IReadOnlyList<Exception>>(
+            exception.Data["Groundwork.Relational.CleanupFailures"]);
+        Assert.Collection(cleanupFailures, cleanup => Assert.Equal("connection dispose failed", cleanup.Message));
+        Assert.Equal(1, connection.DisposeCount);
+    }
+
+    [Fact]
     public async Task CancellationDuringOperationDisposesItsConnection()
     {
         SqliteConnection? ownedConnection = null;
