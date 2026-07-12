@@ -74,4 +74,5 @@ plus linked projection/index maintenance.
 
 This Core contract contains no provider SDK types and performs no DDL, schema-history I/O, document
 I/O, provider capability probing, or query translation. Those layers consume the compiled route in
-later work units.
+later work units. The first consumer is the provider-neutral additive diff and durable-state
+pipeline documented in [Physical schema diffs and durable applied state](physical-schema-diffs.md).

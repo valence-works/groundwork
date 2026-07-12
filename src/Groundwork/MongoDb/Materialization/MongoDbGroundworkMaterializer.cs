@@ -1,5 +1,6 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Materialization;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -38,6 +39,9 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
                     break;
                 case CreateIndexOperation index:
                     await EnsureIndexAsync(index.Index, physicalizedFields, cancellationToken);
+                    break;
+                case BackfillCanonicalJsonOperation:
+                    // A native MongoDB index covers documents that predate index creation.
                     break;
                 case CreateOptimizedProjectionOperation:
                     break;

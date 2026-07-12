@@ -51,9 +51,16 @@ requirements, resolved names, and fingerprints consumed by later provider execut
 _Avoid_: Provider query translation, inferred workload route, raw DDL plan
 
 **Schema History**:
-Durable evidence of the resolved definition, names, fingerprint, and operations applied to a
-provider.
+Durable evidence of manifest/provider identity, resolved names, definition and executable-route
+fingerprints, operation identities, timestamps, and the canonical applied snapshot recorded only
+after acknowledged provider execution.
 _Avoid_: Migration class list
+
+**Physical Schema Diff**:
+A deterministic additive comparison between desired executable storage routes and durable applied
+provider state. It emits semantic create, projection, index, canonical-JSON backfill, validation,
+and recording operations without provider DDL.
+_Avoid_: Provider migration script, manifest-version comparison
 
 **Semantic Migration**:
 An explicitly authored provider-neutral data transformation used only when a desired-state diff

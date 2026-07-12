@@ -1,4 +1,5 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Materialization;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Materialization;

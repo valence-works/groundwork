@@ -1,4 +1,5 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Materialization;
 
 namespace Groundwork.Materialization;
 
