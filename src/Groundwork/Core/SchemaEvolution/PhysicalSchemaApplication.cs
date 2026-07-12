@@ -29,6 +29,7 @@ public interface IPhysicalSchemaExecutor
     /// The target applied state is not written by this method.
     /// </summary>
     ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
+        PhysicalSchemaTargetIdentity target,
         PhysicalSchemaOperation operation,
         CancellationToken cancellationToken);
 
@@ -105,7 +106,7 @@ public static class PhysicalSchemaApplication
                 continue;
 
             cancellationToken.ThrowIfCancellationRequested();
-            var acknowledgement = await executor.ApplyOperationAsync(operation, cancellationToken);
+            var acknowledgement = await executor.ApplyOperationAsync(target.Identity, operation, cancellationToken);
             if (acknowledgement.Identity != operation.Identity)
             {
                 throw new InvalidOperationException(

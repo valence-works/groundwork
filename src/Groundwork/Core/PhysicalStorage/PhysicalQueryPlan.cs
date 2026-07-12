@@ -59,7 +59,8 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
         bool supportsCount,
         bool supportsAny,
         bool supportsFirst,
-        bool supportsLatestPerKey)
+        bool supportsLatestPerKey,
+        IReadOnlyDictionary<PhysicalQuerySourceKind, IReadOnlySet<IndexValueKind>>? sourceValueKinds = null)
     {
         Provider = provider ?? throw new ArgumentNullException(nameof(provider));
         SourcePreference = Array.AsReadOnly((sourcePreference ?? throw new ArgumentNullException(nameof(sourcePreference)))
@@ -70,6 +71,8 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
             .ToFrozenDictionary();
         NativeFieldIdentifiers = (nativeFieldIdentifiers ?? new Dictionary<string, string>())
             .ToFrozenDictionary(StringComparer.Ordinal);
+        SourceValueKinds = (sourceValueKinds ?? new Dictionary<PhysicalQuerySourceKind, IReadOnlySet<IndexValueKind>>())
+            .ToFrozenDictionary(item => item.Key, item => (IReadOnlySet<IndexValueKind>)item.Value.ToFrozenSet());
         if (SourcePreference.Any(source =>
                 !HandlerIdentities.TryGetValue(source, out var identity) || string.IsNullOrWhiteSpace(identity)))
         {
@@ -95,6 +98,7 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
     public IReadOnlySet<PortableQueryOperation> SupportedOperations { get; }
     public IReadOnlyDictionary<PhysicalQuerySourceKind, string> HandlerIdentities { get; }
     public IReadOnlyDictionary<string, string> NativeFieldIdentifiers { get; }
+    public IReadOnlyDictionary<PhysicalQuerySourceKind, IReadOnlySet<IndexValueKind>> SourceValueKinds { get; }
     public bool SupportsCompoundPredicates { get; }
     public bool SupportsDisjunction { get; }
     public bool SupportsOffsetPaging { get; }
@@ -111,6 +115,7 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
         SupportedOperations.SetEquals(other.SupportedOperations) &&
         DictionaryEquals(HandlerIdentities, other.HandlerIdentities) &&
         DictionaryEquals(NativeFieldIdentifiers, other.NativeFieldIdentifiers) &&
+        SetDictionaryEquals(SourceValueKinds, other.SourceValueKinds) &&
         SupportsCompoundPredicates == other.SupportsCompoundPredicates &&
         SupportsDisjunction == other.SupportsDisjunction &&
         SupportsOffsetPaging == other.SupportsOffsetPaging &&
@@ -132,6 +137,12 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
             hash.Add(operation);
         AddDictionaryHash(ref hash, HandlerIdentities);
         AddDictionaryHash(ref hash, NativeFieldIdentifiers);
+        foreach (var item in SourceValueKinds.OrderBy(item => item.Key))
+        {
+            hash.Add(item.Key);
+            foreach (var kind in item.Value.Order())
+                hash.Add(kind);
+        }
         hash.Add(SupportsCompoundPredicates);
         hash.Add(SupportsDisjunction);
         hash.Add(SupportsOffsetPaging);
@@ -159,6 +170,15 @@ public sealed class PhysicalQueryPlannerCapabilities : IEquatable<PhysicalQueryP
             hash.Add(item.Value);
         }
     }
+
+    public bool Supports(PhysicalQuerySourceKind source, IndexValueKind valueKind) =>
+        !SourceValueKinds.TryGetValue(source, out var supported) || supported.Contains(valueKind);
+
+    private static bool SetDictionaryEquals<TKey, TValue>(
+        IReadOnlyDictionary<TKey, IReadOnlySet<TValue>> first,
+        IReadOnlyDictionary<TKey, IReadOnlySet<TValue>> second) where TKey : notnull =>
+        first.Count == second.Count && first.All(item =>
+            second.TryGetValue(item.Key, out var value) && item.Value.SetEquals(value));
 }
 
 public sealed record PhysicalQueryField(
@@ -166,7 +186,8 @@ public sealed record PhysicalQueryField(
     string Identifier,
     PhysicalQueryFieldSource Source,
     ExecutableStorageObjectRole Target,
-    ProviderPhysicalObjectName ObjectName);
+    ProviderPhysicalObjectName ObjectName,
+    IndexValueKind ValueKind);
 
 public sealed record PhysicalQueryScope(
     PhysicalQueryField Field,
@@ -454,6 +475,7 @@ public static class PhysicalQueryPlanSerializer
         writer.WriteString("source", field.Source.ToString());
         writer.WriteString("target", field.Target.ToString());
         writer.WriteString("object", field.ObjectName.Identifier);
+        writer.WriteString("valueKind", field.ValueKind.ToString());
         writer.WriteEndObject();
     }
 }

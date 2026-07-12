@@ -14,6 +14,18 @@
 - Enforces unique declared indexes through SQLite constraints.
 - Provides a durable Groundwork migration executor backed by `groundwork_migration_history`.
 - Adds and backfills new optimized physicalized projection columns during materialization.
+- Applies typed physical-schema diffs for shared+linked, dedicated+optional-linked, and entity
+  routes with durable operation acknowledgements and canonical applied-state compare-and-swap.
+- Executes compiled-route CRUD/OCC/unit-of-work maintenance atomically across envelopes, canonical
+  JSON, linked rows, and entity projections.
+- Executes exactly certified bounded physical query plans for filters, compound predicates,
+  ordering, offset paging, count, any, and first, with explain-plan index conformance.
+- Stores declared Decimal projections as checked fixed-scale integers (precision 1–18) and explicitly
+  offset DateTime projections as UTC ticks. Original numeric lexemes are validated before CLR
+  conversion, and date-time fractions beyond seven digits are rejected before parsing. Canonical
+  JSON Number/DateTime query plans are not certified because SQLite's native conversions are lossy.
+- Exposes route-driven physical stores through serialized per-operation sessions; explicit units of
+  work own one connection/transaction and private in-memory databases remain direct-connection only.
 - Exposes `SqliteGroundworkCapabilities.Runtime()` and `SqliteGroundworkCapabilities.Materialization()`.
 - Materializes a dedicated diagnostic-record schema and executes the complete bounded
   `IDiagnosticRecordStore` contract through a real, file-backed SQLite database.
@@ -49,3 +61,4 @@ materialized.
 - Single-field index extraction only.
 - JSON content is stored as text; provider-specific JSON indexing is deferred.
 - This package is a Groundwork provider package, not a host-specific integration package.
+- The physical query profile does not yet advertise keyset paging or latest-per-key execution.

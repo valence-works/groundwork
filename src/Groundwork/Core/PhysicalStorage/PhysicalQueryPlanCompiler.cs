@@ -68,6 +68,7 @@ public static class PhysicalQueryPlanCompiler
         }
         ValidateOperations(predicateDeclarations, query, capabilities, target, diagnostics);
         ValidateShape(query, predicateDeclarations.Count, capabilities, target, diagnostics);
+        ValidateEnvelopeKinds(logicalIndex, target, diagnostics);
 
         var physicalIndex = route.Indexes.SingleOrDefault(index => index.Identity == logicalIndex.Identity);
         var selectedSource = SelectSource(route, logicalIndex, physicalIndex, query, capabilities);
@@ -97,6 +98,14 @@ public static class PhysicalQueryPlanCompiler
                 target));
             return null;
         }
+
+        var predicates = predicateDeclarations
+            .Select(predicate => new PhysicalQueryPredicate(
+                predicate.Path,
+                ResolveField(route, selectedSource.Value, predicate.Path, logicalIndex.GetValueKind(predicate.Path), capabilities),
+                predicate.Operations.ToFrozenSet()))
+            .ToArray();
+        ValidateExecutableCompatibility(route, predicates, target, diagnostics);
 
         IReadOnlyList<string> requiredEqualityPrefixPaths = [];
         if (HasIndexedAccess(selectedSource.Value, physicalIndex) &&
@@ -139,7 +148,8 @@ public static class PhysicalQueryPlanCompiler
                     _ => PhysicalQueryFieldSource.Envelope
                 },
                 lookupTarget,
-                lookupObject),
+                lookupObject,
+                IndexValueKind.Keyword),
             route.ScopePolicy,
             IsMandatory: true,
             route.ScopeKey.UsesGlobalSentinel);
@@ -159,13 +169,8 @@ public static class PhysicalQueryPlanCompiler
                 _ => PhysicalQueryFieldSource.Envelope
             },
             lookupTarget,
-            lookupObject);
-        var predicates = predicateDeclarations
-            .Select(predicate => new PhysicalQueryPredicate(
-                predicate.Path,
-                ResolveField(route, physicalIndex, selectedSource.Value, predicate.Path, capabilities),
-                predicate.Operations.ToFrozenSet()))
-            .ToArray();
+            lookupObject,
+            IndexValueKind.Keyword);
         var order = ResolveOrder(route, physicalIndex, selectedSource.Value, logicalIndex, query, capabilities);
 
         var draft = new PhysicalQueryPlan(
@@ -279,6 +284,50 @@ public static class PhysicalQueryPlanCompiler
             diagnostics.Add(Error("GW-QUERY-003", "Provider cannot execute declared first results.", target));
     }
 
+    private static void ValidateExecutableCompatibility(
+        ExecutableStorageRoute route,
+        IReadOnlyList<PhysicalQueryPredicate> predicates,
+        string target,
+        List<GroundworkDiagnostic> diagnostics)
+    {
+        foreach (var predicate in predicates)
+        {
+            var projection = predicate.Field.Source == PhysicalQueryFieldSource.ProjectedColumn
+                ? route.ProjectedColumns.Single(column =>
+                    column.Target == predicate.Field.Target &&
+                    column.Definition.Path == predicate.Path)
+                : null;
+            if (projection is not null &&
+                !PortableQueryOperationCompatibility.Supports(
+                    predicate.Field.ValueKind,
+                    projection.Definition.Type))
+            {
+                diagnostics.Add(Error(
+                    "GW-QUERY-009",
+                    $"Logical value kind '{predicate.Field.ValueKind}' cannot be represented by projected physical type " +
+                    $"'{projection.Definition.Type}' on predicate path '{predicate.Path}' without changing query semantics.",
+                    target));
+                continue;
+            }
+            foreach (var operation in predicate.Operations)
+            {
+                var supported = PortableQueryOperationCompatibility.Supports(predicate.Field.ValueKind, operation) &&
+                                (projection is null ||
+                                 PortableQueryOperationCompatibility.Supports(projection.Definition.Type, operation));
+                if (!supported)
+                {
+                    var typeDescription = projection is null
+                        ? $"value kind '{predicate.Field.ValueKind}'"
+                        : $"projected physical type '{projection.Definition.Type}' (value kind '{predicate.Field.ValueKind}')";
+                    diagnostics.Add(Error(
+                        "GW-QUERY-009",
+                        $"Operation '{operation}' cannot execute against {typeDescription} on predicate path '{predicate.Path}'.",
+                        target));
+                }
+            }
+        }
+    }
+
     private static PhysicalQuerySourceKind? SelectSource(
         ExecutableStorageRoute route,
         LogicalIndexDeclaration logicalIndex,
@@ -315,10 +364,15 @@ public static class PhysicalQueryPlanCompiler
         var candidates = query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing
             ? capabilities.SourcePreference.Where(source => HasIndexedAccess(source, physicalIndex)).ToArray()
             : capabilities.SourcePreference;
-        return candidates.FirstOrDefault(source => available.Contains(source)) is var selected &&
-               candidates.Contains(selected) && available.Contains(selected)
-            ? selected
-            : null;
+        foreach (var source in candidates)
+        {
+            if (available.Contains(source) &&
+                logicalIndex.Fields.All(field => capabilities.Supports(source, logicalIndex.GetValueKind(field))))
+            {
+                return source;
+            }
+        }
+        return null;
     }
 
     private static bool ValidatePhysicalCompatibility(
@@ -412,14 +466,14 @@ public static class PhysicalQueryPlanCompiler
                         : PhysicalSortDirection.Ascending)).ToArray();
         var order = declared.Select(field => new PhysicalQueryOrder(
             field.Path,
-            ResolveField(route, physicalIndex, source, field.Path, capabilities),
+            ResolveField(route, source, field.Path, logicalIndex.GetValueKind(field.Path), capabilities),
             field.Direction,
             IsIdentityTieBreak: false)).ToList();
         if (order.All(item => item.Path != "id"))
         {
             order.Add(new PhysicalQueryOrder(
                 "id",
-                ResolveField(route, physicalIndex, source, "id", capabilities),
+                ResolveField(route, source, "id", IndexValueKind.Keyword, capabilities),
                 PhysicalSortDirection.Ascending,
                 IsIdentityTieBreak: true));
         }
@@ -428,9 +482,9 @@ public static class PhysicalQueryPlanCompiler
 
     private static PhysicalQueryField ResolveField(
         ExecutableStorageRoute route,
-        ExecutablePhysicalIndexRoute? physicalIndex,
         PhysicalQuerySourceKind source,
         string path,
+        IndexValueKind logicalValueKind,
         PhysicalQueryPlannerCapabilities capabilities)
     {
         var linked = source == PhysicalQuerySourceKind.LinkedIndex;
@@ -443,7 +497,8 @@ public static class PhysicalQueryPlanCompiler
                 capabilities.NativeFieldIdentifiers[path],
                 PhysicalQueryFieldSource.NativeDocumentField,
                 target,
-                objectName);
+                objectName,
+                logicalValueKind);
         }
 
         if (IsEnvelopePath(path))
@@ -456,13 +511,20 @@ public static class PhysicalQueryPlanCompiler
                 column.Identifier,
                 linked ? PhysicalQueryFieldSource.LinkedRelationship : PhysicalQueryFieldSource.Envelope,
                 target,
-                objectName);
+                objectName,
+                logicalValueKind);
         }
 
         if (source is PhysicalQuerySourceKind.LinkedIndex or PhysicalQuerySourceKind.PrimaryProjectedColumns)
         {
             var projection = route.ProjectedColumns.Single(column => column.Definition.Path == path);
-            return new PhysicalQueryField(path, projection.Column.Identifier, PhysicalQueryFieldSource.ProjectedColumn, target, objectName);
+            return new PhysicalQueryField(
+                path,
+                projection.Column.Identifier,
+                PhysicalQueryFieldSource.ProjectedColumn,
+                target,
+                objectName,
+                logicalValueKind);
         }
 
         return new PhysicalQueryField(
@@ -470,7 +532,30 @@ public static class PhysicalQueryPlanCompiler
             route.Envelope.CanonicalJson.Identifier,
             PhysicalQueryFieldSource.CanonicalJsonPath,
             target,
-            objectName);
+            objectName,
+            logicalValueKind);
+    }
+
+    private static IndexValueKind EnvelopeValueKind(string path) => path == "version"
+        ? IndexValueKind.Number
+        : IndexValueKind.Keyword;
+
+    private static void ValidateEnvelopeKinds(
+        LogicalIndexDeclaration logicalIndex,
+        string target,
+        List<GroundworkDiagnostic> diagnostics)
+    {
+        foreach (var field in logicalIndex.Fields.Where(field => IsEnvelopePath(field.Path)))
+        {
+            var declared = logicalIndex.GetValueKind(field);
+            var intrinsic = EnvelopeValueKind(field.Path);
+            if (declared == intrinsic)
+                continue;
+            diagnostics.Add(Error(
+                "GW-QUERY-010",
+                $"Envelope path '{field.Path}' has intrinsic value kind '{intrinsic}' and cannot be declared as '{declared}'.",
+                target));
+        }
     }
 
     private static string ResolveIndexPath(

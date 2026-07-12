@@ -11,12 +11,18 @@ public static class ContainsPattern
     public static string Build(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
+        return $"%{Escape(value)}%";
+    }
 
-        var escaped = value
+    public static string BuildStartsWith(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        return $"{Escape(value)}%";
+    }
+
+    private static string Escape(string value) =>
+        value
             .Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("%", "\\%", StringComparison.Ordinal)
             .Replace("_", "\\_", StringComparison.Ordinal);
-
-        return $"%{escaped}%";
-    }
 }

@@ -80,15 +80,25 @@ adds deterministic additive diffs from executable routes to typed durable applie
 semantic creation/projection/index/canonical-JSON-backfill/validation/recording operations,
 canonical state serialization, provider/manifest exclusion and compare-and-swap contracts, and
 failure/acknowledgement-loss recovery proven by a fake executor. The greenfield policy rejects
-legacy history without an applied snapshot. Provider ledgers and DDL translation remain #46–#48.
+legacy history without an applied snapshot. SQLite provider execution is now delivered by #46;
+SQL Server and PostgreSQL remain #47; MongoDB remains #48.
 
 Bounded-query-plan progress: [issue #45](https://github.com/valence-works/Groundwork/issues/45)
 compiles one closed declaration family against executable routes and provider handler profiles.
 Plans cover linked+primary, primary envelope/JSON, entity projections, and provider-native fields;
 scope, compound prefix/direction, identity tie-breaking, paging/results, latest/keyset behavior, and
-scale-bearing fail-fast are binding. The `DocumentQuery` compatibility bridge is in place. Provider
-SQL/BSON execution and native explain assertions remain subsequent work units, so #24 is not yet
-superseded.
+scale-bearing fail-fast are binding. The `DocumentQuery` compatibility bridge is in place. SQLite
+SQL execution and native explain assertions are now delivered by #46; remaining providers are
+subsequent work units, so #24 is superseded only for SQLite.
+
+Relational physical-runtime progress: [issue #46](https://github.com/valence-works/Groundwork/issues/46)
+connects executable routes, typed schema diffs/applied state, and bounded query plans through a
+reusable relational CRUD/OCC/unit-of-work and query engine, with SQLite as the complete three-form
+reference. SQLite now covers optional linked storage, atomic linked/entity projection maintenance,
+scoped unique and same-identity isolation, compound filters, count/order/page terminals,
+same-version restart-safe canonical-JSON backfill, durable fingerprints/CAS, and native explain
+evidence. SQL Server and PostgreSQL conformance remain #47, MongoDB conformance remains #48, and
+CLI execution remains #49.
 
 Diagnostic-record observability progress: [issue #57](https://github.com/valence-works/Groundwork/issues/57)
 defines one versioned provider-neutral trace and metric boundary around append, query, inspect, and
@@ -121,6 +131,7 @@ storage, session, materialization, migration, and provider-health signals remain
 - [Groundwork vocabulary and public API reconciliation](../reports/groundwork-vocabulary-and-public-api.md)
 - [Physical schema diffs and durable applied state](../physical-schema-diffs.md)
 - [Bounded physical query plans](../bounded-physical-query-plans.md)
+- [Relational physical storage runtime](../relational-physical-storage-runtime.md)
 - [Relational session lifecycle prototype](../reports/relational-session-lifecycle-prototype.md)
 - [Diagnostic record-store contract](../../src/Groundwork/DiagnosticRecords/README.md) ([issue #30](https://github.com/valence-works/Groundwork/issues/30))
 - [Stateless relational document-store factory migration](https://github.com/valence-works/Groundwork/issues/34)
