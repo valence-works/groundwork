@@ -21,7 +21,7 @@ the storage boundary and is never read from document JSON.
 - `Groundwork.Sqlite`: SQLite materialization plus document-store and diagnostic-record providers.
 - `Groundwork.SqlServer`: SQL Server materialization and document-store provider.
 - `Groundwork.PostgreSql`: PostgreSQL materialization and document-store provider.
-- `Groundwork.MongoDb`: MongoDB materialization and document-store provider.
+- `Groundwork.MongoDb`: MongoDB materialization, document-store, and transactional diagnostic-record provider.
 
 ## Requirements
 
