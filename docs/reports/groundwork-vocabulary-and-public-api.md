@@ -92,6 +92,7 @@ The following terms are normative for new work.
 | **Physical storage form** | One of the three provider-neutral layouts selected for a storage unit. | Portable/optimized mode. |
 | **Shared document storage** | Canonical envelopes and JSON for multiple units in a provider-level structure, with linked index structures as needed. | Portable table. |
 | **Shared storage definition** | A manifest/composition-owned definition of one shared primary document structure. Units reference it by a stable binding identity rather than redefining its name or envelope independently. | A per-unit shared table definition. |
+| **Shared storage binding** | A stable reference from a unit's default policy or explicit definition to one manifest/composition-owned shared storage definition. It carries identity, not a competing primary shape. | Repeating the shared table name/envelope on every unit. |
 | **Dedicated document table** | One unit-specific envelope-plus-canonical-JSON table or provider-native equivalent. | Optimized table. |
 | **Physical entity table** | One unit-specific table containing the envelope, canonical JSON, and declared projected columns. | ORM entity table, columns-only entity. |
 | **Linked index table** | A derived structure that stores query keys and a document reference. It is not a fourth storage form. | Physicalization table, optimized projection. |
@@ -123,7 +124,7 @@ Names below are the recommended target. Exact record-vs-class construction can b
 
 - Keep `StorageManifest` and `StorageUnit`. Add a binding `StorageUnitProvisioningMode` with `Declared` and `Dynamic`; do not derive this choice from the current diagnostic-only `WorkloadIntent` descriptor.
 - Replace `PhysicalizationPolicy` with `PhysicalStoragePolicy`. Each `StorageUnit` owns exactly one policy:
-  - `Default` asks Groundwork to apply ADR 0003's deterministic provisioning/query-demand rules.
+  - `Default(SharedStorageBinding? sharedStorage = null)` asks Groundwork to apply ADR 0003's deterministic provisioning/query-demand rules. `Dynamic` units require the binding; `Declared` units reject it because their default is unit-specific storage.
   - `Explicit(PhysicalTableDefinition)` supplies the provider-neutral form, feature-default logical name, projected columns, and indexes directly.
 - Introduce `PhysicalStorageForm` with exactly:
   - `SharedDocuments`
@@ -138,7 +139,7 @@ Names below are the recommended target. Exact record-vs-class construction can b
 
 Default resolution remains the ADR 0003 policy, made executable through binding declarations rather than heuristics:
 
-1. `Dynamic` units resolve to shared documents and must identify a declared shared-storage binding.
+1. `Dynamic` units resolve to shared documents and must identify a declared shared-storage binding through their `Default` policy (or through an explicit shared-form definition).
 2. `Declared` units with no scale-bearing projected-field demand resolve to dedicated document tables.
 3. `Declared` units whose `BoundedQueryDeclaration`s explicitly mark stable non-envelope fields as scale-bearing resolve to physical entity tables.
 
@@ -165,7 +166,7 @@ The relationship among the main concepts is:
 
 1. `StorageManifest` owns one or more logical `StorageUnit` declarations.
 2. The manifest/composition owns each `SharedDocumentStorageDefinition`; units using shared form reference one by stable binding identity. Resolution groups those units, resolves the shared primary name/envelope once, and rejects conflicting definitions.
-3. Each unit's `PhysicalStoragePolicy` either supplies a `PhysicalTableDefinition` or asks the resolver to synthesize one from its binding provisioning mode and declared query/index requirements.
+3. Each unit's `PhysicalStoragePolicy` either supplies a `PhysicalTableDefinition` or asks the resolver to synthesize one from its binding provisioning mode, optional default-policy shared binding, and declared query/index requirements.
 4. Host naming produces a resolved physical definition; provider normalization produces a provider physical definition and deterministic fingerprint.
 5. `MaterializationPlanner` compares the provider physical definition with durable `SchemaHistory` and emits one `MaterializationPlan`.
 6. The plan contains typed `MaterializationOperation` values for structures, indexes, backfills, semantic transforms, validation, authorized destructive work, and history recording.
@@ -216,7 +217,7 @@ Groundwork is currently versioned `0.0.1`, so this is the right time for a delib
 - Require an explicit adapter or diagnostic for `Specialized`; it has no honest three-form mapping.
 - Map `IndexPhysicalizationPolicy.Optimized` to legacy linked projected-field placement and `Portable` to the shared index path during the bridge.
 - Convert each legacy `PortableQueryDeclaration` into an authoritative bounded-query declaration. Preserve the current valid-subset rule: error only when a query requests an operation outside its index's legacy `SupportedOperations`; extra index operations do not create implicit query capabilities. Convert ordering only from a query's declared sort support after validating the legacy index is sortable, then retire the index-level sortability flag.
-- Legacy units have no binding static/dynamic signal. Preserve their explicit `Portable`/`Optimized` mappings during the bridge; require new units using `Default` to provide `StorageUnitProvisioningMode` and scale-bearing query declarations rather than inferring from `WorkloadIntent.Descriptor`.
+- Legacy units have no binding static/dynamic signal. Preserve their explicit `Portable`/`Optimized` mappings during the bridge; require new units using `Default` to provide `StorageUnitProvisioningMode`, a shared binding when dynamic, and scale-bearing query declarations rather than inferring from `WorkloadIntent.Descriptor`.
 - Implement `DocumentStoreQuery` by converting it to a single equality `DocumentQuery` and delete provider-specific overload logic.
 - Mark legacy policies, projection plan types, legacy query names, and duplicate Core materialization types obsolete with replacement guidance.
 
