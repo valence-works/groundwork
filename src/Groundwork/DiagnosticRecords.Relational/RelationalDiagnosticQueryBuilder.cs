@@ -69,15 +69,14 @@ internal sealed class RelationalDiagnosticQueryBuilder(
               latest_winners AS (
                   SELECT lfield.comparison_key, MAX(lfield.cursor) AS cursor
                   FROM {dialect.TableReference(RelationalDiagnosticRecordSchema.FieldsTable, "lfield")}
-                  JOIN {dialect.TableReference(RelationalDiagnosticRecordSchema.RecordsTable, "lr")}
-                    ON {FieldJoin("lfield", "lr")}
+                  {(query.Predicate is null ? "" : $"JOIN {dialect.TableReference(RelationalDiagnosticRecordSchema.RecordsTable, "lr")} ON {FieldJoin("lfield", "lr")}")}
                   WHERE lfield.tenant_id = {dialect.Parameter("tenant")}
                     AND lfield.scope_id = {dialect.Parameter("scope")}
                     AND lfield.stream_id = {dialect.Parameter("stream")}
                     AND lfield.field_name = {dialect.Parameter("latestField")}
                     AND lfield.field_type = {dialect.Parameter("latestFieldType")}
                     AND lfield.value_ordinal = 0
-                    AND lr.cursor <= {dialect.Parameter("snapshot")}
+                    AND lfield.cursor <= {dialect.Parameter("snapshot")}
                     {(query.Predicate is null ? "" : $"AND {BuildPredicate(query.Predicate, "lr")}")}
                   GROUP BY lfield.comparison_key
               ),
@@ -105,10 +104,7 @@ internal sealed class RelationalDiagnosticQueryBuilder(
     public RelationalDiagnosticCommand BuildCount(DiagnosticRecordQuery query, long snapshotHighWater)
     {
         var page = Build(query with { Limit = 1, Continuation = null }, snapshotHighWater);
-        var sql = page.CommandText;
-        var marker = "SELECT * FROM selected";
-        var selectIndex = sql.LastIndexOf(marker, StringComparison.Ordinal);
-        return new($"{sql[..selectIndex]}SELECT COUNT(*) FROM selected;", page.Parameters);
+        return new(dialect.BuildCountFromPage(page.CommandText), page.Parameters);
     }
 
     private string BuildPredicate(DiagnosticRecordPredicate predicate, string recordAlias = "r") => predicate switch
@@ -123,23 +119,29 @@ internal sealed class RelationalDiagnosticQueryBuilder(
     {
         var field = DiagnosticRecordFieldResolver.Resolve(definition, comparison.Field)!;
         if (StringComparer.Ordinal.Equals(field.Name, DiagnosticRecordFieldNames.OccurredAt))
-            return BuildValueExpression($"{recordAlias}.occurred_at_ticks", comparison, value => DateTimeOffset.Parse(value.CanonicalValue).UtcTicks);
+            return BuildValueExpression($"{recordAlias}.occurred_at_ticks", comparison, "value", value => DateTimeOffset.Parse(value.CanonicalValue).UtcTicks);
 
         var fieldParameter = Add("field", field.Name);
         var fieldTypeParameter = Add("fieldType", (int)field.Type);
+        var usesCanonicalContains = comparison.Operator == DiagnosticPredicateOperator.Contains &&
+                                    field.CasePolicy == DiagnosticStringCasePolicy.Ordinal;
         var valueExpression = BuildValueExpression(
-            "f.comparison_key",
+            usesCanonicalContains ? "f.canonical_value" : "f.comparison_key",
             comparison,
-            value => DiagnosticComparisonKeys.Create(value, field.CasePolicy));
+            usesCanonicalContains ? "canonicalValue" : "value",
+            usesCanonicalContains
+                ? value => value.CanonicalValue
+                : value => DiagnosticComparisonKeys.Create(value, field.CasePolicy));
         return $"EXISTS (SELECT 1 FROM {dialect.TableReference(RelationalDiagnosticRecordSchema.FieldsTable, "f")} WHERE {FieldJoin("f", recordAlias)} AND f.field_name = {fieldParameter} AND f.field_type = {fieldTypeParameter} AND {valueExpression})";
     }
 
     private string BuildValueExpression(
         string expression,
         DiagnosticRecordPredicate.Comparison comparison,
+        string parameterPrefix,
         Func<DiagnosticFieldValue, object> convert)
     {
-        var values = comparison.Values.Select(value => Add("value", convert(value))).ToArray();
+        var values = comparison.Values.Select(value => Add(parameterPrefix, convert(value))).ToArray();
         return comparison.Operator switch
         {
             DiagnosticPredicateOperator.Equal => $"{expression} = {values[0]}",

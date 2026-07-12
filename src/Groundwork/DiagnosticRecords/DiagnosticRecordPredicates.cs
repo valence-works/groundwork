@@ -127,7 +127,10 @@ public static class DiagnosticRecordQueryValidator
         }
 
         if (query.Predicate is not null)
-            ValidatePredicate(query.Predicate, definition, capabilities, errors, 1);
+        {
+            var valueCount = 0;
+            ValidatePredicate(query.Predicate, definition, capabilities, errors, 1, ref valueCount);
+        }
 
         if (errors.Count == 0 && query.Continuation is { } validContinuation &&
             validContinuation.QueryFingerprint != DiagnosticRequestFingerprint.ForQuery(query with { Continuation = null }, definition))
@@ -142,7 +145,8 @@ public static class DiagnosticRecordQueryValidator
         DiagnosticRecordStreamDefinition definition,
         DiagnosticQueryHandlerCapabilities capabilities,
         List<DiagnosticValidationError> errors,
-        int count)
+        int count,
+        ref int valueCount)
     {
         if (count > definition.Limits.MaxPredicateNodes)
         {
@@ -163,7 +167,7 @@ public static class DiagnosticRecordQueryValidator
                     if (child is null)
                         errors.Add(new("query.predicate.child_null", "Predicate children cannot be null.", "predicate"));
                     else
-                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1);
+                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1, ref valueCount);
                 }
                 break;
             case DiagnosticRecordPredicate.Any any:
@@ -177,7 +181,7 @@ public static class DiagnosticRecordQueryValidator
                     if (child is null)
                         errors.Add(new("query.predicate.child_null", "Predicate children cannot be null.", "predicate"));
                     else
-                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1);
+                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1, ref valueCount);
                 }
                 break;
             case DiagnosticRecordPredicate.Comparison comparison:
@@ -208,6 +212,12 @@ public static class DiagnosticRecordQueryValidator
                     errors.Add(new("query.predicate.values.invalid", $"{comparison.Operator} requires a value collection.", "predicate.values"));
                     break;
                 }
+                valueCount += comparison.Values.Count;
+                if (valueCount > definition.Limits.MaxPredicateValues)
+                    errors.Add(new(
+                        "query.predicate.values.too_many",
+                        $"The predicate exceeds the declared value bound of {definition.Limits.MaxPredicateValues}.",
+                        "predicate.values"));
                 if (requiredCount >= 0 && comparison.Values.Count != requiredCount || requiredCount == -1 && comparison.Values.Count == 0)
                     errors.Add(new("query.predicate.values.invalid", $"{comparison.Operator} has an invalid value count.", "predicate.values"));
                 if (comparison.Values.Any(x => !x.IsInitialized))

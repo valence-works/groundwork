@@ -2,6 +2,11 @@
 
 `Groundwork.PostgreSql` provides PostgreSQL materialization and document-store operations for portable Groundwork documents.
 
+It also implements the provider-neutral diagnostic-record contract through
+`PostgreSqlDiagnosticRecordStoreFactory`. Diagnostic stores use independent pooled sessions, native
+`LIMIT`, `strpos`, session advisory per-stream locks, `C`-collated comparison keys, partial latest-per-key
+indexes, durable operation tombstones, and bounded `ctid` cleanup.
+
 ## Current Scope
 
 - Creates document, declared-index, and schema-history tables.
@@ -27,5 +32,7 @@ removed because a stateless store has no single connection to expose or dispose.
 ## Deliberate Limits
 
 - JSON content is stored as text (no `jsonb` column or provider-specific JSON indexing).
+- Definitions whose predicate bounds can exceed PostgreSQL's 65,535-parameter command ceiling are
+  rejected before materialization.
 - No Entity Framework dependency.
 - No host-specific dependency.

@@ -4,7 +4,44 @@ namespace Groundwork.DiagnosticRecords;
 
 public static class DiagnosticStringComparisonKey
 {
+    public const string OrdinalAlgorithmId = "groundwork-utf16-hex-v1";
     public const string AsciiIgnoreCaseAlgorithmId = "groundwork-ascii-lower-v1";
+
+    public static bool IsPortableOrdinalValue(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (character == '\0' || char.IsLowSurrogate(character))
+                return false;
+            if (!char.IsHighSurrogate(character))
+                continue;
+            if (++index >= value.Length || !char.IsLowSurrogate(value[index]))
+                return false;
+        }
+        return true;
+    }
+
+    public static string CreateOrdinal(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (!IsPortableOrdinalValue(value))
+            throw new ArgumentException("Ordinal strings must be well-formed UTF-16 and cannot contain U+0000.", nameof(value));
+        return string.Create(value.Length * 4, value, static (buffer, source) =>
+        {
+            const string hex = "0123456789ABCDEF";
+            for (var index = 0; index < source.Length; index++)
+            {
+                var character = source[index];
+                var offset = index * 4;
+                buffer[offset] = hex[(character >> 12) & 0xF];
+                buffer[offset + 1] = hex[(character >> 8) & 0xF];
+                buffer[offset + 2] = hex[(character >> 4) & 0xF];
+                buffer[offset + 3] = hex[character & 0xF];
+            }
+        });
+    }
 
     public static bool IsAsciiIgnoreCaseValue(string value)
     {
@@ -38,7 +75,7 @@ public readonly record struct DiagnosticFieldValue
         Type = type;
         CanonicalValue = type switch
         {
-            DiagnosticFieldType.String => canonicalValue,
+            DiagnosticFieldType.String when DiagnosticStringComparisonKey.IsPortableOrdinalValue(canonicalValue) => canonicalValue,
             DiagnosticFieldType.Int64 when long.TryParse(canonicalValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer) =>
                 integer.ToString(CultureInfo.InvariantCulture),
             DiagnosticFieldType.Decimal when decimal.TryParse(canonicalValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) =>
@@ -68,7 +105,9 @@ public readonly record struct DiagnosticFieldValue
         {
             DiagnosticFieldType.String => casePolicy switch
             {
-                DiagnosticStringCasePolicy.Ordinal => StringComparer.Ordinal.Compare(CanonicalValue, other.CanonicalValue),
+                DiagnosticStringCasePolicy.Ordinal => StringComparer.Ordinal.Compare(
+                    DiagnosticStringComparisonKey.CreateOrdinal(CanonicalValue),
+                    DiagnosticStringComparisonKey.CreateOrdinal(other.CanonicalValue)),
                 DiagnosticStringCasePolicy.AsciiIgnoreCase => StringComparer.Ordinal.Compare(
                     DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(CanonicalValue),
                     DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(other.CanonicalValue)),

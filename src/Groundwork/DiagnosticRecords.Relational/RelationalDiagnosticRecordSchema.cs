@@ -88,7 +88,7 @@ public sealed record RelationalDiagnosticRecordSchema(
                 new("ix_groundwork_diagnostic_records_scope_cursor", RecordsTable,
                     ["tenant_id", "scope_id", "stream_id", "cursor"]),
                 new("ix_groundwork_diagnostic_fields_scope_value", FieldsTable,
-                    ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key", "cursor"]),
+                    ["tenant_id", "scope_id", "stream_id", "field_name", "comparison_key", "field_type", "cursor"]),
                 new("ix_groundwork_diagnostic_fields_scope_latest", FieldsTable,
                     ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal", "comparison_key", "cursor"]),
                 new("ix_groundwork_diagnostic_append_tombstone", AppendOperationsTable, ["tombstone_until_ticks"]),

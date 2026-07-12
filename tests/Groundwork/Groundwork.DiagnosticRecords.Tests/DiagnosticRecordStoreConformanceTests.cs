@@ -16,7 +16,7 @@ public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordCo
                 new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.In, DiagnosticPredicateOperator.RangeInclusive },
                 IsRequired: false, IsOrderable: true),
             new("category", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
-                new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.In, DiagnosticPredicateOperator.Contains },
+                new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.In, DiagnosticPredicateOperator.RangeInclusive, DiagnosticPredicateOperator.Contains },
                 IsOrderable: true, MaxStringBytes: 32),
             new("service", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
                 new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.In, DiagnosticPredicateOperator.Contains },
@@ -1151,8 +1151,10 @@ public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordCo
     {
         var store = CreateStore();
         await store.AppendAsync(Batch("missing-order",
-            Record("with-sequence", ("sequence", [DiagnosticFieldValue.Int64(1)])),
-            Record("without-sequence")));
+            Record("with-sequence",
+                ("sequence", [DiagnosticFieldValue.Int64(1)]),
+                ("category", [DiagnosticFieldValue.String("\U00010000")])),
+            Record("without-sequence", ("category", [DiagnosticFieldValue.String("\uE000")]))));
 
         var page = await store.QueryAsync(new(
             new("tenant-a", "shell-a"),
@@ -1163,6 +1165,22 @@ public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordCo
 
         Assert.Equal("with-sequence", Assert.Single(page.Records).RecordId);
         Assert.Equal(1, page.ExactCount);
+
+        var unicodeOrder = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"), new("logs"), 1, Order: new("category"));
+        var first = await store.QueryAsync(unicodeOrder);
+        var second = await store.QueryAsync(unicodeOrder with { Continuation = first.Continuation });
+        var range = await store.QueryAsync(unicodeOrder with
+        {
+            Limit = 10,
+            Continuation = null,
+            Predicate = DiagnosticRecordPredicate.RangeInclusive(
+                "category", DiagnosticFieldValue.String("\U00010000"), DiagnosticFieldValue.String("\uE000"))
+        });
+
+        Assert.Equal("with-sequence", Assert.Single(first.Records).RecordId);
+        Assert.Equal("without-sequence", Assert.Single(second.Records).RecordId);
+        Assert.Equal(["with-sequence", "without-sequence"], range.Records.Select(record => record.RecordId));
     }
 
     [Fact]
@@ -1454,6 +1472,7 @@ public abstract class RelationalDiagnosticRecordStoreConformanceTests : Diagnost
 public enum DiagnosticExecutionPoint
 {
     AppendBeforeCommit,
+    AppendBeforeStreamLock,
     /// <summary>
     /// Runs after one record has been staged inside the provider's atomic append transaction and
     /// before that transaction commits. Concrete fixtures must place this hook after durable work
@@ -1981,7 +2000,9 @@ internal sealed class InMemoryDiagnosticRecordStore : IDiagnosticRecordStore, ID
     private static string ComparisonKey(DiagnosticFieldValue value, DiagnosticStringCasePolicy casePolicy) =>
         casePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase
             ? DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value.CanonicalValue)
-            : value.CanonicalValue;
+            : value.Type == DiagnosticFieldType.String
+                ? DiagnosticStringComparisonKey.CreateOrdinal(value.CanonicalValue)
+                : value.CanonicalValue;
 
     private static long ParseCursor(DiagnosticCursor cursor) => long.Parse(cursor.Value, System.Globalization.CultureInfo.InvariantCulture);
 
