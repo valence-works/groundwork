@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
@@ -222,6 +224,40 @@ public abstract class RelationalProviderContractTests
         var deleteMissing = await harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", id, ExpectedVersion: 0));
 
         Assert.Equal(DocumentStoreWriteStatus.NotFound, deleteMissing.Status);
+    }
+
+    [Fact]
+    public async Task FactoryStoreUnitOfWorkCommitsAndRollsBackAtomically()
+    {
+        await using var harness = await CreateHarnessAsync();
+        await harness.MaterializeAsync();
+        var scope = DocumentCommitScope.Of("configurationDocument");
+        var committed = NewId();
+        var rolledBack = NewId();
+
+        await using (var unitOfWork = await harness.Store.BeginAsync(scope))
+        {
+            await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                committed,
+                "1.0.0",
+                $$"""{"key":"{{NewValue("commit")}}","category":"system"}"""));
+            await unitOfWork.CommitAsync();
+        }
+
+        await using (var unitOfWork = await harness.Store.BeginAsync(scope))
+        {
+            await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                rolledBack,
+                "1.0.0",
+                $$"""{"key":"{{NewValue("rollback")}}","category":"system"}"""));
+            await unitOfWork.RollbackAsync();
+        }
+
+        Assert.Equal(TransactionBoundary.CrossUnitAtomic, harness.Store.TransactionBoundary);
+        Assert.NotNull(await harness.Store.LoadAsync("configurationDocument", committed));
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", rolledBack));
     }
 
     protected abstract Task<IRelationalProviderHarness> CreateHarnessAsync();

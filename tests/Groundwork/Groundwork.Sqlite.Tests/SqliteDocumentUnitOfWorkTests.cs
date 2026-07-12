@@ -3,8 +3,6 @@ using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
 using Groundwork.Sqlite.Documents;
-using Groundwork.Sqlite.Materialization;
-using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Groundwork.Sqlite.Tests;
@@ -270,10 +268,12 @@ public sealed class SqliteDocumentUnitOfWorkTests
         public static async Task<TxHarness> Create()
         {
             var databasePath = Path.GetTempFileName();
-            await using var connection = new SqliteConnection($"Data Source={databasePath}");
             var manifest = ClosedQueryManifests.WidgetManifest();
-            await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, ClosedQueryManifests.Provider);
-            return new TxHarness(databasePath, new SqliteDocumentStore($"Data Source={databasePath}", manifest));
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                $"Data Source={databasePath};Pooling=False",
+                manifest,
+                ClosedQueryManifests.Provider);
+            return new TxHarness(databasePath, store);
         }
 
         public ValueTask DisposeAsync()
