@@ -107,6 +107,7 @@ The following terms are normative for new work.
 | **Schema history** | Durable evidence of which resolved manifest fingerprint, names, definitions, and operations a provider applied. | A list of migration class names only. |
 | **Semantic migration** | An explicitly authored, provider-neutral data transformation used only when a manifest diff cannot infer the change. | General schema creation pipeline. |
 | **Bounded query declaration** | The operations, ordering, paging, projection, or aggregate shapes a unit promises and providers must validate. | Arbitrary LINQ/IQueryable. |
+| **Scale-bearing query demand** | An explicit `BoundedQueryExecutionClass.ScaleBearing` declaration for a bounded query whose referenced stable non-envelope index paths require an indexed native physical plan. It participates in default form resolution and fingerprints; it is never inferred from names, workload labels, or observed cardinality. | A vague performance hint or runtime heuristic. |
 | **Document query** | The one runtime request model for a declared bounded document query. | Portable query vs optimized query. |
 | **Physical query plan** | A provider-selected execution choice over shared indexes, a dedicated table, or entity columns. It is diagnostic/provider output, not a caller request. | Document query. |
 | **Logical name** | A feature-owned default database-object name before host policy. | Quoted SQL identifier. |
@@ -133,6 +134,7 @@ Names below are the recommended target. Exact record-vs-class construction can b
 - Do not add `Specialized` to that enum. Diagnostic streams and other non-document workloads use their own Groundwork contract families.
 - Replace `IndexDeclaration` with `LogicalIndexDeclaration`, retaining field/value shape, uniqueness, and missing-value semantics. Ordering demand belongs only to bounded queries.
 - Remove `IndexPhysicalizationPolicy` and `SupportedOperations` from the logical index declaration. `BoundedQueryDeclaration` exclusively owns allowed query operations, ordering, paging, projection, and aggregate shapes.
+- Add `BoundedQueryExecutionClass` with `Ordinary` and `ScaleBearing`. A scale-bearing declaration identifies its required stable paths through referenced `LogicalIndexDeclaration`s; those paths become projected-column demand for default resolution. This is a binding contract requiring a native indexed server-side plan, not advisory metadata.
 - Add `PhysicalTableDefinition` as the portable per-unit structural description. For dedicated/entity forms it owns the primary logical table identity/name, standard envelope and JSON columns, projected-column definitions, physical indexes, schema version, and migration hints. For shared form it instead owns a `SharedStorageBinding` plus only unit-owned linked/index structures; the primary name and common envelope come from a manifest/composition-owned `SharedDocumentStorageDefinition`.
 - Projected columns reference stable serialized paths. A `ProjectedColumnDefinition` owns portable type, length, precision, nullability, collation/default metadata, and rebuild semantics.
 - `PhysicalIndexDefinition` values reference columns in a `PhysicalTableDefinition` and express compound order, uniqueness, and sort direction. They are distinct from logical index and bounded-query declarations even when planning derives one from both.
@@ -280,6 +282,7 @@ Each slice must keep canonical JSON authoritative, preserve caller-independent p
 | `DocumentPlan` / `RelationalPlan` | Internalize as diagnostics/read models or replace with one resolved-storage plan; do not grow competing execution plans. |
 | Existing migration interface/record/runner/executor/options/result/ledger family | Converge into materialization diffs, application modes/results, and schema history; retain explicit semantic migrations only. |
 | `PortableQueryDeclaration` | Evolve to `BoundedQueryDeclaration`. |
+| Scale-bearing query selection | Declare through `BoundedQueryExecutionClass.ScaleBearing` plus referenced logical-index paths; include it in resolution and fingerprints. |
 | `PortableDocumentQuery` | Evolve to the single `DocumentQuery`. |
 | `DocumentStoreQuery` | Compatibility wrapper only, then remove. |
 | `ClosedQueryCapabilityModel` / `ClosedQueryNativeSupport` | Rename around bounded-query support and make production fallback an explicit validation policy. |
