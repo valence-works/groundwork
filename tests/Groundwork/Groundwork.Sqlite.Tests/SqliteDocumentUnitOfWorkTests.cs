@@ -258,23 +258,28 @@ public sealed class SqliteDocumentUnitOfWorkTests
 
     private sealed class TxHarness : IAsyncDisposable
     {
-        private TxHarness(SqliteConnection connection, IDocumentStore store)
+        private TxHarness(string databasePath, IDocumentStore store)
         {
-            this.connection = connection;
+            this.databasePath = databasePath;
             Store = store;
         }
 
-        private readonly SqliteConnection connection;
+        private readonly string databasePath;
         public IDocumentStore Store { get; }
 
         public static async Task<TxHarness> Create()
         {
-            var connection = new SqliteConnection("Data Source=:memory:");
+            var databasePath = Path.GetTempFileName();
+            await using var connection = new SqliteConnection($"Data Source={databasePath}");
             var manifest = ClosedQueryManifests.WidgetManifest();
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, ClosedQueryManifests.Provider);
-            return new TxHarness(connection, new SqliteDocumentStore(connection, manifest));
+            return new TxHarness(databasePath, new SqliteDocumentStore($"Data Source={databasePath}", manifest));
         }
 
-        public async ValueTask DisposeAsync() => await connection.DisposeAsync();
+        public ValueTask DisposeAsync()
+        {
+            File.Delete(databasePath);
+            return ValueTask.CompletedTask;
+        }
     }
 }

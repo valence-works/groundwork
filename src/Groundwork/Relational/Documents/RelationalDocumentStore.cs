@@ -7,20 +7,50 @@ using Groundwork.Core.Physicalization;
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
+using Groundwork.Provider.Relational;
 using Groundwork.Relational.Physicalization;
 
 namespace Groundwork.Relational.Documents;
 
-public class RelationalDocumentStore(DbConnection connection, StorageManifest manifest, RelationalDocumentStoreDialect dialect, Func<string?>? ambientTenantId = null) : IDocumentStore
+public class RelationalDocumentStore : IDocumentStore
 {
+    private readonly DbConnection? connection;
+    private readonly RelationalSessionFactory? sessionFactory;
+    private readonly StorageManifest manifest;
+    private readonly RelationalDocumentStoreDialect dialect;
+    private readonly Func<string?>? ambientTenantId;
     private readonly SemaphoreSlim connectionGate = new(1, 1);
+
+    public RelationalDocumentStore(
+        DbConnection connection,
+        StorageManifest manifest,
+        RelationalDocumentStoreDialect dialect,
+        Func<string?>? ambientTenantId = null)
+    {
+        this.connection = connection ?? throw new ArgumentNullException(nameof(connection));
+        this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
+        this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
+        this.ambientTenantId = ambientTenantId;
+    }
+
+    public RelationalDocumentStore(
+        RelationalSessionFactory sessionFactory,
+        StorageManifest manifest,
+        RelationalDocumentStoreDialect dialect,
+        Func<string?>? ambientTenantId = null)
+    {
+        this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
+        this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
+        this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
+        this.ambientTenantId = ambientTenantId;
+    }
 
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
-        return await ExecuteWithConnectionAsync(async ct =>
+        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using var transaction = await currentConnection.BeginTransactionAsync(ct);
             var result = await SaveCoreAsync(request, unit, transaction, ct);
             if (result.Status == DocumentStoreWriteStatus.Saved)
                 await transaction.CommitAsync(ct);
@@ -35,7 +65,7 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, ct);
+        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, transaction, ct);
         if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
 
@@ -96,16 +126,16 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
     {
         _ = GetUnit(documentKind);
         return await ExecuteWithConnectionAsync(
-            ct => LoadCoreAsync(documentKind, id, null, ct),
+            (currentConnection, ct) => LoadCoreAsync(currentConnection, documentKind, id, null, ct),
             cancellationToken);
     }
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
     {
         var unit = GetUnit(request.DocumentKind);
-        return await ExecuteWithConnectionAsync(async ct =>
+        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using var transaction = await currentConnection.BeginTransactionAsync(ct);
             var result = await DeleteCoreAsync(request, unit, transaction, ct);
             if (result.Status == DocumentStoreWriteStatus.Deleted)
                 await transaction.CommitAsync(ct);
@@ -120,7 +150,7 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var existing = await LoadCoreAsync(request.DocumentKind, request.Id, transaction, ct);
+        var existing = await LoadCoreAsync(transaction.Connection!, request.DocumentKind, request.Id, transaction, ct);
         if (existing is null)
             return DocumentStoreWriteResult.NotFound;
 
@@ -147,11 +177,14 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
 
     public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
+        if (sessionFactory is not null)
+            return new RelationalDocumentUnitOfWork(this, await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
+
         await connectionGate.WaitAsync(cancellationToken);
         try
         {
             await EnsureOpenAsync(cancellationToken);
-            var transaction = await connection.BeginTransactionAsync(cancellationToken);
+            var transaction = await connection!.BeginTransactionAsync(cancellationToken);
             return new RelationalDocumentUnitOfWork(this, transaction);
         }
         catch
@@ -174,9 +207,9 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         if (index.Fields.Count != 1)
             throw new UndeclaredDocumentIndexException(query.DocumentKind, query.IndexName);
 
-        return await ExecuteWithConnectionAsync(async ct =>
+        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            await using var command = CreateQueryCommand(unit, query);
+            await using var command = CreateQueryCommand(currentConnection, unit, query);
             AddParameter(command, "kind", query.DocumentKind);
             AddParameter(command, "index", query.IndexName);
             AddParameter(command, "value", query.Value);
@@ -197,13 +230,13 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         var unit = GetUnit(query.DocumentKind);
         var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
 
-        return await ExecuteWithConnectionAsync(async ct =>
+        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            var total = await CountClosedAsync(translator, whereSql, ct);
+            var total = await CountClosedAsync(currentConnection, translator, whereSql, ct);
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult(Array.Empty<DocumentEnvelope>(), total);
 
-            await using var command = CreateCommand(translator.SelectSql(whereSql, orderSql, query.Skip ?? 0, query.Take));
+            await using var command = CreateCommand(currentConnection, translator.SelectSql(whereSql, orderSql, query.Skip ?? 0, query.Take));
             AddClosedQueryParameters(command, translator.Parameters);
 
             var documents = new List<DocumentEnvelope>();
@@ -220,9 +253,9 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         var unit = GetUnit(query.DocumentKind);
         var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out var orderSql);
 
-        return await ExecuteWithConnectionAsync(async ct =>
+        return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
         {
-            await using var command = CreateCommand(translator.SelectSql(whereSql, orderSql, 0, 1));
+            await using var command = CreateCommand(currentConnection, translator.SelectSql(whereSql, orderSql, 0, 1));
             AddClosedQueryParameters(command, translator.Parameters);
 
             await using var reader = await command.ExecuteReaderAsync(ct);
@@ -236,13 +269,13 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         var translator = RelationalClosedQueryTranslator.Translate(unit, query, dialect, ambientTenantId?.Invoke(), out var whereSql, out _);
 
         return await ExecuteWithConnectionAsync(
-            async ct => await CountClosedAsync(translator, whereSql, ct) > 0,
+            async (currentConnection, ct) => await CountClosedAsync(currentConnection, translator, whereSql, ct) > 0,
             cancellationToken);
     }
 
-    private async Task<long> CountClosedAsync(RelationalClosedQueryTranslator translator, string whereSql, CancellationToken cancellationToken)
+    private async Task<long> CountClosedAsync(DbConnection currentConnection, RelationalClosedQueryTranslator translator, string whereSql, CancellationToken cancellationToken)
     {
-        await using var command = CreateCommand(translator.CountSql(whereSql));
+        await using var command = CreateCommand(currentConnection, translator.CountSql(whereSql));
         AddClosedQueryParameters(command, translator.WhereParameters);
         var scalar = await command.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt64(scalar);
@@ -254,15 +287,15 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
             AddParameter(command, name, value);
     }
 
-    private DbCommand CreateQueryCommand(StorageUnit unit, DocumentStoreQuery query)
+    private DbCommand CreateQueryCommand(DbConnection currentConnection, StorageUnit unit, DocumentStoreQuery query)
     {
         var physicalizedField = PhysicalizationProjection.EligibleFields(unit).SingleOrDefault(field => field.Name == query.IndexName);
         if (physicalizedField is null)
-            return CreateCommand(dialect.QueryByIndexSql);
+            return CreateCommand(currentConnection, dialect.QueryByIndexSql);
 
         var table = RelationalPhysicalizationNames.TableName(unit);
         var column = RelationalPhysicalizationNames.ColumnName(physicalizedField);
-        return CreateCommand(dialect.QueryByPhysicalizedSql(table, column));
+        return CreateCommand(currentConnection, dialect.QueryByPhysicalizedSql(table, column));
     }
 
     private async Task InsertDocumentAsync(
@@ -315,9 +348,9 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         AddParameter(command, "content", request.ContentJson);
     }
 
-    private async Task<DocumentEnvelope?> LoadCoreAsync(string documentKind, string id, DbTransaction? transaction, CancellationToken cancellationToken)
+    private async Task<DocumentEnvelope?> LoadCoreAsync(DbConnection currentConnection, string documentKind, string id, DbTransaction? transaction, CancellationToken cancellationToken)
     {
-        await using var command = CreateCommand(dialect.LoadDocumentSql, transaction);
+        await using var command = CreateCommand(currentConnection, dialect.LoadDocumentSql, transaction);
         AddParameter(command, "kind", documentKind);
         AddParameter(command, "id", id);
 
@@ -395,7 +428,10 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private DbCommand CreateCommand(string commandText, DbTransaction? transaction = null)
+    private DbCommand CreateCommand(string commandText, DbTransaction transaction) =>
+        CreateCommand(transaction.Connection!, commandText, transaction);
+
+    private static DbCommand CreateCommand(DbConnection connection, string commandText, DbTransaction? transaction = null)
     {
         var command = connection.CreateCommand();
         command.CommandText = commandText;
@@ -449,19 +485,22 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
 
     private async Task EnsureOpenAsync(CancellationToken cancellationToken)
     {
-        if (connection.State != ConnectionState.Open)
+        if (connection!.State != ConnectionState.Open)
             await connection.OpenAsync(cancellationToken);
     }
 
     private async Task<T> ExecuteWithConnectionAsync<T>(
-        Func<CancellationToken, Task<T>> operation,
+        Func<DbConnection, CancellationToken, Task<T>> operation,
         CancellationToken cancellationToken)
     {
+        if (sessionFactory is not null)
+            return await sessionFactory.ExecuteAsync(operation, cancellationToken);
+
         await connectionGate.WaitAsync(cancellationToken);
         try
         {
             await EnsureOpenAsync(cancellationToken);
-            return await operation(cancellationToken);
+            return await operation(connection!, cancellationToken);
         }
         finally
         {
@@ -469,37 +508,67 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         }
     }
 
-    private sealed class RelationalDocumentUnitOfWork(RelationalDocumentStore store, DbTransaction transaction) : IDocumentUnitOfWork
+    private sealed class RelationalDocumentUnitOfWork : IDocumentUnitOfWork
     {
+        private readonly RelationalDocumentStore store;
+        private readonly DbTransaction? transaction;
+        private readonly RelationalUnitOfWork? ownedUnitOfWork;
         private bool completed;
+
+        public RelationalDocumentUnitOfWork(RelationalDocumentStore store, DbTransaction transaction)
+        {
+            this.store = store;
+            this.transaction = transaction;
+        }
+
+        public RelationalDocumentUnitOfWork(RelationalDocumentStore store, RelationalUnitOfWork ownedUnitOfWork)
+        {
+            this.store = store;
+            this.ownedUnitOfWork = ownedUnitOfWork;
+        }
 
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
             var unit = store.GetUnit(request.DocumentKind);
-            return await store.SaveCoreAsync(request, unit, transaction, cancellationToken);
+            return await ExecuteAsync((currentTransaction, ct) => store.SaveCoreAsync(request, unit, currentTransaction, ct), cancellationToken);
         }
 
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
             var unit = store.GetUnit(request.DocumentKind);
-            return await store.DeleteCoreAsync(request, unit, transaction, cancellationToken);
+            return await ExecuteAsync((currentTransaction, ct) => store.DeleteCoreAsync(request, unit, currentTransaction, ct), cancellationToken);
         }
 
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
             _ = store.GetUnit(documentKind);
-            return await store.LoadCoreAsync(documentKind, id, transaction, cancellationToken);
+            return await ExecuteAsync(
+                (currentTransaction, ct) => store.LoadCoreAsync(currentTransaction.Connection!, documentKind, id, currentTransaction, ct),
+                cancellationToken);
         }
 
         public async Task CommitAsync(CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            if (ownedUnitOfWork is not null)
+            {
+                try
+                {
+                    await ownedUnitOfWork.CommitAsync(cancellationToken);
+                }
+                finally
+                {
+                    completed = true;
+                }
+                return;
+            }
+
             try
             {
-                await transaction.CommitAsync(cancellationToken);
+                await transaction!.CommitAsync(cancellationToken);
             }
             finally
             {
@@ -510,9 +579,22 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
         public async Task RollbackAsync(CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            if (ownedUnitOfWork is not null)
+            {
+                try
+                {
+                    await ownedUnitOfWork.RollbackAsync(cancellationToken);
+                }
+                finally
+                {
+                    completed = true;
+                }
+                return;
+            }
+
             try
             {
-                await transaction.RollbackAsync(cancellationToken);
+                await transaction!.RollbackAsync(cancellationToken);
             }
             finally
             {
@@ -525,9 +607,16 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
             if (completed)
                 return;
 
+            if (ownedUnitOfWork is not null)
+            {
+                completed = true;
+                await ownedUnitOfWork.DisposeAsync();
+                return;
+            }
+
             try
             {
-                await transaction.RollbackAsync();
+                await transaction!.RollbackAsync();
             }
             catch
             {
@@ -545,9 +634,16 @@ public class RelationalDocumentStore(DbConnection connection, StorageManifest ma
                 return;
 
             completed = true;
-            await transaction.DisposeAsync();
+            await transaction!.DisposeAsync();
             store.connectionGate.Release();
         }
+
+        private Task<T> ExecuteAsync<T>(
+            Func<DbTransaction, CancellationToken, Task<T>> operation,
+            CancellationToken cancellationToken) =>
+            ownedUnitOfWork is not null
+                ? ownedUnitOfWork.Executor.ExecuteAsync((_, currentTransaction, ct) => operation(currentTransaction, ct), cancellationToken)
+                : operation(transaction!, cancellationToken);
 
         private void EnsureActive()
         {

@@ -6,23 +6,28 @@ namespace Groundwork.Sqlite.Tests;
 
 internal sealed class OperationalHarness : IAsyncDisposable
 {
-    private OperationalHarness(SqliteConnection connection, SqliteOperationalStore store)
+    private readonly string databasePath;
+
+    private OperationalHarness(string databasePath, SqliteOperationalStore store)
     {
-        Connection = connection;
+        this.databasePath = databasePath;
         Store = store;
     }
-
-    public SqliteConnection Connection { get; }
 
     public SqliteOperationalStore Store { get; }
 
     public static async Task<OperationalHarness> Create(IOperationalClock? clock = null)
     {
-        var connection = new SqliteConnection("Data Source=:memory:");
+        var databasePath = Path.GetTempFileName();
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
         await connection.OpenAsync();
         await new SqliteOperationalMaterializer(connection).MaterializeAsync();
-        return new OperationalHarness(connection, new SqliteOperationalStore(connection, clock));
+        return new OperationalHarness(databasePath, new SqliteOperationalStore($"Data Source={databasePath}", clock));
     }
 
-    public async ValueTask DisposeAsync() => await Connection.DisposeAsync();
+    public ValueTask DisposeAsync()
+    {
+        File.Delete(databasePath);
+        return ValueTask.CompletedTask;
+    }
 }
