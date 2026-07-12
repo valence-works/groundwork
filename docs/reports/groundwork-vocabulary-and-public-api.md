@@ -34,7 +34,7 @@ This is an API-design report. It intentionally changes no runtime implementation
 | [`StorageUnit`](../../src/Groundwork/Core/Manifests/StorageUnit.cs) | Logical document kind plus lifecycle, identity, tenancy, concurrency, serialization, index, query, and physicalization declarations. Providers also use its identity as the current document kind/collection key. | Keep, but replace its physicalization member with an explicit physical-storage policy in the breaking API. |
 | [`PhysicalizationPolicy` / `PhysicalizationKind`](../../src/Groundwork/Core/Manifests/StoragePolicies.cs) | Selects `Portable`, `Optimized`, or `Specialized`. Only `Optimized` affects the generic document runtime, by making otherwise-default eligible indexes physicalized. | Rename and reshape. The values do not correspond to ADR 0003's forms; `Specialized` belongs to a distinct contract family, not a document layout. |
 | [`IndexPhysicalizationPolicy`](../../src/Groundwork/Core/Indexing/IndexDeclaration.cs) | Overrides unit policy per index with `Default`, `Portable`, or `Optimized`. | Remove from the logical index declaration. A logical index/query requirement should not choose a sidecar or inline physical placement. |
-| [`IndexDeclaration`](../../src/Groundwork/Core/Indexing/IndexDeclaration.cs) | Declares serialized fields, value kind, uniqueness, sortability, missing-value behavior, supported query operations, and physicalization placement. Providers use it for write constraints and both query paths. | Narrow and rename to `LogicalIndexDeclaration`; move supported operations to bounded-query declarations and physical placement to `PhysicalTableDefinition`. |
+| [`IndexDeclaration`](../../src/Groundwork/Core/Indexing/IndexDeclaration.cs) | Declares serialized fields, value kind, uniqueness, sortability, missing-value behavior, supported query operations, and physicalization placement. Providers use it for write constraints and both query paths. | Narrow and rename to `LogicalIndexDeclaration`; move supported operations and ordering demand to bounded-query declarations and physical placement/sort direction to `PhysicalTableDefinition`. |
 | [`PhysicalizationProjection`](../../src/Groundwork/Core/Physicalization/PhysicalizationProjection.cs) | Derives fields only from single-field indexes with `MissingValueBehavior.Excluded` and equality support. It is used by materialization, relational save/delete/equality query paths, and MongoDB materialization/save/query paths. | Make an internal projected-column planning concern. Its current name overstates the scope. |
 | [`PhysicalizedFieldPlan`](../../src/Groundwork/Core/Physicalization/PhysicalizedFieldPlan.cs) | Carries index identity, serialized path, value kind, uniqueness, and sortability into provider naming, materialization, writes, and queries. | Replace with a richer `ProjectedColumnDefinition` inside `PhysicalTableDefinition`; keep query indexes as separate definitions. |
 
@@ -88,13 +88,15 @@ The following terms are normative for new work.
 |---|---|---|
 | **Storage manifest** | A versioned, provider-neutral declaration of desired storage intent owned by a feature or composition. | Schema, migration plan. |
 | **Storage unit** | One logical persisted document kind with lifecycle, identity, tenancy, concurrency, serialization, index, query, and physical-storage intent. | Table, collection. |
+| **Storage-unit provisioning mode** | A binding declaration of whether a unit is a bounded, statically declared kind (`Declared`) or belongs to a runtime-created/unbounded family (`Dynamic`). Unlike `WorkloadIntent`, this value participates in physical resolution and fingerprints. | Inferring storage form from a diagnostic workload label. |
 | **Physical storage form** | One of the three provider-neutral layouts selected for a storage unit. | Portable/optimized mode. |
 | **Shared document storage** | Canonical envelopes and JSON for multiple units in a provider-level structure, with linked index structures as needed. | Portable table. |
+| **Shared storage definition** | A manifest/composition-owned definition of one shared primary document structure. Units reference it by a stable binding identity rather than redefining its name or envelope independently. | A per-unit shared table definition. |
 | **Dedicated document table** | One unit-specific envelope-plus-canonical-JSON table or provider-native equivalent. | Optimized table. |
 | **Physical entity table** | One unit-specific table containing the envelope, canonical JSON, and declared projected columns. | ORM entity table, columns-only entity. |
 | **Linked index table** | A derived structure that stores query keys and a document reference. It is not a fourth storage form. | Physicalization table, optimized projection. |
 | **Projected column** | A rebuildable native field derived from a stable serialized JSON path and maintained atomically with canonical JSON. | Authoritative entity property. |
-| **Logical index declaration** | A provider-neutral uniqueness, ordering, key-shape, and missing-value requirement. It does not promise query operators or choose physical placement. | Physical index, query capability. |
+| **Logical index declaration** | A provider-neutral uniqueness, key-shape, and missing-value requirement. It does not promise query operators, ordering, or physical placement. | Physical index, query capability. |
 | **Physical index definition** | An index over columns/fields in a resolved physical definition, selected to satisfy logical index and bounded-query requirements. | Logical query contract. |
 | **Physical table definition** | The provider-neutral structural description of a storage unit's selected form, logical names, envelope/JSON columns, projected columns, indexes, and evolution metadata. | Provider DDL, materialization plan. |
 | **Resolved physical definition** | A physical table definition after defaults, host naming, and explicit per-unit overrides, but before provider normalization. | Raw manifest, provider DDL. |
@@ -119,22 +121,28 @@ Names below are the recommended target. Exact record-vs-class construction can b
 
 ### Storage declarations
 
-- Keep `StorageManifest` and `StorageUnit`.
+- Keep `StorageManifest` and `StorageUnit`. Add a binding `StorageUnitProvisioningMode` with `Declared` and `Dynamic`; do not derive this choice from the current diagnostic-only `WorkloadIntent` descriptor.
 - Replace `PhysicalizationPolicy` with `PhysicalStoragePolicy`. Each `StorageUnit` owns exactly one policy:
-  - `Default` asks Groundwork to apply ADR 0003's static/dynamic/query-field defaulting rules.
+  - `Default` asks Groundwork to apply ADR 0003's deterministic provisioning/query-demand rules.
   - `Explicit(PhysicalTableDefinition)` supplies the provider-neutral form, feature-default logical name, projected columns, and indexes directly.
 - Introduce `PhysicalStorageForm` with exactly:
   - `SharedDocuments`
   - `DedicatedDocumentTable`
   - `PhysicalEntityTable`
 - Do not add `Specialized` to that enum. Diagnostic streams and other non-document workloads use their own Groundwork contract families.
-- Replace `IndexDeclaration` with `LogicalIndexDeclaration`, retaining field/value shape, uniqueness, sortability, and missing-value semantics.
+- Replace `IndexDeclaration` with `LogicalIndexDeclaration`, retaining field/value shape, uniqueness, and missing-value semantics. Ordering demand belongs only to bounded queries.
 - Remove `IndexPhysicalizationPolicy` and `SupportedOperations` from the logical index declaration. `BoundedQueryDeclaration` exclusively owns allowed query operations, ordering, paging, projection, and aggregate shapes.
-- Add `PhysicalTableDefinition` as the portable structural description. It contains the form, logical table identity/name, standard envelope and JSON columns, projected-column definitions, physical indexes, schema version, and migration hints. A feature may author it through `PhysicalStoragePolicy.Explicit`; default resolution synthesizes the same complete type.
+- Add `PhysicalTableDefinition` as the portable per-unit structural description. For dedicated/entity forms it owns the primary logical table identity/name, standard envelope and JSON columns, projected-column definitions, physical indexes, schema version, and migration hints. For shared form it instead owns a `SharedStorageBinding` plus only unit-owned linked/index structures; the primary name and common envelope come from a manifest/composition-owned `SharedDocumentStorageDefinition`.
 - Projected columns reference stable serialized paths. A `ProjectedColumnDefinition` owns portable type, length, precision, nullability, collation/default metadata, and rebuild semantics.
 - `PhysicalIndexDefinition` values reference columns in a `PhysicalTableDefinition` and express compound order, uniqueness, and sort direction. They are distinct from logical index and bounded-query declarations even when planning derives one from both.
 
-Default resolution remains the ADR 0003 policy: static units resolve to dedicated document tables, stable scale-bearing projected fields select physical entity tables, and dynamic units resolve to shared documents unless explicitly configured otherwise. An explicit definition wins form defaulting but still passes through host naming, per-unit host override, provider normalization, capability validation, and collision checks.
+Default resolution remains the ADR 0003 policy, made executable through binding declarations rather than heuristics:
+
+1. `Dynamic` units resolve to shared documents and must identify a declared shared-storage binding.
+2. `Declared` units with no scale-bearing projected-field demand resolve to dedicated document tables.
+3. `Declared` units whose `BoundedQueryDeclaration`s explicitly mark stable non-envelope fields as scale-bearing resolve to physical entity tables.
+
+The provisioning mode, scale-bearing declarations, shared binding, and synthesized definition all participate in the fingerprint. Ambiguous or contradictory declarations fail validation and require an explicit definition; `WorkloadIntent.Descriptor` never selects a form. An explicit definition wins form defaulting but still passes through host naming, per-unit host override, provider normalization, capability validation, and collision checks.
 
 ### Resolution and naming
 
@@ -156,16 +164,29 @@ The current `PhysicalizationNameEncoder`, relational naming helper, and MongoDB 
 The relationship among the main concepts is:
 
 1. `StorageManifest` owns one or more logical `StorageUnit` declarations.
-2. Each unit's `PhysicalStoragePolicy` either supplies a `PhysicalTableDefinition` or asks the resolver to synthesize one from the ratified defaults and declared query/index requirements.
-3. Host naming produces a resolved physical definition; provider normalization produces a provider physical definition and deterministic fingerprint.
-4. `MaterializationPlanner` compares the provider physical definition with durable `SchemaHistory` and emits one `MaterializationPlan`.
-5. The plan contains typed `MaterializationOperation` values for structures, indexes, backfills, semantic transforms, validation, authorized destructive work, and history recording.
-6. A provider materializer executes that plan under its migration lock and records the resolved fingerprint, names, definition version, and applied operations.
-7. Runtime storage and query planners consume the same resolved definitions; they do not re-derive different names or shapes from raw `StorageUnit` values.
+2. The manifest/composition owns each `SharedDocumentStorageDefinition`; units using shared form reference one by stable binding identity. Resolution groups those units, resolves the shared primary name/envelope once, and rejects conflicting definitions.
+3. Each unit's `PhysicalStoragePolicy` either supplies a `PhysicalTableDefinition` or asks the resolver to synthesize one from its binding provisioning mode and declared query/index requirements.
+4. Host naming produces a resolved physical definition; provider normalization produces a provider physical definition and deterministic fingerprint.
+5. `MaterializationPlanner` compares the provider physical definition with durable `SchemaHistory` and emits one `MaterializationPlan`.
+6. The plan contains typed `MaterializationOperation` values for structures, indexes, backfills, semantic transforms, validation, authorized destructive work, and history recording.
+7. A provider materializer executes that plan under its migration lock and records the resolved fingerprint, names, definition version, and applied operations.
+8. Runtime storage and query planners consume the same resolved definitions; they do not re-derive different names or shapes from raw `StorageUnit` values.
 
 `Groundwork.Materialization` remains the owner of the canonical plan, operation, capability, planner, and schema-history contracts. Remove the unused `Groundwork.Core.Materialization` duplicates rather than maintaining converters indefinitely.
 
 The imperative migration surface narrows to explicit `SemanticMigration` declarations and optional provider extensions. Structural create/add/drop/backfill operations are generated into the materialization plan from manifest/history diffs. The CLI may call this workflow "migrations" for operator familiarity, but there is only one plan and executor lifecycle underneath.
+
+The existing public migration family has this complete target disposition:
+
+| Current migration API | Target disposition |
+|---|---|
+| `IGroundworkMigration` / `GroundworkMigration` | Replace with a narrow `ISemanticMigration`/`SemanticMigration` declaration for non-inferable provider-neutral data transforms only. |
+| `GroundworkMigrationOperation` / `GroundworkMigrationOperationKind` | Generate structural operations from definition/history diffs; adapt semantic transforms into typed `MaterializationOperation`s. Raw provider SQL is an explicitly non-portable provider extension, never the general feature migration contract. |
+| `GroundworkMigrationRunner` | Replace with the single materialization application coordinator used by startup and the CLI; it consumes resolved plans rather than owning a second ordering/execution lifecycle. |
+| `IGroundworkMigrationExecutor` | Remove as a parallel provider executor. Provider materializers execute the unified plan under the provider migration lock. |
+| `GroundworkMigrationExecutionOptions` | Replace `DryRun`/`AllowDestructive` with the ratified `ValidateOnly`, `ApplySafe`, and explicitly authorized `ApplyAuthorized` modes. |
+| `GroundworkMigrationResult` | Replace with one materialization application result carrying the plan fingerprint, status, applied/skipped operations, and deterministic diagnostics. |
+| `GroundworkMigrationRecord` and the migration ledger | Fold semantic-migration identity/version evidence into expanded schema history; do not retain a second structural ledger. |
 
 ### Bounded queries and physical plans
 
@@ -194,7 +215,8 @@ Groundwork is currently versioned `0.0.1`, so this is the right time for a delib
 - Map legacy `PhysicalizationPolicy.Optimized` to shared document storage with the existing linked projection/index structure—not to a physical entity table. Mapping it to the entity form would silently change storage semantics.
 - Require an explicit adapter or diagnostic for `Specialized`; it has no honest three-form mapping.
 - Map `IndexPhysicalizationPolicy.Optimized` to legacy linked projected-field placement and `Portable` to the shared index path during the bridge.
-- Convert legacy `IndexDeclaration.SupportedOperations` and `PortableQueryDeclaration.Operations` into one bounded-query declaration. Emit a validation error when both are present and disagree rather than guessing which path wins.
+- Convert each legacy `PortableQueryDeclaration` into an authoritative bounded-query declaration. Preserve the current valid-subset rule: error only when a query requests an operation outside its index's legacy `SupportedOperations`; extra index operations do not create implicit query capabilities. Convert ordering only from a query's declared sort support after validating the legacy index is sortable, then retire the index-level sortability flag.
+- Legacy units have no binding static/dynamic signal. Preserve their explicit `Portable`/`Optimized` mappings during the bridge; require new units using `Default` to provide `StorageUnitProvisioningMode` and scale-bearing query declarations rather than inferring from `WorkloadIntent.Descriptor`.
 - Implement `DocumentStoreQuery` by converting it to a single equality `DocumentQuery` and delete provider-specific overload logic.
 - Mark legacy policies, projection plan types, legacy query names, and duplicate Core materialization types obsolete with replacement guidance.
 
@@ -242,17 +264,20 @@ Each slice must keep canonical JSON authoritative, preserve caller-independent p
 |---|---|
 | `StorageManifest` | Keep as versioned desired storage intent. |
 | `StorageUnit` | Keep as a logical document kind; revise its physical-storage member. |
+| `WorkloadIntent.Descriptor` | Keep diagnostic-only; never use it to select or fingerprint a physical form. |
+| `StorageUnitProvisioningMode` | Add as the binding `Declared`/`Dynamic` input required by default physical resolution. |
 | `PhysicalizationPolicy` / `PhysicalizationKind` | Replace with `PhysicalStoragePolicy` / `PhysicalStorageForm`. |
 | Portable vs optimized modes | Retire as form names; all declared forms are portable and optimization is measured. |
 | `IndexPhysicalizationPolicy` | Remove from logical indexes; placement belongs to resolved physical definitions. |
-| `IndexDeclaration` | Narrow/rename to `LogicalIndexDeclaration`; remove duplicated query operations and physical placement. |
+| `IndexDeclaration` | Narrow/rename to `LogicalIndexDeclaration`; remove duplicated query operations, ordering demand, and physical placement. |
 | `PhysicalizationProjection` | Internalize/rename as projected-column planning. |
 | `PhysicalizedFieldPlan` | Replace with `ProjectedColumnDefinition`. |
 | `PhysicalTableDefinition` | Adopt as the provider-neutral structural definition for the selected form. |
+| Shared primary document storage | Define once at manifest/composition scope; shared-form units reference it through `SharedStorageBinding`. |
 | Active `Groundwork.Materialization` types | Keep and extend as the only preparation/evolution plan. |
 | Duplicate `Groundwork.Core.Materialization` types | Deprecate, then remove. |
 | `DocumentPlan` / `RelationalPlan` | Internalize as diagnostics/read models or replace with one resolved-storage plan; do not grow competing execution plans. |
-| `GroundworkMigration` structural operations | Converge into materialization diffs; retain explicit semantic migrations only. |
+| Existing migration interface/record/runner/executor/options/result/ledger family | Converge into materialization diffs, application modes/results, and schema history; retain explicit semantic migrations only. |
 | `PortableQueryDeclaration` | Evolve to `BoundedQueryDeclaration`. |
 | `PortableDocumentQuery` | Evolve to the single `DocumentQuery`. |
 | `DocumentStoreQuery` | Compatibility wrapper only, then remove. |
