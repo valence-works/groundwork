@@ -132,6 +132,92 @@ static PortableQueryDeclaration Query(
         paging);
 ```
 
+### Physical storage declarations
+
+The positional `StorageUnit` constructor above remains source-compatible for the additive bridge
+release, but its `PhysicalizationPolicy`/`IndexDeclaration`/`PortableQueryDeclaration` family is
+obsolete. New physical intent uses exactly three forms:
+
+- `SharedDocuments` for dynamic/runtime-defined units, with the primary store owned once by the
+  manifest or composition;
+- `DedicatedDocumentTable` for declared units without scale-bearing projected-field demand;
+- `PhysicalEntityTable` for declared units whose bounded queries mark stable non-envelope paths as
+  scale-bearing.
+
+All three forms retain the standard envelope and authoritative canonical JSON. Projected columns
+are rebuildable derivatives, not a second source of truth. An explicit dedicated-document
+definition may also name a linked projected/index table; this preserves document partitioning
+without placing those projections in the primary table. Physical-entity projections remain
+in-primary.
+
+The mechanical first step for an existing manifest is explicit conversion; `Optimized` remains a
+shared document plus linked projection and never becomes an entity table silently:
+
+```csharp
+using Groundwork.Core.PhysicalStorage;
+
+var sharedBinding = new SharedStorageBinding("application-documents");
+var legacyUnit = manifest.StorageUnits.Single();
+var bridgedUnit = LegacyPhysicalStorageBridge.Apply(legacyUnit, sharedBinding);
+
+manifest = manifest with
+{
+    StorageUnits = [bridgedUnit],
+    SharedDocumentStorages =
+    [
+        new SharedDocumentStorageDefinition(
+            sharedBinding,
+            "groundwork_documents",
+            new DocumentEnvelopeDefinition())
+    ]
+};
+
+var resolved = PhysicalStorageResolver.Resolve(
+    manifest,
+    new DelegatePhysicalNamePolicy(context => $"app_{context.FeatureDefaultLogicalName}"),
+    new DelegateProviderPhysicalNameNormalizer(context => context.LogicalName.ToLowerInvariant()));
+
+if (!resolved.IsValid)
+    throw new InvalidOperationException(string.Join(Environment.NewLine, resolved.Diagnostics));
+```
+
+For a new statically declared unit, attach native intent without changing the legacy constructor
+during the bridge release:
+
+```csharp
+var declaredUnit = legacyUnit with
+{
+    PhysicalStorage = new StorageUnitPhysicalStorage(
+        StorageUnitProvisioningMode.Declared,
+        PhysicalStoragePolicy.Default(),
+        logicalIndexes:
+        [
+            new LogicalIndexDeclaration(
+                "by-status",
+                [new IndexField("status")],
+                IndexValueKind.Keyword,
+                isUnique: false,
+                MissingValueBehavior.Excluded)
+        ],
+        boundedQueries:
+        [
+            new BoundedQueryDeclaration(
+                "list-by-status",
+                "by-status",
+                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                QuerySortSupport.Ascending,
+                QueryPagingSupport.Offset,
+                BoundedQueryExecutionClass.ScaleBearing,
+                sortFields:
+                [new BoundedQuerySortField("status", PhysicalSortDirection.Ascending)])
+        ])
+};
+```
+
+The resolver and provider-definition types in this release are declaration/planning inputs. Provider
+DDL, writes, and runtime query routing move to these resolved definitions in the next implementation
+slices; the bridge keeps current provider execution behavior intact meanwhile.
+
 ### Storage intent
 
 Storage intent declares whether a unit fits Groundwork's portable document/table contract or needs additional evidence or provider-specific behavior:
@@ -430,7 +516,9 @@ var documentPlan = new DocumentManifestPlanner(
     .Plan(manifest, runtimeCapabilities, materializationCapabilities);
 ```
 
-Set `PhysicalizationPolicy.Optimized` on a storage unit when a provider should maintain native query projections for eligible declared indexes. SQLite creates provider tables for those projections, while MongoDB stores physicalized fields and indexes them natively.
+Legacy `PhysicalizationPolicy.Optimized` asks current providers to maintain linked native query
+projections for eligible declared indexes. It is not a physical entity table. Convert it with
+`LegacyPhysicalStorageBridge` while providers move to resolved physical definitions.
 
 ## Sample
 

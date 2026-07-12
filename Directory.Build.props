@@ -13,6 +13,9 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- This repository intentionally exercises the bridge APIs. Packaged consumers still see
+         these actionable Obsolete diagnostics because NoWarn is not transitive. -->
+    <NoWarn>$(NoWarn);GW0001;GW0002;GW0003;GW0004</NoWarn>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(IsPackable)' != 'false'">

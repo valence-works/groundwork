@@ -11,6 +11,9 @@ namespace Groundwork.Core.Queries;
 /// capability, so these do not gate native support (see <c>ClosedQueryCapabilityModel</c>). They are
 /// retained so manifests can describe intent without changing the gating contract.
 /// </summary>
+[Obsolete(
+    "Use BoundedQueryDeclaration. Convert existing declarations with LegacyPhysicalStorageBridge.",
+    DiagnosticId = "GW0003")]
 public sealed record PortableQueryDeclaration(
     string Identity,
     string IndexIdentity,

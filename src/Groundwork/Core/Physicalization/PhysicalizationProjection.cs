@@ -3,6 +3,9 @@ using Groundwork.Core.Manifests;
 
 namespace Groundwork.Core.Physicalization;
 
+[Obsolete(
+    "Use ProjectedColumnDefinition within PhysicalTableDefinition. This helper remains only for LegacyPhysicalStorageBridge.",
+    DiagnosticId = "GW0004")]
 public static class PhysicalizationProjection
 {
     public static IReadOnlyList<PhysicalizedFieldPlan> EligibleFields(StorageUnit unit)

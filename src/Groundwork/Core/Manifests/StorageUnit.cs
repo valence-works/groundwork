@@ -1,5 +1,6 @@
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
+using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 
 namespace Groundwork.Core.Manifests;
@@ -15,4 +16,12 @@ public sealed record StorageUnit(
     SerializationPolicy Serialization,
     IReadOnlyList<IndexDeclaration> Indexes,
     IReadOnlyList<PortableQueryDeclaration> Queries,
-    PhysicalizationPolicy Physicalization);
+    PhysicalizationPolicy Physicalization)
+{
+    /// <summary>
+    /// Gets the provider-neutral physical-storage declaration used by the three-form resolver.
+    /// A null value identifies a legacy unit that must be converted explicitly through
+    /// <see cref="LegacyPhysicalStorageBridge"/>.
+    /// </summary>
+    public StorageUnitPhysicalStorage? PhysicalStorage { get; init; }
+}

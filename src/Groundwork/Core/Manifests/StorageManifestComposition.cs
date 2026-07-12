@@ -1,5 +1,7 @@
 namespace Groundwork.Core.Manifests;
 
+using Groundwork.Core.PhysicalStorage;
+
 /// <summary>
 /// Composes several <see cref="StorageManifest"/> instances whose storage units are disjoint into a
 /// single union manifest. This lets one materialized provider instance (one <c>IDocumentStore</c>)
@@ -44,6 +46,7 @@ public static class StorageManifestComposition
         var requiredCapabilities = new HashSet<string>(StringComparer.Ordinal);
         var compatibilityNotes = new List<string>();
         var seenNotes = new HashSet<string>(StringComparer.Ordinal);
+        var sharedDocumentStorages = new Dictionary<string, SharedDocumentStorageDefinition>(StringComparer.Ordinal);
 
         foreach (var manifest in manifests)
         {
@@ -60,6 +63,17 @@ public static class StorageManifestComposition
             foreach (var capability in manifest.RequiredCapabilities)
                 requiredCapabilities.Add(capability);
 
+            foreach (var sharedStorage in manifest.SharedDocumentStorages)
+            {
+                if (sharedDocumentStorages.TryGetValue(sharedStorage.Binding.Value, out var existing) &&
+                    existing != sharedStorage)
+                {
+                    throw new SharedStorageDefinitionCompositionException(sharedStorage.Binding.Value);
+                }
+
+                sharedDocumentStorages[sharedStorage.Binding.Value] = sharedStorage;
+            }
+
             foreach (var note in manifest.CompatibilityNotes)
             {
                 if (seenNotes.Add(note))
@@ -73,7 +87,12 @@ public static class StorageManifestComposition
             version,
             units,
             requiredCapabilities,
-            compatibilityNotes);
+            compatibilityNotes)
+        {
+            SharedDocumentStorages = sharedDocumentStorages.Values
+                .OrderBy(x => x.Binding.Value, StringComparer.Ordinal)
+                .ToArray()
+        };
     }
 }
 
@@ -90,4 +109,19 @@ public sealed class StorageManifestCompositionException : InvalidOperationExcept
     }
 
     public string UnitIdentity { get; }
+}
+
+/// <summary>
+/// Thrown when two composed manifests assign different primary definitions to the same shared
+/// storage binding. Shared storage has one manifest/composition owner.
+/// </summary>
+public sealed class SharedStorageDefinitionCompositionException : InvalidOperationException
+{
+    public SharedStorageDefinitionCompositionException(string binding)
+        : base($"Shared-storage binding '{binding}' has conflicting manifest-owned definitions.")
+    {
+        Binding = binding;
+    }
+
+    public string Binding { get; }
 }

@@ -19,3 +19,46 @@ _Avoid_: Storage manifest, provider plan
 **Materialization Operation**:
 One executable storage-preparation step inside a materialization plan.
 _Avoid_: Provider capability, manifest rule
+
+**Physical Storage Form**:
+One of the three provider-neutral document layouts: shared documents, a dedicated document table,
+or a physical entity table. Canonical JSON remains authoritative in every form.
+_Avoid_: Portable mode, optimized mode
+
+**Physical Table Definition**:
+The provider-neutral structural definition for one storage unit: its selected form, envelope and
+canonical JSON columns or shared-storage binding, projected columns, physical indexes, schema
+version, and evolution metadata. Shared or dedicated document storage may name an auxiliary linked
+projected/index table; physical-entity projections are stored in-primary.
+_Avoid_: Provider DDL, materialization plan
+
+**Resolved Physical Definition**:
+A physical table definition after deterministic defaults, host naming policy, and per-unit name
+overrides, but before provider identifier normalization.
+_Avoid_: Provider physical definition, raw manifest
+
+**Provider Physical Definition**:
+A resolved physical definition with final provider identifiers and a deterministic fingerprint.
+It contains no provider SDK types and is the common input for later provider execution work.
+_Avoid_: Hand-authored provider schema
+
+**Schema History**:
+Durable evidence of the resolved definition, names, fingerprint, and operations applied to a
+provider.
+_Avoid_: Migration class list
+
+**Semantic Migration**:
+An explicitly authored provider-neutral data transformation used only when a desired-state diff
+cannot infer the change.
+_Avoid_: General structural migration pipeline
+
+**Bounded Query**:
+A declared, closed set of query operations and ordering/paging behavior. A scale-bearing bounded
+query makes its referenced stable index paths binding physical projection demand. Compound ordering
+uses stable per-field paths and directions rather than one inferred direction for every field.
+_Avoid_: IQueryable, arbitrary LINQ
+
+**Physical Query Plan**:
+Provider output describing the selected table/index/field route for a bounded document query.
+Callers do not submit physical query plans.
+_Avoid_: Document query
