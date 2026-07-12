@@ -35,6 +35,12 @@ public sealed record DocumentEnvelopeDefinition(
     string SchemaVersionColumn = "schema_version",
     string CanonicalJsonColumn = "document");
 
+/// <summary>Relationship fields stored in one unit-owned linked projection/index object.</summary>
+public sealed record LinkedDocumentKeyDefinition(
+    string DocumentIdColumn = "document_id",
+    string DocumentKindColumn = "document_kind",
+    string StorageScopeColumn = "storage_scope");
+
 /// <summary>Schema-evolution hints that remain provider-neutral.</summary>
 public sealed record PhysicalEvolutionMetadata(
     bool RequiresBackfill = false,
@@ -60,6 +66,15 @@ public sealed record PhysicalIndexColumnDefinition(
     int Order,
     PhysicalSortDirection Direction = PhysicalSortDirection.Ascending);
 
+/// <summary>Physical object that owns one declared index.</summary>
+public enum PhysicalIndexStorageTarget
+{
+    /// <summary>Preserves the form default: linked for shared/linked documents, otherwise primary.</summary>
+    FormDefault,
+    PrimaryStorage,
+    LinkedIndexStorage
+}
+
 /// <summary>A physical index over columns owned by one physical table definition.</summary>
 public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition>
 {
@@ -68,16 +83,18 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         IReadOnlyList<PhysicalIndexColumnDefinition> columns,
         bool isUnique = false,
         int schemaVersion = 1,
-        PhysicalEvolutionMetadata? evolution = null)
+        PhysicalEvolutionMetadata? evolution = null,
+        PhysicalIndexStorageTarget target = PhysicalIndexStorageTarget.FormDefault)
     {
         LogicalName = logicalName;
-        Columns = columns?
+        Columns = Array.AsReadOnly(columns?
             .OrderBy(x => x.Order)
             .ThenBy(x => x.ColumnLogicalName, StringComparer.Ordinal)
-            .ToArray() ?? throw new ArgumentNullException(nameof(columns));
+            .ToArray() ?? throw new ArgumentNullException(nameof(columns)));
         IsUnique = isUnique;
         SchemaVersion = schemaVersion;
         Evolution = evolution;
+        Target = target;
     }
 
     public string LogicalName { get; }
@@ -90,13 +107,16 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
 
     public PhysicalEvolutionMetadata? Evolution { get; }
 
+    public PhysicalIndexStorageTarget Target { get; }
+
     public bool Equals(PhysicalIndexDefinition? other) =>
         other is not null &&
         LogicalName == other.LogicalName &&
         Columns.SequenceEqual(other.Columns) &&
         IsUnique == other.IsUnique &&
         SchemaVersion == other.SchemaVersion &&
-        Evolution == other.Evolution;
+        Evolution == other.Evolution &&
+        Target == other.Target;
 
     public override bool Equals(object? obj) => Equals(obj as PhysicalIndexDefinition);
 
@@ -109,6 +129,7 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         hash.Add(IsUnique);
         hash.Add(SchemaVersion);
         hash.Add(Evolution);
+        hash.Add(Target);
         return hash.ToHashCode();
     }
 }
@@ -129,7 +150,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         IReadOnlyList<PhysicalIndexDefinition>? indexes,
         int schemaVersion,
         PhysicalEvolutionMetadata? evolution,
-        string? linkedProjectionLogicalName)
+        string? linkedProjectionLogicalName,
+        LinkedDocumentKeyDefinition? linkedKey)
     {
         Form = form;
         FeatureDefaultLogicalName = featureDefaultLogicalName;
@@ -144,6 +166,9 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         SchemaVersion = schemaVersion;
         Evolution = evolution;
         LinkedProjectionLogicalName = linkedProjectionLogicalName;
+        LinkedKey = linkedProjectionLogicalName is null
+            ? linkedKey
+            : linkedKey ?? new LinkedDocumentKeyDefinition();
     }
 
     public PhysicalStorageForm Form { get; }
@@ -163,10 +188,13 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
     public PhysicalEvolutionMetadata? Evolution { get; }
 
     /// <summary>
-    /// Gets the unit-owned linked projection table name for shared-document storage. It is null
-    /// for shared units without linked structures and for dedicated/entity primary tables.
+    /// Gets the unit-owned linked projection/index object name for shared or dedicated document
+    /// storage. It is null when there are no linked structures and for physical entity tables.
     /// </summary>
     public string? LinkedProjectionLogicalName { get; }
+
+    /// <summary>Explicit relationship fields owned by linked projection/index storage.</summary>
+    public LinkedDocumentKeyDefinition? LinkedKey { get; }
 
     public static PhysicalTableDefinition SharedDocuments(
         SharedStorageBinding sharedStorage,
@@ -174,7 +202,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         IReadOnlyList<PhysicalIndexDefinition>? linkedIndexes = null,
         int schemaVersion = 1,
         PhysicalEvolutionMetadata? evolution = null,
-        string? linkedProjectionLogicalName = null) =>
+        string? linkedProjectionLogicalName = null,
+        LinkedDocumentKeyDefinition? linkedKey = null) =>
         new(
             PhysicalStorageForm.SharedDocuments,
             null,
@@ -184,7 +213,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
             linkedIndexes,
             schemaVersion,
             evolution,
-            linkedProjectionLogicalName);
+            linkedProjectionLogicalName,
+            linkedKey);
 
     public static PhysicalTableDefinition DedicatedDocumentTable(
         string featureDefaultLogicalName,
@@ -193,7 +223,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         int schemaVersion = 1,
         PhysicalEvolutionMetadata? evolution = null,
         IReadOnlyList<ProjectedColumnDefinition>? linkedProjectedColumns = null,
-        string? linkedProjectionLogicalName = null) =>
+        string? linkedProjectionLogicalName = null,
+        LinkedDocumentKeyDefinition? linkedKey = null) =>
         new(
             PhysicalStorageForm.DedicatedDocumentTable,
             featureDefaultLogicalName,
@@ -203,7 +234,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
             indexes,
             schemaVersion,
             evolution,
-            linkedProjectionLogicalName);
+            linkedProjectionLogicalName,
+            linkedKey);
 
     public static PhysicalTableDefinition PhysicalEntityTable(
         string featureDefaultLogicalName,
@@ -221,6 +253,7 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
             indexes,
             schemaVersion,
             evolution,
+            null,
             null);
 
     public bool Equals(PhysicalTableDefinition? other) =>
@@ -233,7 +266,8 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         Indexes.SequenceEqual(other.Indexes) &&
         SchemaVersion == other.SchemaVersion &&
         Evolution == other.Evolution &&
-        LinkedProjectionLogicalName == other.LinkedProjectionLogicalName;
+        LinkedProjectionLogicalName == other.LinkedProjectionLogicalName &&
+        LinkedKey == other.LinkedKey;
 
     public override bool Equals(object? obj) => Equals(obj as PhysicalTableDefinition);
 
@@ -251,6 +285,32 @@ public sealed class PhysicalTableDefinition : IEquatable<PhysicalTableDefinition
         hash.Add(SchemaVersion);
         hash.Add(Evolution);
         hash.Add(LinkedProjectionLogicalName, StringComparer.Ordinal);
+        hash.Add(LinkedKey);
         return hash.ToHashCode();
     }
+}
+
+internal static class PhysicalIndexStorageTargetResolver
+{
+    public static PhysicalIndexStorageTarget Resolve(
+        PhysicalTableDefinition definition,
+        PhysicalIndexDefinition index) => index.Target switch
+    {
+        PhysicalIndexStorageTarget.FormDefault =>
+            definition.Form == PhysicalStorageForm.SharedDocuments || definition.LinkedProjectionLogicalName is not null
+                ? PhysicalIndexStorageTarget.LinkedIndexStorage
+                : PhysicalIndexStorageTarget.PrimaryStorage,
+        _ => index.Target
+    };
+
+    public static bool IsValid(
+        PhysicalTableDefinition definition,
+        PhysicalIndexDefinition index) => Resolve(definition, index) switch
+    {
+        PhysicalIndexStorageTarget.PrimaryStorage => definition.Form != PhysicalStorageForm.SharedDocuments,
+        PhysicalIndexStorageTarget.LinkedIndexStorage =>
+            definition.Form != PhysicalStorageForm.PhysicalEntityTable &&
+            !string.IsNullOrWhiteSpace(definition.LinkedProjectionLogicalName),
+        _ => false
+    };
 }

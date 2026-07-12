@@ -137,7 +137,7 @@ Names below are the recommended target. Exact record-vs-class construction can b
 - Add `BoundedQueryExecutionClass` with `Ordinary` and `ScaleBearing`. A scale-bearing declaration identifies its required stable paths through referenced `LogicalIndexDeclaration`s; those paths become projected-column demand for default resolution. This is a binding contract requiring a native indexed server-side plan, not advisory metadata.
 - Add `PhysicalTableDefinition` as the portable per-unit structural description. For dedicated/entity forms it owns the primary logical table identity/name, standard envelope and JSON columns, projected-column definitions, physical indexes, schema version, and migration hints. For shared form it instead owns a `SharedStorageBinding` plus only unit-owned linked/index structures; the primary name and common envelope come from a manifest/composition-owned `SharedDocumentStorageDefinition`.
 - Projected columns reference stable serialized paths. A `ProjectedColumnDefinition` owns portable type, length, precision, nullability, collation/default metadata, and rebuild semantics.
-- `PhysicalIndexDefinition` values reference columns in a `PhysicalTableDefinition` and express compound order, uniqueness, and sort direction. They are distinct from logical index and bounded-query declarations even when planning derives one from both.
+- `PhysicalIndexDefinition` values reference columns in a `PhysicalTableDefinition` and express storage target, compound order, uniqueness, and sort direction. They are distinct from logical index and bounded-query declarations even when planning derives one from both.
 
 Default resolution remains the ADR 0003 policy, made executable through binding declarations rather than heuristics:
 

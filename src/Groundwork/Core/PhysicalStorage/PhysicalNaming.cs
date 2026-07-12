@@ -6,7 +6,10 @@ public enum PhysicalObjectKind
 {
     PrimaryStorage,
     LinkedIndexStorage,
+    EnvelopeField,
+    LinkedIndexField,
     ProjectedField,
+    LinkedProjectedField,
     PhysicalIndex,
     SchemaHistory
 }
@@ -73,13 +76,14 @@ public sealed class DelegateProviderPhysicalNameNormalizer(
 internal static class ProviderPhysicalNameNormalizerDefaults
 {
     public static string GetCollisionScope(ProviderPhysicalNameContext context) => context.ObjectKind switch
-        {
-            PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage => "primary-storage",
-            PhysicalObjectKind.ProjectedField => $"{context.StorageUnit.Value}:projected-fields",
-            PhysicalObjectKind.PhysicalIndex => $"{context.StorageUnit.Value}:physical-indexes",
-            PhysicalObjectKind.SchemaHistory => "schema-history",
-            _ => throw new ArgumentOutOfRangeException(nameof(context), context.ObjectKind, null)
-        };
+    {
+        PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage => "primary-storage",
+        PhysicalObjectKind.EnvelopeField or PhysicalObjectKind.ProjectedField => $"{context.StorageUnit.Value}:columns",
+        PhysicalObjectKind.LinkedIndexField or PhysicalObjectKind.LinkedProjectedField => $"{context.StorageUnit.Value}:linked-columns",
+        PhysicalObjectKind.PhysicalIndex => $"{context.StorageUnit.Value}:physical-indexes",
+        PhysicalObjectKind.SchemaHistory => "schema-history",
+        _ => throw new ArgumentOutOfRangeException(nameof(context), context.ObjectKind, null)
+    };
 }
 
 public static class ProviderPhysicalNameNormalizer

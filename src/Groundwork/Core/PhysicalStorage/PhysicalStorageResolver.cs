@@ -605,18 +605,37 @@ public static class PhysicalStorageResolver
             valid = false;
         }
 
-        var hasLinkedStructures = definition.ProjectedColumns.Count != 0 || definition.Indexes.Count != 0;
         var hasLinkedName = !string.IsNullOrWhiteSpace(definition.LinkedProjectionLogicalName);
+        var hasLinkedStructures = definition.ProjectedColumns.Count != 0 ||
+                                  definition.Indexes.Any(index =>
+                                      PhysicalIndexStorageTargetResolver.Resolve(definition, index) == PhysicalIndexStorageTarget.LinkedIndexStorage);
+        var hasLinkedKey = definition.LinkedKey is not null;
         if ((definition.Form == PhysicalStorageForm.SharedDocuments && hasLinkedStructures != hasLinkedName) ||
             (definition.Form == PhysicalStorageForm.DedicatedDocumentTable &&
              ((definition.ProjectedColumns.Count != 0 && !hasLinkedName) || (hasLinkedName && !hasLinkedStructures))) ||
-            (definition.Form == PhysicalStorageForm.PhysicalEntityTable && hasLinkedName))
+            (definition.Form == PhysicalStorageForm.PhysicalEntityTable && hasLinkedName) ||
+            hasLinkedName != hasLinkedKey ||
+            definition.Indexes.Any(index => !PhysicalIndexStorageTargetResolver.IsValid(definition, index)))
         {
             diagnostics.Add(GroundworkDiagnostic.Error(
                 "GW-PHYSICAL-013",
                 "Linked projected/index structures require exactly one auxiliary table logical name and entity projections remain in-primary.",
                 $"{target}.linkedProjectionLogicalName"));
             valid = false;
+        }
+
+        if (definition.LinkedKey is not null)
+        {
+            var linkedKeyColumns = LinkedKeyColumnNames(definition.LinkedKey);
+            if (linkedKeyColumns.Any(string.IsNullOrWhiteSpace) ||
+                linkedKeyColumns.Distinct(StringComparer.Ordinal).Count() != linkedKeyColumns.Length)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-013",
+                    "Linked document relationship fields must be non-empty and distinct.",
+                    $"{target}.linkedKey"));
+                valid = false;
+            }
         }
 
         if (definition.Form == PhysicalStorageForm.PhysicalEntityTable && definition.ProjectedColumns.Count == 0)
@@ -628,9 +647,21 @@ public static class PhysicalStorageResolver
             valid = false;
         }
 
+        var envelope = definition.Envelope ?? sharedDefinition?.Envelope;
+        var envelopeColumns = envelope is null
+            ? Array.Empty<string>()
+            : EnvelopeColumnNames(envelope);
+        var unavailableProjectedNames = definition.LinkedKey is null || envelope is null
+            ? envelopeColumns
+            : envelopeColumns
+                .Take(3)
+                .Concat(LinkedKeyColumnNames(definition.LinkedKey))
+                .ToArray();
         var duplicateColumnNames = definition.ProjectedColumns
             .GroupBy(x => x.LogicalName, StringComparer.Ordinal)
-            .Any(x => x.Count() > 1);
+            .Any(x => x.Count() > 1) ||
+            definition.ProjectedColumns.Any(column =>
+                unavailableProjectedNames.Contains(column.LogicalName, StringComparer.Ordinal));
         var duplicatePaths = definition.ProjectedColumns
             .GroupBy(x => x.Path, StringComparer.Ordinal)
             .Any(x => x.Count() > 1);
@@ -661,20 +692,13 @@ public static class PhysicalStorageResolver
             }
         }
 
-        var envelope = definition.Envelope ?? sharedDefinition?.Envelope;
-        var availableColumns = definition.ProjectedColumns
-            .Select(x => x.LogicalName)
-            .Concat(envelope is null
-                ? []
-                :
-                [
-                    envelope.IdColumn,
-                    envelope.DocumentKindColumn,
-                    envelope.StorageScopeColumn,
-                    envelope.VersionColumn,
-                    envelope.SchemaVersionColumn,
-                    envelope.CanonicalJsonColumn
-                ])
+        var envelopeColumnSet = envelopeColumns.ToHashSet(StringComparer.Ordinal);
+        var primaryAvailableColumns = definition.Form == PhysicalStorageForm.PhysicalEntityTable
+            ? envelopeColumns.Concat(definition.ProjectedColumns.Select(column => column.LogicalName)).ToHashSet(StringComparer.Ordinal)
+            : envelopeColumnSet;
+        var linkedAvailableColumns = envelopeColumns
+            .Take(3)
+            .Concat(definition.ProjectedColumns.Select(column => column.LogicalName))
             .ToHashSet(StringComparer.Ordinal);
         if (definition.Indexes.GroupBy(x => x.LogicalName, StringComparer.Ordinal).Any(x => x.Count() > 1))
         {
@@ -720,6 +744,9 @@ public static class PhysicalStorageResolver
                 valid = false;
             }
 
+            var availableColumns = PhysicalIndexStorageTargetResolver.Resolve(definition, index) == PhysicalIndexStorageTarget.LinkedIndexStorage
+                ? linkedAvailableColumns
+                : primaryAvailableColumns;
             foreach (var indexColumn in index.Columns)
             {
                 if (!availableColumns.Contains(indexColumn.ColumnLogicalName))
@@ -782,13 +809,12 @@ public static class PhysicalStorageResolver
         return valid;
     }
 
-    private static bool HasCanonicalEnvelope(DocumentEnvelopeDefinition envelope) =>
-        !string.IsNullOrWhiteSpace(envelope.IdColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.DocumentKindColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.StorageScopeColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.VersionColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.SchemaVersionColumn) &&
-        !string.IsNullOrWhiteSpace(envelope.CanonicalJsonColumn);
+    private static bool HasCanonicalEnvelope(DocumentEnvelopeDefinition envelope)
+    {
+        var columns = EnvelopeColumnNames(envelope);
+        return columns.All(column => !string.IsNullOrWhiteSpace(column)) &&
+               columns.Distinct(StringComparer.Ordinal).Count() == columns.Length;
+    }
 
     private static IReadOnlyList<ResolvedPhysicalObjectName> ResolveHostNames(
         StorageUnit unit,
@@ -820,6 +846,17 @@ public static class PhysicalStorageResolver
                 true));
         }
 
+        var envelope = definition.Envelope ?? sharedStorageDefinition!.Envelope;
+        var envelopeOwner = definition.Form == PhysicalStorageForm.SharedDocuments
+            ? new StorageUnitIdentity($"shared:{sharedStorageDefinition!.Binding.Value}")
+            : unit.Identity;
+        var allowsEnvelopeOverride = definition.Form != PhysicalStorageForm.SharedDocuments;
+        defaultNames.AddRange(EnvelopeColumnNames(envelope).Distinct(StringComparer.Ordinal).Select(name => (
+            PhysicalObjectKind.EnvelopeField,
+            name,
+            envelopeOwner,
+            allowsEnvelopeOverride)));
+
         if (definition.LinkedProjectionLogicalName is not null)
         {
             defaultNames.Add((
@@ -827,10 +864,19 @@ public static class PhysicalStorageResolver
                 definition.LinkedProjectionLogicalName,
                 unit.Identity,
                 true));
+
+            defaultNames.AddRange(LinkedKeyColumnNames(definition.LinkedKey!).Select(name => (
+                PhysicalObjectKind.LinkedIndexField,
+                name,
+                unit.Identity,
+                true)));
         }
 
+        var projectedFieldKind = definition.LinkedProjectionLogicalName is null
+            ? PhysicalObjectKind.ProjectedField
+            : PhysicalObjectKind.LinkedProjectedField;
         defaultNames.AddRange(definition.ProjectedColumns.Select(x => (
-            PhysicalObjectKind.ProjectedField,
+            projectedFieldKind,
             x.LogicalName,
             unit.Identity,
             true)));
@@ -866,7 +912,8 @@ public static class PhysicalStorageResolver
                 }
             }
 
-            if (!item.AllowsUnitOverride &&
+            if (item.Kind == PhysicalObjectKind.PrimaryStorage &&
+                !item.AllowsUnitOverride &&
                 sharedPrimaryNames.TryGetValue(sharedStorageDefinition!.Binding.Value, out var sharedPrimaryName))
             {
                 result.Add(sharedPrimaryName);
@@ -895,7 +942,7 @@ public static class PhysicalStorageResolver
                 logicalName,
                 item.NamingOwner);
             result.Add(resolvedName);
-            if (!item.AllowsUnitOverride)
+            if (item.Kind == PhysicalObjectKind.PrimaryStorage && !item.AllowsUnitOverride)
                 sharedPrimaryNames[sharedStorageDefinition!.Binding.Value] = resolvedName;
         }
 
@@ -915,6 +962,23 @@ public static class PhysicalStorageResolver
 
         return result;
     }
+
+    private static string[] EnvelopeColumnNames(DocumentEnvelopeDefinition envelope) =>
+    [
+        envelope.IdColumn,
+        envelope.DocumentKindColumn,
+        envelope.StorageScopeColumn,
+        envelope.VersionColumn,
+        envelope.SchemaVersionColumn,
+        envelope.CanonicalJsonColumn
+    ];
+
+    private static string[] LinkedKeyColumnNames(LinkedDocumentKeyDefinition linkedKey) =>
+    [
+        linkedKey.DocumentIdColumn,
+        linkedKey.DocumentKindColumn,
+        linkedKey.StorageScopeColumn
+    ];
 
     private static IReadOnlyList<ProviderPhysicalObjectName> NormalizeNames(
         ResolvedPhysicalTableDefinition definition,
@@ -983,7 +1047,7 @@ public static class PhysicalStorageResolver
                     Scope: x.Name.CollisionScope,
                     x.Name.Identifier),
                 PhysicalNameCollisionKeyComparer.Instance)
-            .Where(group => !IsExactSharedPrimary(group));
+            .Where(group => !IsExactSharedObject(group));
 
         foreach (var collision in collisions)
         {
@@ -998,7 +1062,7 @@ public static class PhysicalStorageResolver
         }
     }
 
-    private static bool IsExactSharedPrimary(
+    private static bool IsExactSharedObject(
         IEnumerable<(ProviderPhysicalTableDefinition Definition, ProviderPhysicalObjectName Name)> group)
     {
         var entries = group.ToArray();
@@ -1008,7 +1072,7 @@ public static class PhysicalStorageResolver
         var first = entries[0];
         var binding = first.Definition.Resolved.SharedStorageDefinition?.Binding;
         return binding is not null &&
-               first.Name.ObjectKind == PhysicalObjectKind.PrimaryStorage &&
+               first.Name.ObjectKind is PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.EnvelopeField &&
                entries.All(entry =>
                    entry.Definition.Definition.Form == PhysicalStorageForm.SharedDocuments &&
                    entry.Definition.Resolved.SharedStorageDefinition?.Binding == binding &&
