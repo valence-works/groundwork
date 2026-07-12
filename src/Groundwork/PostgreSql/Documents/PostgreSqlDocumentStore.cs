@@ -12,6 +12,11 @@ public sealed class PostgreSqlDocumentStore : RelationalDocumentStore
     {
     }
 
+    internal PostgreSqlDocumentStore(RelationalSessionFactory sessions, StorageManifest manifest, Func<string?>? ambientTenantId = null)
+        : base(sessions, manifest, new PostgreSqlDocumentStoreDialect(), ambientTenantId)
+    {
+    }
+
     public PostgreSqlDocumentStore(string connectionString, StorageManifest manifest, Func<string?>? ambientTenantId = null)
         : base(
             RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),

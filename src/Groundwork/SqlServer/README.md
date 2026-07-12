@@ -13,6 +13,17 @@
 - Uses optimistic concurrency through expected document versions.
 - Exposes `SqlServerGroundworkCapabilities.Runtime()` and `SqlServerGroundworkCapabilities.Materialization()`.
 
+## Factory and session lifecycle
+
+`SqlServerDocumentStoreFactory.CreateAsync` materializes through one short-lived pooled connection,
+disposes it before returning, and returns `SqlServerDocumentStore` directly. The returned store is
+stateless: independent operations acquire concurrent pooled connections, while an explicit unit of
+work owns one connection and transaction until completion. Pool limits and timeouts—not a
+Groundwork-wide semaphore—provide backpressure.
+
+The former `SqlServerDocumentStoreHandle` and its lifetime-owning `Connection` property were removed
+because a stateless store has no single connection to expose or dispose.
+
 ## Deliberate Limits
 
 - JSON content is stored as text.

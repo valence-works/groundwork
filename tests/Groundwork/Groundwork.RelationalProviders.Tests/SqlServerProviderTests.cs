@@ -20,16 +20,43 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
     public async Task IndependentOperationsUseTheProviderPoolWithoutGlobalSerialization()
     {
         var builder = new SqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 2 };
+        var blockerBuilder = new SqlConnectionStringBuilder(builder.ConnectionString) { Pooling = false };
+        var twoConnectionsOpened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var opened = 0;
+        var manifest = RelationalTestManifests.MetadataManifest();
+        var store = await SqlServerDocumentStoreFactory.CreateAsync(
+            builder.ConnectionString,
+            manifest,
+            RelationalTestManifests.SqlServerProvider,
+            () => new SqlConnection(builder.ConnectionString),
+            () =>
+            {
+                var connection = new SqlConnection(builder.ConnectionString);
+                connection.StateChange += (_, args) =>
+                {
+                    if (args.CurrentState == System.Data.ConnectionState.Open && Interlocked.Increment(ref opened) == 2)
+                        twoConnectionsOpened.TrySetResult();
+                };
+                return connection;
+            });
+        var blocker = await RelationalSessionPoolPressure.BlockSqlServerDocumentsAsync(blockerBuilder.ConnectionString);
+
         await RelationalSessionPoolPressure.AssertTwoOperationsRunWhileThirdWaitsForProviderPoolAsync(
-            () => new SqlConnection(builder.ConnectionString));
+            store,
+            twoConnectionsOpened.Task,
+            blocker);
     }
 
-    protected override Task<IRelationalProviderHarness> CreateHarnessAsync()
+    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync()
     {
-        var connection = new SqlConnection(container.GetConnectionString());
+        var connectionString = container.GetConnectionString();
+        var connection = new SqlConnection(connectionString);
         var manifest = RelationalTestManifests.MetadataManifest();
-        var store = new SqlServerDocumentStore(container.GetConnectionString(), manifest);
-        return Task.FromResult<IRelationalProviderHarness>(new SqlServerProviderHarness(connection, store, manifest, container.GetConnectionString()));
+        var store = await SqlServerDocumentStoreFactory.CreateAsync(
+            connectionString,
+            manifest,
+            RelationalTestManifests.SqlServerProvider);
+        return new SqlServerProviderHarness(connection, store, manifest, connectionString);
     }
 
     private sealed class SqlServerProviderHarness(
@@ -46,8 +73,10 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
 
         public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
         {
-            await new SqlServerGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.SqlServerProvider);
-            return new SqlServerDocumentStore(connectionString, targetManifest);
+            return await SqlServerDocumentStoreFactory.CreateAsync(
+                connectionString,
+                targetManifest,
+                RelationalTestManifests.SqlServerProvider);
         }
 
         public async Task<long> CountSchemaHistoryRowsAsync()

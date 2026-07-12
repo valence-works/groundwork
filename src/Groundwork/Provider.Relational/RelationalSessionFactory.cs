@@ -34,8 +34,28 @@ public sealed class RelationalSessionFactory
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(operation);
-        await using var session = await OpenAsync(cancellationToken);
-        return await operation(session.Connection, cancellationToken);
+        var session = await OpenAsync(cancellationToken);
+        Exception? primaryFailure = null;
+        try
+        {
+            return await operation(session.Connection, cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            primaryFailure = exception;
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                await session.DisposeAsync();
+            }
+            catch (Exception cleanupFailure) when (primaryFailure is not null)
+            {
+                RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+            }
+        }
     }
 
     /// <summary>

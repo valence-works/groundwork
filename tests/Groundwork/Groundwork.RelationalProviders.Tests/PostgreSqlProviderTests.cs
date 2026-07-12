@@ -23,16 +23,43 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
     public async Task IndependentOperationsUseTheProviderPoolWithoutGlobalSerialization()
     {
         var builder = new NpgsqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 2 };
+        var blockerBuilder = new NpgsqlConnectionStringBuilder(builder.ConnectionString) { Pooling = false };
+        var twoConnectionsOpened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var opened = 0;
+        var manifest = RelationalTestManifests.MetadataManifest();
+        var store = await PostgreSqlDocumentStoreFactory.CreateAsync(
+            builder.ConnectionString,
+            manifest,
+            RelationalTestManifests.PostgreSqlProvider,
+            () => new NpgsqlConnection(builder.ConnectionString),
+            () =>
+            {
+                var connection = new NpgsqlConnection(builder.ConnectionString);
+                connection.StateChange += (_, args) =>
+                {
+                    if (args.CurrentState == System.Data.ConnectionState.Open && Interlocked.Increment(ref opened) == 2)
+                        twoConnectionsOpened.TrySetResult();
+                };
+                return connection;
+            });
+        var blocker = await RelationalSessionPoolPressure.BlockPostgreSqlDocumentsAsync(blockerBuilder.ConnectionString);
+
         await RelationalSessionPoolPressure.AssertTwoOperationsRunWhileThirdWaitsForProviderPoolAsync(
-            () => new NpgsqlConnection(builder.ConnectionString));
+            store,
+            twoConnectionsOpened.Task,
+            blocker);
     }
 
-    protected override Task<IRelationalProviderHarness> CreateHarnessAsync()
+    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync()
     {
-        var connection = new NpgsqlConnection(container.GetConnectionString());
+        var connectionString = container.GetConnectionString();
+        var connection = new NpgsqlConnection(connectionString);
         var manifest = RelationalTestManifests.MetadataManifest();
-        var store = new PostgreSqlDocumentStore(container.GetConnectionString(), manifest);
-        return Task.FromResult<IRelationalProviderHarness>(new PostgreSqlProviderHarness(connection, store, manifest, container.GetConnectionString()));
+        var store = await PostgreSqlDocumentStoreFactory.CreateAsync(
+            connectionString,
+            manifest,
+            RelationalTestManifests.PostgreSqlProvider);
+        return new PostgreSqlProviderHarness(connection, store, manifest, connectionString);
     }
 
     private sealed class PostgreSqlProviderHarness(
@@ -49,8 +76,10 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
 
         public async Task<IDocumentStore> ApplyManifestAsync(Groundwork.Core.Manifests.StorageManifest targetManifest)
         {
-            await new PostgreSqlGroundworkMaterializer(connection).MaterializeAsync(targetManifest, RelationalTestManifests.PostgreSqlProvider);
-            return new PostgreSqlDocumentStore(connectionString, targetManifest);
+            return await PostgreSqlDocumentStoreFactory.CreateAsync(
+                connectionString,
+                targetManifest,
+                RelationalTestManifests.PostgreSqlProvider);
         }
 
         public async Task<long> CountSchemaHistoryRowsAsync()
