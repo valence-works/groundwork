@@ -1,5 +1,8 @@
 namespace Groundwork.Core.Indexing;
 
+[Obsolete(
+    "Use LogicalIndexDeclaration for logical lookup intent and PhysicalIndexDefinition for physical structure.",
+    DiagnosticId = "GW0002")]
 public sealed record IndexDeclaration(
     string Identity,
     IReadOnlyList<IndexField> Fields,
@@ -40,6 +43,9 @@ public enum PortableQueryOperation
     In
 }
 
+[Obsolete(
+    "Physical placement belongs to PhysicalTableDefinition. Convert existing declarations with LegacyPhysicalStorageBridge.",
+    DiagnosticId = "GW0002")]
 public enum IndexPhysicalizationPolicy
 {
     Default,

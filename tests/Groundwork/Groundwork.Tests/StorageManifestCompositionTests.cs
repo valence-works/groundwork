@@ -1,4 +1,5 @@
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Validation;
 using Xunit;
 
@@ -101,5 +102,52 @@ public sealed class StorageManifestCompositionTests
                 new StorageManifestIdentity("composite.documents"),
                 new StorageManifestOwner("sample.application"),
                 new StorageManifestVersion("1.0.0")));
+    }
+
+    [Fact]
+    public void UnionKeepsOneStructurallyIdenticalSharedDefinition()
+    {
+        var binding = new SharedStorageBinding("application-documents");
+        var shared = new SharedDocumentStorageDefinition(
+            binding,
+            "groundwork_documents",
+            new DocumentEnvelopeDefinition());
+        var runtime = RuntimeManifest() with { SharedDocumentStorages = [shared] };
+        var design = DesignManifest() with { SharedDocumentStorages = [shared] };
+
+        var union = StorageManifestComposition.Union(
+            new StorageManifestIdentity("composite.documents"),
+            new StorageManifestOwner("sample.application"),
+            new StorageManifestVersion("1.0.0"),
+            runtime,
+            design);
+
+        Assert.Equal(shared, Assert.Single(union.SharedDocumentStorages));
+    }
+
+    [Fact]
+    public void UnionRejectsConflictingSharedDefinitions()
+    {
+        var binding = new SharedStorageBinding("application-documents");
+        var runtime = RuntimeManifest() with
+        {
+            SharedDocumentStorages =
+            [new SharedDocumentStorageDefinition(binding, "runtime_documents", new DocumentEnvelopeDefinition())]
+        };
+        var design = DesignManifest() with
+        {
+            SharedDocumentStorages =
+            [new SharedDocumentStorageDefinition(binding, "design_documents", new DocumentEnvelopeDefinition())]
+        };
+
+        var exception = Assert.Throws<SharedStorageDefinitionCompositionException>(() =>
+            StorageManifestComposition.Union(
+                new StorageManifestIdentity("composite.documents"),
+                new StorageManifestOwner("sample.application"),
+                new StorageManifestVersion("1.0.0"),
+                runtime,
+                design));
+
+        Assert.Equal(binding.Value, exception.Binding);
     }
 }
