@@ -25,6 +25,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\Groundwork\Materialization\Groundwork.Materialization.csproj" />
     <ProjectReference Include="..\..\..\src\Groundwork\MongoDb\Groundwork.MongoDb.csproj" />
+    <ProjectReference Include="..\Groundwork.DiagnosticRecords.Tests\Groundwork.DiagnosticRecords.Tests.csproj" />
   </ItemGroup>
 
 </Project>
