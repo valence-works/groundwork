@@ -1,0 +1,5 @@
+{
+  "$schema": "baseline-index.schema.json",
+  "schemaVersion": "groundwork.physical-storage.benchmark/v1",
+  "baselines": []
+}

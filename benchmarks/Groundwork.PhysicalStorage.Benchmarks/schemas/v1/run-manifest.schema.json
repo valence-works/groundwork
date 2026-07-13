@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/run-manifest.schema.json",
+  "title": "Groundwork physical-storage benchmark run manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "status",
+    "mode",
+    "startedAtUtc",
+    "gitCommit",
+    "gitDirty",
+    "rawMeasurements",
+    "summary",
+    "elsaMigrationDecision",
+    "machineMetadata",
+    "providerMetadata",
+    "configuration",
+    "planArtifacts",
+    "regressionConfirmationRun"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
+    "runId": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["running", "completed", "failed"] },
+    "mode": { "enum": ["smoke", "scheduled"] },
+    "startedAtUtc": { "type": "string", "format": "date-time" },
+    "completedAtUtc": { "type": ["string", "null"], "format": "date-time" },
+    "gitCommit": { "type": "string", "minLength": 1 },
+    "gitDirty": { "type": "boolean" },
+    "rawMeasurements": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "elsaMigrationDecision": { "type": "string", "minLength": 1 },
+    "machineMetadata": { "type": "string", "minLength": 1 },
+    "providerMetadata": { "type": "string", "minLength": 1 },
+    "configuration": { "type": "string", "minLength": 1 },
+    "planArtifacts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "baselineRun": { "type": ["string", "null"] },
+    "regressionConfirmationRun": { "type": "boolean" },
+    "failure": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

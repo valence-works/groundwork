@@ -48,13 +48,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult([], total);
 
-            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, store.ApplyOffsetPage(
-                $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}",
-                store.P("take"),
-                store.P("skip")));
-            AddParameters(command, built.Parameters);
-            store.AddPhysicalParameter(command, "take", query.Take ?? int.MaxValue);
-            store.AddPhysicalParameter(command, "skip", query.Skip ?? 0);
+            var rendered = RenderQuery(query, plan, built, route);
+            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
+            AddParameters(command, rendered.Parameters);
             var documents = new List<DocumentEnvelope>();
             await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
@@ -68,6 +64,33 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
         RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind)));
+
+    internal RelationalPhysicalQueryCommand BuildQueryCommand(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var route = store.GetRoute(query.DocumentKind);
+        return RenderQuery(query, plan, Build(query, plan, route), route);
+    }
+
+    private RelationalPhysicalQueryCommand RenderQuery(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        BuiltQuery built,
+        ExecutableStorageRoute route)
+    {
+        var parameters = built.Parameters
+            .Concat(new[]
+            {
+                ("take", (object?)(query.Take ?? int.MaxValue)),
+                ("skip", (object?)(query.Skip ?? 0))
+            })
+            .ToArray();
+        return new RelationalPhysicalQueryCommand(
+            store.ApplyOffsetPage(
+                $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}",
+                store.P("take"),
+                store.P("skip")),
+            parameters);
+    }
 
     public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>

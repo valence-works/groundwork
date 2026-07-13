@@ -80,6 +80,24 @@ public static class RelationalPhysicalQueryRuntime
         return handler.BuildCountCommand(query, plan);
     }
 
+    internal static RelationalPhysicalQueryCommand BuildQueryCommand(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        DocumentQuery query,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds);
+        var plan = runtime.Compilation.Plans.Single(candidate => candidate.QueryIdentity == query.QueryIdentity);
+        var handler = runtime.Handlers
+            .OfType<RelationalPhysicalDocumentQueryHandler>()
+            .Single(candidate => candidate.Identity == plan.HandlerIdentity);
+        return handler.BuildQueryCommand(query, plan);
+    }
+
     private static RuntimeComponents BuildRuntime(
         RelationalPhysicalDocumentStore store,
         StorageManifest manifest,

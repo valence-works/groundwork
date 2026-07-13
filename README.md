@@ -53,6 +53,9 @@ For explicit deployment-time schema planning and application, see the
 [Groundwork schema tool](docs/schema-tool.md). It supports stable human/JSON output and documented
 pipeline exit codes without introducing application-startup migration fallback.
 
+The reproducible physical-storage macrobenchmark and its baseline-promotion policy are documented
+in [`benchmarks/Groundwork.PhysicalStorage.Benchmarks`](benchmarks/Groundwork.PhysicalStorage.Benchmarks/README.md).
+
 The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization for every eligible index:
 
 ```bash
