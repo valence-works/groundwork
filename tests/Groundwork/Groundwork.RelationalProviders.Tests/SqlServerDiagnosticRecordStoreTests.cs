@@ -87,41 +87,50 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
         const int workerCount = 4;
         const int iterationsPerWorker = 4;
         var databaseNames = new ConcurrentBag<string>();
+        using var stressTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         var workers = Enumerable.Range(0, workerCount).Select(async _ =>
         {
-            for (var iteration = 0; iteration < iterationsPerWorker; iteration++)
+            try
             {
-                var connectionString = await container.CreateDatabaseAsync();
-                var databaseName = new SqlConnectionStringBuilder(connectionString).InitialCatalog;
-                databaseNames.Add(databaseName);
-                try
+                for (var iteration = 0; iteration < iterationsPerWorker; iteration++)
                 {
-                    await using var connection = new SqlConnection(connectionString);
-                    await connection.OpenAsync();
-                    await using var command = connection.CreateCommand();
-                    command.CommandText = """
-                        SELECT DB_NAME(), is_read_committed_snapshot_on
-                        FROM sys.databases
-                        WHERE name = DB_NAME();
-                        """;
-                    await using var reader = await command.ExecuteReaderAsync();
+                    var connectionString = await container.CreateDatabaseAsync(cancellationToken: stressTimeout.Token);
+                    var databaseName = new SqlConnectionStringBuilder(connectionString).InitialCatalog;
+                    databaseNames.Add(databaseName);
+                    try
+                    {
+                        await using var connection = new SqlConnection(connectionString);
+                        await connection.OpenAsync(stressTimeout.Token);
+                        await using var command = connection.CreateCommand();
+                        command.CommandText = """
+                            SELECT DB_NAME(), is_read_committed_snapshot_on
+                            FROM sys.databases
+                            WHERE name = DB_NAME();
+                            """;
+                        await using var reader = await command.ExecuteReaderAsync(stressTimeout.Token);
 
-                    Assert.True(await reader.ReadAsync());
-                    Assert.Equal(databaseName, reader.GetString(0));
-                    Assert.True(reader.GetBoolean(1));
-                }
-                finally
-                {
-                    await container.DropDatabaseAsync(connectionString);
+                        Assert.True(await reader.ReadAsync(stressTimeout.Token));
+                        Assert.Equal(databaseName, reader.GetString(0));
+                        Assert.True(reader.GetBoolean(1));
+                    }
+                    finally
+                    {
+                        await container.DropDatabaseAsync(connectionString);
+                    }
                 }
             }
-        });
+            catch
+            {
+                await stressTimeout.CancelAsync();
+                throw;
+            }
+        }).ToArray();
 
-        await Task.WhenAll(workers).WaitAsync(TimeSpan.FromMinutes(2));
+        await Task.WhenAll(workers);
 
         Assert.Equal(workerCount * iterationsPerWorker, databaseNames.Distinct(StringComparer.Ordinal).Count());
         await using var master = new SqlConnection(container.ConnectionString);
-        await master.OpenAsync();
+        await master.OpenAsync(stressTimeout.Token);
         await using var leaked = master.CreateCommand();
         var parameters = databaseNames.Select((name, index) =>
         {
@@ -130,7 +139,9 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
         });
         leaked.CommandText = $"SELECT COUNT(*) FROM sys.databases WHERE name IN ({string.Join(", ", parameters)});";
 
-        Assert.Equal(0, Convert.ToInt32(await leaked.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture));
+        Assert.Equal(0, Convert.ToInt32(
+            await leaked.ExecuteScalarAsync(stressTimeout.Token),
+            System.Globalization.CultureInfo.InvariantCulture));
     }
 }
 

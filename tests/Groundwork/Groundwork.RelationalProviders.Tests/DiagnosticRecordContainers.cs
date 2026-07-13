@@ -17,9 +17,12 @@ public sealed class SqlServerDiagnosticRecordCollection : ICollectionFixture<Sql
 public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
 {
     private static readonly TimeSpan DatabaseOperationTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DatabaseAbortTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DatabaseDiagnosticTimeout = TimeSpan.FromSeconds(5);
     private readonly MsSqlContainer container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-CU18-ubuntu-22.04").Build();
     private readonly SemaphoreSlim databaseLifecycleGate = new(1, 1);
     private readonly ConcurrentDictionary<string, byte> ownedDatabases = new(StringComparer.Ordinal);
+    private int poisoned;
 
     public string ConnectionString => container.GetConnectionString();
     public Task InitializeAsync() => container.StartAsync();
@@ -29,16 +32,19 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
         await databaseLifecycleGate.WaitAsync();
         try
         {
-            foreach (var name in ownedDatabases.Keys)
+            if (!IsPoisoned)
             {
-                try
+                foreach (var name in ownedDatabases.Keys)
                 {
-                    await DropDatabaseCoreAsync(name, CancellationToken.None);
-                    ownedDatabases.TryRemove(name, out _);
-                }
-                catch (Exception exception)
-                {
-                    cleanupFailures.Add(exception);
+                    try
+                    {
+                        await DropDatabaseCoreAsync(name, CancellationToken.None);
+                        ownedDatabases.TryRemove(name, out _);
+                    }
+                    catch (Exception exception)
+                    {
+                        cleanupFailures.Add(exception);
+                    }
                 }
             }
         }
@@ -69,6 +75,7 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
         await databaseLifecycleGate.WaitAsync(cancellationToken);
         try
         {
+            ThrowIfPoisoned();
             if (!ownedDatabases.TryAdd(name, 0))
                 throw new InvalidOperationException($"SQL diagnostic database '{name}' is already owned by this fixture.");
             await ExecuteDatabaseOperationAsync(
@@ -89,7 +96,7 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
         }
         catch (Exception primaryFailure)
         {
-            if (ownedDatabases.ContainsKey(name))
+            if (!IsPoisoned && ownedDatabases.ContainsKey(name))
             {
                 try
                 {
@@ -120,6 +127,7 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
         await databaseLifecycleGate.WaitAsync(cancellationToken);
         try
         {
+            ThrowIfPoisoned();
             if (!ownedDatabases.ContainsKey(name))
                 throw new InvalidOperationException($"SQL diagnostic database '{name}' is not owned by this fixture.");
             using var pooledConnection = new SqlConnection(connectionString);
@@ -144,22 +152,59 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
         string name,
         string operation,
         string commandText,
-        CancellationToken cancellationToken) =>
-        await SqlServerDiagnosticDatabaseOperation.ExecuteAsync(
-            name,
-            operation,
-            DatabaseOperationTimeout,
-            async operationToken =>
-            {
-                await using var connection = new SqlConnection(ConnectionString);
-                await connection.OpenAsync(operationToken);
-                await using var command = connection.CreateCommand();
-                command.CommandTimeout = checked((int)DatabaseOperationTimeout.TotalSeconds);
-                command.CommandText = commandText;
-                await command.ExecuteNonQueryAsync(operationToken);
-            },
-            diagnosticToken => ReadDatabaseDiagnosticsAsync(name, diagnosticToken),
-            cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        SqlConnection? activeConnection = null;
+        SqlCommand? activeCommand = null;
+        try
+        {
+            await SqlServerDiagnosticDatabaseOperation.ExecuteAsync(
+                name,
+                operation,
+                DatabaseOperationTimeout,
+                DatabaseAbortTimeout,
+                DatabaseDiagnosticTimeout,
+                async operationToken =>
+                {
+                    await using var connection = new SqlConnection(ConnectionString);
+                    activeConnection = connection;
+                    await connection.OpenAsync(operationToken);
+                    await using var command = connection.CreateCommand();
+                    activeCommand = command;
+                    command.CommandTimeout = checked((int)DatabaseOperationTimeout.TotalSeconds);
+                    command.CommandText = commandText;
+                    await command.ExecuteNonQueryAsync(operationToken);
+                },
+                () =>
+                {
+                    try
+                    {
+                        activeCommand?.Cancel();
+                    }
+                    finally
+                    {
+                        activeConnection?.Close();
+                    }
+
+                    return ValueTask.CompletedTask;
+                },
+                diagnosticToken => ReadDatabaseDiagnosticsAsync(name, diagnosticToken),
+                cancellationToken);
+        }
+        catch (SqlServerDiagnosticDatabaseOperationException exception) when (!exception.OperationQuiesced)
+        {
+            Interlocked.Exchange(ref poisoned, 1);
+            throw;
+        }
+    }
+
+    private bool IsPoisoned => Volatile.Read(ref poisoned) != 0;
+
+    private void ThrowIfPoisoned()
+    {
+        if (IsPoisoned)
+            throw new InvalidOperationException("The SQL diagnostic container is poisoned by an operation that did not quiesce and must be disposed.");
+    }
 
     private async Task<string> ReadDatabaseDiagnosticsAsync(string name, CancellationToken cancellationToken)
     {
@@ -197,44 +242,162 @@ public sealed class SqlServerDiagnosticContainer : IAsyncLifetime
 
 internal static class SqlServerDiagnosticDatabaseOperation
 {
-    private static readonly TimeSpan DiagnosticTimeout = TimeSpan.FromSeconds(5);
-
     public static async Task ExecuteAsync(
         string databaseName,
         string operation,
-        TimeSpan timeout,
+        TimeSpan operationTimeout,
+        TimeSpan abortTimeout,
+        TimeSpan diagnosticTimeout,
         Func<CancellationToken, Task> execute,
+        Func<ValueTask> abort,
         Func<CancellationToken, Task<string>> readDiagnostics,
         CancellationToken cancellationToken)
     {
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutSource.CancelAfter(timeout);
+        timeoutSource.CancelAfter(operationTimeout);
+        var executionTask = Task.Run(() => execute(timeoutSource.Token), CancellationToken.None);
+
         try
         {
-            await execute(timeoutSource.Token);
-        }
-        catch (Exception) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
+            await executionTask.WaitAsync(timeoutSource.Token);
         }
         catch (Exception exception)
         {
-            string diagnostics;
-            using var diagnosticSource = new CancellationTokenSource(DiagnosticTimeout);
-            try
+            var quiescence = await QuiesceAsync(executionTask, abort, abortTimeout);
+            if (cancellationToken.IsCancellationRequested && quiescence.OperationQuiesced)
             {
-                diagnostics = await readDiagnostics(diagnosticSource.Token);
-            }
-            catch (Exception diagnosticFailure)
-            {
-                diagnostics = $"diagnostics unavailable ({diagnosticFailure.GetType().Name}: {diagnosticFailure.Message})";
+                AttachAbortFailure(exception, quiescence.AbortFailure);
+                AttachCompletionFailure(exception, quiescence.CompletionFailure);
+                throw;
             }
 
-            throw new InvalidOperationException(
-                $"SQL diagnostic database '{databaseName}' {operation} failed within {timeout}. Server diagnostics: {diagnostics}.",
-                exception);
+            var diagnostics = cancellationToken.IsCancellationRequested
+                ? "diagnostics not collected after caller cancellation because the operation did not quiesce"
+                : await ReadDiagnosticsAsync(readDiagnostics, diagnosticTimeout);
+            var failure = new SqlServerDiagnosticDatabaseOperationException(
+                $"SQL diagnostic database '{databaseName}' {operation} failed " +
+                $"(operation deadline {operationTimeout}; quiesced={quiescence.OperationQuiesced}). " +
+                $"Server diagnostics: {diagnostics}.",
+                quiescence.CompletionFailure ?? exception,
+                quiescence.OperationQuiesced);
+            AttachAbortFailure(failure, quiescence.AbortFailure);
+            throw failure;
         }
     }
+
+    private static async Task<QuiescenceResult> QuiesceAsync(
+        Task executionTask,
+        Func<ValueTask> abort,
+        TimeSpan abortTimeout)
+    {
+        if (executionTask.IsCompleted)
+        {
+            try
+            {
+                await executionTask;
+                return new(true, null, null);
+            }
+            catch (Exception completionFailure)
+            {
+                return new(true, null, completionFailure);
+            }
+        }
+
+        using var abortDeadline = new CancellationTokenSource(abortTimeout);
+        Exception? abortFailure = null;
+        Task? abortTask = null;
+        try
+        {
+            abortTask = Task.Run(async () => await abort(), CancellationToken.None);
+            await abortTask.WaitAsync(abortDeadline.Token);
+        }
+        catch (Exception exception)
+        {
+            abortFailure = abortDeadline.IsCancellationRequested
+                ? new TimeoutException($"SQL diagnostic database abort exceeded {abortTimeout}.", exception)
+                : exception;
+            if (abortTask is { IsCompleted: false })
+                ObserveEventually(abortTask);
+        }
+
+        try
+        {
+            await executionTask.WaitAsync(abortDeadline.Token);
+            return new(true, abortFailure, null);
+        }
+        catch (OperationCanceledException) when (abortDeadline.IsCancellationRequested)
+        {
+            ObserveEventually(executionTask);
+            return new(
+                false,
+                abortFailure ?? new TimeoutException($"SQL diagnostic database operation did not quiesce within {abortTimeout}."),
+                null);
+        }
+        catch (Exception completionFailure)
+        {
+            return new(true, abortFailure, completionFailure);
+        }
+    }
+
+    private static async Task<string> ReadDiagnosticsAsync(
+        Func<CancellationToken, Task<string>> readDiagnostics,
+        TimeSpan diagnosticTimeout)
+    {
+        using var diagnosticDeadline = new CancellationTokenSource(diagnosticTimeout);
+        var diagnosticTask = Task.Run(
+            () => readDiagnostics(diagnosticDeadline.Token),
+            CancellationToken.None);
+
+        try
+        {
+            return await diagnosticTask.WaitAsync(diagnosticDeadline.Token);
+        }
+        catch (OperationCanceledException) when (diagnosticDeadline.IsCancellationRequested)
+        {
+            if (!diagnosticTask.IsCompleted)
+                ObserveEventually(diagnosticTask);
+            return $"diagnostics unavailable (deadline {diagnosticTimeout} exceeded)";
+        }
+        catch (Exception exception)
+        {
+            return UnavailableDiagnostics(exception);
+        }
+    }
+
+    private static string UnavailableDiagnostics(Exception exception) =>
+        $"diagnostics unavailable ({exception.GetType().Name}: {exception.Message})";
+
+    private static void AttachAbortFailure(Exception target, Exception? abortFailure)
+    {
+        if (abortFailure is not null)
+            target.Data["Groundwork.Tests.SqlServerDiagnosticDatabaseAbortFailure"] = abortFailure;
+    }
+
+    private static void AttachCompletionFailure(Exception target, Exception? completionFailure)
+    {
+        if (completionFailure is not null && !ReferenceEquals(target, completionFailure))
+            target.Data["Groundwork.Tests.SqlServerDiagnosticDatabaseCompletionFailure"] = completionFailure;
+    }
+
+    private static void ObserveEventually(Task task) =>
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+    private sealed record QuiescenceResult(
+        bool OperationQuiesced,
+        Exception? AbortFailure,
+        Exception? CompletionFailure);
+}
+
+internal sealed class SqlServerDiagnosticDatabaseOperationException(
+    string message,
+    Exception innerException,
+    bool operationQuiesced) : InvalidOperationException(message, innerException)
+{
+    public bool OperationQuiesced { get; } = operationQuiesced;
 }
 
 [CollectionDefinition(PostgreSqlDiagnosticRecordCollection.Name, DisableParallelization = true)]
