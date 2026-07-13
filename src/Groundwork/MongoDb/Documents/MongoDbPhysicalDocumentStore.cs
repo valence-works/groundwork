@@ -195,7 +195,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 storage,
                 () => ResolveScope(Unit(route.StorageUnit.Value), StorageScopeOperation.Query, allowAcrossScopes: true),
                 linkedPlans.Select(Certification).ToArray(),
-                capabilities.NativeFieldIdentifiers),
+                capabilities.NativeFieldIdentifiers,
+                options,
+                timeProvider,
+                hooks),
             new MongoDbPhysicalQueryHandler(
                 MongoDbPhysicalQueryHandler.NativeIdentity,
                 PhysicalQuerySourceKind.NativeDocumentFields,
@@ -204,7 +207,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 storage,
                 () => ResolveScope(Unit(route.StorageUnit.Value), StorageScopeOperation.Query, allowAcrossScopes: true),
                 nativePlans.Select(Certification).ToArray(),
-                capabilities.NativeFieldIdentifiers)
+                capabilities.NativeFieldIdentifiers,
+                options,
+                timeProvider,
+                hooks)
         };
         return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
     }
@@ -407,6 +413,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     {
         var retryStarted = timeProvider.GetTimestamp();
         MongoException? unknownCommitResult = null;
+        var commitWasInvoked = false;
         try
         {
             for (var attempt = 1; ; attempt++)
@@ -415,7 +422,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 try
                 {
                     await hooks.CommitStarting(session, attempt, cancellationToken);
-                    await session.CommitTransactionAsync(cancellationToken);
+                    commitWasInvoked = true;
+                    var commit = session.CommitTransactionAsync(cancellationToken);
+                    await hooks.CommitInvoked(session, attempt, cancellationToken);
+                    await commit;
                     return;
                 }
                 catch (MongoException exception)
@@ -447,7 +457,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 }
             }
         }
-        catch (OperationCanceledException exception) when (unknownCommitResult is not null)
+        catch (OperationCanceledException exception) when (commitWasInvoked)
+        {
+            throw new DocumentCommitAcknowledgementUncertainException(documentKinds, exception);
+        }
+        catch (TimeoutException exception) when (commitWasInvoked)
         {
             throw new DocumentCommitAcknowledgementUncertainException(documentKinds, exception);
         }
@@ -462,7 +476,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         return Task.Delay(Random.Shared.Next(1, maximumDelay + 1), cancellationToken);
     }
 
-    private static bool IsTransientTransactionConflict(MongoException exception) =>
+    internal static bool IsTransientTransactionConflict(MongoException exception) =>
         exception.HasErrorLabel("TransientTransactionError") ||
         exception switch
         {
@@ -490,7 +504,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private static bool IsTransientTransactionConflictCode(int? code) =>
         code is 112 or 244 or 251;
 
-    private static async Task AbortTransactionIgnoringFailureAsync(IClientSessionHandle session)
+    internal static async Task AbortTransactionIgnoringFailureAsync(IClientSessionHandle session)
     {
         if (!session.IsInTransaction)
             return;
@@ -821,6 +835,12 @@ internal sealed record MongoDbPhysicalDocumentStoreExecutionHooks(
     Func<IClientSessionHandle, int, CancellationToken, ValueTask> CommitRetryDelayStarting,
     Func<IClientSessionHandle, int, CancellationToken, ValueTask> CommitRetryDelayCompleted)
 {
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> CommitInvoked { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryPageRead { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
     public static MongoDbPhysicalDocumentStoreExecutionHooks None { get; } = new(
         static (_, _, _) => ValueTask.CompletedTask,
         static (_, _, _) => ValueTask.CompletedTask,
@@ -839,6 +859,9 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     private readonly ExecutableStorageRoute route;
     private readonly StorageUnitPhysicalStorage storage;
     private readonly Func<DocumentScopeSelection> scope;
+    private readonly MongoDbPhysicalDocumentStoreOptions options;
+    private readonly TimeProvider timeProvider;
+    private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
 
     public MongoDbPhysicalQueryHandler(
         string identity,
@@ -848,7 +871,10 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         StorageUnitPhysicalStorage storage,
         Func<DocumentScopeSelection> scope,
         IReadOnlyList<PhysicalQueryHandlerCertification> certifications,
-        IReadOnlyDictionary<string, string> nativeFieldIdentifiers)
+        IReadOnlyDictionary<string, string> nativeFieldIdentifiers,
+        MongoDbPhysicalDocumentStoreOptions options,
+        TimeProvider timeProvider,
+        MongoDbPhysicalDocumentStoreExecutionHooks hooks)
     {
         Identity = identity;
         Source = source;
@@ -856,6 +882,9 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         this.route = route;
         this.storage = storage;
         this.scope = scope;
+        this.options = options;
+        this.timeProvider = timeProvider;
+        this.hooks = hooks;
         Certifications = Array.AsReadOnly(certifications.ToArray());
         NativeFieldIdentifiers = source == PhysicalQuerySourceKind.NativeDocumentFields
             ? nativeFieldIdentifiers.ToFrozenDictionary(StringComparer.Ordinal)
@@ -880,16 +909,48 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     {
         var collection = database.GetCollection<BsonDocument>(plan.LookupObject.Identifier);
         var filter = BuildFilter(query, plan, scope(), storage, route);
-        var total = await collection.CountDocumentsAsync(filter, cancellationToken: cancellationToken);
-        if (total == 0 || query.Take == 0)
-            return new DocumentQueryResult([], total);
-        var find = collection.Find(filter).Sort(BuildSort(query, plan)).Skip(query.Skip ?? 0);
-        if (query.Take is { } take) find = find.Limit(take);
-        var found = await find.ToListAsync(cancellationToken);
-        var documents = plan.RequiresPrimaryLookup
-            ? await LoadPrimaryAsync(found, cancellationToken)
-            : found.Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
-        return new DocumentQueryResult(documents, total);
+        var started = timeProvider.GetTimestamp();
+        for (var attempt = 1; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
+            session.StartTransaction(new TransactionOptions(ReadConcern.Snapshot));
+            try
+            {
+                var total = await collection.CountDocumentsAsync(session, filter, cancellationToken: cancellationToken);
+                if (total == 0 || query.Take == 0)
+                {
+                    await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                    return new DocumentQueryResult([], total);
+                }
+                var find = collection.Find(session, filter).Sort(BuildSort(query, plan)).Skip(query.Skip ?? 0);
+                if (query.Take is { } take) find = find.Limit(take);
+                var found = await find.ToListAsync(cancellationToken);
+                await hooks.QueryPageRead(session, attempt, cancellationToken);
+                var documents = plan.RequiresPrimaryLookup
+                    ? await LoadPrimaryAsync(session, found, cancellationToken)
+                    : found.Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
+                await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                return new DocumentQueryResult(documents, total);
+            }
+            catch (MongoException exception) when (
+                MongoDbPhysicalDocumentStore.IsTransientTransactionConflict(exception) &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                if (attempt >= options.MaximumTransactionAttempts ||
+                    timeProvider.GetElapsedTime(started) >= options.TransactionRetryTimeout)
+                {
+                    throw;
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(100, 2 << Math.Min(attempt, 5))), cancellationToken);
+            }
+            catch
+            {
+                await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                throw;
+            }
+        }
     }
 
     public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
@@ -965,6 +1026,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     }
 
     private async Task<IReadOnlyList<DocumentEnvelope>> LoadPrimaryAsync(
+        IClientSessionHandle session,
         IReadOnlyList<BsonDocument> linked,
         CancellationToken cancellationToken)
     {
@@ -980,14 +1042,16 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                                          Builders<BsonDocument>.Filter.Eq(route.Envelope.DocumentKind.Identifier, key[route.Envelope.DocumentKind.Identifier]) &
                                          Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, key[route.Envelope.StorageScope.Identifier]));
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .Find(Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);
+            .Find(session, Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);
         var byKey = primary.ToDictionary(document => Key(document, route.Envelope.Id.Identifier, route.Envelope.StorageScope.Identifier));
         return linked.Select(document => byKey[Key(document, rel.DocumentId.Identifier, rel.StorageScope.Identifier)])
             .Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
     }
 
-    private static string Key(BsonDocument document, string id, string scope) =>
-        $"{document[scope].AsString}\u001f{document[id].AsString}";
+    private static DocumentIdentity Key(BsonDocument document, string id, string scope) =>
+        new(document[scope].AsString, document[id].AsString);
+
+    private readonly record struct DocumentIdentity(string Scope, string Id);
 
     private static FilterDefinition<BsonDocument> Comparison(
         DocumentQueryComparison comparison,
@@ -1008,7 +1072,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             QueryComparisonOperator.NotEqual => Builders<BsonDocument>.Filter.Ne(field, value),
             QueryComparisonOperator.In => comparison.Values.Count == 0
                 ? Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true)
-                : Builders<BsonDocument>.Filter.In(field, comparison.Values.Select(ToValue)),
+                : Builders<BsonDocument>.Filter.In(field, comparison.Values.Select(ToValue).ToArray()),
             QueryComparisonOperator.Contains => Builders<BsonDocument>.Filter.Regex(field, new BsonRegularExpression(Regex.Escape(comparison.Values[0]!), "i")),
             QueryComparisonOperator.StartsWith => Builders<BsonDocument>.Filter.Regex(field, new BsonRegularExpression("^" + Regex.Escape(comparison.Values[0]!), "i")),
             QueryComparisonOperator.GreaterThan => Builders<BsonDocument>.Filter.Gt(field, value),
@@ -1022,13 +1086,22 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     private static BsonValue ToLogicalValue(IndexValueKind kind, string? value)
     {
         if (value is null) return BsonNull.Value;
-        return kind switch
+        try
         {
-            IndexValueKind.Number => new BsonDecimal128(Decimal128.Parse(value)),
-            IndexValueKind.Boolean when bool.TryParse(value, out var boolean) => boolean,
-            IndexValueKind.DateTime => throw new InvalidOperationException(
-                "MongoDB exact DateTime queries require a typed projected field."),
-            _ => value
-        };
+            return kind switch
+            {
+                IndexValueKind.Number => new BsonDecimal128(Decimal128.Parse(value)),
+                IndexValueKind.Boolean => bool.Parse(value),
+                IndexValueKind.DateTime => throw new InvalidOperationException(
+                    "MongoDB exact DateTime queries require a typed projected field."),
+                _ => value
+            };
+        }
+        catch (Exception exception) when (exception is FormatException or OverflowException)
+        {
+            throw new InvalidDataException(
+                $"MongoDB query value '{value}' cannot be converted to logical value kind '{kind}'.",
+                exception);
+        }
     }
 }

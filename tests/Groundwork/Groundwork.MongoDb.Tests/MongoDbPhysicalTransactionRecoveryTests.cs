@@ -461,6 +461,53 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Cancellation_after_initial_commit_invocation_is_acknowledgement_uncertain()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = Store(database, model, hooks: Hooks(commitInvoked: (_, _, _) =>
+        {
+            cancellation.Cancel();
+            return ValueTask.CompletedTask;
+        }));
+
+        var exception = await Assert.ThrowsAsync<DocumentCommitAcknowledgementUncertainException>(() =>
+            store.SaveAsync(new SaveDocumentRequest(
+                "workItem", "cancel-invoked", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0),
+                cancellation.Token));
+
+        Assert.Equal(["workItem"], exception.DocumentKinds);
+    }
+
+    [Fact]
+    public async Task Cancellation_before_initial_commit_invocation_remains_ordinary_cancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var commitInvoked = false;
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = Store(database, model, hooks: Hooks(
+            commit: (_, _, _) =>
+            {
+                cancellation.Cancel();
+                return ValueTask.FromCanceled(cancellation.Token);
+            },
+            commitInvoked: (_, _, _) =>
+            {
+                commitInvoked = true;
+                return ValueTask.CompletedTask;
+            }));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "cancel-before-invocation", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0),
+            cancellation.Token));
+        Assert.False(commitInvoked);
+    }
+
+    [Fact]
     public async Task Explicit_unit_of_work_transient_failure_is_structured_terminal_and_rolls_back_prior_write()
     {
         var database = Database();
@@ -529,6 +576,7 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
     private static MongoDbPhysicalDocumentStoreExecutionHooks Hooks(
         Func<IClientSessionHandle, int, CancellationToken, ValueTask>? body = null,
         Func<IClientSessionHandle, int, CancellationToken, ValueTask>? commit = null,
+        Func<IClientSessionHandle, int, CancellationToken, ValueTask>? commitInvoked = null,
         Func<IClientSessionHandle, int, MongoException, CancellationToken, ValueTask>? unknown = null,
         Func<IClientSessionHandle, int, CancellationToken, ValueTask>? beforeCommitRetryDelay = null,
         Func<IClientSessionHandle, int, CancellationToken, ValueTask>? commitRetryDelayCompleted = null) =>
@@ -537,7 +585,10 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
             commit ?? ((_, _, _) => ValueTask.CompletedTask),
             unknown ?? ((_, _, _, _) => ValueTask.CompletedTask),
             beforeCommitRetryDelay ?? ((_, _, _) => ValueTask.CompletedTask),
-            commitRetryDelayCompleted ?? ((_, _, _) => ValueTask.CompletedTask));
+            commitRetryDelayCompleted ?? ((_, _, _) => ValueTask.CompletedTask))
+        {
+            CommitInvoked = commitInvoked ?? ((_, _, _) => ValueTask.CompletedTask)
+        };
 
     private static async Task AssertTerminalAsync(IDocumentUnitOfWork transaction)
     {

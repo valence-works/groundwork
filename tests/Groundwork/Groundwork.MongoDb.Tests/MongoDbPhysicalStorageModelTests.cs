@@ -3,7 +3,9 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Queries;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Bson;
@@ -87,6 +89,40 @@ public sealed class MongoDbPhysicalStorageModelTests
 
         Assert.NotEqual(logicalName, normalized);
         Assert.InRange(Encoding.UTF8.GetByteCount(normalized), 1, 120);
+    }
+
+    [Fact]
+    public void Provider_normalization_truncates_unicode_letters_by_UTF8_bytes()
+    {
+        var logicalName = string.Concat(Enumerable.Repeat("界", 100));
+
+        var normalized = MongoDbPhysicalNameNormalizer.Instance.Normalize(new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("workItem"),
+            PhysicalObjectKind.PhysicalIndex,
+            logicalName));
+
+        Assert.NotEqual(logicalName, normalized);
+        Assert.InRange(Encoding.UTF8.GetByteCount(normalized), 1, 120);
+        Assert.EndsWith("_57c42d71b2a0", normalized, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Provider_normalization_is_stable_and_collision_resistant_for_mixed_and_combining_unicode()
+    {
+        var names = new[]
+        {
+            string.Concat(Enumerable.Repeat("界A", 80)),
+            string.Concat(Enumerable.Repeat("e\u0301", 100)),
+            string.Concat(Enumerable.Repeat("界A", 79)) + "B"
+        };
+        var normalized = names.Select(name => MongoDbPhysicalNameNormalizer.Instance.Normalize(
+            new ProviderPhysicalNameContext(new StorageUnitIdentity("workItem"), PhysicalObjectKind.PhysicalIndex, name)))
+            .ToArray();
+
+        Assert.All(normalized, name => Assert.InRange(Encoding.UTF8.GetByteCount(name), 1, 120));
+        Assert.Equal(normalized, names.Select(name => MongoDbPhysicalNameNormalizer.Instance.Normalize(
+            new ProviderPhysicalNameContext(new StorageUnitIdentity("workItem"), PhysicalObjectKind.PhysicalIndex, name))));
+        Assert.Equal(normalized.Length, normalized.Distinct(StringComparer.Ordinal).Count());
     }
 
     [Theory]
@@ -250,6 +286,27 @@ public sealed class MongoDbPhysicalStorageModelTests
         Assert.DoesNotContain(publicStatic, method => method.Name is "Resolve" or "Normalize");
     }
 
+    [Theory]
+    [InlineData(QueryComparisonOperator.Equal)]
+    [InlineData(QueryComparisonOperator.In)]
+    public async Task Native_boolean_query_rejects_an_invalid_lexical_value_before_database_traffic(
+        QueryComparisonOperator comparisonOperator)
+    {
+        var model = NativeBooleanModel();
+        var database = new MongoClient("mongodb://localhost/?serverSelectionTimeoutMS=10")
+            .GetDatabase("groundwork_invalid_boolean");
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        var comparison = comparisonOperator == QueryComparisonOperator.In
+            ? DocumentQueryComparison.In("enabled", ["true", "not-a-boolean"])
+            : DocumentQueryComparison.Equal("enabled", "not-a-boolean");
+        await Assert.ThrowsAsync<InvalidDataException>(() => store.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-enabled", [DocumentQueryClause.Of(comparison)])));
+    }
+
     private static StorageManifest Manifest()
     {
         var shared = new SharedStorageBinding("runtime");
@@ -293,4 +350,36 @@ public sealed class MongoDbPhysicalStorageModelTests
                 StorageUnitProvisioningMode.Declared,
                 PhysicalStoragePolicy.Explicit(definition))
         };
+
+    private static MongoDbPhysicalStorageModel NativeBooleanModel()
+    {
+        var logical = new LogicalIndexDeclaration(
+            "by-enabled",
+            [new IndexField("enabled")],
+            IndexValueKind.Boolean,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-enabled",
+            logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.In },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.Ordinary);
+        var unit = Unit("workItem", PhysicalTableDefinition.DedicatedDocumentTable("work_items")) with
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(PhysicalTableDefinition.DedicatedDocumentTable("work_items")),
+                [logical],
+                [query])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.native-boolean"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
 }

@@ -356,7 +356,24 @@ public sealed class PhysicalQueryPlanCompilerTests
         Assert.Equal(PhysicalQueryFieldSource.NativeDocumentField, Assert.Single(plan.Predicates).Field.Source);
         Assert.Equal("content.stimulusType", Assert.Single(plan.Predicates).Field.Identifier);
         Assert.Equal("storage_scope", plan.Scope.Field.Identifier);
-        Assert.Equal("_id.id", Assert.Single(plan.Order, order => order.IsIdentityTieBreak).Field.Identifier);
+        Assert.Collection(
+            plan.Order.Where(order => order.IsIdentityTieBreak),
+            order => Assert.Equal("storage_scope", order.Field.Identifier),
+            order => Assert.Equal("_id.id", order.Field.Identifier));
+    }
+
+    [Fact]
+    public void Global_route_uses_only_id_as_the_structural_identity_tie_break()
+    {
+        var scoped = CreateFixture(PhysicalStorageForm.DedicatedDocumentTable, BoundedQueryExecutionClass.Ordinary);
+        var global = Resolve(scoped.Storage, binding: null, TenancyPolicy.Global);
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            global.Route,
+            global.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson)));
+
+        Assert.Equal("id", Assert.Single(plan.Order, order => order.IsIdentityTieBreak).Path);
     }
 
     [Fact]
@@ -730,6 +747,12 @@ public sealed class PhysicalQueryPlanCompilerTests
                 Assert.Equal("createdAt", order.Path);
                 Assert.Equal(PhysicalSortDirection.Descending, order.Direction);
                 Assert.False(order.IsIdentityTieBreak);
+            },
+            order =>
+            {
+                Assert.Equal("storageScope", order.Path);
+                Assert.Equal(PhysicalSortDirection.Ascending, order.Direction);
+                Assert.True(order.IsIdentityTieBreak);
             },
             order =>
             {
@@ -1230,12 +1253,16 @@ public sealed class PhysicalQueryPlanCompilerTests
             Precision: type == PortablePhysicalType.Decimal ? 18 : null,
             Scale: type == PortablePhysicalType.Decimal ? 4 : null);
 
-    private static PlanningFixture Resolve(StorageUnitPhysicalStorage storage, SharedStorageBinding? binding)
+    private static PlanningFixture Resolve(
+        StorageUnitPhysicalStorage storage,
+        SharedStorageBinding? binding,
+        TenancyPolicy? tenancy = null)
     {
         var template = SampleManifests.MetadataManifest();
         var unit = template.StorageUnits.Single() with
         {
             Identity = new StorageUnitIdentity("workflowTriggerBinding"),
+            Tenancy = tenancy ?? template.StorageUnits.Single().Tenancy,
             PhysicalStorage = storage
         };
         var manifest = template with

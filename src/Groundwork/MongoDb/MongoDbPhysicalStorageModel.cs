@@ -154,8 +154,31 @@ public sealed class MongoDbPhysicalNameNormalizer : IProviderPhysicalNameNormali
                       (!isCollection && (name.Contains('.', StringComparison.Ordinal) || name.StartsWith('$'))) ||
                       (isCollection && (name.Contains('$', StringComparison.Ordinal) || name.StartsWith("system.", StringComparison.Ordinal)));
         return invalid || Encoding.UTF8.GetByteCount(name) > maximum
-            ? PhysicalizationNameEncoder.Encode(name, maximum)
+            ? EncodeWithinUtf8Budget(name, maximum)
             : name;
+    }
+
+    private static string EncodeWithinUtf8Budget(string name, int maximumBytes)
+    {
+        var encoded = PhysicalizationNameEncoder.Encode(name);
+        if (Encoding.UTF8.GetByteCount(encoded) <= maximumBytes)
+            return encoded;
+
+        const int suffixLength = 13; // '_' plus the stable 12-character hash.
+        var suffix = encoded[^suffixLength..];
+        var prefixBudget = maximumBytes - Encoding.UTF8.GetByteCount(suffix);
+        var prefix = new StringBuilder();
+        var usedBytes = 0;
+        foreach (var rune in encoded[..^suffixLength].EnumerateRunes())
+        {
+            if (usedBytes + rune.Utf8SequenceLength > prefixBudget)
+                break;
+            prefix.Append(rune);
+            usedBytes += rune.Utf8SequenceLength;
+        }
+
+        var readable = prefix.ToString().TrimEnd('_');
+        return $"{readable}{suffix}";
     }
 
     public string GetCollisionScope(ProviderPhysicalNameContext context) => context.ObjectKind switch

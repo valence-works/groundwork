@@ -77,7 +77,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         {
             cancellationToken.ThrowIfCancellationRequested();
             var now = timeProvider.GetUtcNow();
-            var filter = Builders<BsonDocument>.Filter.Eq("_id", target.ToString()) &
+            var filter = Builders<BsonDocument>.Filter.Eq("_id", TargetIdentityDocument(target)) &
                          Builders<BsonDocument>.Filter.Lte("expires_at", now.UtcDateTime);
             var update = Builders<BsonDocument>.Update
                 .Set("owner", owner)
@@ -127,7 +127,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         var lease = RequireLease(applicationLock, target);
         await lease.AssertOwnedAsync(session: null, cancellationToken);
         var state = await database.GetCollection<BsonDocument>(AppliedStateCollection)
-            .Find(Builders<BsonDocument>.Filter.Eq("_id", target.ToString()))
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", TargetIdentityDocument(target)))
             .SingleOrDefaultAsync(cancellationToken);
         if (state is not null)
         {
@@ -180,7 +180,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         var evidence = new BsonDocument
         {
             ["_id"] = evidenceIdentity,
-            ["target_id"] = target.ToString(),
+            ["target_id"] = TargetIdentityDocument(target),
             ["operation_id"] = operation.Identity,
             ["fingerprint"] = operation.Fingerprint,
             ["kind"] = operation.Kind.ToString(),
@@ -239,7 +239,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         CancellationToken cancellationToken)
     {
         var document = await database.GetCollection<BsonDocument>(AppliedStateCollection)
-            .Find(Builders<BsonDocument>.Filter.Eq("_id", target.ToString()))
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", TargetIdentityDocument(target)))
             .SingleOrDefaultAsync(cancellationToken);
         if (document is null)
             return false;
@@ -257,14 +257,15 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(state);
-        var target = new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name).ToString();
-        var lease = RequireLease(applicationLock, new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name));
+        var targetIdentity = new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name);
+        var target = TargetIdentityDocument(targetIdentity);
+        var lease = RequireLease(applicationLock, targetIdentity);
         if (beforeAppliedStateWrite is not null)
             await beforeAppliedStateWrite(cancellationToken);
         var collection = database.GetCollection<BsonDocument>(AppliedStateCollection);
         var filter = Builders<BsonDocument>.Filter.Eq("_id", target);
         filter &= expectedAppliedTargetFingerprint is null
-            ? Builders<BsonDocument>.Filter.Exists("_id", false)
+            ? Builders<BsonDocument>.Filter.Exists("target_fingerprint", false)
             : Builders<BsonDocument>.Filter.Eq("target_fingerprint", expectedAppliedTargetFingerprint);
         var replacement = new BsonDocument
         {
@@ -311,7 +312,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         await session.AbortTransactionAsync(CancellationToken.None);
 
         throw new InvalidOperationException(
-            $"MongoDB applied physical-schema state for '{target}' changed since fingerprint '{expectedAppliedTargetFingerprint ?? "<empty>"}'.");
+            $"MongoDB applied physical-schema state for '{targetIdentity}' changed since fingerprint '{expectedAppliedTargetFingerprint ?? "<empty>"}'.");
     }
 
     private async Task ExecuteAsync(PhysicalSchemaOperation operation, CancellationToken cancellationToken)
@@ -375,12 +376,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             new ListCollectionsOptions { Filter = Builders<BsonDocument>.Filter.Eq("name", name) },
             cancellationToken);
         var existing = (await cursor.ToListAsync(cancellationToken)).Single();
-        var options = existing.GetValue("options", new BsonDocument()).AsBsonDocument;
-        if (options.TryGetValue("collation", out var collation) &&
-            collation.AsBsonDocument.GetValue("locale", "simple").AsString != "simple")
-        {
-            throw new InvalidOperationException($"MongoDB collection '{name}' must use simple binary collation.");
-        }
+        ValidateWritableCollection(name, existing, "resolved physical route");
     }
 
     private async Task EnsureIndexAsync(CreatePhysicalIndexOperation operation, CancellationToken cancellationToken)
@@ -461,13 +457,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                     $"MongoDB collection '{storageName}' required by durable applied route state is missing.");
             }
 
-            var options = collection.GetValue("options", new BsonDocument()).AsBsonDocument;
-            if (options.TryGetValue("collation", out var collation) &&
-                collation.AsBsonDocument.GetValue("locale", "simple").AsString != "simple")
-            {
-                throw new InvalidOperationException(
-                    $"MongoDB collection '{storageName}' conflicts with durable applied route state because it does not use simple binary collation.");
-            }
+            ValidateWritableCollection(storageName, collection, "durable applied route state");
         }
 
         foreach (var operation in state.AppliedOperations.Where(operation =>
@@ -781,15 +771,20 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
     private async Task ValidateAsync(ValidatePhysicalSchemaOperation operation, CancellationToken cancellationToken)
     {
-        var names = (await (await database.ListCollectionNamesAsync(cancellationToken: cancellationToken))
-            .ToListAsync(cancellationToken)).ToHashSet(StringComparer.Ordinal);
+        using var collectionCursor = await database.ListCollectionsAsync(cancellationToken: cancellationToken);
+        var collections = (await collectionCursor.ToListAsync(cancellationToken))
+            .ToDictionary(collection => collection.GetValue("name").AsString, StringComparer.Ordinal);
         foreach (var route in operation.Routes)
         {
-            if (!names.Contains(route.PrimaryStorage.Name.Identifier) ||
-                route.LinkedIndexStorage is not null && !names.Contains(route.LinkedIndexStorage.Name.Identifier))
+            var storageTargets = new[] { route.PrimaryStorage }
+                .Concat(route.LinkedIndexStorage is null ? [] : [route.LinkedIndexStorage])
+                .ToArray();
+            if (storageTargets.Any(target => !collections.ContainsKey(target.Name.Identifier)))
             {
                 throw new InvalidOperationException($"MongoDB physical route '{route.StorageUnit.Value}' is missing a resolved collection.");
             }
+            foreach (var target in storageTargets)
+                ValidateWritableCollection(target.Name.Identifier, collections[target.Name.Identifier], "resolved physical route");
 
             foreach (var index in route.Indexes)
             {
@@ -810,6 +805,26 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                         $"MongoDB index '{index.Name.Identifier}' on collection '{storage.Name.Identifier}' conflicts with the resolved physical route.");
                 }
             }
+        }
+    }
+
+    private static void ValidateWritableCollection(
+        string name,
+        BsonDocument metadata,
+        string evidenceSource)
+    {
+        var type = metadata.GetValue("type", "").AsString;
+        var options = metadata.GetValue("options", new BsonDocument()).AsBsonDocument;
+        if (type != "collection" || options.Contains("timeseries") || options.Contains("viewOn"))
+        {
+            throw new InvalidOperationException(
+                $"MongoDB collection '{name}' conflicts with {evidenceSource} because it is not a writable native collection.");
+        }
+        if (options.TryGetValue("collation", out var collation) &&
+            collation.AsBsonDocument.GetValue("locale", "simple").AsString != "simple")
+        {
+            throw new InvalidOperationException(
+                $"MongoDB collection '{name}' conflicts with {evidenceSource} because it does not use simple binary collation.");
         }
     }
 
@@ -839,8 +854,15 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         string operationIdentity) =>
         new()
         {
-            ["target"] = target.ToString(),
+            ["target"] = TargetIdentityDocument(target),
             ["operation"] = operationIdentity
+        };
+
+    internal static BsonDocument TargetIdentityDocument(PhysicalSchemaTargetIdentity target) =>
+        new()
+        {
+            ["provider"] = target.ProviderName,
+            ["manifest"] = target.ManifestIdentity.Value
         };
 
     internal static TimeSpan LeaseRenewalInterval(TimeSpan duration) =>
@@ -967,7 +989,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
         private FilterDefinition<BsonDocument> OwnershipFilter(bool requireUnexpired)
         {
-            var filter = Builders<BsonDocument>.Filter.Eq("_id", Target.ToString()) &
+            var filter = Builders<BsonDocument>.Filter.Eq("_id", TargetIdentityDocument(Target)) &
                          Builders<BsonDocument>.Filter.Eq("owner", owner) &
                          Builders<BsonDocument>.Filter.Eq("fence", fence);
             if (requireUnexpired)
