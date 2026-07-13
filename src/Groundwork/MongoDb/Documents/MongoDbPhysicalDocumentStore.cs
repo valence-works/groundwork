@@ -789,6 +789,84 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         StorageScopeOperation operation) =>
         (Route(documentKind), ResolveScope(Unit(documentKind), operation));
 
+    internal IMongoDatabase Database => database;
+
+    internal string ManifestIdentity => model.Manifest.Identity.Value;
+
+    internal ProviderIdentity Provider => model.Provider;
+
+    internal ExecutableStorageRoute GetRoute(string documentKind) => Route(documentKind);
+
+    internal DocumentScopeSelection ResolveMutationScope(string documentKind) =>
+        ResolveScope(Unit(documentKind), StorageScopeOperation.Mutate);
+
+    internal PhysicalQueryPlannerCapabilities GetMutationCapabilities(
+        ExecutableStorageRoute route,
+        StorageUnitPhysicalStorage storage) =>
+        Capabilities(route, storage);
+
+    internal async Task<T> ExecutePhysicalMutationAsync<T>(
+        string documentKind,
+        Func<IClientSessionHandle, CancellationToken, Task<T>> action,
+        Func<CancellationToken, ValueTask>? beforeCommit,
+        Func<CancellationToken, ValueTask>? afterCommitBeforeAcknowledgement,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        await transactionCapability.EnsureSupportedAsync(
+            [documentKind],
+            "physical bounded mutation",
+            cancellationToken);
+        var retryStarted = timeProvider.GetTimestamp();
+        for (var attempt = 1; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var session = await startSessionAsync(cancellationToken);
+            session.StartTransaction(new TransactionOptions(
+                ReadConcern.Snapshot,
+                writeConcern: WriteConcern.WMajority));
+            try
+            {
+                await hooks.TransactionBodyStarting(session, attempt, cancellationToken);
+                var result = await action(session, cancellationToken);
+                if (beforeCommit is not null)
+                    await beforeCommit(cancellationToken);
+                await CommitWithRetryAsync(session, [documentKind], cancellationToken);
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(cancellationToken);
+                return result;
+            }
+            catch (MongoException exception) when (
+                !cancellationToken.IsCancellationRequested &&
+                (IsDuplicateKey(exception) || IsTransientTransactionConflict(exception)))
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                if (!CanRetry(
+                        attempt,
+                        retryStarted,
+                        options.MaximumTransactionAttempts,
+                        options.TransactionRetryTimeout))
+                {
+                    throw;
+                }
+                await DelayBeforeRetryAsync(attempt, cancellationToken);
+                if (timeProvider.GetElapsedTime(retryStarted) >= options.TransactionRetryTimeout)
+                    throw;
+            }
+            catch (DocumentCommitAcknowledgementUncertainException)
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                throw;
+            }
+            catch
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
+        }
+    }
+
     private static StorageScopePolicy ScopePolicy(StorageUnit unit) =>
         unit.Tenancy.Kind == TenancyKind.Scoped ? StorageScopePolicy.Scoped : StorageScopePolicy.Global;
 

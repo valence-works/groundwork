@@ -201,6 +201,7 @@ internal static class MongoDbPhysicalStorageFields
     public const string UpdatedAt = "_groundwork_updated_at";
     public const string Incarnation = "_groundwork_incarnation";
     public const string LinkedPrimaryVersion = "_groundwork_primary_version";
+    public const string BoundedMutationOperationsCollection = "groundwork_bounded_mutation_operations";
 
     public static IReadOnlySet<string> PrimaryReserved { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
@@ -224,6 +225,7 @@ internal static class MongoDbPhysicalStorageFields
         "groundwork_physical_schema_state",
         "groundwork_physical_schema_operations",
         "groundwork_physical_schema_locks",
+        BoundedMutationOperationsCollection,
         "groundwork_diagnostic_records",
         "groundwork_diagnostic_streams",
         "groundwork_diagnostic_append_operations",

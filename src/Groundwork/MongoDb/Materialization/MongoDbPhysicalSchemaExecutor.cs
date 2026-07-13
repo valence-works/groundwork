@@ -417,6 +417,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         await EnsureCollectionAsync(AppliedStateCollection, cancellationToken);
         await EnsureCollectionAsync(OperationCollection, cancellationToken);
         await EnsureCollectionAsync(LockCollection, cancellationToken);
+        await EnsureCollectionAsync(MongoDbPhysicalStorageFields.BoundedMutationOperationsCollection, cancellationToken);
     }
 
     private async Task EnsureCollectionAsync(string name, CancellationToken cancellationToken)
