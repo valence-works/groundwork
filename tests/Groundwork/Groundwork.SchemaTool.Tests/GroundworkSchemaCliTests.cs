@@ -239,6 +239,46 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Live_validate_reports_applied_drift_and_pending_desired_diff_without_mutation()
+    {
+        var database = Path.Combine(directory, "drift-with-pending-addition.db");
+        var applyExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var applied = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, applyExit);
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DROP INDEX \"by-category\";";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var validateExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("validate", database, typeof(AdditiveV2ManifestSource)),
+            output,
+            error);
+        using var validation = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, validateExit);
+        Assert.Equal("blocked", validation.RootElement.GetProperty("outcome").GetString());
+        Assert.Contains(
+            validation.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-CLI-012");
+        Assert.Contains(
+            validation.RootElement.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "AddProjectedColumn");
+        Assert.NotNull(validation.RootElement.GetProperty("appliedTargetFingerprint").GetString());
+        Assert.True(validation.RootElement.GetProperty("appliedOperations").GetArrayLength() > 0);
+        Assert.False(await IndexExistsAsync(database, "by-category"));
+        Assert.False(await ColumnExistsAsync(database, "schema_tool_documents", "priority"));
+        Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
     public async Task Apply_requires_exact_destructive_and_semantic_authorization_before_target_operations()
     {
         var database = Path.Combine(directory, "authorization.db");
@@ -520,6 +560,16 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
     }
 
+    private static async Task<bool> ColumnExistsAsync(string database, string table, string column)
+    {
+        await using var connection = new SqliteConnection($"Data Source={database}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = @name;";
+        command.Parameters.AddWithValue("@name", column);
+        return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
+    }
+
     public sealed class TestManifestSource : IPhysicalSchemaManifestSource
     {
         public StorageManifest CreateManifest() => CreateTestManifest();
@@ -539,18 +589,33 @@ public sealed class GroundworkSchemaCliTests : IDisposable
             rebuildMode: ProjectionRebuildMode.SemanticMigrationRequired);
     }
 
+    public sealed class AdditiveV2ManifestSource : IPhysicalSchemaManifestSource
+    {
+        public StorageManifest CreateManifest() => CreateTestManifest(
+            manifestVersion: "2",
+            includePriority: true);
+    }
+
     private static StorageManifest CreateTestManifest(
         PhysicalEvolutionMetadata? evolution = null,
-        ProjectionRebuildMode rebuildMode = ProjectionRebuildMode.FromCanonicalJson)
+        ProjectionRebuildMode rebuildMode = ProjectionRebuildMode.FromCanonicalJson,
+        string manifestVersion = "1",
+        bool includePriority = false)
     {
+        var columns = new List<ProjectedColumnDefinition>
+        {
+            new(
+                "category",
+                "category",
+                PortablePhysicalType.String,
+                IsNullable: false,
+                RebuildMode: rebuildMode)
+        };
+        if (includePriority)
+            columns.Add(new ProjectedColumnDefinition("priority", "priority", PortablePhysicalType.Int32));
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             "schema_tool_documents",
-            [new ProjectedColumnDefinition(
-                    "category",
-                    "category",
-                    PortablePhysicalType.String,
-                    IsNullable: false,
-                    RebuildMode: rebuildMode)],
+            columns,
             indexes:
             [
                 new PhysicalIndexDefinition(
@@ -579,7 +644,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         return new StorageManifest(
                 new StorageManifestIdentity("schema-tool-tests"),
                 new StorageManifestOwner("tests"),
-                new StorageManifestVersion("1"),
+                new StorageManifestVersion(manifestVersion),
                 [unit],
                 new HashSet<string>(),
                 []);

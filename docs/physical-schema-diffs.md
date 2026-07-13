@@ -83,7 +83,10 @@ an operation or recording state; an approval executes that exact plan before rel
 This is the concurrency boundary used by CLI safe/authorized modes and prevents an unlocked
 authorize-then-replan race. Separately, `IPhysicalSchemaHistoryInspector` provides a non-mutating,
 point-in-time history read for live readiness validation. Inspection never authorizes application;
-apply always rereads under the exclusion lease.
+it validates the physical objects described by the durable applied-route snapshot even when the
+desired target fingerprint differs, then reports the desired diff from that same history. Desired
+operations are never inspection input and cannot be executed by validation. Apply always rereads
+under the exclusion lease.
 
 An executor must apply `(operation identity, fingerprint)` idempotently. The same identity with a
 different fingerprint is a conflict. An acknowledgement means the operation is durably observable;

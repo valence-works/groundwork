@@ -101,8 +101,10 @@ Live `validate` is the default. It opens the selected provider, performs a point
 durable applied state, and computes readiness without acquiring the application lock, creating
 Groundwork infrastructure, recording evidence, or changing target objects. `validate --offline` is
 the explicitly separate manifest/route compilation mode and accepts no connection input. Because a
-live validation is intentionally non-locking, deployment still recomputes and authorizes the exact
-plan under the application lock.
+live validation is intentionally non-locking, it validates the physical objects described by the
+recorded applied routes before computing the desired diff. This detects drift in the applied schema
+even when an additive or semantic target change is pending, without executing any pending operation.
+Deployment still recomputes and authorizes the exact plan under the application lock.
 
 `plan` and `status` read durable applied state under the provider/manifest exclusion lock; an
 executor may establish its provider-owned lock/history infrastructure while doing so, but neither

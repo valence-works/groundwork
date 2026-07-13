@@ -73,7 +73,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
         }, cancellationToken);
 
-    public async ValueTask<PhysicalSchemaHistoryState> InspectHistoryAsync(
+    public async ValueTask<PhysicalSchemaInspectionResult> InspectHistoryAsync(
         PhysicalSchemaTarget target,
         CancellationToken cancellationToken)
     {
@@ -94,7 +94,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         }
         catch (SqliteException exception) when (exception.SqliteErrorCode == 14)
         {
-            return PhysicalSchemaHistoryState.Empty;
+            return new PhysicalSchemaInspectionResult(PhysicalSchemaHistoryState.Empty, IsAppliedSchemaValid: true);
         }
         return await ReadAndValidateInspectedHistoryAsync(
             new SqlitePhysicalSchemaExecutor(inspection),
@@ -852,7 +852,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             """, null, ct);
     }
 
-    private static async Task<PhysicalSchemaHistoryState> ReadAndValidateInspectedHistoryAsync(
+    private static async Task<PhysicalSchemaInspectionResult> ReadAndValidateInspectedHistoryAsync(
         SqlitePhysicalSchemaExecutor inspector,
         SqliteConnection inspection,
         PhysicalSchemaTarget target,
@@ -862,7 +862,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         {
             exists.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groundwork_physical_schema_state';";
             if (Convert.ToInt64(await exists.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) == 0)
-                return PhysicalSchemaHistoryState.Empty;
+                return new PhysicalSchemaInspectionResult(PhysicalSchemaHistoryState.Empty, IsAppliedSchemaValid: true);
         }
 
         await using var command = inspection.CreateCommand();
@@ -877,15 +877,23 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         var history = json is null
             ? PhysicalSchemaHistoryState.Empty
             : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
-        if (history.AppliedState?.TargetFingerprint == target.Fingerprint)
+        var isAppliedSchemaValid = true;
+        if (history.AppliedState is { } appliedState)
         {
-            await using var transaction = await inspection.BeginTransactionAsync(cancellationToken);
-            await inspector.ValidateAsync(
-                ValidatePhysicalSchemaOperation.ForTarget(target),
-                transaction,
-                cancellationToken);
+            try
+            {
+                await using var transaction = await inspection.BeginTransactionAsync(cancellationToken);
+                await inspector.ValidateAsync(
+                    ValidatePhysicalSchemaOperation.ForAppliedState(appliedState),
+                    transaction,
+                    cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                isAppliedSchemaValid = false;
+            }
         }
-        return history;
+        return new PhysicalSchemaInspectionResult(history, isAppliedSchemaValid);
     }
 
     private async Task<(string Fingerprint, DateTimeOffset AppliedAt)?> ReadOperationAsync(

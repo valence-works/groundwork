@@ -37,6 +37,8 @@ public sealed class SchemaToolProviderParityTests
             connection,
             database: null,
             () => CountSqlServerInfrastructureAsync(connection),
+            () => DropSqlServerIndexAsync(connection),
+            () => ReadSqlServerIndexStateAsync(connection),
             "Server=127.0.0.1,1;Database=none;User Id=none;Password=provider-secret;Connect Timeout=1;Encrypt=false");
     }
 
@@ -56,6 +58,8 @@ public sealed class SchemaToolProviderParityTests
             connection,
             database: null,
             () => CountPostgreSqlInfrastructureAsync(connection),
+            () => DropPostgreSqlIndexAsync(connection),
+            () => ReadPostgreSqlIndexStateAsync(connection),
             "Host=127.0.0.1;Port=1;Database=none;Username=none;Password=provider-secret;Timeout=1");
     }
 
@@ -74,6 +78,8 @@ public sealed class SchemaToolProviderParityTests
             connection,
             database,
             () => CountMongoDbInfrastructureAsync(connection, database),
+            () => DropMongoDbIndexAsync(connection, database),
+            () => ReadMongoDbIndexStateAsync(connection, database),
             "mongodb://none:provider-secret@127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200");
     }
 
@@ -82,6 +88,8 @@ public sealed class SchemaToolProviderParityTests
         string connection,
         string? database,
         Func<Task<int>> countInfrastructure,
+        Func<Task> driftAppliedSchema,
+        Func<Task<(bool AppliedIndexExists, bool PendingIndexExists)>> readIndexState,
         string failingConnection)
     {
         Assert.Equal(0, await countInfrastructure());
@@ -124,6 +132,26 @@ public sealed class SchemaToolProviderParityTests
         Assert.Equal("ready", statusRestart.Report.GetProperty("outcome").GetString());
         Assert.Equal(SchemaToolExitCodes.Success, applyRestart.ExitCode);
         Assert.Equal("ready", applyRestart.Report.GetProperty("outcome").GetString());
+
+        await driftAppliedSchema();
+        var driftedWithPendingDiff = await RunAsync(
+            "validate",
+            provider,
+            connection,
+            database,
+            typeof(AdditiveManifestSource));
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, driftedWithPendingDiff.ExitCode);
+        Assert.Contains(
+            driftedWithPendingDiff.Report.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-CLI-012");
+        Assert.Contains(
+            driftedWithPendingDiff.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "AddProjectedColumn");
+        Assert.NotNull(driftedWithPendingDiff.Report.GetProperty("appliedTargetFingerprint").GetString());
+        Assert.False(driftedWithPendingDiff.Report.GetProperty("targetMutated").GetBoolean());
+        var indexState = await readIndexState();
+        Assert.False(indexState.AppliedIndexExists);
+        Assert.False(indexState.PendingIndexExists);
 
         var authorizedPlan = await RunAsync(
             "plan",
@@ -229,6 +257,89 @@ public sealed class SchemaToolProviderParityTests
         return names.Count(name => name.StartsWith("groundwork_physical_schema_", StringComparison.Ordinal));
     }
 
+    private static async Task DropSqlServerIndexAsync(string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DROP INDEX [schema_tool_provider_documents-by-category] ON [schema_tool_provider_documents];";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<(bool AppliedIndexExists, bool PendingIndexExists)> ReadSqlServerIndexStateAsync(
+        string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT name
+            FROM sys.indexes
+            WHERE object_id = OBJECT_ID('schema_tool_provider_documents')
+              AND name IN ('schema_tool_provider_documents-by-category', 'schema_tool_provider_documents-by-priority');
+            """;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+        return (
+            names.Contains("schema_tool_provider_documents-by-category"),
+            names.Contains("schema_tool_provider_documents-by-priority"));
+    }
+
+    private static async Task DropPostgreSqlIndexAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DROP INDEX \"schema_tool_provider_documents-by-category\";";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<(bool AppliedIndexExists, bool PendingIndexExists)> ReadPostgreSqlIndexStateAsync(
+        string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname IN ('schema_tool_provider_documents-by-category', 'schema_tool_provider_documents-by-priority');
+            """;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+        return (
+            names.Contains("schema_tool_provider_documents-by-category"),
+            names.Contains("schema_tool_provider_documents-by-priority"));
+    }
+
+    private static async Task DropMongoDbIndexAsync(string connectionString, string database)
+    {
+        var collection = new MongoClient(connectionString)
+            .GetDatabase(database)
+            .GetCollection<MongoDB.Bson.BsonDocument>("schema_tool_provider_documents");
+        await collection.Indexes.DropOneAsync("schema_tool_provider_documents-by-category");
+    }
+
+    private static async Task<(bool AppliedIndexExists, bool PendingIndexExists)> ReadMongoDbIndexStateAsync(
+        string connectionString,
+        string database)
+    {
+        var collection = new MongoClient(connectionString)
+            .GetDatabase(database)
+            .GetCollection<MongoDB.Bson.BsonDocument>("schema_tool_provider_documents");
+        var names = (await (await collection.Indexes.ListAsync()).ToListAsync())
+            .Select(index => index.GetValue("name").AsString)
+            .ToHashSet(StringComparer.Ordinal);
+        return (
+            names.Contains("schema_tool_provider_documents-by-category"),
+            names.Contains("schema_tool_provider_documents-by-priority"));
+    }
+
     public sealed class SafeManifestSource : IPhysicalSchemaManifestSource
     {
         public StorageManifest CreateManifest() => SchemaToolProviderParityTests.CreateManifest(
@@ -246,24 +357,51 @@ public sealed class SchemaToolProviderParityTests
                 SemanticMigrationIdentity: "provider-reclassify-v2"));
     }
 
+    public sealed class AdditiveManifestSource : IPhysicalSchemaManifestSource
+    {
+        public StorageManifest CreateManifest() => SchemaToolProviderParityTests.CreateManifest(
+            "schema-tool-provider-tests",
+            "schema_tool_provider_documents",
+            manifestVersion: "2",
+            includePriority: true);
+    }
+
     private static StorageManifest CreateManifest(
         string identity,
         string table,
-        PhysicalEvolutionMetadata? evolution = null)
+        PhysicalEvolutionMetadata? evolution = null,
+        string manifestVersion = "1",
+        bool includePriority = false)
     {
+        var columns = new List<ProjectedColumnDefinition>
+        {
+            new("category", "category", PortablePhysicalType.String, Length: 128, IsNullable: false)
+        };
+        var indexes = new List<PhysicalIndexDefinition>
+        {
+            new(
+                $"{table}-by-category",
+                [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("category", 1)
+                ],
+                missingValueBehavior: MissingValueBehavior.Excluded)
+        };
+        if (includePriority)
+        {
+            columns.Add(new ProjectedColumnDefinition("priority", "priority", PortablePhysicalType.Int32));
+            indexes.Add(new PhysicalIndexDefinition(
+                $"{table}-by-priority",
+                [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("priority", 1)
+                ],
+                missingValueBehavior: MissingValueBehavior.Excluded));
+        }
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             table,
-            [new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String, Length: 128, IsNullable: false)],
-            indexes:
-            [
-                new PhysicalIndexDefinition(
-                    $"{table}-by-category",
-                    [
-                        new PhysicalIndexColumnDefinition("storage_scope", 0),
-                        new PhysicalIndexColumnDefinition("category", 1)
-                    ],
-                    missingValueBehavior: MissingValueBehavior.Excluded)
-            ],
+            columns,
+            indexes: indexes,
             evolution: evolution);
         var unit = new StorageUnit(
             new StorageUnitIdentity("documents"),
@@ -285,7 +423,7 @@ public sealed class SchemaToolProviderParityTests
         return new StorageManifest(
             new StorageManifestIdentity(identity),
             new StorageManifestOwner("tests"),
-            new StorageManifestVersion("1"),
+            new StorageManifestVersion(manifestVersion),
             [unit],
             new HashSet<string>(),
             []);

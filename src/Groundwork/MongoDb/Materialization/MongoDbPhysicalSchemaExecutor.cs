@@ -126,33 +126,49 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
     {
         var lease = RequireLease(applicationLock, target);
         await lease.AssertOwnedAsync(session: null, cancellationToken);
-        return await ReadInspectedHistoryAsync(target, cancellationToken);
+        return await ReadInspectedHistoryAsync(
+            target,
+            validateDurableEvidence: true,
+            cancellationToken);
     }
 
-    public ValueTask<PhysicalSchemaHistoryState> InspectHistoryAsync(
+    public ValueTask<PhysicalSchemaInspectionResult> InspectHistoryAsync(
         PhysicalSchemaTarget target,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(target);
-        return new ValueTask<PhysicalSchemaHistoryState>(InspectTargetAsync(target, cancellationToken));
+        return new ValueTask<PhysicalSchemaInspectionResult>(InspectTargetAsync(target, cancellationToken));
     }
 
-    private async Task<PhysicalSchemaHistoryState> InspectTargetAsync(
+    private async Task<PhysicalSchemaInspectionResult> InspectTargetAsync(
         PhysicalSchemaTarget target,
         CancellationToken cancellationToken)
     {
-        var history = await ReadInspectedHistoryAsync(target.Identity, cancellationToken);
-        if (history.AppliedState?.TargetFingerprint == target.Fingerprint)
+        var history = await ReadInspectedHistoryAsync(
+            target.Identity,
+            validateDurableEvidence: false,
+            cancellationToken);
+        var isAppliedSchemaValid = true;
+        if (history.AppliedState is { } appliedState)
         {
-            await ValidateAsync(
-                ValidatePhysicalSchemaOperation.ForTarget(target),
-                cancellationToken);
+            try
+            {
+                await ValidateDurableEvidenceAsync(appliedState, cancellationToken);
+                await ValidateAsync(
+                    ValidatePhysicalSchemaOperation.ForAppliedState(appliedState),
+                    cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                isAppliedSchemaValid = false;
+            }
         }
-        return history;
+        return new PhysicalSchemaInspectionResult(history, isAppliedSchemaValid);
     }
 
     private async Task<PhysicalSchemaHistoryState> ReadInspectedHistoryAsync(
         PhysicalSchemaTargetIdentity target,
+        bool validateDurableEvidence,
         CancellationToken cancellationToken)
     {
         var collectionNames = await (await database.ListCollectionNamesAsync(cancellationToken: cancellationToken))
@@ -166,7 +182,8 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         if (state is not null)
         {
             var applied = PhysicalSchemaAppliedStateSerializer.Deserialize(state.GetValue("state").AsString);
-            await ValidateDurableEvidenceAsync(applied, cancellationToken);
+            if (validateDurableEvidence)
+                await ValidateDurableEvidenceAsync(applied, cancellationToken);
             return PhysicalSchemaHistoryState.FromApplied(applied);
         }
         return await ReadLegacyHistoryAsync(target, collectionNames, cancellationToken);

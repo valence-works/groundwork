@@ -1,6 +1,9 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.Scoping;
 
 namespace Groundwork.Core.PhysicalStorage;
 
@@ -15,6 +18,66 @@ public static class ExecutableStorageRouteSerializer
 
     internal static string CreateFingerprint(ExecutableStorageRoute route) =>
         Convert.ToHexString(SHA256.HashData(SerializeCore(route, includeFingerprint: false))).ToLowerInvariant();
+
+    internal static ExecutableStorageRoute Deserialize(string canonicalJson)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(canonicalJson);
+        using var document = JsonDocument.Parse(canonicalJson);
+        var root = document.RootElement;
+        var sharedStorage = root.GetProperty("sharedStorage");
+        var linkedStorage = root.GetProperty("linkedIndexStorage");
+        var linkedRelationship = root.GetProperty("linkedRelationship");
+        var auxiliaryKey = root.GetProperty("auxiliaryKey");
+        var envelope = root.GetProperty("envelope");
+        var discriminator = root.GetProperty("discriminator");
+        var scopeKey = root.GetProperty("scopeKey");
+        var route = new ExecutableStorageRoute(
+            new StorageUnitIdentity(root.GetProperty("storageUnit").GetString()!),
+            ReadEnum<StorageUnitProvisioningMode>(root, "provisioningMode"),
+            ReadEnum<PhysicalStorageForm>(root, "form"),
+            sharedStorage.ValueKind == JsonValueKind.Null
+                ? null
+                : new SharedStorageBinding(sharedStorage.GetString()!),
+            ReadEnum<StorageScopePolicy>(root, "scopePolicy"),
+            ReadStorageObject(root.GetProperty("primaryStorage")),
+            linkedStorage.ValueKind == JsonValueKind.Null ? null : ReadStorageObject(linkedStorage),
+            new ExecutableDocumentEnvelopeRoute(
+                ReadColumn(envelope.GetProperty("id")),
+                ReadColumn(envelope.GetProperty("documentKind")),
+                ReadColumn(envelope.GetProperty("storageScope")),
+                ReadColumn(envelope.GetProperty("version")),
+                ReadColumn(envelope.GetProperty("schemaVersion")),
+                ReadColumn(envelope.GetProperty("canonicalJson"))),
+            linkedRelationship.ValueKind == JsonValueKind.Null
+                ? null
+                : new ExecutableLinkedRelationshipRoute(
+                    ReadColumn(linkedRelationship.GetProperty("documentId")),
+                    ReadColumn(linkedRelationship.GetProperty("documentKind")),
+                    ReadColumn(linkedRelationship.GetProperty("storageScope"))),
+            new ExecutableDiscriminatorRoute(
+                ReadColumn(discriminator.GetProperty("column")),
+                discriminator.GetProperty("value").GetString()!,
+                discriminator.GetProperty("primaryKey").GetBoolean()),
+            new ExecutableScopeKeyRoute(
+                ReadColumn(scopeKey.GetProperty("column")),
+                ReadEnum<StorageScopePolicy>(scopeKey, "policy"),
+                scopeKey.GetProperty("primaryKey").GetBoolean(),
+                scopeKey.GetProperty("auxiliaryKey").GetBoolean()),
+            ReadKey(root.GetProperty("primaryKey")),
+            auxiliaryKey.ValueKind == JsonValueKind.Null ? null : ReadKey(auxiliaryKey),
+            root.GetProperty("projectedColumns").EnumerateArray().Select(ReadProjectedColumn).ToArray(),
+            root.GetProperty("indexes").EnumerateArray().Select(ReadIndex).ToArray(),
+            root.GetProperty("maintenance").EnumerateArray().Select(ReadMaintenance).ToArray(),
+            root.GetProperty("queryPaths").EnumerateArray().Select(ReadQueryPath).ToArray(),
+            root.GetProperty("capabilities").EnumerateArray()
+                .Select(capability => Enum.Parse<ExecutableStorageCapability>(capability.GetString()!))
+                .ToArray(),
+            root.GetProperty("definitionFingerprint").GetString()!,
+            root.GetProperty("fingerprint").GetString()!);
+        if (!string.Equals(Serialize(route), canonicalJson, StringComparison.Ordinal))
+            throw new InvalidOperationException("Executable storage route snapshot is not in canonical form.");
+        return route;
+    }
 
     internal static void ValidateCanonicalSnapshot(
         string canonicalJson,
@@ -216,6 +279,126 @@ public static class ExecutableStorageRouteSerializer
             writer.WriteEndObject();
         }
         return stream.ToArray();
+    }
+
+    private static ExecutableStorageObjectRoute ReadStorageObject(JsonElement element) =>
+        new(
+            ReadEnum<ExecutableStorageObjectRole>(element, "role"),
+            ReadName(element.GetProperty("name")),
+            element.GetProperty("schemaVersion").GetInt32(),
+            ReadEvolution(element));
+
+    private static ExecutableKeyRoute ReadKey(JsonElement element) =>
+        new(
+            ReadEnum<ExecutableStorageObjectRole>(element, "target"),
+            element.GetProperty("columns").EnumerateArray().Select(ReadColumn).ToArray());
+
+    private static ExecutableProjectedColumnRoute ReadProjectedColumn(JsonElement element)
+    {
+        var definition = new ProjectedColumnDefinition(
+            element.GetProperty("logicalName").GetString()!,
+            element.GetProperty("path").GetString()!,
+            ReadEnum<PortablePhysicalType>(element, "type"),
+            ReadNullableInt32(element, "length"),
+            ReadNullableInt32(element, "precision"),
+            ReadNullableInt32(element, "scale"),
+            element.GetProperty("nullable").GetBoolean(),
+            ReadNullableString(element, "collation"),
+            ReadNullableString(element, "default"),
+            ReadEnum<ProjectionRebuildMode>(element, "rebuild"));
+        return new ExecutableProjectedColumnRoute(
+            definition,
+            ReadColumn(element.GetProperty("column")),
+            ReadEnum<ExecutableStorageObjectRole>(element, "target"),
+            ReadName(element.GetProperty("name")));
+    }
+
+    private static ExecutablePhysicalIndexRoute ReadIndex(JsonElement element)
+    {
+        var columns = ReadIndexColumns(element).ToArray();
+        var definition = new PhysicalIndexDefinition(
+            element.GetProperty("identity").GetString()!,
+            columns.Select(column => new PhysicalIndexColumnDefinition(
+                    column.Column.LogicalName,
+                    column.Order,
+                    column.Direction))
+                .ToArray(),
+            element.GetProperty("unique").GetBoolean(),
+            element.GetProperty("schemaVersion").GetInt32(),
+            ReadEvolution(element),
+            ReadEnum<PhysicalIndexStorageTarget>(element, "declaredTarget"),
+            ReadEnum<MissingValueBehavior>(element, "missingValueBehavior"));
+        return new ExecutablePhysicalIndexRoute(
+            definition,
+            ReadName(element.GetProperty("name")),
+            ReadEnum<ExecutableStorageObjectRole>(element, "target"),
+            columns);
+    }
+
+    private static ExecutableMaintenanceRoute ReadMaintenance(JsonElement element) =>
+        new(
+            ReadEnum<ExecutableMaintenanceOperation>(element, "operation"),
+            element.GetProperty("targets").EnumerateArray()
+                .Select(target => Enum.Parse<ExecutableStorageObjectRole>(target.GetString()!))
+                .ToArray());
+
+    private static ExecutableQueryPathRoute ReadQueryPath(JsonElement element)
+    {
+        var indexName = element.GetProperty("indexName");
+        return new ExecutableQueryPathRoute(
+            element.GetProperty("identity").GetString()!,
+            ReadEnum<ExecutableQueryPathKind>(element, "kind"),
+            ReadEnum<ExecutableStorageObjectRole>(element, "target"),
+            indexName.ValueKind == JsonValueKind.Null ? null : ReadName(indexName),
+            ReadIndexColumns(element).ToArray(),
+            element.GetProperty("queries").EnumerateArray().Select(query => query.GetString()!).ToArray(),
+            element.GetProperty("scaleBearing").GetBoolean());
+    }
+
+    private static IEnumerable<ExecutableIndexColumnRoute> ReadIndexColumns(JsonElement element) =>
+        element.GetProperty("columns").EnumerateArray().Select(column =>
+            new ExecutableIndexColumnRoute(
+                ReadColumn(column.GetProperty("column")),
+                column.GetProperty("order").GetInt32(),
+                ReadEnum<PhysicalSortDirection>(column, "direction")));
+
+    private static ExecutableColumnRoute ReadColumn(JsonElement element) =>
+        new(
+            element.GetProperty("logical").GetString()!,
+            element.GetProperty("identifier").GetString()!);
+
+    private static ProviderPhysicalObjectName ReadName(JsonElement element) =>
+        new(
+            ReadEnum<PhysicalObjectKind>(element, "kind"),
+            element.GetProperty("featureDefault").GetString()!,
+            element.GetProperty("logical").GetString()!,
+            element.GetProperty("identifier").GetString()!,
+            element.GetProperty("collisionScope").GetString()!,
+            new StorageUnitIdentity(element.GetProperty("namingOwner").GetString()!));
+
+    private static PhysicalEvolutionMetadata? ReadEvolution(JsonElement element)
+    {
+        if (!element.TryGetProperty("evolution", out var evolution))
+            return null;
+        return new PhysicalEvolutionMetadata(
+            evolution.GetProperty("requiresBackfill").GetBoolean(),
+            evolution.GetProperty("destructive").GetBoolean(),
+            ReadNullableString(evolution, "semanticMigrationIdentity"));
+    }
+
+    private static T ReadEnum<T>(JsonElement element, string property) where T : struct, Enum =>
+        Enum.Parse<T>(element.GetProperty(property).GetString()!);
+
+    private static int? ReadNullableInt32(JsonElement element, string property)
+    {
+        var value = element.GetProperty(property);
+        return value.ValueKind == JsonValueKind.Null ? null : value.GetInt32();
+    }
+
+    private static string? ReadNullableString(JsonElement element, string property)
+    {
+        var value = element.GetProperty(property);
+        return value.ValueKind == JsonValueKind.Null ? null : value.GetString();
     }
 
     private static void WriteStorageObject(Utf8JsonWriter writer, string property, ExecutableStorageObjectRoute storage)

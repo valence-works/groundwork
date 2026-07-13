@@ -136,7 +136,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
         }, cancellationToken);
 
-    public async ValueTask<PhysicalSchemaHistoryState> InspectHistoryAsync(
+    public async ValueTask<PhysicalSchemaInspectionResult> InspectHistoryAsync(
         PhysicalSchemaTarget target,
         CancellationToken cancellationToken)
     {
@@ -153,7 +153,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 cancellationToken))
         {
             await transaction.CommitAsync(cancellationToken);
-            return PhysicalSchemaHistoryState.Empty;
+            return new PhysicalSchemaInspectionResult(PhysicalSchemaHistoryState.Empty, IsAppliedSchemaValid: true);
         }
 
         await using var command = Command(connection, transaction, """
@@ -167,16 +167,24 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         var history = json is null
             ? PhysicalSchemaHistoryState.Empty
             : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
-        if (history.AppliedState?.TargetFingerprint == target.Fingerprint)
+        var isAppliedSchemaValid = true;
+        if (history.AppliedState is { } appliedState)
         {
-            await ValidateAsync(
-                connection,
-                transaction,
-                ValidatePhysicalSchemaOperation.ForTarget(target),
-                cancellationToken);
+            try
+            {
+                await ValidateAsync(
+                    connection,
+                    transaction,
+                    ValidatePhysicalSchemaOperation.ForAppliedState(appliedState),
+                    cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                isAppliedSchemaValid = false;
+            }
         }
         await transaction.CommitAsync(cancellationToken);
-        return history;
+        return new PhysicalSchemaInspectionResult(history, isAppliedSchemaValid);
     }
 
     public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(

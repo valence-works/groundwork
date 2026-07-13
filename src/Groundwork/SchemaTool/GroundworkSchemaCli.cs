@@ -115,10 +115,10 @@ public static class GroundworkSchemaCli
                 parsedOptions.Database);
             if (parsedOptions.Command == SchemaToolCommand.Validate)
             {
-                PhysicalSchemaHistoryState inspectedHistory;
+                PhysicalSchemaInspectionResult inspection;
                 try
                 {
-                    inspectedHistory = await provider.Inspector.InspectHistoryAsync(
+                    inspection = await provider.Inspector.InspectHistoryAsync(
                         compilation.Target!,
                         cancellationToken);
                 }
@@ -138,10 +138,19 @@ public static class GroundworkSchemaCli
                     await SchemaToolReportWriter.WriteAsync(drift, parsedOptions.Output, output);
                     return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
                 }
+                var inspectionDiagnostics = inspection.IsAppliedSchemaValid
+                    ? compilation.Diagnostics
+                    : compilation.Diagnostics.Concat(
+                    [
+                        GroundworkDiagnostic.Error(
+                            "GW-CLI-012",
+                            "Live provider state is incompatible with the recorded physical-schema target.",
+                            "providerState")
+                    ]).ToArray();
                 var validation = SchemaToolReport.Validate(
                     compilation.Target,
-                    compilation.Diagnostics,
-                    inspectedHistory,
+                    inspectionDiagnostics,
+                    inspection.History,
                     "live");
                 await SchemaToolReportWriter.WriteAsync(validation, parsedOptions.Output, output);
                 return validation.Diagnostics.Any(item => item.IsError)
