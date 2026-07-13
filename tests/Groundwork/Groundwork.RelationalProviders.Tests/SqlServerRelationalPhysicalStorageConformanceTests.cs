@@ -1,7 +1,9 @@
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
 using Groundwork.Provider.Relational;
+using Groundwork.Relational.Documents;
 using Groundwork.SqlServer;
 using Groundwork.SqlServer.Documents;
 using Groundwork.SqlServer.PhysicalStorage;
@@ -96,6 +98,76 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
             (manifest, routes) => new SqlServerPhysicalDocumentStore(
                 container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global));
+
+    [Fact]
+    public async Task FourHundredFiftyCharacterUnicodeKindAndIdSupportCrudOccAndRestart()
+    {
+        var kind = string.Concat(Enumerable.Repeat("界", 450));
+        var id = string.Concat(Enumerable.Repeat("é", 450));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            documentKind: kind);
+        var connectionString = container.GetConnectionString();
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, new SqlServerPhysicalSchemaExecutor(connectionString));
+
+        var store = new SqlServerPhysicalDocumentStore(
+            connectionString, model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        var saved = await store.SaveAsync(new SaveDocumentRequest(kind, id, "1", "{\"category\":\"before\"}", 0));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(1, saved.Document!.Version);
+        Assert.Equal(id, (await store.LoadAsync(kind, id))!.Id);
+
+        var updated = await store.SaveAsync(new SaveDocumentRequest(kind, id, "1", "{\"category\":\"after\"}", 1));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, updated.Status);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await store.SaveAsync(
+            new SaveDocumentRequest(kind, id, "1", "{\"category\":\"stale\"}", 1))).Status);
+
+        var restarted = new SqlServerPhysicalDocumentStore(
+            connectionString, model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        var loaded = await restarted.LoadAsync(kind, id);
+        Assert.NotNull(loaded);
+        Assert.Equal(2, loaded.Version);
+        Assert.Equal("{\"category\":\"after\"}", loaded.ContentJson);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await restarted.DeleteAsync(
+            new DeleteDocumentRequest(kind, id, 2))).Status);
+        Assert.Null(await new SqlServerPhysicalDocumentStore(
+            connectionString, model.Manifest, model.Target.Routes, DocumentStoreAccess.Global).LoadAsync(kind, id));
+    }
+
+    [Fact]
+    public async Task RetainedIdentityMismatchBehindTheSameHashThrowsDedicatedCollision()
+    {
+        var hash = new SqlServerPhysicalIdentityHash(_ =>
+            "CONVERT(binary(32), 0x0000000000000000000000000000000000000000000000000000000000000000)");
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        var connectionString = container.GetConnectionString();
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(connectionString, hash));
+        var store = new SqlServerPhysicalDocumentStore(
+            connectionString,
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global,
+            hash);
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "first", "1", "{\"category\":\"tools\"}", 0))).Status);
+        var collision = await Assert.ThrowsAsync<PhysicalIdentityHashCollisionException>(() => store.SaveAsync(
+            new SaveDocumentRequest("configurationDocument", "second", "1", "{\"category\":\"tools\"}", 0)));
+
+        Assert.Equal(model.Target.Routes.Single().PrimaryStorage.Name.Identifier, collision.Table);
+        Assert.Equal(3, collision.IdentityColumns.Count);
+        Assert.NotNull(await store.LoadAsync("configurationDocument", "first"));
+        Assert.Null(await store.LoadAsync("configurationDocument", "second"));
+    }
 
     protected override Task<RelationalPhysicalStorageFixture> CreateAsync(
         PhysicalStorageForm form,

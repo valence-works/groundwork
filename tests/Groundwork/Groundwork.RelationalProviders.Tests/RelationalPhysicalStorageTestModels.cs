@@ -21,7 +21,8 @@ internal static class RelationalPhysicalStorageTestModels
         string? instance = null,
         IProviderPhysicalNameNormalizer? normalizer = null,
         bool categoryUnique = false,
-        bool categoryNullable = false)
+        bool categoryNullable = false,
+        string documentKind = "configurationDocument")
     {
         var template = RelationalTestManifests.MetadataManifest();
         instance ??= Guid.NewGuid().ToString("N")[..8];
@@ -131,6 +132,7 @@ internal static class RelationalPhysicalStorageTestModels
             [
                 template.StorageUnits.Single() with
                 {
+                    Identity = new StorageUnitIdentity(documentKind),
                     Tenancy = scoped ? TenancyPolicy.Scoped : TenancyPolicy.Global,
                     PhysicalStorage = new StorageUnitPhysicalStorage(
                         StorageUnitProvisioningMode.Declared,

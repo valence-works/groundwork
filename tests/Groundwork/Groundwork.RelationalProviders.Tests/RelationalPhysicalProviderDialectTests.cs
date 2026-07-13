@@ -1,6 +1,7 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Documents.Scoping;
 using Groundwork.PostgreSql.Documents;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
@@ -48,10 +49,104 @@ public sealed class RelationalPhysicalProviderDialectTests
         var dialect = new SqlServerPhysicalSchemaDialect();
         var projected = new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String);
 
+        Assert.Equal("nvarchar(450)", dialect.EnvelopeType(RelationalEnvelopeColumnKind.DocumentKind));
+        Assert.Equal("nvarchar(128)", dialect.EnvelopeType(RelationalEnvelopeColumnKind.StorageScope));
+        Assert.Equal("nvarchar(450)", dialect.EnvelopeType(RelationalEnvelopeColumnKind.Id));
         Assert.Equal("Latin1_General_100_BIN2", dialect.EnvelopeCollation(RelationalEnvelopeColumnKind.Id));
         Assert.Equal("Latin1_General_100_BIN2", dialect.ProjectedCollation(projected));
         Assert.Contains("COLLATE Latin1_General_100_BIN2", dialect.EnvelopeColumn("id", RelationalEnvelopeColumnKind.Id));
         Assert.Contains("PRIMARY KEY NONCLUSTERED", dialect.CreateTableSql("records", ["[id] nvarchar(450) NOT NULL"], ["id"]));
+    }
+
+    [Fact]
+    public void Sql_server_maps_logical_identity_to_persisted_sha256_columns()
+    {
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        var layout = dialect.IdentityLayout(
+        [
+            new RelationalPhysicalIdentityColumn("document_kind", RelationalEnvelopeColumnKind.DocumentKind),
+            new RelationalPhysicalIdentityColumn("storage_scope", RelationalEnvelopeColumnKind.StorageScope),
+            new RelationalPhysicalIdentityColumn("id", RelationalEnvelopeColumnKind.Id)
+        ], ["document_kind", "storage_scope", "id"]);
+
+        Assert.Equal(["document_kind_key", "storage_scope_key", "id_key"], layout.PrimaryKey);
+        Assert.Equal(["document_kind_key", "storage_scope_key", "id_key"], layout.ProviderColumns.Select(column => column.Name));
+        Assert.All(layout.ProviderColumns, column =>
+        {
+            Assert.Equal("binary(32)", column.Type);
+            Assert.False(column.IsNullable);
+            Assert.Contains("HASHBYTES('SHA2_256'", column.Definition, StringComparison.Ordinal);
+            Assert.Contains("PERSISTED NOT NULL", column.Definition, StringComparison.Ordinal);
+        });
+
+        var longName = new string('x', 128);
+        var otherLongName = longName[..^1] + "y";
+        var longLayout = dialect.IdentityLayout(
+        [
+            new RelationalPhysicalIdentityColumn(longName, RelationalEnvelopeColumnKind.Id),
+            new RelationalPhysicalIdentityColumn(otherLongName, RelationalEnvelopeColumnKind.Id)
+        ], [longName, otherLongName]);
+        Assert.All(longLayout.ProviderColumns, column => Assert.True(column.Name.Length <= 128));
+        Assert.NotEqual(longLayout.ProviderColumns[0].Name, longLayout.ProviderColumns[1].Name);
+    }
+
+    [Fact]
+    public void Sql_server_rejects_visible_columns_that_collide_with_hidden_identity_keys()
+    {
+        const string instance = "hidden_collision";
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.ObjectKind == PhysicalObjectKind.ProjectedField &&
+                       context.LogicalName.EndsWith("_category", StringComparison.Ordinal)
+                ? $"gw_{instance}_id_key"
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains("gw_hidden_collision_id_key", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Sql_server_exact_identity_predicates_and_joins_verify_hash_and_original_values()
+    {
+        var dialect = new SqlServerPhysicalDocumentDialect();
+
+        var predicate = dialect.ExactIdentityPredicate(
+        [
+            new RelationalPhysicalIdentityPredicatePart("document_kind", "p", "@kind"),
+            new RelationalPhysicalIdentityPredicatePart("storage_scope", "p", "@scope"),
+            new RelationalPhysicalIdentityPredicatePart("id", "p", "@id")
+        ]);
+        var hashOnly = dialect.HashOnlyIdentityPredicate(
+        [
+            new RelationalPhysicalIdentityPredicatePart("document_kind", "p", "@kind"),
+            new RelationalPhysicalIdentityPredicatePart("storage_scope", "p", "@scope"),
+            new RelationalPhysicalIdentityPredicatePart("id", "p", "@id")
+        ]);
+        var join = dialect.ExactIdentityJoin(
+        [
+            new RelationalPhysicalIdentityJoinPart("document_kind", "p", "kind_fk", "l"),
+            new RelationalPhysicalIdentityJoinPart("storage_scope", "p", "scope_fk", "l"),
+            new RelationalPhysicalIdentityJoinPart("id", "p", "document_fk", "l")
+        ]);
+
+        Assert.Contains("p.[document_kind_key] = CONVERT(binary(32), HASHBYTES('SHA2_256'", predicate, StringComparison.Ordinal);
+        Assert.Contains("p.[document_kind] = @kind", predicate, StringComparison.Ordinal);
+        Assert.DoesNotContain("p.[document_kind] = @kind", hashOnly, StringComparison.Ordinal);
+        Assert.Contains("p.[document_kind_key] = l.[kind_fk_key]", join, StringComparison.Ordinal);
+        Assert.Contains("p.[document_kind] = l.[kind_fk]", join, StringComparison.Ordinal);
     }
 
     [Theory]

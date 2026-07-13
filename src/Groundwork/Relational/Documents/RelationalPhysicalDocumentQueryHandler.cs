@@ -129,19 +129,24 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         var linked = plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary;
         var from = linked
             ? $"FROM {store.Q(route.LinkedIndexStorage!.Name.Identifier)} l JOIN {store.Q(route.PrimaryStorage.Name.Identifier)} p ON " +
-              $"p.{store.Q(route.Envelope.DocumentKind.Identifier)} = l.{store.Q(route.LinkedRelationship!.DocumentKind.Identifier)} AND " +
-              $"p.{store.Q(route.Envelope.StorageScope.Identifier)} = l.{store.Q(route.LinkedRelationship.StorageScope.Identifier)} AND " +
-              $"p.{store.Q(route.Envelope.Id.Identifier)} = l.{store.Q(route.LinkedRelationship.DocumentId.Identifier)}"
+              store.ExactPhysicalIdentityJoin(
+              [
+                  new(route.Envelope.DocumentKind.Identifier, "p", route.LinkedRelationship!.DocumentKind.Identifier, "l"),
+                  new(route.Envelope.StorageScope.Identifier, "p", route.LinkedRelationship.StorageScope.Identifier, "l"),
+                  new(route.Envelope.Id.Identifier, "p", route.LinkedRelationship.DocumentId.Identifier, "l")
+              ])
             : $"FROM {store.Q(route.PrimaryStorage.Name.Identifier)} p";
         var parameters = new List<(string Name, object? Value)>();
         var predicates = new List<string>();
         var scope = store.ResolveQueryScope(query.DocumentKind);
         if (!scope.AcrossScopes)
         {
-            predicates.Add($"{Field(plan.Scope.Field)} = {store.P("scope")}");
+            predicates.Add(store.ExactPhysicalIdentityPredicate(
+                [new(plan.Scope.Field.Identifier, Alias(plan.Scope.Field), store.P("scope"))]));
             parameters.Add(("scope", scope.StorageKey));
         }
-        predicates.Add($"{Field(plan.Discriminator)} = {store.P("kind")}");
+        predicates.Add(store.ExactPhysicalIdentityPredicate(
+            [new(plan.Discriminator.Identifier, Alias(plan.Discriminator), store.P("kind"))]));
         parameters.Add(("kind", route.Discriminator.Value));
 
         var parameterIndex = 0;
@@ -229,13 +234,16 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private string Field(PhysicalQueryField field)
     {
-        var alias = field.Target == ExecutableStorageObjectRole.LinkedIndexStorage ? "l" : "p";
+        var alias = Alias(field);
         var expression = $"{alias}.{store.Q(field.Identifier)}";
         var value = field.Source == PhysicalQueryFieldSource.CanonicalJsonPath
             ? store.JsonValue(expression, field.Path)
             : expression;
         return store.NormalizeQueryExpression(value, field.Source, field.ValueKind);
     }
+
+    private static string Alias(PhysicalQueryField field) =>
+        field.Target == ExecutableStorageObjectRole.LinkedIndexStorage ? "l" : "p";
 
     private string OrderBy(PhysicalQueryPlan plan) =>
         plan.Order.Count == 0

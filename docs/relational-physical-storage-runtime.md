@@ -131,8 +131,13 @@ and index ownership/uniqueness/order/direction must match the compiled route. Sa
 changes remain visible through route fingerprints and additive operations rebuild projected values
 from authoritative canonical JSON in bounded batches.
 
-SQL Server uses binary (`Latin1_General_100_BIN2`) identity and projected-string collation and a
-nonclustered primary key so declared opaque keys remain inside native index limits. PostgreSQL stores
+SQL Server retains document kind and id as binary-collated `nvarchar(450)` values and scope as
+binary-collated `nvarchar(128)`. Persisted SHA-256 `binary(32)` provider-owned columns form the
+nonclustered physical primary key, while every exact lookup and linked join compares both the digest
+and retained original. A native key violation is probed by digest and a different retained identity
+raises `PhysicalIdentityHashCollisionException` rather than masquerading as optimistic concurrency.
+Provider-owned column names use the same deterministic 128-character normalizer as declared names,
+and a route whose visible column collides with one is rejected before use. PostgreSQL stores
 portable `DateTime` projections as UTC ticks because native timestamps round Groundwork's 100ns
 contract to microseconds; SQL Server uses `datetimeoffset(7)`. Both providers restrict portable
 `Decimal` projections to precision 1–28 with explicit scale, matching the exact CLR decimal

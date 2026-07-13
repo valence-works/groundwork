@@ -57,9 +57,11 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
     public async ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
         PhysicalSchemaTargetIdentity target,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await sessions.ExecuteAsync(async (connection, ct) =>
         {
+            RequireApplicationLock(applicationLock, target);
             await using var command = Command(connection, null, """
                 SELECT applied_state_json
                 FROM groundwork_physical_schema_state
@@ -76,9 +78,12 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
         PhysicalSchemaTargetIdentity target,
         PhysicalSchemaOperation operation,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await sessions.ExecuteAsync(async (connection, ct) =>
         {
+            ArgumentNullException.ThrowIfNull(operation);
+            RequireApplicationLock(applicationLock, target);
             await using var transaction = await connection.BeginTransactionAsync(ct);
             var prior = await ReadOperationAsync(connection, transaction, target, operation.Identity, ct);
             if (prior is not null)
@@ -115,9 +120,14 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     public async ValueTask RecordAppliedStateAsync(
         PhysicalSchemaAppliedState state,
         string? expectedAppliedTargetFingerprint,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await sessions.ExecuteAsync(async (connection, ct) =>
         {
+            ArgumentNullException.ThrowIfNull(state);
+            RequireApplicationLock(
+                applicationLock,
+                new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name));
             await using var transaction = await connection.BeginTransactionAsync(ct);
             var current = await ReadTargetFingerprintAsync(connection, transaction, state.ManifestIdentity.Value, state.Provider.Name, ct);
             if (current == state.TargetFingerprint)
@@ -174,20 +184,20 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 await CreateLinkedAsync(connection, transaction, create.Route, ct);
                 break;
             case AddProjectedColumnOperation add:
-                RelationalPhysicalStorageColumns.Validate(add.Route);
+                ValidateRoute(add.Route);
                 await AddColumnAsync(connection, transaction, add.Storage.Name.Identifier, add.Column, ct);
                 break;
             case FinalizeProjectedColumnOperation finalize:
-                RelationalPhysicalStorageColumns.Validate(finalize.Route);
+                ValidateRoute(finalize.Route);
                 await FinalizeColumnAsync(connection, transaction, finalize.Storage.Name.Identifier, finalize.Column, ct);
                 break;
             case CreatePhysicalIndexOperation create:
-                RelationalPhysicalStorageColumns.Validate(create.Route);
+                ValidateRoute(create.Route);
                 await CreateIndexAsync(connection, transaction, create.Route, create.Storage.Name.Identifier, create.Index, ct);
                 break;
             case BackfillCanonicalJsonOperation backfill:
                 if (backfill.Route is not null)
-                    RelationalPhysicalStorageColumns.Validate(backfill.Route);
+                    ValidateRoute(backfill.Route);
                 await BackfillAsync(connection, transaction, backfill, ct);
                 break;
             case ValidatePhysicalSchemaOperation validate:
@@ -200,8 +210,11 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
     private async Task CreatePrimaryAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
     {
-        RelationalPhysicalStorageColumns.Validate(route);
+        ValidateRoute(route);
         var envelope = route.Envelope;
+        var identity = dialect.IdentityLayout(
+            PrimaryIdentityColumns(route),
+            route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray());
         var columns = new[]
         {
             dialect.EnvelopeColumn(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
@@ -212,30 +225,34 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             dialect.EnvelopeColumn(envelope.CanonicalJson.Identifier, RelationalEnvelopeColumnKind.CanonicalJson),
             dialect.EnvelopeColumn(RelationalPhysicalStorageColumns.CreatedUtc, RelationalEnvelopeColumnKind.Timestamp),
             dialect.EnvelopeColumn(RelationalPhysicalStorageColumns.UpdatedUtc, RelationalEnvelopeColumnKind.Timestamp)
-        };
+        }.Concat(identity.ProviderColumns.Select(column => column.Definition)).ToArray();
         if (!await dialect.TableExistsAsync(connection, transaction, route.PrimaryStorage.Name.Identifier, ct))
         {
             await ExecuteAsync(connection, transaction, dialect.CreateTableSql(
                 route.PrimaryStorage.Name.Identifier,
                 columns,
-                route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray()), ct);
+                identity.PrimaryKey), ct);
         }
         await ValidatePrimaryAsync(connection, transaction, route, ct);
     }
 
     private async Task CreateLinkedAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
     {
+        ValidateRoute(route);
         var relationship = route.LinkedRelationship!;
         var key = route.AuxiliaryKey ?? throw new InvalidOperationException("Linked storage requires an auxiliary key.");
+        var identity = dialect.IdentityLayout(
+            LinkedIdentityColumns(route),
+            key.Columns.Select(column => column.Identifier).ToArray());
         var columns = new[]
         {
             dialect.EnvelopeColumn(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             dialect.EnvelopeColumn(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
             dialect.EnvelopeColumn(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id)
-        };
+        }.Concat(identity.ProviderColumns.Select(column => column.Definition)).ToArray();
         var table = route.LinkedIndexStorage!.Name.Identifier;
         if (!await dialect.TableExistsAsync(connection, transaction, table, ct))
-            await ExecuteAsync(connection, transaction, dialect.CreateTableSql(table, columns, key.Columns.Select(column => column.Identifier).ToArray()), ct);
+            await ExecuteAsync(connection, transaction, dialect.CreateTableSql(table, columns, identity.PrimaryKey), ct);
         await ValidateLinkedAsync(connection, transaction, route, ct);
     }
 
@@ -317,8 +334,12 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 var assignments = string.Join(", ", selected.Select((column, index) => $"{dialect.Q(column.Column.Identifier)} = @v{index}"));
                 await using var command = Command(connection, transaction,
                     $"UPDATE {dialect.Q(route.PrimaryStorage.Name.Identifier)} SET {assignments} WHERE " +
-                    $"{dialect.Q(route.Discriminator.Column.Identifier)} = @kind AND " +
-                    $"{dialect.Q(route.ScopeKey.Column.Identifier)} = @scope AND {dialect.Q(route.Envelope.Id.Identifier)} = @id;");
+                    dialect.ExactIdentityPredicate(
+                    [
+                        new(route.Discriminator.Column.Identifier, null, "@kind"),
+                        new(route.ScopeKey.Column.Identifier, null, "@scope"),
+                        new(route.Envelope.Id.Identifier, null, "@id")
+                    ]) + ";");
                 for (var index = 0; index < selected.Length; index++)
                     Add(command, $"v{index}", dialect.ConvertStorageValue(values[selected[index].Definition.LogicalName], selected[index].Definition));
                 Add(command, "kind", route.Discriminator.Value);
@@ -394,7 +415,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     {
         foreach (var route in operation.Routes)
         {
-            RelationalPhysicalStorageColumns.Validate(route);
+            ValidateRoute(route);
             await ValidatePrimaryAsync(connection, transaction, route, ct);
             if (route.LinkedIndexStorage is not null)
                 await ValidateLinkedAsync(connection, transaction, route, ct);
@@ -418,6 +439,9 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     private Task ValidatePrimaryAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
     {
         var envelope = route.Envelope;
+        var identity = dialect.IdentityLayout(
+            PrimaryIdentityColumns(route),
+            route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray());
         return ValidateTableAsync(connection, transaction, route.PrimaryStorage.Name.Identifier,
         [
             Envelope(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
@@ -427,25 +451,34 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             Envelope(envelope.Version.Identifier, RelationalEnvelopeColumnKind.Version),
             Envelope(envelope.CanonicalJson.Identifier, RelationalEnvelopeColumnKind.CanonicalJson),
             Envelope(RelationalPhysicalStorageColumns.CreatedUtc, RelationalEnvelopeColumnKind.Timestamp),
-            Envelope(RelationalPhysicalStorageColumns.UpdatedUtc, RelationalEnvelopeColumnKind.Timestamp)
-        ], route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray(), ct);
+            Envelope(RelationalPhysicalStorageColumns.UpdatedUtc, RelationalEnvelopeColumnKind.Timestamp),
+            .. identity.ProviderColumns.Select(ProviderColumn)
+        ], identity.PrimaryKey, ct);
 
         ExpectedColumn Envelope(string name, RelationalEnvelopeColumnKind kind) =>
             new(name, dialect.EnvelopeType(kind), false, null, dialect.EnvelopeCollation(kind));
+        static ExpectedColumn ProviderColumn(RelationalProviderOwnedPhysicalColumn column) =>
+            new(column.Name, column.Type, column.IsNullable, column.DefaultValue, column.Collation);
     }
 
     private Task ValidateLinkedAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
     {
         var relationship = route.LinkedRelationship!;
+        var identity = dialect.IdentityLayout(
+            LinkedIdentityColumns(route),
+            route.AuxiliaryKey!.Columns.Select(column => column.Identifier).ToArray());
         return ValidateTableAsync(connection, transaction, route.LinkedIndexStorage!.Name.Identifier,
         [
             Envelope(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             Envelope(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-            Envelope(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id)
-        ], route.AuxiliaryKey!.Columns.Select(column => column.Identifier).ToArray(), ct);
+            Envelope(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id),
+            .. identity.ProviderColumns.Select(ProviderColumn)
+        ], identity.PrimaryKey, ct);
 
         ExpectedColumn Envelope(string name, RelationalEnvelopeColumnKind kind) =>
             new(name, dialect.EnvelopeType(kind), false, null, dialect.EnvelopeCollation(kind));
+        static ExpectedColumn ProviderColumn(RelationalProviderOwnedPhysicalColumn column) =>
+            new(column.Name, column.Type, column.IsNullable, column.DefaultValue, column.Collation);
     }
 
     private async Task ValidateTableAsync(
@@ -593,6 +626,26 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                  column.Definition.LogicalName == operation.SubjectIdentity))
             .ToArray();
 
+    private void ValidateRoute(ExecutableStorageRoute route)
+    {
+        RelationalPhysicalStorageColumns.Validate(route);
+        dialect.ValidateRoute(route);
+    }
+
+    private static RelationalPhysicalIdentityColumn[] PrimaryIdentityColumns(ExecutableStorageRoute route) =>
+    [
+        new(route.Envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+        new(route.Envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+        new(route.Envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id)
+    ];
+
+    private static RelationalPhysicalIdentityColumn[] LinkedIdentityColumns(ExecutableStorageRoute route) =>
+    [
+        new(route.LinkedRelationship!.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+        new(route.LinkedRelationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+        new(route.LinkedRelationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id)
+    ];
+
     private static string[] NullableIndexColumns(ExecutableStorageRoute route, ExecutablePhysicalIndexRoute index)
     {
         var indexed = index.Columns.Select(column => column.Column.Identifier).ToHashSet(StringComparer.Ordinal);
@@ -609,20 +662,66 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         return $"groundwork:physical:{Convert.ToHexString(hash).ToLowerInvariant()}";
     }
 
-    private sealed class ApplicationLock(
-        PhysicalSchemaTargetIdentity target,
-        DbConnection connection,
-        string resource,
-        RelationalServerPhysicalSchemaDialect dialect) : IPhysicalSchemaApplicationLock
+    private static void RequireApplicationLock(
+        IPhysicalSchemaApplicationLock applicationLock,
+        PhysicalSchemaTargetIdentity expectedTarget)
     {
+        ArgumentNullException.ThrowIfNull(applicationLock);
+        if (applicationLock is not ApplicationLock relationalLock ||
+            relationalLock.Target != expectedTarget ||
+            !relationalLock.IsOwned)
+        {
+            throw new InvalidOperationException(
+                $"Relational physical schema execution requires its active application lock for target '{expectedTarget}'.");
+        }
+    }
+
+    private sealed class ApplicationLock : IPhysicalSchemaApplicationLock
+    {
+        private readonly DbConnection connection;
+        private readonly string resource;
+        private readonly RelationalServerPhysicalSchemaDialect dialect;
+        private readonly CancellationTokenSource ownershipLost = new();
         private int disposed;
-        public PhysicalSchemaTargetIdentity Target { get; } = target;
+
+        public ApplicationLock(
+            PhysicalSchemaTargetIdentity target,
+            DbConnection connection,
+            string resource,
+            RelationalServerPhysicalSchemaDialect dialect)
+        {
+            Target = target;
+            this.connection = connection;
+            this.resource = resource;
+            this.dialect = dialect;
+            connection.StateChange += OnConnectionStateChanged;
+        }
+
+        public PhysicalSchemaTargetIdentity Target { get; }
+        public CancellationToken OwnershipLost => ownershipLost.Token;
+        public bool IsOwned => Volatile.Read(ref disposed) == 0 && connection.State == ConnectionState.Open;
+
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0)
                 return;
-            try { await dialect.ReleaseApplicationLockAsync(connection, resource, CancellationToken.None); }
-            finally { await connection.DisposeAsync(); }
+            connection.StateChange -= OnConnectionStateChanged;
+            try
+            {
+                if (connection.State == ConnectionState.Open)
+                    await dialect.ReleaseApplicationLockAsync(connection, resource, CancellationToken.None);
+            }
+            finally
+            {
+                await connection.DisposeAsync();
+                ownershipLost.Dispose();
+            }
+        }
+
+        private void OnConnectionStateChanged(object sender, StateChangeEventArgs args)
+        {
+            if (args.CurrentState != ConnectionState.Open && Volatile.Read(ref disposed) == 0)
+                ownershipLost.Cancel();
         }
     }
 
@@ -656,6 +755,23 @@ public sealed record RelationalPhysicalIndexMetadata(
     IReadOnlyList<RelationalPhysicalIndexColumnMetadata> Columns,
     string? Filter);
 
+/// <summary>A retained provider column that participates in a document identity.</summary>
+public sealed record RelationalPhysicalIdentityColumn(string Name, RelationalEnvelopeColumnKind Kind);
+
+/// <summary>A provider-owned column added behind the portable physical-storage interface.</summary>
+public sealed record RelationalProviderOwnedPhysicalColumn(
+    string Name,
+    string Definition,
+    string Type,
+    bool IsNullable,
+    string? DefaultValue = null,
+    string? Collation = null);
+
+/// <summary>Maps the retained logical identity to the provider's physical key representation.</summary>
+public sealed record RelationalPhysicalIdentityLayout(
+    IReadOnlyList<RelationalProviderOwnedPhysicalColumn> ProviderColumns,
+    IReadOnlyList<string> PrimaryKey);
+
 /// <summary>Provider-owned SQL and metadata behavior behind the shared physical-schema executor.</summary>
 public abstract class RelationalServerPhysicalSchemaDialect
 {
@@ -670,7 +786,28 @@ public abstract class RelationalServerPhysicalSchemaDialect
             ? Collation(definition.Collation)
             : null;
     public abstract string? NormalizeDefault(ProjectedColumnDefinition definition);
+    public virtual void ValidateRoute(ExecutableStorageRoute route) => ArgumentNullException.ThrowIfNull(route);
+    public virtual string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+        return string.Join(" AND ", parts.Select(part =>
+        {
+            var column = part.Alias is null ? Q(part.ColumnIdentifier) : $"{part.Alias}.{Q(part.ColumnIdentifier)}";
+            return $"{column} = {part.ValueExpression}";
+        }));
+    }
     public abstract string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind);
+    public virtual RelationalPhysicalIdentityLayout IdentityLayout(
+        IReadOnlyList<RelationalPhysicalIdentityColumn> identityColumns,
+        IReadOnlyList<string> logicalPrimaryKey)
+    {
+        ArgumentNullException.ThrowIfNull(identityColumns);
+        ArgumentNullException.ThrowIfNull(logicalPrimaryKey);
+        var identityNames = identityColumns.Select(column => column.Name).ToHashSet(StringComparer.Ordinal);
+        if (logicalPrimaryKey.Any(column => !identityNames.Contains(column)))
+            throw new ArgumentException("Every logical primary-key column must be a retained identity column.", nameof(logicalPrimaryKey));
+        return new RelationalPhysicalIdentityLayout([], Array.AsReadOnly(logicalPrimaryKey.ToArray()));
+    }
     public abstract string CreateTableSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> primaryKey);
     public abstract string AddColumnSql(string table, string column, ProjectedColumnDefinition definition);
     public abstract string FinalizeColumnSql(string table, string column, ProjectedColumnDefinition definition);

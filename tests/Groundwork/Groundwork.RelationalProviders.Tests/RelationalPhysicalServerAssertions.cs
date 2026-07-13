@@ -141,15 +141,17 @@ internal static class RelationalPhysicalServerAssertions
 
         public ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
             PhysicalSchemaTargetIdentity target,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken) =>
-            inner.ReadHistoryAsync(target, cancellationToken);
+            inner.ReadHistoryAsync(target, applicationLock, cancellationToken);
 
         public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
             PhysicalSchemaTargetIdentity target,
             PhysicalSchemaOperation operation,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken)
         {
-            var acknowledgement = await inner.ApplyOperationAsync(target, operation, cancellationToken);
+            var acknowledgement = await inner.ApplyOperationAsync(target, operation, applicationLock, cancellationToken);
             if (Interlocked.Exchange(ref lost, 1) == 0)
                 throw new SimulatedAcknowledgementLossException();
             return acknowledgement;
@@ -158,8 +160,9 @@ internal static class RelationalPhysicalServerAssertions
         public ValueTask RecordAppliedStateAsync(
             PhysicalSchemaAppliedState state,
             string? expectedAppliedTargetFingerprint,
+            IPhysicalSchemaApplicationLock applicationLock,
             CancellationToken cancellationToken) =>
-            inner.RecordAppliedStateAsync(state, expectedAppliedTargetFingerprint, cancellationToken);
+            inner.RecordAppliedStateAsync(state, expectedAppliedTargetFingerprint, applicationLock, cancellationToken);
     }
 
     private sealed class SimulatedAcknowledgementLossException : Exception;

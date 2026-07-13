@@ -2,6 +2,7 @@ using System.Data.Common;
 using System.Globalization;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Provider.Relational;
+using Groundwork.Relational.Documents;
 using Groundwork.Relational.PhysicalStorage;
 using Groundwork.Relational.Physicalization;
 using Microsoft.Data.SqlClient;
@@ -12,10 +13,17 @@ namespace Groundwork.SqlServer.PhysicalStorage;
 public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSchemaExecutor
 {
     public SqlServerPhysicalSchemaExecutor(string connectionString)
+        : this(connectionString, new SqlServerPhysicalIdentityHash())
+    {
+    }
+
+    internal SqlServerPhysicalSchemaExecutor(
+        string connectionString,
+        SqlServerPhysicalIdentityHash hash)
         : base(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             () => new SqlConnection(LockConnectionString(connectionString)),
-            new SqlServerPhysicalSchemaDialect())
+            new SqlServerPhysicalSchemaDialect(hash))
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
@@ -23,7 +31,15 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
     internal SqlServerPhysicalSchemaExecutor(
         RelationalSessionFactory sessions,
         Func<DbConnection> createLockConnection)
-        : base(sessions, createLockConnection, new SqlServerPhysicalSchemaDialect())
+        : this(sessions, createLockConnection, new SqlServerPhysicalIdentityHash())
+    {
+    }
+
+    internal SqlServerPhysicalSchemaExecutor(
+        RelationalSessionFactory sessions,
+        Func<DbConnection> createLockConnection,
+        SqlServerPhysicalIdentityHash hash)
+        : base(sessions, createLockConnection, new SqlServerPhysicalSchemaDialect(hash))
     {
     }
 
@@ -33,13 +49,27 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
 
 internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDialect
 {
+    private readonly SqlServerPhysicalIdentity identity;
+
+    public SqlServerPhysicalSchemaDialect()
+        : this(new SqlServerPhysicalIdentityHash())
+    {
+    }
+
+    internal SqlServerPhysicalSchemaDialect(SqlServerPhysicalIdentityHash hash) =>
+        identity = new SqlServerPhysicalIdentity(hash);
+
+    public override void ValidateRoute(ExecutableStorageRoute route) => identity.ValidateRoute(route);
+    public override string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        identity.ExactPredicate(parts, Q, includeOriginal: true);
+
     public override string ProviderDisplayName => "SQL Server";
     public override string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
 
     public override string EnvelopeType(RelationalEnvelopeColumnKind kind) => kind switch
     {
-        RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.StorageScope => "nvarchar(200)",
-        RelationalEnvelopeColumnKind.Id => "nvarchar(450)",
+        RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.Id => "nvarchar(450)",
+        RelationalEnvelopeColumnKind.StorageScope => "nvarchar(128)",
         RelationalEnvelopeColumnKind.SchemaVersion => "nvarchar(100)",
         RelationalEnvelopeColumnKind.Version => "bigint",
         RelationalEnvelopeColumnKind.CanonicalJson => "nvarchar(max)",
@@ -84,6 +114,11 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         (EnvelopeCollation(kind) is { } collation ? $" COLLATE {CollationToken(collation)}" : string.Empty) +
         " NOT NULL";
 
+    public override RelationalPhysicalIdentityLayout IdentityLayout(
+        IReadOnlyList<RelationalPhysicalIdentityColumn> identityColumns,
+        IReadOnlyList<string> logicalPrimaryKey) =>
+        identity.Layout(identityColumns, logicalPrimaryKey, Q);
+
     public override string CreateTableSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> primaryKey)
     {
         var constraint = Q(TrimIdentifier($"PK_{table}"));
@@ -114,7 +149,13 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
     {
         var parameterByColumn = columns.Select((column, index) => (column, parameter: $"@v{index}"))
             .ToDictionary(item => item.column, item => item.parameter, StringComparer.Ordinal);
-        var predicate = string.Join(" AND ", keyColumns.Select(column => $"{Q(column)} = {parameterByColumn[column]}"));
+        var predicate = identity.ExactPredicate(
+            keyColumns.Select(column => new RelationalPhysicalIdentityPredicatePart(
+                column,
+                null,
+                parameterByColumn[column])).ToArray(),
+            Q,
+            includeOriginal: true);
         var insert = $"INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))}) VALUES ({string.Join(", ", columns.Select((_, index) => $"@v{index}"))});";
         return updateColumns.Count == 0
             ? $"IF NOT EXISTS (SELECT 1 FROM {Q(table)} WITH (UPDLOCK, HOLDLOCK) WHERE {predicate}) {insert}"
@@ -126,8 +167,12 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         var cursor = hasCursor
             ? $" AND ({Q(route.ScopeKey.Column.Identifier)} > @afterScope OR ({Q(route.ScopeKey.Column.Identifier)} = @afterScope AND {Q(route.Envelope.Id.Identifier)} > @afterId))"
             : string.Empty;
+        var kind = identity.ExactPredicate(
+            [new(route.Discriminator.Column.Identifier, null, "@kind")],
+            Q,
+            includeOriginal: true);
         return $"SELECT TOP ({batchSize}) {Q(route.ScopeKey.Column.Identifier)}, {Q(route.Envelope.Id.Identifier)}, {Q(route.Envelope.CanonicalJson.Identifier)} " +
-               $"FROM {Q(route.PrimaryStorage.Name.Identifier)} WHERE {Q(route.Discriminator.Column.Identifier)} = @kind{cursor} " +
+               $"FROM {Q(route.PrimaryStorage.Name.Identifier)} WHERE {kind}{cursor} " +
                $"ORDER BY {Q(route.ScopeKey.Column.Identifier)}, {Q(route.Envelope.Id.Identifier)};";
     }
 
@@ -320,6 +365,7 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
     private static string FormatType(string type, short maxLength, byte precision, byte scale) => type switch
     {
         "nvarchar" => maxLength == -1 ? "nvarchar(max)" : $"nvarchar({maxLength / 2})",
+        "binary" => $"binary({maxLength})",
         "varbinary" => maxLength == -1 ? "varbinary(max)" : $"varbinary({maxLength})",
         "decimal" or "numeric" => $"decimal({precision},{scale})",
         "datetimeoffset" => $"datetimeoffset({scale})",

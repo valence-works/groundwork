@@ -6,6 +6,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
+using Groundwork.SqlServer.PhysicalStorage;
 using Microsoft.Data.SqlClient;
 
 namespace Groundwork.SqlServer.Documents;
@@ -19,11 +20,28 @@ public sealed class SqlServerPhysicalDocumentStore : RelationalPhysicalDocumentS
         IReadOnlyList<ExecutableStorageRoute> routes,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
+        : this(
+            connectionString,
+            manifest,
+            routes,
+            access,
+            new SqlServerPhysicalIdentityHash(),
+            scopeObserver)
+    {
+    }
+
+    internal SqlServerPhysicalDocumentStore(
+        string connectionString,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        DocumentStoreAccess access,
+        SqlServerPhysicalIdentityHash hash,
+        IStorageScopeObserver? scopeObserver = null)
         : base(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             manifest,
             routes,
-            new SqlServerPhysicalDocumentDialect(),
+            new SqlServerPhysicalDocumentDialect(hash),
             access,
             scopeObserver)
     {
@@ -36,13 +54,41 @@ public sealed class SqlServerPhysicalDocumentStore : RelationalPhysicalDocumentS
         IReadOnlyList<ExecutableStorageRoute> routes,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
-        : base(sessions, manifest, routes, new SqlServerPhysicalDocumentDialect(), access, scopeObserver)
+        : this(sessions, manifest, routes, access, new SqlServerPhysicalIdentityHash(), scopeObserver)
+    {
+    }
+
+    internal SqlServerPhysicalDocumentStore(
+        RelationalSessionFactory sessions,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        DocumentStoreAccess access,
+        SqlServerPhysicalIdentityHash hash,
+        IStorageScopeObserver? scopeObserver = null)
+        : base(sessions, manifest, routes, new SqlServerPhysicalDocumentDialect(hash), access, scopeObserver)
     {
     }
 }
 
 internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocumentDialect
 {
+    private readonly SqlServerPhysicalIdentity identity;
+
+    public SqlServerPhysicalDocumentDialect()
+        : this(new SqlServerPhysicalIdentityHash())
+    {
+    }
+
+    internal SqlServerPhysicalDocumentDialect(SqlServerPhysicalIdentityHash hash) =>
+        identity = new SqlServerPhysicalIdentity(hash);
+
+    public override void ValidateRoute(ExecutableStorageRoute route) => identity.ValidateRoute(route);
+    public override string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        identity.ExactPredicate(parts, QuoteIdentifier, includeOriginal: true);
+    public override string? HashOnlyIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        identity.ExactPredicate(parts, QuoteIdentifier, includeOriginal: false);
+    public override string ExactIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>
+        SqlServerPhysicalIdentity.ExactJoin(parts, QuoteIdentifier);
     public override int MaxParameters => 2100;
     public override string QuoteIdentifier(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
     public override bool IsUniqueConstraintException(DbException exception) =>

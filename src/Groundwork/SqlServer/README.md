@@ -3,8 +3,11 @@
 `SqlServerPhysicalSchemaExecutor`, `SqlServerPhysicalDocumentStore`, and
 `SqlServerPhysicalQueryRuntime` implement all three compiled physical storage forms. Schema
 application uses session-scoped application locks and a transactional operation ledger; document and
-query operations use independent pooled sessions. Physical string identity is binary and no
-client-side query fallback is available.
+query operations use independent pooled sessions. Route-driven physical tables retain kind/id in
+binary-collated `NVARCHAR(450)` and scope in `NVARCHAR(128)`, with persisted SHA-256 `BINARY(32)`
+provider-owned primary-key columns. Exact predicates and joins compare both digest and retained
+original; a proven mismatch raises `PhysicalIdentityHashCollisionException`. No client-side query
+fallback is available.
 
 `Groundwork.SqlServer` provides SQL Server materialization and document-store operations for portable Groundwork documents.
 
