@@ -109,7 +109,12 @@ renewable generation-fenced application locking, atomically fenced operation/app
 evidence, same-version conflict detection, incarnation-safe restart backfill, replica-set
 transactions with structured same-identity conflict convergence, terminal failed units of work,
 unpublished-attempt backfill recovery, and concurrent materialization are covered by MongoDB
-container conformance.
+container conformance. Factory and direct physical entry points share a cached transaction-topology
+gate, standalone deployments are rejected before schema or session side effects, and incompatible
+view, time-series, or capped namespaces fail creation/final/restart validation. Across conventional
+and physical relational/MongoDB stores, immutable commit-scope preconditions remain nonterminal,
+while every in-scope save/delete failure or non-success atomically rolls back and terminally poisons
+that unit of work.
 Keyset/latest physical-query certification remains a deliberate fail-fast gap rather than an
 advertised capability.
 

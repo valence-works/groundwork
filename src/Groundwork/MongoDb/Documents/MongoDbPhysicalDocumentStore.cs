@@ -33,6 +33,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private readonly TimeProvider timeProvider;
     private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
     private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
+    private readonly MongoDbTransactionCapability transactionCapability;
 
     public MongoDbPhysicalDocumentStore(
         IMongoDatabase database,
@@ -52,7 +53,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         MongoDbPhysicalDocumentStoreOptions? options,
         TimeProvider timeProvider,
         MongoDbPhysicalDocumentStoreExecutionHooks? hooks,
-        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync = null)
+        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync = null,
+        MongoDbTransactionCapability? transactionCapability = null)
     {
         ArgumentNullException.ThrowIfNull(database);
         this.database = database
@@ -67,6 +69,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         this.hooks = hooks ?? MongoDbPhysicalDocumentStoreExecutionHooks.None;
         this.startSessionAsync = startSessionAsync ??
             (ct => this.database.Client.StartSessionAsync(cancellationToken: ct));
+        this.transactionCapability = transactionCapability ?? MongoDbTransactionCapability.ForDatabase(this.database);
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
         queryStores = model.Routes.ToFrozenDictionary(
             route => route.StorageUnit.Value,
@@ -76,7 +79,9 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     public DocumentStoreAccess Access { get; }
 
-    public TransactionBoundary TransactionBoundary => TransactionBoundary.CrossUnitAtomic;
+    public TransactionBoundary TransactionBoundary => transactionCapability.IsKnownSupported
+        ? TransactionBoundary.CrossUnitAtomic
+        : TransactionBoundary.PerOperation;
 
     public Task<DocumentStoreWriteResult> SaveAsync(
         SaveDocumentRequest request,
@@ -108,6 +113,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         var units = scope.Kinds.Select(Unit).ToArray();
         if (units.Select(unit => unit.Tenancy.Kind).Distinct().Count() != 1)
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(units[0]));
+        await transactionCapability.EnsureSupportedAsync(scope.Kinds, "physical storage", cancellationToken);
         foreach (var unit in units)
             ResolveScope(unit, StorageScopeOperation.BeginUnitOfWork);
 
@@ -210,7 +216,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 capabilities.NativeFieldIdentifiers,
                 options,
                 timeProvider,
-                hooks),
+                hooks,
+                transactionCapability),
             new MongoDbPhysicalQueryHandler(
                 MongoDbPhysicalQueryHandler.NativeIdentity,
                 PhysicalQuerySourceKind.NativeDocumentFields,
@@ -222,7 +229,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 capabilities.NativeFieldIdentifiers,
                 options,
                 timeProvider,
-                hooks)
+                hooks,
+                transactionCapability)
         };
         return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
     }
@@ -364,6 +372,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         Func<IClientSessionHandle, Task<DocumentStoreWriteResult>> action,
         CancellationToken cancellationToken)
     {
+        await transactionCapability.EnsureSupportedAsync(documentKinds, "physical storage", cancellationToken);
         var retryStarted = timeProvider.GetTimestamp();
         for (var attempt = 1; ; attempt++)
         {
@@ -892,6 +901,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     private readonly MongoDbPhysicalDocumentStoreOptions options;
     private readonly TimeProvider timeProvider;
     private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
+    private readonly MongoDbTransactionCapability transactionCapability;
 
     public MongoDbPhysicalQueryHandler(
         string identity,
@@ -904,7 +914,8 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         IReadOnlyDictionary<string, string> nativeFieldIdentifiers,
         MongoDbPhysicalDocumentStoreOptions options,
         TimeProvider timeProvider,
-        MongoDbPhysicalDocumentStoreExecutionHooks hooks)
+        MongoDbPhysicalDocumentStoreExecutionHooks hooks,
+        MongoDbTransactionCapability transactionCapability)
     {
         Identity = identity;
         Source = source;
@@ -915,6 +926,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         this.options = options;
         this.timeProvider = timeProvider;
         this.hooks = hooks;
+        this.transactionCapability = transactionCapability;
         Certifications = Array.AsReadOnly(certifications.ToArray());
         NativeFieldIdentifiers = source == PhysicalQuerySourceKind.NativeDocumentFields
             ? nativeFieldIdentifiers.ToFrozenDictionary(StringComparer.Ordinal)
@@ -939,6 +951,11 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     {
         var collection = database.GetCollection<BsonDocument>(plan.LookupObject.Identifier);
         var filter = BuildFilter(query, plan, scope(), storage, route);
+        var sort = BuildSort(query, plan);
+        await transactionCapability.EnsureSupportedAsync(
+            [route.StorageUnit.Value],
+            "physical snapshot query",
+            cancellationToken);
         var started = timeProvider.GetTimestamp();
         for (var attempt = 1; ; attempt++)
         {
@@ -955,7 +972,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                     await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
                     return new DocumentQueryResult([], total);
                 }
-                var find = collection.Find(session, filter).Sort(BuildSort(query, plan)).Skip(query.Skip ?? 0);
+                var find = collection.Find(session, filter).Sort(sort).Skip(query.Skip ?? 0);
                 if (query.Take is { } take) find = find.Limit(take);
                 var found = await find.ToListAsync(cancellationToken);
                 await hooks.QueryPageRead(session, attempt, cancellationToken);

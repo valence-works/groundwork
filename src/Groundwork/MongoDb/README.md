@@ -81,4 +81,12 @@ defaults.
 - Standalone MongoDB deployments cannot serve atomic multi-object physical writes or the
   diagnostic-record contract; use a replica set or sharded cluster. `CreatePhysicalAsync` probes
   this requirement before compiling or materializing the physical model, so rejection creates no
-  database state.
+  database state. The direct physical materializer performs the same probe before schema
+  application. A directly constructed physical store uses one cached asynchronous capability gate:
+  it reports a conservative transaction boundary until support is proven and rejects transactional
+  writes, units of work, and snapshot queries before sessions or collection traffic on unsupported
+  deployments.
+- Resolved physical namespaces must be writable ordinary collections with simple binary collation.
+  Views, time-series collections, and capped collections are rejected during creation validation,
+  final route validation, and durable restart validation; capped collections cannot participate in
+  the snapshot transactions required by the physical runtime.

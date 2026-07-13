@@ -80,7 +80,7 @@ public sealed class SqliteDocumentUnitOfWorkTests
     }
 
     [Fact]
-    public async Task CallerRollsBackOnNonSuccessForAllOrNothing()
+    public async Task NonSuccessRollsBackAndMakesTheUnitOfWorkTerminal()
     {
         await using var harness = await TxHarness.Create();
 
@@ -93,10 +93,10 @@ public sealed class SqliteDocumentUnitOfWorkTests
             var conflict = await unitOfWork.SaveAsync(new SaveDocumentRequest("widget", "w2", "1.0.0", """{"category":"gadgets"}""", ExpectedVersion: 7));
             Assert.Equal(DocumentStoreWriteStatus.NotFound, conflict.Status);
 
-            await unitOfWork.RollbackAsync();
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.RollbackAsync());
         }
 
-        // Because the caller rolled back, the earlier successful save is also discarded.
+        // The non-success automatically rolls back the earlier successful save.
         Assert.Null(await harness.Store.LoadAsync("widget", "w1"));
     }
 
@@ -127,7 +127,7 @@ public sealed class SqliteDocumentUnitOfWorkTests
 
             Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, refused.Status);
 
-            await unitOfWork.RollbackAsync();
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.RollbackAsync());
         }
 
         var loaded = await harness.Store.LoadAsync("widget", "w1");

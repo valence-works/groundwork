@@ -130,6 +130,28 @@ public abstract class RelationalPhysicalStorageConformance
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task UnitOfWorkNonSuccessRollsBackAndMakesTheTransactionTerminal(PhysicalStorageForm form)
+    {
+        await using var fixture = await CreateAsync(form);
+        await using var transaction = await fixture.Documents.BeginAsync(
+            DocumentCommitScope.Of("configurationDocument"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(
+            Save("staged-before-non-success", "tools", 0))).Status);
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, (await transaction.SaveAsync(
+            Save("missing", "tools", 1))).Status);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.RollbackAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.LoadAsync(
+            "configurationDocument", "staged-before-non-success"));
+        Assert.Null(await fixture.Documents.LoadAsync("configurationDocument", "staged-before-non-success"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
     public async Task AdditiveEvolutionBackfillsRestartsAndUsesAnExclusiveApplicationLock(PhysicalStorageForm form)
     {
         await using var fixture = await CreateEvolutionAsync(form);

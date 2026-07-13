@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
@@ -333,6 +334,7 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
             model.Provider,
             DocumentStoreAccess.Scoped(new("tenant-a")));
 
+        Assert.Equal(TransactionBoundary.CrossUnitAtomic, handle.Store.TransactionBoundary);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await handle.Store.SaveAsync(new SaveDocumentRequest(
             "workItem", "replica", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
     }

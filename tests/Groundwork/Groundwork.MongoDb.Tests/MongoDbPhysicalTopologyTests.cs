@@ -1,7 +1,10 @@
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Transactions;
+using Groundwork.Core.Queries;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Bson;
@@ -84,6 +87,83 @@ public sealed class MongoDbPhysicalTopologyTests : IAsyncLifetime
         using var names = await database.ListCollectionNamesAsync();
         Assert.Equal(["groundwork_physical_schema_state"], await names.ToListAsync());
         Assert.Equal(state, await stateCollection.Find(Builders<BsonDocument>.Filter.Empty).SingleAsync());
+    }
+
+    [Fact]
+    public async Task Direct_materializer_rejects_a_fresh_standalone_before_creating_database_state()
+    {
+        var databaseName = $"gw_st_dm_{Guid.NewGuid():N}";
+        var database = Database(databaseName);
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(model));
+
+        using var names = await database.ListCollectionNamesAsync();
+        Assert.Empty(await names.ToListAsync());
+    }
+
+    [Fact]
+    public async Task Direct_materializer_rejects_standalone_before_reading_or_changing_seeded_applied_state()
+    {
+        var databaseName = $"gw_st_da_{Guid.NewGuid():N}";
+        var database = Database(databaseName);
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            model.Target,
+            PhysicalSchemaHistoryState.Empty,
+            DateTimeOffset.UtcNow);
+        var acknowledgements = plan.Operations
+            .Where(operation => operation.Kind != PhysicalSchemaOperationKind.RecordAppliedState)
+            .Select(operation => new PhysicalSchemaOperationAcknowledgement(
+                operation.Identity,
+                operation.Fingerprint,
+                DateTimeOffset.UtcNow))
+            .ToArray();
+        var applied = plan.Complete(acknowledgements, DateTimeOffset.UtcNow);
+        await database.CreateCollectionAsync("groundwork_physical_schema_state");
+        var stateCollection = database.GetCollection<BsonDocument>("groundwork_physical_schema_state");
+        var state = new BsonDocument
+        {
+            ["_id"] = MongoDbPhysicalSchemaExecutor.TargetIdentityDocument(model.Target.Identity),
+            ["target_fingerprint"] = applied.TargetFingerprint,
+            ["state"] = PhysicalSchemaAppliedStateSerializer.Serialize(applied)
+        };
+        await stateCollection.InsertOneAsync(state);
+
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(model));
+
+        using var names = await database.ListCollectionNamesAsync();
+        Assert.Equal(["groundwork_physical_schema_state"], await names.ToListAsync());
+        Assert.Equal(state, await stateCollection.Find(Builders<BsonDocument>.Filter.Empty).SingleAsync());
+    }
+
+    [Fact]
+    public async Task Direct_store_rejects_transactional_entries_on_standalone_without_creating_state()
+    {
+        var databaseName = $"gw_st_ds_{Guid.NewGuid():N}";
+        var database = Database(databaseName);
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "save", "1", "{}")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.DeleteAsync(new DeleteDocumentRequest(
+            "workItem", "delete")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.BeginAsync(DocumentCommitScope.Of("workItem")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+        Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
+
+        using var names = await database.ListCollectionNamesAsync();
+        Assert.Empty(await names.ToListAsync());
     }
 
     private IMongoDatabase Database(string name) =>

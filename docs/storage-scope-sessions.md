@@ -60,7 +60,10 @@ rows. Unconditional saves remain upserts within the session's own scope.
 
 An explicit unit of work inherits its store's access context. Groundwork rejects a commit scope that
 mixes global and scoped storage-unit policies before opening a provider transaction. Relational and
-MongoDB transactional units of work retain the same scope for every enlisted operation.
+MongoDB transactional units of work retain the same immutable commit scope for every enlisted
+operation. Save, delete, and load reject an undeclared document kind before provider traffic without
+poisoning the transaction. Any in-scope save/delete failure or non-success outcome rolls back the
+complete transaction and makes that unit terminal; callers must begin a new unit of work.
 
 ## Conformance evidence
 

@@ -1,7 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
-using Groundwork.Core.Transactions;
 using Groundwork.Core.Validation;
 using Groundwork.Documents.Scoping;
 using Groundwork.Materialization;
@@ -36,23 +35,33 @@ public static class MongoDbDocumentStoreFactory
         try
         {
             var database = client.GetDatabase(databaseName);
-            if (!await MongoDbTransactionTopology.SupportsTransactionsAsync(database, cancellationToken))
-            {
-                var documentKinds = manifest.StorageUnits
-                    .Select(unit => unit.Identity.Value)
-                    .Order(StringComparer.Ordinal)
-                    .ToArray();
-                throw new UnsupportedAtomicCommitException(
-                    documentKinds,
-                    $"MongoDB physical storage requires a replica set or sharded cluster, but the connected deployment is " +
-                    $"'{client.Cluster.Description.Type}'.");
-            }
+            var transactionCapability = MongoDbTransactionCapability.ForDatabase(database);
+            var documentKinds = manifest.StorageUnits
+                .Select(unit => unit.Identity.Value)
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            await transactionCapability.EnsureSupportedAsync(
+                documentKinds,
+                "physical storage",
+                cancellationToken);
             var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
-            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model, cancellationToken);
+            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
+                model,
+                transactionCapability,
+                cancellationToken);
             return new MongoDbPhysicalDocumentStoreHandle(
                 disposableClient,
                 model,
-                new MongoDbPhysicalDocumentStore(database, model, access, scopeObserver, validatedOptions));
+                new MongoDbPhysicalDocumentStore(
+                    database,
+                    model,
+                    access,
+                    scopeObserver,
+                    validatedOptions,
+                    TimeProvider.System,
+                    hooks: null,
+                    startSessionAsync: null,
+                    transactionCapability));
         }
         catch
         {

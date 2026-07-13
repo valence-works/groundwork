@@ -120,5 +120,8 @@ documents. Generation-fenced leases atomically protect operation evidence and ap
 document-incarnation tokens keep restart backfill safe across delete/recreate races. Exact
 linked/native handler certifications bind bounded queries to resolved collections, fields, and
 indexes. Typed numeric projections validate their original JSON lexemes and declared shape;
-DateTime projections use exact UTC ticks. Native Number/DateTime paths without a typed projection
-and unsupported keyset/latest query declarations fail before traffic.
+DateTime projections use exact UTC ticks. A cached transaction-topology gate protects factory and
+direct physical materializer/store entry points before side effects or sessions, and route
+validation rejects views, time-series namespaces, and capped collections. Native Number/DateTime
+paths without a typed projection and unsupported keyset/latest query declarations fail before
+traffic.

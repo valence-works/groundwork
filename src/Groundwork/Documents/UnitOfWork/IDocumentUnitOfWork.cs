@@ -40,22 +40,21 @@ public interface IDocumentSessionFactory
 /// </para>
 /// <para>
 /// <b>Staging:</b> each <see cref="SaveAsync"/>/<see cref="DeleteAsync"/> executes against the open
-/// unit of work and returns its <see cref="DocumentStoreWriteResult"/> immediately (including
-/// optimistic-concurrency <c>ConcurrencyConflict</c>/<c>NotFound</c> outcomes), so the caller can
-/// decide whether to continue, <see cref="CommitAsync"/>, or <see cref="RollbackAsync"/>.
+/// unit of work and returns its <see cref="DocumentStoreWriteResult"/> immediately. A non-success
+/// outcome (including optimistic-concurrency <c>ConcurrencyConflict</c>/<c>NotFound</c>) atomically
+/// rolls back and terminally poisons that unit of work; the caller must begin a new unit of work.
 /// </para>
 /// <para>
-/// <b>All-or-nothing contract:</b> nothing is durable until <see cref="CommitAsync"/>. To honour
-/// all-or-nothing semantics the caller must roll back when any staged operation reports a non-success
-/// status (a status other than <see cref="DocumentStoreWriteStatus.Saved"/> or
-/// <see cref="DocumentStoreWriteStatus.Deleted"/>). If a staged operation throws, or the unit of work
-/// is disposed without committing, it is rolled back.
+/// <b>All-or-nothing contract:</b> nothing is durable until <see cref="CommitAsync"/>. A non-successful
+/// or failed save/delete rolls back the complete transaction before returning or throwing. Disposing
+/// without committing also rolls back.
 /// </para>
 /// <para>
 /// <b>Failure contract:</b> some providers (for example PostgreSQL) abort the whole transaction when a
-/// single statement fails at the database level; after such a failure the only valid next step is
-/// <see cref="RollbackAsync"/>/dispose. <see cref="CommitAsync"/> surfaces any commit-time failure as
-/// an exception, leaving nothing durable.
+/// single statement fails at the database level. Groundwork therefore makes every failed or
+/// non-successful save/delete terminal consistently across providers. <see cref="CommitAsync"/>,
+/// <see cref="RollbackAsync"/>, and further operations reject the completed unit. Commit-time failures
+/// surface as exceptions and leave the unit terminal.
 /// </para>
 /// </remarks>
 public interface IDocumentUnitOfWork : IAsyncDisposable

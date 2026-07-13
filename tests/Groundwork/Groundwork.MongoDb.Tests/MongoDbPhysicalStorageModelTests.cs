@@ -5,6 +5,7 @@ using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Core.Transactions;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
@@ -324,7 +325,8 @@ public sealed class MongoDbPhysicalStorageModelTests
             options: null,
             TimeProvider.System,
             hooks: null,
-            _ => Task.FromResult(session));
+            _ => Task.FromResult(session),
+            new MongoDbTransactionCapability(_ => Task.FromResult(true), knownSupport: true));
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             store.BeginAsync(DocumentCommitScope.Of("workItem")));
@@ -334,11 +336,139 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Fact]
+    public async Task Conventional_unit_of_work_disposes_an_owned_session_when_transaction_startup_fails()
+    {
+        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_conventional_session_disposal");
+        var session = DispatchProxy.Create<IClientSessionHandle, FailingSessionProxy>();
+        var proxy = (FailingSessionProxy)(object)session;
+        var store = new MongoDbDocumentStore(
+            database,
+            Manifest(),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            scopeObserver: null,
+            _ => Task.FromResult(true),
+            _ => Task.FromResult(session));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.BeginAsync(DocumentCommitScope.Of("orders")));
+
+        Assert.Equal("transaction startup failed", exception.Message);
+        Assert.True(proxy.Disposed);
+    }
+
+    [Fact]
+    public async Task Conventional_unit_of_work_rejects_out_of_scope_kinds_without_becoming_terminal()
+    {
+        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_conventional_commit_scope");
+        var session = DispatchProxy.Create<IClientSessionHandle, ActiveSessionProxy>();
+        var proxy = (ActiveSessionProxy)(object)session;
+        var store = new MongoDbDocumentStore(
+            database,
+            Manifest(),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            scopeObserver: null,
+            _ => Task.FromResult(true),
+            _ => Task.FromResult(session));
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("orders"));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.SaveAsync(new SaveDocumentRequest(
+            "undeclared-kind", "outside-save", "1", "{}")));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.DeleteAsync(new DeleteDocumentRequest(
+            "undeclared-kind", "outside-delete")));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.LoadAsync(
+            "undeclared-kind", "outside-load"));
+
+        await transaction.RollbackAsync();
+        Assert.True(proxy.Aborted);
+        Assert.True(proxy.Disposed);
+    }
+
+    [Fact]
     public void Transaction_topology_probe_distinguishes_standalone_replica_set_and_sharded_hello_evidence()
     {
         Assert.False(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("ok", 1)));
         Assert.True(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("setName", "rs0")));
         Assert.True(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("msg", "isdbgrid")));
+    }
+
+    [Fact]
+    public async Task Transaction_capability_probe_is_cached_only_after_a_conclusive_result()
+    {
+        var probes = 0;
+        var capability = new MongoDbTransactionCapability(_ =>
+        {
+            Interlocked.Increment(ref probes);
+            return Task.FromResult(true);
+        });
+
+        Assert.False(capability.IsKnownSupported);
+        Assert.True(await capability.SupportsTransactionsAsync(CancellationToken.None));
+        Assert.True(await capability.SupportsTransactionsAsync(CancellationToken.None));
+
+        Assert.True(capability.IsKnownSupported);
+        Assert.Equal(1, probes);
+    }
+
+    [Fact]
+    public async Task Direct_physical_store_rejects_every_transactional_entry_before_database_traffic()
+    {
+        var probes = 0;
+        var sessions = 0;
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_direct_topology_gate");
+        var capability = new MongoDbTransactionCapability(_ =>
+        {
+            Interlocked.Increment(ref probes);
+            return Task.FromResult(false);
+        });
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            scopeObserver: null,
+            options: null,
+            TimeProvider.System,
+            hooks: null,
+            _ =>
+            {
+                Interlocked.Increment(ref sessions);
+                throw new InvalidOperationException("Session creation must not be reached.");
+            },
+            capability);
+
+        Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "save", "1", "{}")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.DeleteAsync(new DeleteDocumentRequest(
+            "workItem", "delete")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.BeginAsync(DocumentCommitScope.Of("workItem")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+
+        Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
+        Assert.Equal(1, probes);
+        Assert.Equal(0, sessions);
+    }
+
+    [Fact]
+    public async Task Direct_physical_materializer_rejects_unsupported_topology_before_schema_application()
+    {
+        var probes = 0;
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_direct_materializer_topology");
+        var capability = new MongoDbTransactionCapability(_ =>
+        {
+            Interlocked.Increment(ref probes);
+            return Task.FromResult(false);
+        });
+
+        var exception = await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(model, capability));
+
+        Assert.Equal(["workItem"], exception.Units);
+        Assert.Equal(1, probes);
     }
 
     private static StorageManifest Manifest()
@@ -430,6 +560,31 @@ public sealed class MongoDbPhysicalStorageModelTests
             }
             if (targetMethod?.Name == nameof(IClientSessionHandle.StartTransaction))
                 throw new InvalidOperationException("transaction startup failed");
+            throw new NotSupportedException(targetMethod?.Name);
+        }
+    }
+
+    private class ActiveSessionProxy : DispatchProxy
+    {
+        public bool Aborted { get; private set; }
+        public bool Disposed { get; private set; }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            if (targetMethod?.Name == nameof(IClientSessionHandle.StartTransaction))
+                return null;
+            if (targetMethod?.Name == $"get_{nameof(IClientSessionHandle.IsInTransaction)}")
+                return true;
+            if (targetMethod?.Name == nameof(IClientSessionHandle.AbortTransactionAsync))
+            {
+                Aborted = true;
+                return Task.CompletedTask;
+            }
+            if (targetMethod?.Name == nameof(IDisposable.Dispose))
+            {
+                Disposed = true;
+                return null;
+            }
             throw new NotSupportedException(targetMethod?.Name);
         }
     }

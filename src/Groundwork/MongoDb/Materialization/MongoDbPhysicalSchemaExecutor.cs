@@ -820,6 +820,12 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             throw new InvalidOperationException(
                 $"MongoDB collection '{name}' conflicts with {evidenceSource} because it is not a writable native collection.");
         }
+        if (options.GetValue("capped", false).ToBoolean())
+        {
+            throw new InvalidOperationException(
+                $"MongoDB collection '{name}' conflicts with {evidenceSource} because capped collections " +
+                "cannot participate in Groundwork snapshot transactions.");
+        }
         if (options.TryGetValue("collation", out var collation) &&
             collation.AsBsonDocument.GetValue("locale", "simple").AsString != "simple")
         {

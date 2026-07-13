@@ -206,14 +206,17 @@ public class RelationalDocumentStore : IDocumentStore
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(GetUnit(scope.Kinds[0])));
 
         if (sessionFactory is not null)
-            return new RelationalDocumentUnitOfWork(this, await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
+            return new RelationalDocumentUnitOfWork(
+                this,
+                scope,
+                await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
 
         await connectionGate.WaitAsync(cancellationToken);
         try
         {
             await EnsureOpenAsync(cancellationToken);
             var transaction = await connection!.BeginTransactionAsync(cancellationToken);
-            return new RelationalDocumentUnitOfWork(this, transaction);
+            return new RelationalDocumentUnitOfWork(this, scope, transaction);
         }
         catch
         {
@@ -523,41 +526,79 @@ public class RelationalDocumentStore : IDocumentStore
     private sealed class RelationalDocumentUnitOfWork : IDocumentUnitOfWork
     {
         private readonly RelationalDocumentStore store;
+        private readonly DocumentCommitScope scope;
         private readonly DbTransaction? transaction;
         private readonly RelationalUnitOfWork? ownedUnitOfWork;
         private bool completed;
 
-        public RelationalDocumentUnitOfWork(RelationalDocumentStore store, DbTransaction transaction)
+        public RelationalDocumentUnitOfWork(
+            RelationalDocumentStore store,
+            DocumentCommitScope scope,
+            DbTransaction transaction)
         {
             this.store = store;
+            this.scope = scope;
             this.transaction = transaction;
         }
 
-        public RelationalDocumentUnitOfWork(RelationalDocumentStore store, RelationalUnitOfWork ownedUnitOfWork)
+        public RelationalDocumentUnitOfWork(
+            RelationalDocumentStore store,
+            DocumentCommitScope scope,
+            RelationalUnitOfWork ownedUnitOfWork)
         {
             this.store = store;
+            this.scope = scope;
             this.ownedUnitOfWork = ownedUnitOfWork;
         }
 
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            var unit = store.GetUnit(request.DocumentKind);
-            var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
-            return await ExecuteAsync((currentTransaction, ct) => store.SaveCoreAsync(request, unit, scope, currentTransaction, ct), cancellationToken);
+            this.scope.EnsureIncludes(request.DocumentKind);
+            try
+            {
+                var unit = store.GetUnit(request.DocumentKind);
+                var selection = store.ResolveScope(unit, StorageScopeOperation.Save);
+                var result = await ExecuteAsync(
+                    (currentTransaction, ct) => store.SaveCoreAsync(request, unit, selection, currentTransaction, ct),
+                    cancellationToken);
+                if (result.Status != DocumentStoreWriteStatus.Saved)
+                    await AbortAsync(CancellationToken.None);
+                return result;
+            }
+            catch
+            {
+                await AbortAsync(CancellationToken.None);
+                throw;
+            }
         }
 
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            var unit = store.GetUnit(request.DocumentKind);
-            var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
-            return await ExecuteAsync((currentTransaction, ct) => store.DeleteCoreAsync(request, unit, scope, currentTransaction, ct), cancellationToken);
+            this.scope.EnsureIncludes(request.DocumentKind);
+            try
+            {
+                var unit = store.GetUnit(request.DocumentKind);
+                var selection = store.ResolveScope(unit, StorageScopeOperation.Delete);
+                var result = await ExecuteAsync(
+                    (currentTransaction, ct) => store.DeleteCoreAsync(request, unit, selection, currentTransaction, ct),
+                    cancellationToken);
+                if (result.Status != DocumentStoreWriteStatus.Deleted)
+                    await AbortAsync(CancellationToken.None);
+                return result;
+            }
+            catch
+            {
+                await AbortAsync(CancellationToken.None);
+                throw;
+            }
         }
 
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            this.scope.EnsureIncludes(documentKind);
             var unit = store.GetUnit(documentKind);
             var scope = store.ResolveScope(unit, StorageScopeOperation.Load);
             return await ExecuteAsync(
@@ -594,27 +635,7 @@ public class RelationalDocumentStore : IDocumentStore
         public async Task RollbackAsync(CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            if (ownedUnitOfWork is not null)
-            {
-                try
-                {
-                    await ownedUnitOfWork.RollbackAsync(cancellationToken);
-                }
-                finally
-                {
-                    completed = true;
-                }
-                return;
-            }
-
-            try
-            {
-                await transaction!.RollbackAsync(cancellationToken);
-            }
-            finally
-            {
-                await CompleteAsync();
-            }
+            await AbortAsync(cancellationToken);
         }
 
         public async ValueTask DisposeAsync()
@@ -651,6 +672,34 @@ public class RelationalDocumentStore : IDocumentStore
             completed = true;
             await transaction!.DisposeAsync();
             store.connectionGate.Release();
+        }
+
+        private async Task AbortAsync(CancellationToken cancellationToken)
+        {
+            if (completed)
+                return;
+
+            if (ownedUnitOfWork is not null)
+            {
+                try
+                {
+                    await ownedUnitOfWork.RollbackAsync(cancellationToken);
+                }
+                finally
+                {
+                    completed = true;
+                }
+                return;
+            }
+
+            try
+            {
+                await transaction!.RollbackAsync(cancellationToken);
+            }
+            finally
+            {
+                await CompleteAsync();
+            }
         }
 
         private Task<T> ExecuteAsync<T>(

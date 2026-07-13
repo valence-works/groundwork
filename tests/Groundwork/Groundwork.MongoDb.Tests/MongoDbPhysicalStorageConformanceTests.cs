@@ -303,6 +303,34 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.NotNull(await store.LoadAsync("workItem", "inside"));
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Unit_of_work_non_success_rolls_back_and_makes_the_transaction_terminal(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("workItem"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "staged-before-non-success", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
+
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "missing", "1", "{}", ExpectedVersion: 1))).Status);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.RollbackAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.LoadAsync(
+            "workItem", "staged-before-non-success"));
+        Assert.Null(await store.LoadAsync("workItem", "staged-before-non-success"));
+    }
+
     [Fact]
     public async Task Unit_of_work_unique_write_error_returns_a_structured_conflict_and_is_terminal()
     {
@@ -389,6 +417,28 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Physical_schema_rejects_a_capped_resolved_collection_without_publishing_state()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var route = Assert.Single(model.Routes);
+        await database.CreateCollectionAsync(
+            route.PrimaryStorage.Name.Identifier,
+            new CreateCollectionOptions
+            {
+                Capped = true,
+                MaxSize = 1024 * 1024
+            });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(model));
+
+        Assert.Contains("capped", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, await database.GetCollection<BsonDocument>("groundwork_physical_schema_state")
+            .CountDocumentsAsync(Builders<BsonDocument>.Filter.Empty));
+    }
+
+    [Fact]
     public async Task Durable_restart_rejects_a_primary_collection_replaced_by_a_view()
     {
         var database = Database();
@@ -408,6 +458,29 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
 
         Assert.Contains("writable native collection", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("durable applied route state", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Durable_restart_rejects_a_primary_collection_replaced_by_a_capped_collection()
+    {
+        var database = Database();
+        var model = Model(PhysicalStorageForm.DedicatedDocumentTable);
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        await materializer.MaterializeAsync(model);
+        var route = Assert.Single(model.Routes);
+        await database.DropCollectionAsync(route.PrimaryStorage.Name.Identifier);
+        await database.CreateCollectionAsync(
+            route.PrimaryStorage.Name.Identifier,
+            new CreateCollectionOptions
+            {
+                Capped = true,
+                MaxSize = 1024 * 1024
+            });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => materializer.MaterializeAsync(model));
+
+        Assert.Contains("capped", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("durable applied route state", exception.Message, StringComparison.Ordinal);
     }
 

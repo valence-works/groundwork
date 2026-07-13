@@ -15,10 +15,21 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
 
     public Task<PhysicalSchemaApplicationResult> MaterializeAsync(
         MongoDbPhysicalStorageModel model,
+        CancellationToken cancellationToken = default) =>
+        MaterializeAsync(model, MongoDbTransactionCapability.ForDatabase(database), cancellationToken);
+
+    internal async Task<PhysicalSchemaApplicationResult> MaterializeAsync(
+        MongoDbPhysicalStorageModel model,
+        MongoDbTransactionCapability transactionCapability,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(model);
-        return PhysicalSchemaApplication.ApplyAsync(
+        ArgumentNullException.ThrowIfNull(transactionCapability);
+        await transactionCapability.EnsureSupportedAsync(
+            model.Routes.Select(route => route.StorageUnit.Value).ToArray(),
+            "physical schema application",
+            cancellationToken);
+        return await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new MongoDbPhysicalSchemaExecutor(database),
             cancellationToken: cancellationToken);
