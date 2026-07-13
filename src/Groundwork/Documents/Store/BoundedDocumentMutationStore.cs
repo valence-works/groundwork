@@ -326,6 +326,11 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
                 throw new InvalidOperationException($"Document mutation '{mutation.MutationIdentity}' cannot use a match-none clause.");
             if (clause.Comparisons.Count > 1 && !plan.Predicate.SupportsDisjunction)
                 throw new InvalidOperationException($"Document mutation '{mutation.MutationIdentity}' does not declare disjunction.");
+            if (clause.Comparisons.Select(comparison => comparison.Path).Distinct(StringComparer.Ordinal).Count() != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Document mutation '{mutation.MutationIdentity}' permits disjunction only within one declared predicate path.");
+            }
 
             foreach (var comparison in clause.Comparisons)
             {
@@ -334,7 +339,7 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
                     throw new InvalidOperationException(
                         $"Transition path '{transitionPath}' is fixed by mutation '{mutation.MutationIdentity}' and is not caller supplied.");
                 }
-                var operation = ToPortableOperation(comparison.Operator);
+                var operation = DocumentQueryOperations.ToPortable(comparison.Operator);
                 if (plan.Predicate.Predicates.All(predicate =>
                         predicate.Path != comparison.Path || !predicate.Operations.Contains(operation)))
                 {
@@ -346,25 +351,24 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
 
         foreach (var predicate in plan.Predicate.Predicates.Where(predicate => predicate.Path != transitionPath))
         {
-            if (comparisons.Count(comparison => comparison.Path == predicate.Path) != 1)
+            if (mutation.Clauses.Count(clause => clause.Comparisons.Any(comparison => comparison.Path == predicate.Path)) != 1)
             {
                 throw new InvalidOperationException(
-                    $"Document mutation '{mutation.MutationIdentity}' requires exactly one comparison for path '{predicate.Path}'.");
+                    $"Document mutation '{mutation.MutationIdentity}' requires exactly one clause for path '{predicate.Path}'.");
+            }
+        }
+
+        foreach (var path in plan.Predicate.RequiredEqualityPrefixPaths.Where(path => path != transitionPath))
+        {
+            var clause = mutation.Clauses.Single(item =>
+                item.Comparisons.Any(comparison => comparison.Path == path));
+            if (clause.Comparisons.Count != 1 ||
+                clause.Comparisons[0].Operator != QueryComparisonOperator.Equal)
+            {
+                throw new InvalidOperationException(
+                    $"Bounded mutation '{mutation.MutationIdentity}' requires one standalone equality comparison for prefix path '{path}'.");
             }
         }
     }
 
-    private static PortableQueryOperation ToPortableOperation(QueryComparisonOperator operation) => operation switch
-    {
-        QueryComparisonOperator.Equal => PortableQueryOperation.Equal,
-        QueryComparisonOperator.In => PortableQueryOperation.In,
-        QueryComparisonOperator.Contains => PortableQueryOperation.Contains,
-        QueryComparisonOperator.NotEqual => PortableQueryOperation.NotEqual,
-        QueryComparisonOperator.StartsWith => PortableQueryOperation.StartsWith,
-        QueryComparisonOperator.GreaterThan => PortableQueryOperation.GreaterThan,
-        QueryComparisonOperator.GreaterThanOrEqual => PortableQueryOperation.GreaterThanOrEqual,
-        QueryComparisonOperator.LessThan => PortableQueryOperation.LessThan,
-        QueryComparisonOperator.LessThanOrEqual => PortableQueryOperation.LessThanOrEqual,
-        _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
-    };
 }

@@ -317,7 +317,7 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore
 
             foreach (var comparison in clause.Comparisons)
             {
-                var operation = ToPortableOperation(comparison.Operator);
+                var operation = DocumentQueryOperations.ToPortable(comparison.Operator);
                 if (plan.Predicates.All(predicate =>
                         predicate.Path != comparison.Path || !predicate.Operations.Contains(operation)))
                     throw new InvalidOperationException($"Operation '{operation}' is not bound to query '{query.QueryIdentity}'.");
@@ -354,7 +354,11 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore
         }
     }
 
-    private static PortableQueryOperation ToPortableOperation(QueryComparisonOperator operation) => operation switch
+}
+
+internal static class DocumentQueryOperations
+{
+    public static PortableQueryOperation ToPortable(QueryComparisonOperator operation) => operation switch
     {
         QueryComparisonOperator.Equal => PortableQueryOperation.Equal,
         QueryComparisonOperator.In => PortableQueryOperation.In,

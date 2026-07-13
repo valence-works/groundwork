@@ -833,7 +833,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
 
     private async Task EnsureInfrastructureAsync(CancellationToken ct)
     {
-        await ExecuteAsync("""
+        await ExecuteAsync($$"""
             CREATE TABLE IF NOT EXISTS groundwork_physical_schema_operations (
                 manifest_id TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
@@ -849,7 +849,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 applied_state_json TEXT NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
             );
-            CREATE TABLE IF NOT EXISTS groundwork_document_mutation_operations (
+            CREATE TABLE IF NOT EXISTS {{RelationalPhysicalStorageColumns.MutationOperationsTable}} (
                 manifest_id TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
                 provider_version TEXT NOT NULL,

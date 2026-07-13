@@ -10,7 +10,7 @@ using Groundwork.Documents.Store;
 namespace Groundwork.Relational.Documents;
 
 /// <summary>Observable transaction boundaries used by provider conformance tests.</summary>
-public enum RelationalPhysicalMutationExecutionPoint
+internal enum RelationalPhysicalMutationExecutionPoint
 {
     BeforeCommit,
     AfterCommitBeforeAcknowledgement
@@ -22,7 +22,6 @@ public enum RelationalPhysicalMutationExecutionPoint
 /// </summary>
 public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumentMutationHandler
 {
-    internal const string OperationTable = "groundwork_document_mutation_operations";
     private const string SelectionTable = "groundwork_bounded_mutation_selection";
     private const string SelectionKind = "document_kind";
     private const string SelectionScope = "storage_scope";
@@ -36,8 +35,17 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         string identity,
         PhysicalQuerySourceKind source,
         RelationalPhysicalDocumentStore store,
+        IReadOnlyList<PhysicalMutationHandlerCertification> certifications)
+        : this(identity, source, store, certifications, null)
+    {
+    }
+
+    internal RelationalPhysicalDocumentMutationHandler(
+        string identity,
+        PhysicalQuerySourceKind source,
+        RelationalPhysicalDocumentStore store,
         IReadOnlyList<PhysicalMutationHandlerCertification> certifications,
-        Func<RelationalPhysicalMutationExecutionPoint, CancellationToken, ValueTask>? intercept = null)
+        Func<RelationalPhysicalMutationExecutionPoint, CancellationToken, ValueTask>? intercept)
     {
         Identity = string.IsNullOrWhiteSpace(identity)
             ? throw new ArgumentException("A handler identity is required.", nameof(identity))
@@ -176,18 +184,18 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await ExecuteAsync(
             connection,
             transaction,
-            $"CREATE TEMP TABLE {store.Q(SelectionTable)} (" +
-            $"{store.Q(SelectionKind)} TEXT NOT NULL, " +
-            $"{store.Q(SelectionScope)} TEXT NOT NULL, " +
-            $"{store.Q(SelectionId)} TEXT NOT NULL, " +
-            $"PRIMARY KEY ({store.Q(SelectionKind)}, {store.Q(SelectionScope)}, {store.Q(SelectionId)})) WITHOUT ROWID;",
+            store.CreateMutationSelectionTable(
+                SelectionTableExpression,
+                SelectionKind,
+                SelectionScope,
+                SelectionId),
             [],
             ct);
         var selection = BuildSelectionCommand(mutation, plan, scope);
         await ExecuteAsync(
             connection,
             transaction,
-            $"INSERT INTO {store.Q(SelectionTable)} ({store.Q(SelectionKind)}, {store.Q(SelectionScope)}, {store.Q(SelectionId)}) " +
+            $"INSERT INTO {SelectionTableExpression} ({store.Q(SelectionKind)}, {store.Q(SelectionScope)}, {store.Q(SelectionId)}) " +
             selection.CommandText + ";",
             selection.Parameters,
             ct);
@@ -200,7 +208,7 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
     {
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
-            $"SELECT COUNT(*) FROM {store.Q(SelectionTable)};",
+            $"SELECT COUNT(*) FROM {SelectionTableExpression};",
             transaction);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -216,16 +224,22 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
             await ExecuteAsync(
                 connection,
                 transaction,
-                $"DELETE FROM {store.Q(route.LinkedIndexStorage.Name.Identifier)} AS l WHERE EXISTS (" +
-                $"SELECT 1 FROM {store.Q(SelectionTable)} AS s WHERE {LinkedSelectionJoin(route, "l", "s")});",
+                store.DeleteByMutationSelection(
+                    store.Q(route.LinkedIndexStorage.Name.Identifier),
+                    "l",
+                    SelectionTableExpression,
+                    LinkedSelectionJoin(route, "l", "s")),
                 [],
                 ct);
         }
         await ExecuteAsync(
             connection,
             transaction,
-            $"DELETE FROM {store.Q(route.PrimaryStorage.Name.Identifier)} AS p WHERE EXISTS (" +
-            $"SELECT 1 FROM {store.Q(SelectionTable)} AS s WHERE {PrimarySelectionJoin(route, "p", "s")});",
+            store.DeleteByMutationSelection(
+                store.Q(route.PrimaryStorage.Name.Identifier),
+                "p",
+                SelectionTableExpression,
+                PrimarySelectionJoin(route, "p", "s")),
             [],
             ct);
     }
@@ -261,8 +275,12 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await ExecuteAsync(
             connection,
             transaction,
-            $"UPDATE {store.Q(route.PrimaryStorage.Name.Identifier)} AS p SET {string.Join(", ", primaryAssignments)} " +
-            $"WHERE EXISTS (SELECT 1 FROM {store.Q(SelectionTable)} AS s WHERE {PrimarySelectionJoin(route, "p", "s")});",
+            store.UpdateByMutationSelection(
+                store.Q(route.PrimaryStorage.Name.Identifier),
+                "p",
+                primaryAssignments,
+                SelectionTableExpression,
+                PrimarySelectionJoin(route, "p", "s")),
             parameters,
             ct);
 
@@ -280,8 +298,12 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await ExecuteAsync(
             connection,
             transaction,
-            $"UPDATE {store.Q(route.LinkedIndexStorage.Name.Identifier)} AS l SET {string.Join(", ", linkedAssignments)} " +
-            $"WHERE EXISTS (SELECT 1 FROM {store.Q(SelectionTable)} AS s WHERE {LinkedSelectionJoin(route, "l", "s")});",
+            store.UpdateByMutationSelection(
+                store.Q(route.LinkedIndexStorage.Name.Identifier),
+                "l",
+                linkedAssignments,
+                SelectionTableExpression,
+                LinkedSelectionJoin(route, "l", "s")),
             linkedParameters,
             ct);
     }
@@ -315,7 +337,7 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
     {
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
-            $"SELECT request_fingerprint, affected_count FROM {store.Q(OperationTable)} " +
+            $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
             "WHERE manifest_id = @manifestId AND provider_name = @providerName AND provider_version = @providerVersion " +
             "AND storage_unit = @storageUnit AND storage_scope = @storageScope AND operation_id = @operationId;",
             transaction);
@@ -336,7 +358,7 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
     {
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
-            $"INSERT INTO {store.Q(OperationTable)} " +
+            $"INSERT INTO {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
             "(manifest_id, provider_name, provider_version, storage_unit, storage_scope, operation_id, request_fingerprint, affected_count, completed_utc) " +
             "VALUES (@manifestId, @providerName, @providerVersion, @storageUnit, @storageScope, @operationId, @fingerprint, @affected, @completed);",
             transaction);
@@ -368,9 +390,11 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await ExecuteAsync(
             connection,
             transaction,
-            $"DROP TABLE IF EXISTS {store.Q(SelectionTable)};",
+            store.DropMutationSelectionTable(SelectionTableExpression),
             [],
             ct);
+
+    private string SelectionTableExpression => store.MutationSelectionTable(SelectionTable);
 
     private async Task ExecuteAsync(
         DbConnection connection,

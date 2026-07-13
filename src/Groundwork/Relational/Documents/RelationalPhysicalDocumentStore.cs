@@ -70,6 +70,30 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract string ApplyFirst(string selectSql);
     public virtual string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
         $"{QuoteIdentifier(tableIdentifier)} {alias}";
+    public virtual string MutationSelectionTable(string logicalName) => QuoteIdentifier(logicalName);
+    public virtual string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn) =>
+        throw new NotSupportedException("This relational provider does not support bounded mutation identity selection.");
+    public virtual string DropMutationSelectionTable(string tableExpression) =>
+        $"DROP TABLE IF EXISTS {tableExpression};";
+    public virtual string DeleteByMutationSelection(
+        string tableExpression,
+        string alias,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"DELETE FROM {tableExpression} AS {alias} WHERE EXISTS (" +
+        $"SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+    public virtual string UpdateByMutationSelection(
+        string tableExpression,
+        string alias,
+        IReadOnlyList<string> assignments,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"UPDATE {tableExpression} AS {alias} SET {string.Join(", ", assignments)} " +
+        $"WHERE EXISTS (SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
 
     protected string Qualified(string? alias, string identifier) =>
         alias is null ? QuoteIdentifier(identifier) : $"{alias}.{QuoteIdentifier(identifier)}";
@@ -327,6 +351,29 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal string ApplyFirst(string sql) => dialect.ApplyFirst(sql);
     internal string PhysicalQuerySource(string table, string alias, string? index) =>
         dialect.QuerySource(table, alias, index);
+    internal string MutationSelectionTable(string logicalName) =>
+        dialect.MutationSelectionTable(logicalName);
+    internal string CreateMutationSelectionTable(
+        string table,
+        string kindColumn,
+        string scopeColumn,
+        string idColumn) =>
+        dialect.CreateMutationSelectionTable(table, kindColumn, scopeColumn, idColumn);
+    internal string DropMutationSelectionTable(string table) =>
+        dialect.DropMutationSelectionTable(table);
+    internal string DeleteByMutationSelection(
+        string table,
+        string alias,
+        string selectionTable,
+        string exactIdentityJoin) =>
+        dialect.DeleteByMutationSelection(table, alias, selectionTable, exactIdentityJoin);
+    internal string UpdateByMutationSelection(
+        string table,
+        string alias,
+        IReadOnlyList<string> assignments,
+        string selectionTable,
+        string exactIdentityJoin) =>
+        dialect.UpdateByMutationSelection(table, alias, assignments, selectionTable, exactIdentityJoin);
     internal string ExactPhysicalIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         dialect.ExactIdentityPredicate(parts);
     internal string ExactPhysicalIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>

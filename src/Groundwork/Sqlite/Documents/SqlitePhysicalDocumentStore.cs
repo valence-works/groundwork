@@ -40,7 +40,7 @@ public sealed class SqlitePhysicalDocumentStore : RelationalPhysicalDocumentStor
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
         : base(
-            SqliteRelationalSessions.CreateSerialized(connectionString),
+            SqliteRelationalSessions.CreateSerializedImmediate(connectionString),
             manifest,
             routes,
             new SqlitePhysicalDocumentDialect(),
@@ -111,4 +111,15 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         indexIdentifier is null
             ? $"{QuoteIdentifier(tableIdentifier)} {alias}"
             : $"{QuoteIdentifier(tableIdentifier)} AS {alias} INDEXED BY {QuoteIdentifier(indexIdentifier)}";
+
+    public override string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn) =>
+        $"CREATE TEMP TABLE {tableExpression} (" +
+        $"{QuoteIdentifier(documentKindColumn)} TEXT NOT NULL, " +
+        $"{QuoteIdentifier(storageScopeColumn)} TEXT NOT NULL, " +
+        $"{QuoteIdentifier(documentIdColumn)} TEXT NOT NULL, " +
+        $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) WITHOUT ROWID;";
 }

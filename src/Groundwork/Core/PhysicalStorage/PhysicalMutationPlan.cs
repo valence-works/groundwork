@@ -150,6 +150,15 @@ public static class PhysicalMutationPlanCompiler
                 $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}.action"));
             return null;
         }
+        if (transition.AllowedSourceValues.Count > 1 &&
+            predicate.RequiredEqualityPrefixPaths.Contains(transition.Path, StringComparer.Ordinal))
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-MUTATION-003",
+                $"Transition path '{transition.Path}' is an equality prefix and therefore requires exactly one source value.",
+                $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}.action"));
+            return null;
+        }
 
         return new PhysicalTransitionMutationAction(
             transition.Path,
