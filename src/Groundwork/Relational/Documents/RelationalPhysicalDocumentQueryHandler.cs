@@ -115,7 +115,13 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             plan.RouteFingerprint);
     }
 
-    private async Task<long> CountCoreAsync(DbConnection connection, BuiltQuery built, CancellationToken ct)
+    internal RelationalPhysicalQueryPredicate BuildPredicate(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        DocumentScopeSelection scope) =>
+        Build(query, plan, store.GetRoute(query.DocumentKind), scope);
+
+    private async Task<long> CountCoreAsync(DbConnection connection, RelationalPhysicalQueryPredicate built, CancellationToken ct)
     {
         var rendered = RenderCount(built);
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
@@ -123,10 +129,14 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct));
     }
 
-    private static RelationalPhysicalQueryCommand RenderCount(BuiltQuery built) =>
+    private static RelationalPhysicalQueryCommand RenderCount(RelationalPhysicalQueryPredicate built) =>
         new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters);
 
-    private BuiltQuery Build(DocumentQuery query, PhysicalQueryPlan plan, ExecutableStorageRoute route)
+    private RelationalPhysicalQueryPredicate Build(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection? fixedScope = null)
     {
         if (query.Continuation is not null)
             throw new NotSupportedException("This relational handler profile does not certify keyset continuations.");
@@ -135,17 +145,18 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
         var linked = plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary;
         var from = linked
-            ? $"FROM {store.Q(route.LinkedIndexStorage!.Name.Identifier)} l JOIN {store.Q(route.PrimaryStorage.Name.Identifier)} p ON " +
+            ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)} " +
+              $"JOIN {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", null)} ON " +
               store.ExactPhysicalIdentityJoin(
               [
                   new(route.Envelope.DocumentKind.Identifier, "p", route.LinkedRelationship!.DocumentKind.Identifier, "l"),
                   new(route.Envelope.StorageScope.Identifier, "p", route.LinkedRelationship.StorageScope.Identifier, "l"),
                   new(route.Envelope.Id.Identifier, "p", route.LinkedRelationship.DocumentId.Identifier, "l")
               ])
-            : $"FROM {store.Q(route.PrimaryStorage.Name.Identifier)} p";
+            : $"FROM {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", plan.IndexName?.Identifier)}";
         var parameters = new List<(string Name, object? Value)>();
         var predicates = new List<string>();
-        var scope = store.ResolveQueryScope(query.DocumentKind);
+        var scope = fixedScope ?? store.ResolveQueryScope(query.DocumentKind);
         if (!scope.AcrossScopes)
         {
             predicates.Add(store.ExactPhysicalIdentityPredicate(
@@ -173,7 +184,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             throw new InvalidOperationException(
                 $"Document query '{query.QueryIdentity}' requires {parameters.Count + 2} parameters, exceeding the provider limit of {store.MaxPhysicalParameters}.");
         }
-        return new BuiltQuery($"{from} WHERE {string.Join(" AND ", predicates)}", parameters);
+        return new RelationalPhysicalQueryPredicate($"{from} WHERE {string.Join(" AND ", predicates)}", parameters);
     }
 
     private string Comparison(
@@ -281,8 +292,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             DateTimeOffset.Parse(reader.GetString(6)), DateTimeOffset.Parse(reader.GetString(7)))
         { Scope = DocumentStoreScopeResolver.ReadScope(reader.GetString(1)) };
 
-    private sealed record BuiltQuery(string FromAndWhere, IReadOnlyList<(string Name, object? Value)> Parameters);
 }
+
+internal sealed record RelationalPhysicalQueryPredicate(
+    string FromAndWhere,
+    IReadOnlyList<(string Name, object? Value)> Parameters);
 
 internal sealed record RelationalPhysicalQueryCommand(
     string CommandText,

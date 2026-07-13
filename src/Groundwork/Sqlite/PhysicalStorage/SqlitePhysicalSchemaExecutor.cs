@@ -833,7 +833,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
 
     private async Task EnsureInfrastructureAsync(CancellationToken ct)
     {
-        await ExecuteAsync("""
+        await ExecuteAsync($$"""
             CREATE TABLE IF NOT EXISTS groundwork_physical_schema_operations (
                 manifest_id TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
@@ -848,6 +848,23 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 target_fingerprint TEXT NOT NULL,
                 applied_state_json TEXT NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
+            );
+            CREATE TABLE IF NOT EXISTS {{RelationalPhysicalStorageColumns.MutationOperationsTable}} (
+                manifest_id TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                completed_provider_version TEXT NOT NULL,
+                storage_unit TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                affected_count INTEGER NOT NULL,
+                completed_utc TEXT NOT NULL,
+                PRIMARY KEY (
+                    manifest_id,
+                    provider_name,
+                    storage_unit,
+                    storage_scope,
+                    operation_id)
             );
             """, null, ct);
     }

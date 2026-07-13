@@ -11,6 +11,80 @@ namespace Groundwork.Tests;
 public sealed class PhysicalStorageResolutionTests
 {
     [Fact]
+    public void BoundedMutationMustReferenceOneScaleBearingPredicateDeclaration()
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-status",
+            [new IndexField("status")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var ordinaryQuery = new BoundedQueryDeclaration(
+            "by-status",
+            index.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.Ordinary);
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Default(),
+            [index],
+            [ordinaryQuery],
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration("revoke", ordinaryQuery.Identity,
+                    BoundedMutationAction.Transition("status", ["active"], "revoked")),
+                new BoundedMutationDeclaration("missing", "undeclared", BoundedMutationAction.Delete())
+            ]);
+
+        var result = PhysicalStorageResolver.Resolve(
+            WithPhysicalStorage(SampleManifests.MetadataManifest(), storage),
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-032");
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-033");
+    }
+
+    [Fact]
+    public void BoundedTransitionPathMustBeAnExactlyMatchablePredicate()
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-status",
+            [new IndexField("status")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "by-status",
+            index.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Default(),
+            [index],
+            [query],
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration("revoke", query.Identity,
+                    BoundedMutationAction.Transition("status", ["active"], "revoked"))
+            ]);
+
+        var result = PhysicalStorageResolver.Resolve(
+            WithPhysicalStorage(SampleManifests.MetadataManifest(), storage),
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-034");
+    }
+
+    [Fact]
     public void UnsupportedTenancyDoesNotResolveOrFingerprintAsGlobal()
     {
         var template = SampleManifests.MetadataManifest();

@@ -7,6 +7,7 @@ public static class RelationalPhysicalStorageColumns
 {
     public const string CreatedUtc = "created_utc";
     public const string UpdatedUtc = "updated_utc";
+    public const string MutationOperationsTable = "groundwork_document_mutation_operations";
 
     public static void Validate(ExecutableStorageRoute route)
     {

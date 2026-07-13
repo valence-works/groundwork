@@ -23,6 +23,27 @@ public sealed record RelationalPhysicalIdentityJoinPart(
     string RightColumnIdentifier,
     string? RightAlias);
 
+internal interface IRelationalPhysicalMutationTransaction : IAsyncDisposable
+{
+    DbTransaction Transaction { get; }
+    Task CommitAsync(CancellationToken cancellationToken);
+    Task RollbackAsync(CancellationToken cancellationToken);
+}
+
+internal sealed class RelationalPhysicalMutationTransaction(DbTransaction transaction) :
+    IRelationalPhysicalMutationTransaction
+{
+    public DbTransaction Transaction { get; } = transaction;
+
+    public Task CommitAsync(CancellationToken cancellationToken) =>
+        Transaction.CommitAsync(cancellationToken);
+
+    public Task RollbackAsync(CancellationToken cancellationToken) =>
+        Transaction.RollbackAsync(cancellationToken);
+
+    public ValueTask DisposeAsync() => Transaction.DisposeAsync();
+}
+
 /// <summary>Provider SQL primitives used by the reusable route-driven relational document store.</summary>
 public abstract class RelationalPhysicalDocumentDialect
 {
@@ -49,6 +70,11 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract int MaxParameters { get; }
     public abstract bool IsUniqueConstraintException(DbException exception);
     public abstract string JsonValue(string canonicalJsonExpression, string stablePath);
+    public virtual string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        throw new NotSupportedException("This relational provider does not support physical JSON transitions.");
     public virtual string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -63,6 +89,36 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract string StartsWith(string fieldExpression, string parameterExpression);
     public abstract string ApplyOffsetPage(string selectSql, string takeParameter, string skipParameter);
     public abstract string ApplyFirst(string selectSql);
+    public virtual string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
+        $"{QuoteIdentifier(tableIdentifier)} {alias}";
+    public virtual string MutationSelectionTable(string logicalName) => QuoteIdentifier(logicalName);
+    public virtual string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn) =>
+        throw new NotSupportedException("This relational provider does not support bounded mutation identity selection.");
+    public virtual string DropMutationSelectionTable(string tableExpression) =>
+        $"DROP TABLE IF EXISTS {tableExpression};";
+    public virtual string DeleteByMutationSelection(
+        string tableExpression,
+        string alias,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"DELETE FROM {tableExpression} AS {alias} WHERE EXISTS (" +
+        $"SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+    public virtual string UpdateByMutationSelection(
+        string tableExpression,
+        string alias,
+        IReadOnlyList<string> assignments,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"UPDATE {tableExpression} AS {alias} SET {string.Join(", ", assignments)} " +
+        $"WHERE EXISTS (SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+    public virtual ValueTask<DbTransaction> BeginMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken) =>
+        connection.BeginTransactionAsync(cancellationToken);
 
     protected string Qualified(string? alias, string identifier) =>
         alias is null ? QuoteIdentifier(identifier) : $"{alias}.{QuoteIdentifier(identifier)}";
@@ -81,6 +137,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     private readonly RelationalPhysicalDocumentDialect dialect;
     private readonly IStorageScopeObserver scopeObserver;
     private readonly Func<CancellationToken, ValueTask>? beforeNonSuccessAbort;
+    private readonly Func<DbTransaction, IRelationalPhysicalMutationTransaction> createMutationTransaction;
     private readonly SemaphoreSlim connectionGate = new(1, 1);
 
     public RelationalPhysicalDocumentStore(
@@ -90,7 +147,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         RelationalPhysicalDocumentDialect dialect,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
-        : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, manifest, routes, dialect, access, scopeObserver)
+        : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, manifest, routes, dialect, access, scopeObserver, null)
     {
     }
 
@@ -102,10 +159,30 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         DocumentStoreAccess access,
         Func<CancellationToken, ValueTask> beforeNonSuccessAbort,
         IStorageScopeObserver? scopeObserver = null)
-        : this(connection, null, manifest, routes, dialect, access, scopeObserver)
+        : this(connection, null, manifest, routes, dialect, access, scopeObserver, null)
     {
         this.beforeNonSuccessAbort = beforeNonSuccessAbort ??
             throw new ArgumentNullException(nameof(beforeNonSuccessAbort));
+    }
+
+    internal RelationalPhysicalDocumentStore(
+        DbConnection connection,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        RelationalPhysicalDocumentDialect dialect,
+        DocumentStoreAccess access,
+        Func<DbTransaction, IRelationalPhysicalMutationTransaction> createMutationTransaction,
+        IStorageScopeObserver? scopeObserver = null)
+        : this(
+            connection,
+            null,
+            manifest,
+            routes,
+            dialect,
+            access,
+            scopeObserver,
+            createMutationTransaction ?? throw new ArgumentNullException(nameof(createMutationTransaction)))
+    {
     }
 
     public RelationalPhysicalDocumentStore(
@@ -115,7 +192,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         RelationalPhysicalDocumentDialect dialect,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
-        : this(null, sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory)), manifest, routes, dialect, access, scopeObserver)
+        : this(null, sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory)), manifest, routes, dialect, access, scopeObserver, null)
     {
     }
 
@@ -126,12 +203,15 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         IReadOnlyList<ExecutableStorageRoute> routes,
         RelationalPhysicalDocumentDialect dialect,
         DocumentStoreAccess access,
-        IStorageScopeObserver? scopeObserver)
+        IStorageScopeObserver? scopeObserver,
+        Func<DbTransaction, IRelationalPhysicalMutationTransaction>? createMutationTransaction)
     {
         this.connection = connection;
         this.sessionFactory = sessionFactory;
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
+        this.createMutationTransaction = createMutationTransaction ??
+            (transaction => new RelationalPhysicalMutationTransaction(transaction));
         Access = access ?? throw new ArgumentNullException(nameof(access));
         this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
@@ -220,8 +300,113 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal DocumentScopeSelection ResolveQueryScope(string documentKind) =>
         DocumentStoreScopeResolver.Resolve(GetUnit(documentKind), Access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
 
+    internal DocumentScopeSelection ResolveMutationScope(string documentKind) =>
+        DocumentStoreScopeResolver.Resolve(GetUnit(documentKind), Access, StorageScopeOperation.Mutate, scopeObserver);
+
+    internal string ManifestIdentity => manifest.Identity.Value;
+
     internal Task<T> ExecutePhysicalQueryAsync<T>(Func<DbConnection, CancellationToken, Task<T>> action, CancellationToken cancellationToken) =>
         ExecuteAsync(action, cancellationToken);
+
+    internal async Task<T> ExecutePhysicalMutationAsync<T>(
+        Func<DbConnection, DbTransaction, CancellationToken, Task<T>> action,
+        Func<CancellationToken, ValueTask>? beforeCommit,
+        Func<CancellationToken, ValueTask>? afterCommitBeforeAcknowledgement,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        if (sessionFactory is not null)
+        {
+            var unitOfWork = await sessionFactory.BeginUnitOfWorkAsync(cancellationToken);
+            var committed = false;
+            Exception? primaryFailure = null;
+            try
+            {
+                var result = await unitOfWork.Executor.ExecuteAsync(action, cancellationToken);
+                if (beforeCommit is not null)
+                    await beforeCommit(cancellationToken);
+                await unitOfWork.CommitAsync(cancellationToken);
+                committed = true;
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(cancellationToken);
+                return result;
+            }
+            catch (Exception exception)
+            {
+                primaryFailure = exception;
+                if (!committed)
+                {
+                    try
+                    {
+                        await unitOfWork.RollbackAsync(CancellationToken.None);
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        RelationalCleanupFailures.Attach(exception, cleanupFailure);
+                    }
+                }
+                throw;
+            }
+            finally
+            {
+                await DisposeMutationResourceAsync(unitOfWork, primaryFailure);
+            }
+        }
+
+        return await ExecuteAsync(async (current, ct) =>
+        {
+            var transaction = createMutationTransaction(
+                await dialect.BeginMutationTransactionAsync(current, ct)) ??
+                throw new InvalidOperationException("The physical mutation transaction factory returned null.");
+            var committed = false;
+            Exception? primaryFailure = null;
+            try
+            {
+                var result = await action(current, transaction.Transaction, ct);
+                if (beforeCommit is not null)
+                    await beforeCommit(ct);
+                await transaction.CommitAsync(ct);
+                committed = true;
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(ct);
+                return result;
+            }
+            catch (Exception exception)
+            {
+                primaryFailure = exception;
+                if (!committed)
+                {
+                    try
+                    {
+                        await transaction.RollbackAsync(CancellationToken.None);
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        RelationalCleanupFailures.Attach(exception, cleanupFailure);
+                    }
+                }
+                throw;
+            }
+            finally
+            {
+                await DisposeMutationResourceAsync(transaction, primaryFailure);
+            }
+        }, cancellationToken);
+    }
+
+    private static async ValueTask DisposeMutationResourceAsync(
+        IAsyncDisposable resource,
+        Exception? primaryFailure)
+    {
+        try
+        {
+            await resource.DisposeAsync();
+        }
+        catch (Exception cleanupFailure) when (primaryFailure is not null)
+        {
+            RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+        }
+    }
 
     internal static DbCommand CreatePhysicalCommand(DbConnection connection, string sql, DbTransaction? transaction = null)
     {
@@ -241,6 +426,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     internal string Q(string identifier) => dialect.QuoteIdentifier(identifier);
     internal string JsonValue(string expression, string path) => dialect.JsonValue(expression, path);
+    internal string SetJsonValue(string expression, string pathParameter, string valueParameter) =>
+        dialect.SetJsonValue(expression, pathParameter, valueParameter);
     internal string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -257,6 +444,31 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal string StartsWith(string field, string parameter) => dialect.StartsWith(field, parameter);
     internal string ApplyOffsetPage(string sql, string take, string skip) => dialect.ApplyOffsetPage(sql, take, skip);
     internal string ApplyFirst(string sql) => dialect.ApplyFirst(sql);
+    internal string PhysicalQuerySource(string table, string alias, string? index) =>
+        dialect.QuerySource(table, alias, index);
+    internal string MutationSelectionTable(string logicalName) =>
+        dialect.MutationSelectionTable(logicalName);
+    internal string CreateMutationSelectionTable(
+        string table,
+        string kindColumn,
+        string scopeColumn,
+        string idColumn) =>
+        dialect.CreateMutationSelectionTable(table, kindColumn, scopeColumn, idColumn);
+    internal string DropMutationSelectionTable(string table) =>
+        dialect.DropMutationSelectionTable(table);
+    internal string DeleteByMutationSelection(
+        string table,
+        string alias,
+        string selectionTable,
+        string exactIdentityJoin) =>
+        dialect.DeleteByMutationSelection(table, alias, selectionTable, exactIdentityJoin);
+    internal string UpdateByMutationSelection(
+        string table,
+        string alias,
+        IReadOnlyList<string> assignments,
+        string selectionTable,
+        string exactIdentityJoin) =>
+        dialect.UpdateByMutationSelection(table, alias, assignments, selectionTable, exactIdentityJoin);
     internal string ExactPhysicalIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         dialect.ExactIdentityPredicate(parts);
     internal string ExactPhysicalIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>

@@ -343,6 +343,62 @@ public static class PhysicalStorageResolver
             valid = false;
         }
 
+        var mutationGroups = storage.BoundedMutations
+            .GroupBy(mutation => mutation.Identity ?? string.Empty, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
+        if (mutationGroups.Any(group => string.IsNullOrWhiteSpace(group.Key) || group.Value.Length != 1))
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-PHYSICAL-031",
+                "Bounded mutation identities must be non-empty and unique within a storage unit.",
+                $"{target}.boundedMutations"));
+            valid = false;
+        }
+
+        foreach (var mutation in storage.BoundedMutations)
+        {
+            if (!queryGroups.TryGetValue(mutation.PredicateQueryIdentity, out var queries) || queries.Length != 1)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-032",
+                    $"Bounded mutation '{mutation.Identity}' must reference exactly one bounded predicate query '{mutation.PredicateQueryIdentity}'.",
+                    $"{target}.boundedMutations.{mutation.Identity}.predicateQueryIdentity"));
+                valid = false;
+                continue;
+            }
+
+            var query = queries[0];
+            if (query.ExecutionClass != BoundedQueryExecutionClass.ScaleBearing)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-033",
+                    $"Bounded mutation '{mutation.Identity}' requires a scale-bearing predicate query.",
+                    $"{target}.boundedMutations.{mutation.Identity}.predicateQueryIdentity"));
+                valid = false;
+            }
+
+            if (mutation.Action is not BoundedTransitionMutationAction transition)
+                continue;
+            var effectivePredicates = query.PredicateFields.Count != 0
+                ? query.PredicateFields
+                : indexGroups.TryGetValue(query.IndexIdentity, out var mutationIndexes) && mutationIndexes.Length == 1
+                    ? mutationIndexes[0].Fields.Take(1)
+                        .Select(field => new BoundedQueryPredicateField(field.Path, query.Operations))
+                        .ToArray()
+                    : [];
+            var transitionPredicate = effectivePredicates.SingleOrDefault(field => field.Path == transition.Path);
+            if (transitionPredicate is null ||
+                !transitionPredicate.Operations.Contains(PortableQueryOperation.Equal) &&
+                !transitionPredicate.Operations.Contains(PortableQueryOperation.In))
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-034",
+                    $"Bounded transition '{mutation.Identity}' requires exact matching on declared predicate path '{transition.Path}'.",
+                    $"{target}.boundedMutations.{mutation.Identity}.action"));
+                valid = false;
+            }
+        }
+
         return valid;
     }
 

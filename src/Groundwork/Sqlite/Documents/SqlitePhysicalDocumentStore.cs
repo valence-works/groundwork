@@ -24,6 +24,24 @@ public sealed class SqlitePhysicalDocumentStore : RelationalPhysicalDocumentStor
     }
 
     internal SqlitePhysicalDocumentStore(
+        SqliteConnection connection,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        DocumentStoreAccess access,
+        Func<DbTransaction, IRelationalPhysicalMutationTransaction> createMutationTransaction,
+        IStorageScopeObserver? scopeObserver = null)
+        : base(
+            connection,
+            manifest,
+            routes,
+            new SqlitePhysicalDocumentDialect(),
+            access,
+            createMutationTransaction,
+            scopeObserver)
+    {
+    }
+
+    internal SqlitePhysicalDocumentStore(
         RelationalSessionFactory sessions,
         StorageManifest manifest,
         IReadOnlyList<ExecutableStorageRoute> routes,
@@ -40,7 +58,7 @@ public sealed class SqlitePhysicalDocumentStore : RelationalPhysicalDocumentStor
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
         : base(
-            SqliteRelationalSessions.CreateSerialized(connectionString),
+            SqliteRelationalSessions.CreateSerializedImmediate(connectionString),
             manifest,
             routes,
             new SqlitePhysicalDocumentDialect(),
@@ -71,6 +89,12 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         return $"json_extract({canonicalJsonExpression}, '{path.Replace("'", "''")}')";
     }
 
+    public override string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        $"json_set({canonicalJsonExpression}, {jsonPathParameter}, json({jsonValueParameter}))";
+
     public override string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -100,4 +124,29 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         $"{selectSql} LIMIT {takeParameter} OFFSET {skipParameter};";
 
     public override string ApplyFirst(string selectSql) => $"{selectSql} LIMIT 1;";
+
+    public override string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
+        indexIdentifier is null
+            ? $"{QuoteIdentifier(tableIdentifier)} {alias}"
+            : $"{QuoteIdentifier(tableIdentifier)} AS {alias} INDEXED BY {QuoteIdentifier(indexIdentifier)}";
+
+    public override string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn) =>
+        $"CREATE TEMP TABLE {tableExpression} (" +
+        $"{QuoteIdentifier(documentKindColumn)} TEXT NOT NULL, " +
+        $"{QuoteIdentifier(storageScopeColumn)} TEXT NOT NULL, " +
+        $"{QuoteIdentifier(documentIdColumn)} TEXT NOT NULL, " +
+        $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) WITHOUT ROWID;";
+
+    public override ValueTask<DbTransaction> BeginMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult<DbTransaction>(
+            ((SqliteConnection)connection).BeginTransaction(deferred: false));
+    }
 }
