@@ -87,11 +87,15 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
             {
                 if (!string.Equals(prior.Value.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
                     throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, prior.Value.Fingerprint);
-                if (operation is ValidatePhysicalSchemaOperation)
+                if (operation is ValidatePhysicalSchemaOperation || operation is BackfillCanonicalJsonOperation)
                 {
-                    await using var validationTransaction = await connection.BeginTransactionAsync(ct);
-                    await ApplyOperationCoreAsync(operation, validationTransaction, ct);
-                    await validationTransaction.CommitAsync(ct);
+                    await using var reconciliationTransaction = await connection.BeginTransactionAsync(ct);
+                    if (operation is ValidatePhysicalSchemaOperation ||
+                        !await IsOperationPublishedAsync(target, operation, reconciliationTransaction, ct))
+                    {
+                        await ApplyOperationCoreAsync(operation, reconciliationTransaction, ct);
+                    }
+                    await reconciliationTransaction.CommitAsync(ct);
                 }
                 return new PhysicalSchemaOperationAcknowledgement(operation.Identity, prior.Value.Fingerprint, prior.Value.AppliedAt);
             }
@@ -836,6 +840,30 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
         return await reader.ReadAsync(ct)
             ? (reader.GetString(0), DateTimeOffset.Parse(reader.GetString(1)))
             : null;
+    }
+
+    private async Task<bool> IsOperationPublishedAsync(
+        PhysicalSchemaTargetIdentity target,
+        PhysicalSchemaOperation operation,
+        DbTransaction transaction,
+        CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = (SqliteTransaction)transaction;
+        command.CommandText = """
+            SELECT applied_state_json
+            FROM groundwork_physical_schema_state
+            WHERE manifest_id = @manifestId AND provider_name = @providerName;
+            """;
+        command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("@providerName", target.ProviderName);
+        var json = await command.ExecuteScalarAsync(ct) as string;
+        if (json is null)
+            return false;
+        var state = PhysicalSchemaAppliedStateSerializer.Deserialize(json);
+        return state.Snapshot.SemanticOperations.Any(applied =>
+            applied.Identity == operation.Identity &&
+            applied.Fingerprint == operation.Fingerprint);
     }
 
     private async Task<string?> ReadTargetFingerprintAsync(

@@ -6,7 +6,9 @@ namespace Groundwork.Core.SchemaEvolution;
 /// Reusing an identity with another fingerprint must raise
 /// <see cref="PhysicalSchemaFingerprintConflictException"/>. Returning an acknowledgement means
 /// the operation is durably observable; if acknowledgement delivery is lost after durability, a
-/// retry must return the same acknowledgement without applying the operation again.
+/// retry must return the same acknowledgement. An unpublished, idempotent operation may be
+/// reconciled before returning that acknowledgement when writes since the first attempt must be
+/// included; evidence already represented by published applied state remains a skip token.
 /// </summary>
 public interface IPhysicalSchemaExecutor
 {

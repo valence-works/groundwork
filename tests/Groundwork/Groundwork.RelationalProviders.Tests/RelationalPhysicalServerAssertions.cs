@@ -4,6 +4,7 @@ using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Relational.Documents;
+using Groundwork.TestInfrastructure;
 using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
@@ -122,6 +123,81 @@ internal static class RelationalPhysicalServerAssertions
         Assert.Equal(
             PhysicalSchemaApplicationOutcome.Applied,
             (await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor(null, null))).Outcome);
+    }
+
+    public static async Task NonProviderFailureAfterRealLockLossUsesStableErrorAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<Func<PhysicalSchemaAppliedState, CancellationToken, Task>?, IPhysicalSchemaExecutor> createExecutor,
+        Func<IPhysicalSchemaApplicationLock, long> readSessionId,
+        Func<long, Task> terminateSession,
+        Func<string, string, Task<long>> countAppliedState)
+    {
+        const string injectedMessage = "simulated invalid transaction after relational lock loss";
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            provider,
+            includePriority: true,
+            normalizer: normalizer);
+        long sessionId = 0;
+        var executor = createExecutor(async (_, _) =>
+        {
+            await terminateSession(sessionId);
+            throw new InvalidOperationException(injectedMessage);
+        });
+        await using var applicationLock = await executor.AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None);
+        sessionId = readSessionId(applicationLock);
+        var state = await PreparePendingStateAsync(model.Target, executor, applicationLock);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.RecordAppliedStateAsync(
+            state,
+            null,
+            applicationLock,
+            CancellationToken.None).AsTask());
+
+        Assert.Contains("lock session", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(injectedMessage, exception.ToString(), StringComparison.Ordinal);
+        Assert.True(applicationLock.OwnershipLost.IsCancellationRequested);
+        Assert.Equal(0, await countAppliedState(model.Target.ManifestIdentity.Value, model.Target.Provider.Name));
+    }
+
+    public static async Task OrdinaryInvalidOperationPreservesOwnedLockAndOriginalErrorAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<Func<PhysicalSchemaAppliedState, CancellationToken, Task>?, IPhysicalSchemaExecutor> createExecutor)
+    {
+        const string injectedMessage = "ordinary schema validation failure";
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            provider,
+            includePriority: true,
+            normalizer: normalizer);
+        var remainingFailures = 1;
+        using var callerCancellation = new CancellationTokenSource();
+        var executor = createExecutor((_, _) =>
+        {
+            if (Interlocked.Exchange(ref remainingFailures, 0) != 1)
+                return Task.CompletedTask;
+            callerCancellation.Cancel();
+            return Task.FromException(new InvalidOperationException(injectedMessage));
+        });
+        await using var applicationLock = await executor.AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None);
+        var state = await PreparePendingStateAsync(model.Target, executor, applicationLock);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.RecordAppliedStateAsync(
+            state,
+            null,
+            applicationLock,
+            callerCancellation.Token).AsTask());
+
+        Assert.Equal(injectedMessage, exception.Message);
+        Assert.False(applicationLock.OwnershipLost.IsCancellationRequested);
+        await executor.RecordAppliedStateAsync(state, null, applicationLock, CancellationToken.None);
+        Assert.False(applicationLock.OwnershipLost.IsCancellationRequested);
     }
 
     public static async Task LostBackfillLockCannotCommitDataOrEvidenceAsync(
@@ -266,6 +342,86 @@ internal static class RelationalPhysicalServerAssertions
             (await PhysicalSchemaApplication.ApplyAsync(lost.Target, createExecutor())).Outcome);
     }
 
+    public static async Task UnpublishedBackfillAcknowledgementLossReplaysInterleavedWritesAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<Groundwork.Core.Manifests.StorageManifest, IReadOnlyList<ExecutableStorageRoute>, RelationalPhysicalDocumentStore> createStore,
+        string handlerPrefix)
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var initial = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+        var additive = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: true,
+            instance: instance,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, createExecutor());
+        var oldRouteStore = createStore(initial.Manifest, initial.Target.Routes);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("before-loss", 41))).Status);
+
+        var acknowledgementLosing = new BackfillAcknowledgementLosingExecutor(createExecutor());
+        await Assert.ThrowsAsync<SimulatedBackfillAcknowledgementLossException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(
+                additive.Target,
+                acknowledgementLosing));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("between-attempts", 42))).Status);
+
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(additive.Target, createExecutor())).Outcome);
+        var currentStore = createStore(additive.Manifest, additive.Target.Routes);
+        var route = additive.Target.Routes.Single();
+        var queries = RelationalPhysicalQueryRuntime.Create(
+            currentStore,
+            additive.Manifest,
+            route,
+            provider,
+            handlerPrefix);
+        Assert.Equal(1, await CountPriorityAsync(queries, "41"));
+        Assert.Equal(1, await CountPriorityAsync(queries, "42"));
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.NoChanges,
+            (await PhysicalSchemaApplication.ApplyAsync(additive.Target, createExecutor())).Outcome);
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("after-publication", 43))).Status);
+        var publishedExecutor = createExecutor();
+        await using (var applicationLock = await publishedExecutor.AcquireApplicationLockAsync(
+                         additive.Target.Identity,
+                         CancellationToken.None))
+        {
+            var acknowledgement = await publishedExecutor.ApplyOperationAsync(
+                additive.Target.Identity,
+                acknowledgementLosing.Backfill!,
+                applicationLock,
+                CancellationToken.None);
+            Assert.Equal(acknowledgementLosing.Acknowledgement, acknowledgement);
+        }
+        Assert.Equal(0, await CountPriorityAsync(queries, "43"));
+
+        static SaveDocumentRequest Save(string id, int priority) =>
+            new("configurationDocument", id, "1", $"{{\"category\":\"tools\",\"priority\":{priority}}}", 0);
+
+        static Task<long> CountPriorityAsync(IBoundedDocumentStore queries, string priority) =>
+            queries.CountAsync(new DocumentQuery(
+                "configurationDocument",
+                "find-by-category-priority",
+                [
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools")),
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("priority", priority))
+                ],
+                resultOperation: BoundedQueryResultOperation.Count));
+    }
+
     public static async Task ApplicationLockDisposalIsHeartbeatRaceSafeAsync(
         ProviderIdentity provider,
         IProviderPhysicalNameNormalizer normalizer,
@@ -380,6 +536,25 @@ internal static class RelationalPhysicalServerAssertions
             new SaveDocumentRequest("configurationDocument", "present-a", "1", "{\"category\":\"same\"}", 0))).Status);
         Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await store.SaveAsync(
             new SaveDocumentRequest("configurationDocument", "present-b", "1", "{\"category\":\"same\"}", 0))).Status);
+    }
+
+    private static async Task<PhysicalSchemaAppliedState> PreparePendingStateAsync(
+        PhysicalSchemaTarget target,
+        IPhysicalSchemaExecutor executor,
+        IPhysicalSchemaApplicationLock applicationLock)
+    {
+        var history = await executor.ReadHistoryAsync(target.Identity, applicationLock, CancellationToken.None);
+        var plan = PhysicalSchemaDiffPlanner.Plan(target, history, DateTimeOffset.UtcNow);
+        var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>();
+        foreach (var operation in plan.Operations.Where(candidate => candidate is not RecordPhysicalSchemaAppliedStateOperation))
+        {
+            acknowledgements.Add(await executor.ApplyOperationAsync(
+                target.Identity,
+                operation,
+                applicationLock,
+                CancellationToken.None));
+        }
+        return plan.Complete(acknowledgements, DateTimeOffset.UtcNow);
     }
 
     private sealed class AcknowledgementLosingExecutor(IPhysicalSchemaExecutor inner) : IPhysicalSchemaExecutor

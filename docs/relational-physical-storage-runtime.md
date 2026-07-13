@@ -118,12 +118,14 @@ distinct provider contract in #48.
 ## SQL Server and PostgreSQL parity
 
 `RelationalServerPhysicalSchemaExecutor` keeps server-provider physical schema execution behind one
-deep relational interface. Every independent history, operation, and state call owns a pooled
-connection. A provider/manifest application lease owns a distinct connection and a SQL Server
-session application lock or PostgreSQL advisory lock across history, DDL/backfill, validation, and
-state recording. DDL/backfill and the matching semantic operation ledger row commit in one
-transaction; the returned acknowledgement is reread from durable storage so retry after response
-loss returns the database timestamp.
+deep relational interface. A provider/manifest application lease owns one dedicated, non-pooled
+connection and a SQL Server session application lock or PostgreSQL advisory lock. History reads,
+DDL/backfill operations, validation, applied-state recording, and their transactions all execute on
+that same lock-owning session. DDL/backfill and the matching semantic operation ledger row commit in
+one transaction; the returned acknowledgement is reread from durable storage so retry after
+response loss returns the database timestamp. An evidenced backfill is reconciled again only while
+its identity and fingerprint are absent from published applied state, so writes between an
+unpublished attempt and retry are projected without replaying already-published work.
 
 Both server providers inspect the live catalog rather than treating create-if-absent as compatibility
 evidence. Envelope types, nullability, collation, primary-key order, projected type/default/collation,

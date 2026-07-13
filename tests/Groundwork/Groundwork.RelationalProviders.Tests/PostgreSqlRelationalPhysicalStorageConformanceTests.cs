@@ -44,6 +44,19 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     }
 
     [Fact]
+    public Task Unpublished_backfill_acknowledgement_loss_replays_interleaved_writes() =>
+        RelationalPhysicalServerAssertions.UnpublishedBackfillAcknowledgementLossReplaysInterleavedWritesAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            "postgresql");
+
+    [Fact]
     public async Task Concurrent_distinct_targets_can_bootstrap_a_clean_schema()
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -193,6 +206,29 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PostgreSqlPhysicalSchemaExecutor.LockSessionId,
             TerminateSessionAsync,
             CountAppliedStateAsync);
+
+    [Fact]
+    public Task Non_provider_failure_after_real_lock_loss_marks_ownership_lost_and_uses_stable_error() =>
+        RelationalPhysicalServerAssertions.NonProviderFailureAfterRealLockLossUsesStableErrorAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            beforeState => new PostgreSqlPhysicalSchemaExecutor(
+                container.GetConnectionString(),
+                null,
+                beforeState),
+            PostgreSqlPhysicalSchemaExecutor.LockSessionId,
+            TerminateSessionAsync,
+            CountAppliedStateAsync);
+
+    [Fact]
+    public Task Ordinary_invalid_operation_preserves_owned_lock_and_original_error() =>
+        RelationalPhysicalServerAssertions.OrdinaryInvalidOperationPreservesOwnedLockAndOriginalErrorAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            beforeState => new PostgreSqlPhysicalSchemaExecutor(
+                container.GetConnectionString(),
+                null,
+                beforeState));
 
     [Fact]
     public Task Terminated_lock_backend_cannot_commit_backfill_or_operation_evidence() =>

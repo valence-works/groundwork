@@ -71,7 +71,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             var sessionId = await dialect.ReadServerSessionIdAsync(connection, cancellationToken);
             return new ApplicationLock(target, connection, resource, owner, fence, sessionId, dialect);
         }
-        catch
+        catch (Exception exception)
         {
             if (acquiredResource is not null && connection.State == ConnectionState.Open)
             {
@@ -85,6 +85,13 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 }
             }
             await connection.DisposeAsync();
+            if (cancellationToken.IsCancellationRequested && exception is not OperationCanceledException)
+            {
+                throw new OperationCanceledException(
+                    "Physical-schema application-lock acquisition was canceled.",
+                    exception,
+                    cancellationToken);
+            }
             throw;
         }
     }
@@ -127,7 +134,9 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             {
                 if (!string.Equals(prior.Value.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
                     throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, prior.Value.Fingerprint);
-                if (operation is ValidatePhysicalSchemaOperation)
+                if (operation is ValidatePhysicalSchemaOperation ||
+                    operation is BackfillCanonicalJsonOperation &&
+                    !await IsOperationPublishedAsync(connection, transaction, target, operation, ct))
                     await ApplyOperationCoreAsync(connection, transaction, operation, ct);
                 await dialect.AssertFenceAsync(connection, transaction, target, lease.Owner, lease.Fence, ct);
                 await transaction.CommitAsync(ct);
@@ -708,6 +717,29 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         return (reader.GetString(0), applied);
     }
 
+    private static async Task<bool> IsOperationPublishedAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        PhysicalSchemaTargetIdentity target,
+        PhysicalSchemaOperation operation,
+        CancellationToken ct)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT applied_state_json
+            FROM groundwork_physical_schema_state
+            WHERE manifest_id = @manifestId AND provider_name = @providerName;
+            """);
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        var json = await command.ExecuteScalarAsync(ct) as string;
+        if (json is null)
+            return false;
+        var state = PhysicalSchemaAppliedStateSerializer.Deserialize(json);
+        return state.Snapshot.SemanticOperations.Any(applied =>
+            applied.Identity == operation.Identity &&
+            applied.Fingerprint == operation.Fingerprint);
+    }
+
     private static async Task<string?> ReadTargetFingerprintAsync(
         DbConnection connection,
         DbTransaction transaction,
@@ -811,6 +843,8 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
     private sealed class ApplicationLock : IPhysicalSchemaApplicationLock
     {
+        private static readonly TimeSpan OwnershipVerificationTimeout = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromMilliseconds(100);
         private readonly DbConnection connection;
         private readonly string resource;
         private readonly CancellationTokenSource heartbeatStop = new();
@@ -845,9 +879,6 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         public long Fence { get; }
         public long ServerSessionId { get; }
         public CancellationToken OwnershipLost => ownershipLost.Token;
-        public bool IsOwned => Volatile.Read(ref disposed) == 0 &&
-                               !ownershipLost.IsCancellationRequested &&
-                               connection.State == ConnectionState.Open;
 
         public async Task<T> ExecuteAsync<T>(
             Func<DbConnection, CancellationToken, Task<T>> action,
@@ -875,7 +906,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                     if (Volatile.Read(ref disposed) == 0 && !ownershipLost.IsCancellationRequested &&
                         connection.State == ConnectionState.Open)
                     {
-                        using var verificationTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        using var verificationTimeout = new CancellationTokenSource(OwnershipVerificationTimeout);
                         try
                         {
                             isOwned = await dialect.VerifyApplicationLockAsync(
@@ -962,7 +993,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             {
                 while (!heartbeatStop.IsCancellationRequested)
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(100), heartbeatStop.Token);
+                    await Task.Delay(HeartbeatInterval, heartbeatStop.Token);
                     await sessionGate.WaitAsync(heartbeatStop.Token);
                     try
                     {
