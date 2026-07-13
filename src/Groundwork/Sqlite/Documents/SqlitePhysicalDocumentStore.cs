@@ -24,6 +24,24 @@ public sealed class SqlitePhysicalDocumentStore : RelationalPhysicalDocumentStor
     }
 
     internal SqlitePhysicalDocumentStore(
+        SqliteConnection connection,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        DocumentStoreAccess access,
+        Func<DbTransaction, IRelationalPhysicalMutationTransaction> createMutationTransaction,
+        IStorageScopeObserver? scopeObserver = null)
+        : base(
+            connection,
+            manifest,
+            routes,
+            new SqlitePhysicalDocumentDialect(),
+            access,
+            createMutationTransaction,
+            scopeObserver)
+    {
+    }
+
+    internal SqlitePhysicalDocumentStore(
         RelationalSessionFactory sessions,
         StorageManifest manifest,
         IReadOnlyList<ExecutableStorageRoute> routes,

@@ -13,7 +13,6 @@ namespace Groundwork.Relational.Documents;
 internal enum RelationalPhysicalMutationExecutionPoint
 {
     BeforeCommit,
-    BeforeRollback,
     AfterCommitBeforeAcknowledgement
 }
 
@@ -138,9 +137,6 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
                 : ct => completed
                     ? intercept(RelationalPhysicalMutationExecutionPoint.AfterCommitBeforeAcknowledgement, ct)
                     : ValueTask.CompletedTask,
-            beforeRollback: intercept is null
-                ? null
-                : ct => intercept(RelationalPhysicalMutationExecutionPoint.BeforeRollback, ct),
             cancellationToken);
     }
 

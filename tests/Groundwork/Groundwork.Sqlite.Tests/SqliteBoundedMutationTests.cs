@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Text.Json;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
@@ -133,16 +134,15 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Fact]
-    public async Task Rollback_failure_is_attached_without_replacing_the_primary_mutation_failure()
+    public async Task Rollback_and_disposal_failures_do_not_replace_the_primary_mutation_failure()
     {
+        var transactionFaults = new MutationTransactionFaults();
         await using var fixture = await CreateAsync(point => point switch
         {
             RelationalPhysicalMutationExecutionPoint.BeforeCommit =>
                 ValueTask.FromException(new SimulatedMutationFailureException()),
-            RelationalPhysicalMutationExecutionPoint.BeforeRollback =>
-                ValueTask.FromException(new SimulatedRollbackFailureException()),
             _ => ValueTask.CompletedTask
-        });
+        }, transaction => new FaultingMutationTransaction(transaction, transactionFaults));
         await fixture.SaveAsync("pending", "pending");
 
         var exception = await Assert.ThrowsAsync<SimulatedMutationFailureException>(() =>
@@ -150,24 +150,30 @@ public sealed class SqliteBoundedMutationTests
 
         var cleanupFailures = Assert.IsType<List<Exception>>(
             exception.Data["Groundwork.Relational.CleanupFailures"]);
-        Assert.IsType<SimulatedRollbackFailureException>(Assert.Single(cleanupFailures));
+        Assert.Collection(
+            cleanupFailures,
+            failure => Assert.IsType<SimulatedRollbackFailureException>(failure),
+            failure => Assert.IsType<SimulatedMutationTransactionDisposalFailureException>(failure));
+        Assert.Equal(1, transactionFaults.RollbackCallCount);
+        Assert.Equal(1, transactionFaults.DisposeCallCount);
         Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+        Assert.Equal(1, await fixture.CountAsync("pending"));
+        Assert.Equal(0, await fixture.CountAsync("revoked"));
         Assert.Equal(
             new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
             await fixture.CreateMutationRuntime().ExecuteAsync(Transition("rollback-failure-1")));
     }
 
     [Fact]
-    public async Task Rollback_failure_is_attached_without_replacing_cancellation()
+    public async Task Rollback_and_disposal_failures_do_not_replace_cancellation()
     {
         using var cancellation = new CancellationTokenSource();
+        var transactionFaults = new MutationTransactionFaults();
         await using var fixture = await CreateAsync(point => point switch
         {
             RelationalPhysicalMutationExecutionPoint.BeforeCommit => CancelMutation(cancellation),
-            RelationalPhysicalMutationExecutionPoint.BeforeRollback =>
-                ValueTask.FromException(new SimulatedRollbackFailureException()),
             _ => ValueTask.CompletedTask
-        });
+        }, transaction => new FaultingMutationTransaction(transaction, transactionFaults));
         await fixture.SaveAsync("pending", "pending");
 
         var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
@@ -176,8 +182,18 @@ public sealed class SqliteBoundedMutationTests
         Assert.Equal(cancellation.Token, exception.CancellationToken);
         var cleanupFailures = Assert.IsType<List<Exception>>(
             exception.Data["Groundwork.Relational.CleanupFailures"]);
-        Assert.IsType<SimulatedRollbackFailureException>(Assert.Single(cleanupFailures));
+        Assert.Collection(
+            cleanupFailures,
+            failure => Assert.IsType<SimulatedRollbackFailureException>(failure),
+            failure => Assert.IsType<SimulatedMutationTransactionDisposalFailureException>(failure));
+        Assert.Equal(1, transactionFaults.RollbackCallCount);
+        Assert.Equal(1, transactionFaults.DisposeCallCount);
         Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+        Assert.Equal(1, await fixture.CountAsync("pending"));
+        Assert.Equal(0, await fixture.CountAsync("revoked"));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(Transition("rollback-cancellation-1")));
     }
 
     [Fact]
@@ -554,6 +570,7 @@ public sealed class SqliteBoundedMutationTests
 
     private static async Task<Fixture> CreateAsync(
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null,
+        Func<DbTransaction, IRelationalPhysicalMutationTransaction>? mutationTransactionFactory = null,
         PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable)
     {
         var connection = new SqliteConnection("Data Source=:memory:");
@@ -563,11 +580,18 @@ public sealed class SqliteBoundedMutationTests
             var (manifest, target) = CreateModel(form: form);
             await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
             var route = target.Routes.Single();
-            var documents = new SqlitePhysicalDocumentStore(
-                connection,
-                manifest,
-                target.Routes,
-                DocumentStoreAccess.Global);
+            var documents = mutationTransactionFactory is null
+                ? new SqlitePhysicalDocumentStore(
+                    connection,
+                    manifest,
+                    target.Routes,
+                    DocumentStoreAccess.Global)
+                : new SqlitePhysicalDocumentStore(
+                    connection,
+                    manifest,
+                    target.Routes,
+                    DocumentStoreAccess.Global,
+                    mutationTransactionFactory);
             return new Fixture(
                 connection,
                 manifest,
@@ -700,6 +724,42 @@ public sealed class SqliteBoundedMutationTests
     private sealed class SimulatedMutationAcknowledgementLossException : Exception;
 
     private sealed class SimulatedRollbackFailureException : Exception;
+
+    private sealed class SimulatedMutationTransactionDisposalFailureException : Exception;
+
+    private sealed class MutationTransactionFaults
+    {
+        public int RollbackCallCount { get; set; }
+        public int DisposeCallCount { get; set; }
+    }
+
+    private sealed class FaultingMutationTransaction(
+        DbTransaction transaction,
+        MutationTransactionFaults faults) : IRelationalPhysicalMutationTransaction
+    {
+        private bool rollbackAttempted;
+
+        public DbTransaction Transaction => transaction;
+
+        public Task CommitAsync(CancellationToken cancellationToken) =>
+            transaction.CommitAsync(cancellationToken);
+
+        public async Task RollbackAsync(CancellationToken cancellationToken)
+        {
+            rollbackAttempted = true;
+            faults.RollbackCallCount++;
+            await transaction.RollbackAsync(cancellationToken);
+            throw new SimulatedRollbackFailureException();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            faults.DisposeCallCount++;
+            await transaction.DisposeAsync();
+            if (rollbackAttempted)
+                throw new SimulatedMutationTransactionDisposalFailureException();
+        }
+    }
 
     private static async Task SaveAsync(
         SqlitePhysicalDocumentStore documents,
