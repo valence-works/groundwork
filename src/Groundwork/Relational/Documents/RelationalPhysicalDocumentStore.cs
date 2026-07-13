@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Text.Json;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Scoping;
@@ -60,6 +61,13 @@ public abstract class RelationalPhysicalDocumentDialect
         ArgumentNullException.ThrowIfNull(parts);
         return null;
     }
+    public virtual string MutationOperationIdentityPredicate(
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+        return string.Join(" AND ", parts.Select(part =>
+            $"{Qualified(part.Alias, part.ColumnIdentifier)} = {part.ValueExpression}"));
+    }
     public virtual string ExactIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts)
     {
         ArgumentNullException.ThrowIfNull(parts);
@@ -78,6 +86,14 @@ public abstract class RelationalPhysicalDocumentDialect
     public virtual object ConvertMutationJsonPath(string stablePath) =>
         "$." + string.Join('.', stablePath.Split('.').Select(segment =>
             $"\"{segment.Replace("\"", "\\\"", StringComparison.Ordinal)}\""));
+    public virtual object ConvertMutationJsonValue(
+        string value,
+        Groundwork.Core.Indexing.IndexValueKind valueKind) => valueKind switch
+        {
+            Groundwork.Core.Indexing.IndexValueKind.Boolean or Groundwork.Core.Indexing.IndexValueKind.Number =>
+                JsonSerializer.Serialize(RelationalPhysicalProjectionValues.ConvertScalar(value, valueKind)),
+            _ => JsonSerializer.Serialize(value)
+        };
     public virtual string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -446,6 +462,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         dialect.SetJsonValue(expression, pathParameter, valueParameter);
     internal object ConvertMutationJsonPath(string stablePath) =>
         dialect.ConvertMutationJsonPath(stablePath);
+    internal object ConvertMutationJsonValue(string value, Groundwork.Core.Indexing.IndexValueKind valueKind) =>
+        dialect.ConvertMutationJsonValue(value, valueKind);
     internal string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -489,6 +507,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         dialect.UpdateByMutationSelection(table, alias, assignments, selectionTable, exactIdentityJoin);
     internal string ExactPhysicalIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         dialect.ExactIdentityPredicate(parts);
+    internal string MutationOperationIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        dialect.MutationOperationIdentityPredicate(parts);
     internal string ExactPhysicalIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>
         dialect.ExactIdentityJoin(parts);
     internal Task AcquireMutationOperationLockAsync(

@@ -145,6 +145,104 @@ internal static class RelationalBoundedMutationServerAssertions
         }
     }
 
+    public static async Task TypedTransitionsPreserveCanonicalAndProjectedValuesAsync<TStore>(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<StorageManifest, IReadOnlyList<ExecutableStorageRoute>, TStore> createStore,
+        Func<TStore, StorageManifest, ExecutableStorageRoute, ProviderIdentity, IBoundedDocumentMutationStore> createMutationRuntime,
+        Func<TStore, StorageManifest, ExecutableStorageRoute, ProviderIdentity, IBoundedDocumentStore> createQueryRuntime)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        foreach (var form in Enum.GetValues<PhysicalStorageForm>())
+        {
+            var model = RelationalPhysicalStorageTestModels.Create(
+                form,
+                provider,
+                includePriority: true,
+                includeTypedTransitions: true,
+                normalizer: normalizer);
+            await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+            var store = createStore(model.Manifest, model.Target.Routes);
+            var saved = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                "typed",
+                "1",
+                TypedContent(1, true, "alpha", "TOKEN_A", "2026-01-01T00:00:00Z", "11111111-1111-1111-1111-111111111111")));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+            Assert.Equal(1, saved.Document!.Version);
+            var route = model.Target.Routes.Single();
+            var mutations = createMutationRuntime(store, model.Manifest, route, model.Target.Provider);
+            var queries = createQueryRuntime(store, model.Manifest, route, model.Target.Provider);
+            var expectedVersion = 1L;
+
+            await TransitionAndAssertAsync("raise-priority", "priority", "2", JsonValueKind.Number);
+            await TransitionAndAssertAsync("transition-enabled", "enabled", "false", JsonValueKind.False);
+            await TransitionAndAssertAsync("transition-title", "title", "bravo", JsonValueKind.String);
+            await TransitionAndAssertAsync("transition-token", "token", "TOKEN_B", JsonValueKind.String);
+            await TransitionAndAssertAsync("transition-dueAt", "dueAt", "2026-02-02T00:00:00Z", JsonValueKind.String);
+            await TransitionAndAssertAsync(
+                "transition-externalId",
+                "externalId",
+                "22222222-2222-2222-2222-222222222222",
+                JsonValueKind.String);
+
+            var resaved = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                "typed",
+                "1",
+                TypedContent(3, true, "charlie", "TOKEN_C", "2026-03-03T00:00:00Z", "33333333-3333-3333-3333-333333333333"),
+                expectedVersion));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, resaved.Status);
+            Assert.Equal(++expectedVersion, resaved.Document!.Version);
+            var reloaded = await store.LoadAsync("configurationDocument", "typed");
+            Assert.NotNull(reloaded);
+            Assert.Equal(expectedVersion, reloaded.Version);
+            using var canonical = JsonDocument.Parse(reloaded.ContentJson);
+            Assert.Equal(JsonValueKind.Number, canonical.RootElement.GetProperty("priority").ValueKind);
+            Assert.Equal(3, canonical.RootElement.GetProperty("priority").GetInt32());
+            Assert.Equal(JsonValueKind.True, canonical.RootElement.GetProperty("enabled").ValueKind);
+            Assert.Equal("charlie", canonical.RootElement.GetProperty("title").GetString());
+            Assert.Equal("TOKEN_C", canonical.RootElement.GetProperty("token").GetString());
+            Assert.Equal("2026-03-03T00:00:00Z", canonical.RootElement.GetProperty("dueAt").GetString());
+            Assert.Equal(
+                "33333333-3333-3333-3333-333333333333",
+                canonical.RootElement.GetProperty("externalId").GetString());
+            Assert.Equal(1, await CountFieldAsync(queries, "priority", "3"));
+            Assert.Equal(1, await CountFieldAsync(queries, "enabled", "true"));
+            Assert.Equal(1, await CountFieldAsync(queries, "title", "charlie"));
+            Assert.Equal(1, await CountFieldAsync(queries, "token", "TOKEN_C"));
+            Assert.Equal(1, await CountFieldAsync(queries, "dueAt", "2026-03-03T00:00:00Z"));
+            Assert.Equal(1, await CountFieldAsync(
+                queries,
+                "externalId",
+                "33333333-3333-3333-3333-333333333333"));
+
+            async Task TransitionAndAssertAsync(
+                string mutation,
+                string field,
+                string target,
+                JsonValueKind valueKind)
+            {
+                var result = await mutations.ExecuteAsync(new DocumentMutation(
+                    "configurationDocument",
+                    mutation,
+                    $"{provider.Name}-{form}-{mutation}"));
+                Assert.Equal(new BoundedMutationResult(BoundedMutationStatus.Completed, 1), result);
+                var document = await store.LoadAsync("configurationDocument", "typed");
+                Assert.NotNull(document);
+                Assert.Equal(++expectedVersion, document.Version);
+                using var json = JsonDocument.Parse(document.ContentJson);
+                var value = json.RootElement.GetProperty(field);
+                Assert.Equal(valueKind, value.ValueKind);
+                Assert.Equal(target, valueKind is JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False
+                    ? value.GetRawText()
+                    : value.GetString());
+                Assert.Equal(1, await CountFieldAsync(queries, field, target));
+            }
+        }
+    }
+
     public static async Task MutationScopeIsInheritedFromStoreSessionAsync<TStore>(
         ProviderIdentity provider,
         IProviderPhysicalNameNormalizer normalizer,
@@ -360,6 +458,30 @@ internal static class RelationalBoundedMutationServerAssertions
             "list-by-category",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", category))],
             resultOperation: BoundedQueryResultOperation.Count));
+
+    private static Task<long> CountFieldAsync(IBoundedDocumentStore store, string field, string value) =>
+        store.CountAsync(new DocumentQuery(
+            "configurationDocument",
+            $"list-by-{field}",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal(field, value))],
+            resultOperation: BoundedQueryResultOperation.Count));
+
+    private static string TypedContent(
+        int priority,
+        bool enabled,
+        string title,
+        string token,
+        string dueAt,
+        string externalId) => JsonSerializer.Serialize(new
+        {
+            category = "typed",
+            priority,
+            enabled,
+            title,
+            token,
+            dueAt,
+            externalId
+        });
 
     private static DocumentMutation Transition(string operationId) =>
         new("configurationDocument", "revoke-pending", operationId);

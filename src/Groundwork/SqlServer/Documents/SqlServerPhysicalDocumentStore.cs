@@ -6,6 +6,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
+using Groundwork.Relational.Physicalization;
 using Groundwork.SqlServer.PhysicalStorage;
 using Microsoft.Data.SqlClient;
 
@@ -93,6 +94,9 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         identity.ExactPredicate(parts, QuoteIdentifier, includeOriginal: false);
     public override string ExactIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>
         SqlServerPhysicalIdentity.ExactJoin(parts, QuoteIdentifier);
+    public override string MutationOperationIdentityPredicate(
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        SqlServerMutationOperationIdentity.ExactPredicate(parts, QuoteIdentifier);
     public override int MaxParameters => 2100;
     public override string QuoteIdentifier(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
     public override bool IsUniqueConstraintException(DbException exception) =>
@@ -117,8 +121,14 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         string canonicalJsonExpression,
         string jsonPathParameter,
         string jsonValueParameter) =>
-        $"JSON_MODIFY({canonicalJsonExpression}, {jsonPathParameter}, " +
-        $"JSON_VALUE(CONCAT('[', {jsonValueParameter}, ']'), '$[0]'))";
+        $"JSON_MODIFY({canonicalJsonExpression}, {jsonPathParameter}, {jsonValueParameter})";
+
+    public override object ConvertMutationJsonValue(string value, IndexValueKind valueKind) => valueKind switch
+    {
+        IndexValueKind.Boolean or IndexValueKind.Number =>
+            RelationalPhysicalProjectionValues.ConvertScalar(value, valueKind),
+        _ => value
+    };
 
     public override string Contains(string fieldExpression, string parameterExpression) =>
         $"LOWER({fieldExpression}) LIKE LOWER({parameterExpression}) ESCAPE '\\'";

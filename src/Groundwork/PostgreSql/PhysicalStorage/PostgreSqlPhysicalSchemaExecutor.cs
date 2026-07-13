@@ -97,6 +97,13 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
             : name;
     }
 
+    public override string? NormalizeComputedDefinition(string? definition) => definition is null
+        ? null
+        : string.Concat(definition.Where(character => !char.IsWhiteSpace(character)))
+            .Replace("\"", string.Empty, StringComparison.Ordinal)
+            .Replace("::name", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .ToLowerInvariant();
+
     public override string? NormalizeDefault(ProjectedColumnDefinition definition) =>
         definition.DefaultValue is null ? null : DefaultSql(definition);
 
@@ -262,6 +269,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
     public override async Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken)
     {
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await EnsureInfrastructureHashFunctionAsync(connection, transaction, cancellationToken);
         await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks", """
             CREATE TABLE groundwork_physical_schema_locks (
                 manifest_id text COLLATE pg_catalog."C" NOT NULL,
@@ -301,7 +309,12 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
                 request_fingerprint text COLLATE pg_catalog."C" NOT NULL,
                 affected_count bigint NOT NULL,
                 completed_utc timestamp with time zone NOT NULL,
-                PRIMARY KEY (manifest_id, provider_name, storage_unit, storage_scope, operation_id)
+                manifest_key bytea GENERATED ALWAYS AS (groundwork_utf8_sha256(manifest_id)) STORED NOT NULL,
+                provider_key bytea GENERATED ALWAYS AS (groundwork_utf8_sha256(provider_name)) STORED NOT NULL,
+                storage_unit_key bytea GENERATED ALWAYS AS (groundwork_utf8_sha256(storage_unit)) STORED NOT NULL,
+                storage_scope_key bytea GENERATED ALWAYS AS (groundwork_utf8_sha256(storage_scope)) STORED NOT NULL,
+                operation_key bytea GENERATED ALWAYS AS (groundwork_utf8_sha256(operation_id)) STORED NOT NULL,
+                PRIMARY KEY (manifest_key, provider_key, storage_unit_key, storage_scope_key, operation_key)
             );
             """, cancellationToken);
 
@@ -329,17 +342,80 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         ], cancellationToken);
         await ValidateInfrastructureTableAsync(connection, transaction, RelationalPhysicalStorageColumns.MutationOperationsTable,
         [
-            new("manifest_id", "text", false, "C", 1),
-            new("provider_name", "text", false, "C", 2),
+            new("manifest_id", "text", false, "C"),
+            new("provider_name", "text", false, "C"),
             new("completed_provider_version", "text", false, "C"),
-            new("storage_unit", "text", false, "C", 3),
-            new("storage_scope", "text", false, "C", 4),
-            new("operation_id", "text", false, "C", 5),
+            new("storage_unit", "text", false, "C"),
+            new("storage_scope", "text", false, "C"),
+            new("operation_id", "text", false, "C"),
             new("request_fingerprint", "text", false, "C"),
             new("affected_count", "bigint", false, null),
-            new("completed_utc", "timestamp with time zone", false, null)
+            new("completed_utc", "timestamp with time zone", false, null),
+            HashColumn("manifest_key", "manifest_id", 1),
+            HashColumn("provider_key", "provider_name", 2),
+            HashColumn("storage_unit_key", "storage_unit", 3),
+            HashColumn("storage_scope_key", "storage_scope", 4),
+            HashColumn("operation_key", "operation_id", 5)
         ], cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task EnsureInfrastructureHashFunctionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var inspect = Command(connection, transaction, """
+            SELECT p.prokind::text,
+                   pg_catalog.format_type(p.prorettype, NULL),
+                   p.provolatile::text,
+                   p.proisstrict,
+                   p.proparallel::text,
+                   l.lanname,
+                   p.prosrc,
+                   p.prosecdef,
+                   p.proleakproof,
+                   p.proconfig IS NULL
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+            WHERE n.nspname = current_schema()
+              AND p.proname = @function
+              AND p.pronargs = 1
+              AND p.proargtypes[0] = 'text'::pg_catalog.regtype;
+            """);
+        Add(inspect, "function", PostgreSqlUnboundedIdentityHash.FunctionName);
+        await using var reader = await inspect.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            await reader.DisposeAsync();
+            await using var create = Command(connection, transaction, """
+                CREATE FUNCTION groundwork_utf8_sha256(value text) RETURNS bytea
+                LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+                AS $function$
+                    SELECT pg_catalog.sha256(pg_catalog.convert_to(value, 'UTF8'))
+                $function$;
+                """);
+            await create.ExecuteNonQueryAsync(cancellationToken);
+            return;
+        }
+
+        var source = string.Concat(reader.GetString(6).Where(character => !char.IsWhiteSpace(character)));
+        var compatible = reader.GetString(0) == "f" &&
+                         reader.GetString(1) == "bytea" &&
+                         reader.GetString(2) == "i" &&
+                         reader.GetBoolean(3) &&
+                         reader.GetString(4) == "s" &&
+                         reader.GetString(5) == "sql" &&
+                         source == "SELECTpg_catalog.sha256(pg_catalog.convert_to(value,'UTF8'))" &&
+                         !reader.GetBoolean(7) &&
+                         !reader.GetBoolean(8) &&
+                         reader.GetBoolean(9);
+        if (!compatible)
+        {
+            throw new InvalidOperationException(
+                $"Physical-schema infrastructure function '{PostgreSqlUnboundedIdentityHash.FunctionName}(text)' is incompatible.");
+        }
     }
 
     private static async Task EnsureInfrastructureTableAsync(
@@ -365,6 +441,17 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         await create.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    private InfrastructureColumn HashColumn(string name, string retainedColumn, int primaryKeyOrder) =>
+        new(
+            name,
+            "bytea",
+            false,
+            null,
+            primaryKeyOrder,
+            IsComputed: true,
+            IsPersisted: true,
+            ComputedDefinition: PostgreSqlUnboundedIdentityHash.Expression(retainedColumn));
+
     public override async Task<bool> TableExistsAsync(
         DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken)
     {
@@ -382,6 +469,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
                    pg_catalog.format_type(a.atttypid, a.atttypmod),
                    NOT a.attnotnull,
                    pg_get_expr(ad.adbin, ad.adrelid),
+                   a.attgenerated::text,
                    CASE WHEN a.attcollation = typ.typcollation THEN NULL ELSE coll_ns.nspname || ':' || coll.collname END,
                    COALESCE(pk.ordinality, 0)::integer
             FROM pg_catalog.pg_class c
@@ -402,13 +490,19 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         while (await reader.ReadAsync(cancellationToken))
         {
             var name = reader.GetString(0);
+            var expression = reader.IsDBNull(3) ? null : reader.GetString(3);
+            var generated = reader.GetString(4);
+            var isComputed = generated.Length > 0;
             result.Add(name, new RelationalPhysicalColumnMetadata(
                 name,
                 reader.GetString(1),
                 reader.GetBoolean(2),
-                reader.IsDBNull(3) ? null : NormalizeDatabaseDefault(reader.GetString(3)),
-                reader.IsDBNull(4) ? null : reader.GetString(4),
-                reader.GetInt32(5)));
+                isComputed || expression is null ? null : NormalizeDatabaseDefault(expression),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.GetInt32(6),
+                IsComputed: isComputed,
+                IsPersisted: generated == "s",
+                ComputedDefinition: isComputed ? expression : null));
         }
         return result;
     }

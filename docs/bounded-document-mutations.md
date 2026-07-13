@@ -27,8 +27,11 @@ var physicalStorage = new StorageUnitPhysicalStorage(
 `PhysicalMutationPlanCompiler` resolves each declaration through the existing physical-query plan
 compiler. A mutation is executable only when its predicate is scale-bearing and has a physical
 index. The compiled plan therefore carries the exact provider, route, object, index, scope,
-discriminator, field identifiers, operations, and handler identity. Transition source values and
-the target value are compiled plan data and cannot be supplied or changed at runtime.
+discriminator, field identifiers, operations, and handler identity. Transition paths must resolve
+to document content (canonical JSON, a content projection, or a provider-native content field);
+envelope and linked-relationship fields are immutable through this action, while delete predicates
+may still select by those intrinsic fields. Transition source values and the target value are
+compiled plan data and cannot be supplied or changed at runtime.
 
 `PhysicalMutationDocumentStore` resolves the mutation name and validates its complete closed shape
 before provider I/O. There is no `IQueryable`, expression-tree, caller-supplied assignment, optional
@@ -65,6 +68,12 @@ operation identity. Provider version is retained only as completion evidence, no
 identity, so a version upgrade replays the original exact result instead of executing the mutation
 again.
 
+Relational providers retain all five ledger identity values for exact collision verification while
+using provider-generated SHA-256 keys for the primary key. SQL Server hashes each unbounded
+`nvarchar(max)` value through `varbinary(max)`. PostgreSQL hashes the exact UTF-8 representation
+through a validated provider-owned immutable function and stored generated `bytea` columns. This
+keeps lookup keys bounded without imposing a length limit on operation identities.
+
 ## Relational reference execution
 
 The relational handler renders the selector with the same SQL builder used by bounded reads. It
@@ -78,8 +87,10 @@ provider-bound public runtime factories. SQLite binds indexed selectors with `IN
 canonical JSON with `json_set`, and starts direct-connection transactions at the immediate writer
 boundary. SQL Server uses indexed query sources, transaction-owned `sp_getapplock` operation locks,
 session-local selection tables, `JSON_MODIFY`, and retained-original plus persisted-hash identity
-joins. PostgreSQL uses transaction-scoped advisory operation locks, `ON COMMIT DROP` selection
-tables, native `text[]` JSON paths with `jsonb_set`, and exact retained identity joins.
+joins. Its transition parameters preserve numbers and booleans as native JSON scalars while
+string, keyword, date-time, and GUID values remain JSON strings. PostgreSQL uses transaction-scoped
+advisory operation locks, `ON COMMIT DROP` selection tables, native `text[]` JSON paths with
+`jsonb_set`, and exact retained identity joins.
 
 All three providers provision and validate `groundwork_document_mutation_operations` alongside the
 physical-schema infrastructure. SQL Server and PostgreSQL conformance covers exact transition and

@@ -474,7 +474,7 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
             primaryKeyOrder,
             IsComputed: true,
             IsPersisted: true,
-            ComputedDefinition: $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {Q(retainedColumn)})))");
+            ComputedDefinition: SqlServerUnboundedIdentityHash.Expression(Q(retainedColumn)));
 
     public override async Task<bool> TableExistsAsync(
         DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken)

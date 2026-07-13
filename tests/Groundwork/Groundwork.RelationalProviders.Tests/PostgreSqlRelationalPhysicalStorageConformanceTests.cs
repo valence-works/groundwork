@@ -10,6 +10,8 @@ using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Groundwork.TestInfrastructure;
 using Npgsql;
+using System.Security.Cryptography;
+using System.Text;
 using Testcontainers.PostgreSql;
 using Xunit;
 
@@ -74,6 +76,17 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PostgreSqlPhysicalQueryRuntime.Create);
 
     [Fact]
+    public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            PostgreSqlPhysicalMutationRuntime.Create,
+            PostgreSqlPhysicalQueryRuntime.Create);
+
+    [Fact]
     public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
         RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
             PostgreSqlGroundworkCapabilities.Provider,
@@ -116,6 +129,47 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
                 container.GetConnectionString(), manifest, routes, access),
             PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public async Task Bounded_mutation_ledger_supports_unbounded_operation_identity()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: true,
+            includeCategoryTransition: true,
+            includeRangeDelete: true,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "long-operation", "1", "{\"category\":\"pending\",\"priority\":1}"))).Status);
+        var operationId = string.Concat(Enumerable.Range(0, 100).Select(index =>
+            Convert.ToHexString(SHA256.HashData(BitConverter.GetBytes(index)))));
+        Assert.Equal(6400, Encoding.UTF8.GetByteCount(operationId));
+        var request = new DocumentMutation("configurationDocument", "revoke-pending", operationId);
+        var mutations = PostgreSqlPhysicalMutationRuntime.Create(store, model.Manifest, route, model.Target.Provider);
+
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(request));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Replayed, 1),
+            await mutations.ExecuteAsync(request));
+        await Assert.ThrowsAsync<BoundedMutationOperationConflictException>(() => mutations.ExecuteAsync(
+            new DocumentMutation(
+                "configurationDocument",
+                "prune-by-category-cutoff",
+                operationId,
+                [
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending")),
+                    DocumentQueryClause.Of(DocumentQueryComparison.LessThan("priority", "10"))
+                ])));
+    }
 
     [Fact]
     public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
@@ -223,6 +277,9 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     [InlineData(InfrastructureTamper.SameNameCShadowCollation)]
     [InlineData(InfrastructureTamper.MissingStatePrimaryKey)]
     [InlineData(InfrastructureTamper.ReorderedOperationsPrimaryKey)]
+    [InlineData(InfrastructureTamper.LegacyMutationLedgerPrimaryKey)]
+    [InlineData(InfrastructureTamper.WrongMutationLedgerHashExpression)]
+    [InlineData(InfrastructureTamper.WrongMutationHashFunction)]
     public async Task Restart_rejects_malformed_infrastructure_before_target_fence_mutation(InfrastructureTamper tamper)
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -822,6 +879,35 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 ALTER TABLE groundwork_physical_schema_operations
                     ADD PRIMARY KEY (provider_name, manifest_id, operation_id);
                 """,
+            InfrastructureTamper.LegacyMutationLedgerPrimaryKey => """
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP CONSTRAINT groundwork_document_mutation_operations_pkey;
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP COLUMN manifest_key,
+                    DROP COLUMN provider_key,
+                    DROP COLUMN storage_unit_key,
+                    DROP COLUMN storage_scope_key,
+                    DROP COLUMN operation_key;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD PRIMARY KEY (manifest_id, provider_name, storage_unit, storage_scope, operation_id);
+                """,
+            InfrastructureTamper.WrongMutationLedgerHashExpression => """
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP CONSTRAINT groundwork_document_mutation_operations_pkey;
+                ALTER TABLE groundwork_document_mutation_operations DROP COLUMN operation_key;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD COLUMN operation_key bytea
+                    GENERATED ALWAYS AS (groundwork_utf8_sha256('wrong-operation')) STORED NOT NULL;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD PRIMARY KEY (manifest_key, provider_key, storage_unit_key, storage_scope_key, operation_key);
+                """,
+            InfrastructureTamper.WrongMutationHashFunction => """
+                CREATE OR REPLACE FUNCTION groundwork_utf8_sha256(value text) RETURNS bytea
+                LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+                AS $function$
+                    SELECT pg_catalog.sha256(pg_catalog.convert_to('wrong-value', 'UTF8'))
+                $function$;
+                """,
             _ => throw new ArgumentOutOfRangeException(nameof(tamper), tamper, null)
         };
         await using var command = connection.CreateCommand();
@@ -852,6 +938,9 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         WrongStateCollation,
         SameNameCShadowCollation,
         MissingStatePrimaryKey,
-        ReorderedOperationsPrimaryKey
+        ReorderedOperationsPrimaryKey,
+        LegacyMutationLedgerPrimaryKey,
+        WrongMutationLedgerHashExpression,
+        WrongMutationHashFunction
     }
 }

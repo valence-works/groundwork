@@ -72,6 +72,17 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             SqlServerPhysicalQueryRuntime.Create);
 
     [Fact]
+    public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            SqlServerPhysicalMutationRuntime.Create,
+            SqlServerPhysicalQueryRuntime.Create);
+
+    [Fact]
     public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
         RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
             SqlServerGroundworkCapabilities.Provider,
@@ -149,6 +160,54 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
         Assert.Contains(expectedIndex, plan, StringComparison.Ordinal);
         Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Bounded_mutation_ledger_lookup_seeks_the_hash_primary_key_at_scale()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "ledger-plan", "1", "{\"category\":\"pending\"}"))).Status);
+        var request = new DocumentMutation(
+            "configurationDocument",
+            "revoke-pending",
+            "sqlserver-ledger-plan-target");
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await SqlServerPhysicalMutationRuntime.Create(store, model.Manifest, route, model.Target.Provider)
+                .ExecuteAsync(request));
+        await SeedMutationLedgerPlanNoiseAsync(request.OperationId);
+        var lookup = RelationalPhysicalMutationRuntime.BuildOperationReadCommand(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            SqlServerGroundworkCapabilities.Provider.Name,
+            "sqlserver",
+            request);
+        Assert.All(
+            new[] { "manifest_key", "provider_key", "storage_unit_key", "storage_scope_key", "operation_key" },
+            key => Assert.Contains(key, lookup.CommandText, StringComparison.Ordinal));
+        Assert.Equal(5, lookup.CommandText.Split("varbinary(max)", StringSplitOptions.None).Length - 1);
+        Assert.DoesNotContain("varbinary(900)", lookup.CommandText, StringComparison.Ordinal);
+
+        await ExecuteAdminAsync($"UPDATE STATISTICS {Q(RelationalPhysicalStorageColumns.MutationOperationsTable)};");
+        var plan = await ExplainAsync(lookup, route);
+
+        Assert.Contains("PK_groundwork_document_mutation_operations", plan, StringComparison.Ordinal);
+        Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+        Assert.DoesNotContain("Table Scan", plan, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -828,6 +887,31 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             """;
         seed.Parameters.AddWithValue("@category", "tools");
         await seed.ExecuteNonQueryAsync();
+    }
+
+    private async Task SeedMutationLedgerPlanNoiseAsync(string operationId)
+    {
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var seed = connection.CreateCommand();
+        seed.CommandText = """
+            WITH source AS (
+                SELECT TOP (1) *
+                FROM groundwork_document_mutation_operations
+                WHERE operation_id = @operationId
+            ), numbers AS (
+                SELECT TOP (10000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+                FROM sys.all_objects a CROSS JOIN sys.all_objects b
+            )
+            INSERT INTO groundwork_document_mutation_operations (
+                manifest_id, provider_name, completed_provider_version, storage_unit, storage_scope,
+                operation_id, request_fingerprint, affected_count, completed_utc)
+            SELECT s.manifest_id, s.provider_name, s.completed_provider_version, s.storage_unit, s.storage_scope,
+                CONCAT(N'ledger-plan-noise-', n.n), s.request_fingerprint, s.affected_count, s.completed_utc
+            FROM source s CROSS JOIN numbers n;
+            """;
+        seed.Parameters.AddWithValue("@operationId", operationId);
+        Assert.Equal(10000, await seed.ExecuteNonQueryAsync());
     }
 
     private async Task TerminateSessionAsync(long sessionId)

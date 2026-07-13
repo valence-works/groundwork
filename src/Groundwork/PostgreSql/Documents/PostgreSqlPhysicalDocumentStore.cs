@@ -4,6 +4,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
 using Groundwork.Provider.Relational;
+using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Npgsql;
 
@@ -46,6 +47,9 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
     public override string QuoteIdentifier(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation };
+    public override string MutationOperationIdentityPredicate(
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        PostgreSqlMutationOperationIdentity.ExactPredicate(parts, QuoteIdentifier);
 
     public override object? ConvertProjectionValue(object? value, ProjectedColumnDefinition definition) => value switch
     {

@@ -96,6 +96,40 @@ internal static class RelationalPhysicalMutationRuntime
             store.ResolveMutationScope(mutation.DocumentKind));
     }
 
+    internal static RelationalPhysicalQueryCommand BuildOperationReadCommand(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string expectedProviderName,
+        string handlerPrefix,
+        DocumentMutation mutation,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        var runtime = BuildRuntime(
+            store,
+            manifest,
+            route,
+            provider,
+            expectedProviderName,
+            handlerPrefix,
+            canonicalJsonValueKinds);
+        var plan = runtime.Compilation.Plans.Single(candidate =>
+            candidate.MutationIdentity == mutation.MutationIdentity);
+        var source = runtime.Capabilities.HandlerIdentities.Single(item =>
+            item.Value == plan.HandlerIdentity).Key;
+        var handler = new RelationalPhysicalDocumentMutationHandler(
+            plan.HandlerIdentity,
+            source,
+            store,
+            [RelationalPhysicalDocumentMutationHandler.Certify(plan)]);
+        return handler.BuildOperationReadCommand(
+            mutation,
+            plan,
+            store.ResolveMutationScope(mutation.DocumentKind));
+    }
+
     private static RuntimeComponents BuildRuntime(
         RelationalPhysicalDocumentStore store,
         StorageManifest manifest,

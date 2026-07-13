@@ -3,7 +3,6 @@ using System.Data.Common;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
@@ -164,6 +163,14 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             predicate.Parameters);
     }
 
+    internal RelationalPhysicalQueryCommand BuildOperationReadCommand(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope) => new(
+        $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
+        $"WHERE {store.MutationOperationIdentityPredicate(OperationIdentityPredicate())};",
+        OperationIdentity(mutation, plan, scope));
+
     private static DocumentQuery PredicateQuery(DocumentMutation mutation, PhysicalMutationPlan plan)
     {
         var clauses = mutation.Clauses.ToList();
@@ -261,7 +268,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         var parameters = new List<(string Name, object? Value)>
         {
             ("transitionPath", store.ConvertMutationJsonPath(transition.Path)),
-            ("transitionJson", JsonValue(transition.TargetValue, transition.Field.ValueKind)),
+            ("transitionJson", store.ConvertMutationJsonValue(transition.TargetValue, transition.Field.ValueKind)),
             ("transitionUpdated", DateTimeOffset.UtcNow.ToUniversalTime().ToString("O"))
         };
         var primaryAssignments = new List<string>
@@ -342,13 +349,12 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         DocumentScopeSelection scope,
         CancellationToken ct)
     {
+        var rendered = BuildOperationReadCommand(mutation, plan, scope);
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
-            $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
-            "WHERE manifest_id = @manifestId AND provider_name = @providerName " +
-            "AND storage_unit = @storageUnit AND storage_scope = @storageScope AND operation_id = @operationId;",
+            rendered.CommandText,
             transaction);
-        AddOperationIdentity(command, mutation, plan, scope);
+        AddParameters(command, rendered.Parameters);
         await using var reader = await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? (reader.GetString(0), reader.GetInt64(1)) : null;
     }
@@ -383,11 +389,34 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         PhysicalMutationPlan plan,
         DocumentScopeSelection scope)
     {
-        store.AddPhysicalParameter(command, "manifestId", store.ManifestIdentity);
-        store.AddPhysicalParameter(command, "providerName", plan.Predicate.Provider.Name);
-        store.AddPhysicalParameter(command, "storageUnit", mutation.DocumentKind);
-        store.AddPhysicalParameter(command, "storageScope", scope.StorageKey!);
-        store.AddPhysicalParameter(command, "operationId", mutation.OperationId);
+        AddParameters(command, OperationIdentity(mutation, plan, scope));
+    }
+
+    private IReadOnlyList<RelationalPhysicalIdentityPredicatePart> OperationIdentityPredicate() =>
+    [
+        new("manifest_id", null, store.P("manifestId")),
+        new("provider_name", null, store.P("providerName")),
+        new("storage_unit", null, store.P("storageUnit")),
+        new("storage_scope", null, store.P("storageScope")),
+        new("operation_id", null, store.P("operationId"))
+    ];
+
+    private IReadOnlyList<(string Name, object? Value)> OperationIdentity(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope) =>
+    [
+        ("manifestId", store.ManifestIdentity),
+        ("providerName", plan.Predicate.Provider.Name),
+        ("storageUnit", mutation.DocumentKind),
+        ("storageScope", scope.StorageKey!),
+        ("operationId", mutation.OperationId)
+    ];
+
+    private void AddParameters(DbCommand command, IReadOnlyList<(string Name, object? Value)> parameters)
+    {
+        foreach (var (name, value) in parameters)
+            store.AddPhysicalParameter(command, name, value);
     }
 
     private string OperationLock(
@@ -449,11 +478,4 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             new(route.LinkedRelationship.DocumentId.Identifier, linkedAlias, SelectionId, selectionAlias)
         ]);
 
-    private static string JsonValue(string value, IndexValueKind kind) => kind switch
-    {
-        IndexValueKind.Boolean => JsonSerializer.Serialize(bool.Parse(value)),
-        IndexValueKind.Number => decimal.Parse(value, NumberStyles.Number, CultureInfo.InvariantCulture)
-            .ToString(CultureInfo.InvariantCulture),
-        _ => JsonSerializer.Serialize(value)
-    };
 }

@@ -25,7 +25,8 @@ internal static class RelationalPhysicalStorageTestModels
         bool includeCategoryTransition = false,
         bool includeRangeDelete = false,
         string documentKind = "configurationDocument",
-        Func<PhysicalNameContext, string>? namePolicy = null)
+        Func<PhysicalNameContext, string>? namePolicy = null,
+        bool includeTypedTransitions = false)
     {
         var template = RelationalTestManifests.MetadataManifest();
         instance ??= Guid.NewGuid().ToString("N")[..8];
@@ -60,6 +61,16 @@ internal static class RelationalPhysicalStorageTestModels
             compoundColumns.Add(new PhysicalIndexColumnDefinition("category", compoundColumns.Count));
             compoundColumns.Add(new PhysicalIndexColumnDefinition("priority", compoundColumns.Count));
             indexes.Add(new PhysicalIndexDefinition("by-category-priority", compoundColumns));
+        }
+        if (includeTypedTransitions)
+        {
+            foreach (var field in TypedTransitionFields())
+            {
+                columns.Add(new ProjectedColumnDefinition(field.Name, field.Name, field.PhysicalType, Length: field.Length));
+                indexes.Add(new PhysicalIndexDefinition(
+                    $"by-{field.Name}",
+                    [new PhysicalIndexColumnDefinition(field.Name, 0)]));
+            }
         }
 
         var binding = new SharedStorageBinding("runtime-documents");
@@ -125,6 +136,52 @@ internal static class RelationalPhysicalStorageTestModels
                     BoundedQueryResultOperation.Count
                 }));
         }
+        if (includeTypedTransitions)
+        {
+            var priorityIndex = new LogicalIndexDeclaration(
+                "by-priority",
+                [new IndexField("priority")],
+                IndexValueKind.Number,
+                false,
+                MissingValueBehavior.Excluded);
+            logicalIndexes.Add(priorityIndex);
+            boundedQueries.Add(new BoundedQueryDeclaration(
+                "list-by-priority",
+                priorityIndex.Identity,
+                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                QuerySortSupport.None,
+                QueryPagingSupport.None,
+                BoundedQueryExecutionClass.ScaleBearing,
+                supportsTotalCount: true,
+                resultOperations: new HashSet<BoundedQueryResultOperation>
+                {
+                    BoundedQueryResultOperation.Documents,
+                    BoundedQueryResultOperation.Count
+                }));
+            foreach (var field in TypedTransitionFields())
+            {
+                var index = new LogicalIndexDeclaration(
+                    $"by-{field.Name}",
+                    [new IndexField(field.Name)],
+                    field.ValueKind,
+                    false,
+                    MissingValueBehavior.Excluded);
+                logicalIndexes.Add(index);
+                boundedQueries.Add(new BoundedQueryDeclaration(
+                    $"list-by-{field.Name}",
+                    index.Identity,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.None,
+                    QueryPagingSupport.None,
+                    BoundedQueryExecutionClass.ScaleBearing,
+                    supportsTotalCount: true,
+                    resultOperations: new HashSet<BoundedQueryResultOperation>
+                    {
+                        BoundedQueryResultOperation.Documents,
+                        BoundedQueryResultOperation.Count
+                    }));
+            }
+        }
         var boundedMutations = new List<BoundedMutationDeclaration>();
         if (includeCategoryTransition)
         {
@@ -139,6 +196,20 @@ internal static class RelationalPhysicalStorageTestModels
                 "prune-by-category-cutoff",
                 "find-by-category-priority",
                 BoundedMutationAction.Delete()));
+        }
+        if (includeTypedTransitions)
+        {
+            boundedMutations.Add(new BoundedMutationDeclaration(
+                "raise-priority",
+                "list-by-priority",
+                BoundedMutationAction.Transition("priority", ["1"], "2")));
+            foreach (var field in TypedTransitionFields())
+            {
+                boundedMutations.Add(new BoundedMutationDeclaration(
+                    $"transition-{field.Name}",
+                    $"list-by-{field.Name}",
+                    BoundedMutationAction.Transition(field.Name, [field.Source], field.Target)));
+            }
         }
 
         var definition = dedicatedWithoutLinked
@@ -196,4 +267,22 @@ internal static class RelationalPhysicalStorageTestModels
             throw new InvalidOperationException($"Physical type '{type}' has no portable logical index value kind."),
         _ => IndexValueKind.String
     };
+
+    private static IReadOnlyList<TypedTransitionField> TypedTransitionFields() =>
+    [
+        new("enabled", PortablePhysicalType.Boolean, IndexValueKind.Boolean, "true", "false"),
+        new("title", PortablePhysicalType.String, IndexValueKind.String, "alpha", "bravo", 200),
+        new("token", PortablePhysicalType.String, IndexValueKind.Keyword, "TOKEN_A", "TOKEN_B", 200),
+        new("dueAt", PortablePhysicalType.DateTime, IndexValueKind.DateTime, "2026-01-01T00:00:00Z", "2026-02-02T00:00:00Z"),
+        new("externalId", PortablePhysicalType.Guid, IndexValueKind.Keyword,
+            "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222")
+    ];
+
+    private sealed record TypedTransitionField(
+        string Name,
+        PortablePhysicalType PhysicalType,
+        IndexValueKind ValueKind,
+        string Source,
+        string Target,
+        int? Length = null);
 }

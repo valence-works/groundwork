@@ -131,6 +131,15 @@ public static class PhysicalMutationPlanCompiler
                 $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}.action"));
             return null;
         }
+        if (!IsContentTransitionField(field.Field))
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-MUTATION-005",
+                $"Transition path '{transition.Path}' must resolve to document content; " +
+                $"field source '{field.Field.Source}' is immutable mutation identity or envelope state.",
+                $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}.action"));
+            return null;
+        }
         if (!field.Operations.Contains(Groundwork.Core.Indexing.PortableQueryOperation.Equal) &&
             !field.Operations.Contains(Groundwork.Core.Indexing.PortableQueryOperation.In))
         {
@@ -166,4 +175,12 @@ public static class PhysicalMutationPlanCompiler
             transition.TargetValue,
             field.Field);
     }
+
+    private static bool IsContentTransitionField(PhysicalQueryField field) => field.Source switch
+    {
+        PhysicalQueryFieldSource.CanonicalJsonPath or PhysicalQueryFieldSource.ProjectedColumn => true,
+        PhysicalQueryFieldSource.NativeDocumentField => field.Path is not
+            ("id" or "documentKind" or "storageScope" or "version" or "schemaVersion"),
+        _ => false
+    };
 }
