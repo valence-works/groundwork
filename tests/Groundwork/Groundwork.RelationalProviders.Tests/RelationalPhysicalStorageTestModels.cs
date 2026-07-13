@@ -22,6 +22,8 @@ internal static class RelationalPhysicalStorageTestModels
         IProviderPhysicalNameNormalizer? normalizer = null,
         bool categoryUnique = false,
         bool categoryNullable = false,
+        bool includeCategoryTransition = false,
+        bool includeRangeDelete = false,
         string documentKind = "configurationDocument",
         Func<PhysicalNameContext, string>? namePolicy = null)
     {
@@ -93,10 +95,17 @@ internal static class RelationalPhysicalStorageTestModels
                 false,
                 MissingValueBehavior.Excluded);
             logicalIndexes.Add(compound);
+            var priorityOperations = includeRangeDelete
+                ? new HashSet<PortableQueryOperation>
+                {
+                    PortableQueryOperation.Equal,
+                    PortableQueryOperation.LessThan
+                }
+                : new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal };
             boundedQueries.Add(new BoundedQueryDeclaration(
                 "find-by-category-priority",
                 compound.Identity,
-                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                priorityOperations,
                 QuerySortSupport.None,
                 QueryPagingSupport.None,
                 BoundedQueryExecutionClass.ScaleBearing,
@@ -104,13 +113,32 @@ internal static class RelationalPhysicalStorageTestModels
                 predicateFields:
                 [
                     new BoundedQueryPredicateField("category", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
-                    new BoundedQueryPredicateField("priority", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                    new BoundedQueryPredicateField(
+                        "priority",
+                        includeRangeDelete
+                            ? new HashSet<PortableQueryOperation> { PortableQueryOperation.LessThan }
+                            : new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
                 ],
                 resultOperations: new HashSet<BoundedQueryResultOperation>
                 {
                     BoundedQueryResultOperation.Documents,
                     BoundedQueryResultOperation.Count
                 }));
+        }
+        var boundedMutations = new List<BoundedMutationDeclaration>();
+        if (includeCategoryTransition)
+        {
+            boundedMutations.Add(new BoundedMutationDeclaration(
+                "revoke-pending",
+                "list-by-category",
+                BoundedMutationAction.Transition("category", ["pending"], "revoked")));
+        }
+        if (includeRangeDelete)
+        {
+            boundedMutations.Add(new BoundedMutationDeclaration(
+                "prune-by-category-cutoff",
+                "find-by-category-priority",
+                BoundedMutationAction.Delete()));
         }
 
         var definition = dedicatedWithoutLinked
@@ -139,7 +167,8 @@ internal static class RelationalPhysicalStorageTestModels
                         StorageUnitProvisioningMode.Declared,
                         PhysicalStoragePolicy.Explicit(definition),
                         dedicatedWithoutLinked ? [] : logicalIndexes,
-                        dedicatedWithoutLinked ? [] : boundedQueries)
+                        dedicatedWithoutLinked ? [] : boundedQueries,
+                        boundedMutations: boundedMutations)
                 }
             ],
             SharedDocumentStorages = form == PhysicalStorageForm.SharedDocuments

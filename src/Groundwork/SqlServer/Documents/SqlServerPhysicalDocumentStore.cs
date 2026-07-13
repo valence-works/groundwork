@@ -73,14 +73,18 @@ public sealed class SqlServerPhysicalDocumentStore : RelationalPhysicalDocumentS
 internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocumentDialect
 {
     private readonly SqlServerPhysicalIdentity identity;
+    private readonly SqlServerPhysicalIdentityHash hash;
 
     public SqlServerPhysicalDocumentDialect()
         : this(new SqlServerPhysicalIdentityHash())
     {
     }
 
-    internal SqlServerPhysicalDocumentDialect(SqlServerPhysicalIdentityHash hash) =>
+    internal SqlServerPhysicalDocumentDialect(SqlServerPhysicalIdentityHash hash)
+    {
+        this.hash = hash;
         identity = new SqlServerPhysicalIdentity(hash);
+    }
 
     public override void ValidateRoute(ExecutableStorageRoute route) => identity.ValidateRoute(route);
     public override string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
@@ -109,6 +113,13 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
     public override string JsonValue(string canonicalJsonExpression, string stablePath) =>
         $"JSON_VALUE({canonicalJsonExpression}, {SqlLiteral(JsonPath(stablePath))})";
 
+    public override string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        $"JSON_MODIFY({canonicalJsonExpression}, {jsonPathParameter}, " +
+        $"JSON_VALUE(CONCAT('[', {jsonValueParameter}, ']'), '$[0]'))";
+
     public override string Contains(string fieldExpression, string parameterExpression) =>
         $"LOWER({fieldExpression}) LIKE LOWER({parameterExpression}) ESCAPE '\\'";
 
@@ -122,6 +133,79 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         selectSql.StartsWith("SELECT ", StringComparison.Ordinal)
             ? $"SELECT TOP (1) {selectSql[7..]};"
             : throw new InvalidOperationException("A SQL Server first query must begin with SELECT.");
+
+    public override string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
+        indexIdentifier is null
+            ? $"{QuoteIdentifier(tableIdentifier)} AS {alias}"
+            : $"{QuoteIdentifier(tableIdentifier)} AS {alias} WITH (INDEX({QuoteIdentifier(indexIdentifier)}))";
+
+    public override string MutationSelectionTable(string logicalName) =>
+        QuoteIdentifier($"#{logicalName}");
+
+    public override string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn)
+    {
+        var kindKey = SqlServerPhysicalIdentity.HiddenColumn(documentKindColumn);
+        var scopeKey = SqlServerPhysicalIdentity.HiddenColumn(storageScopeColumn);
+        var idKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdColumn);
+        return $"CREATE TABLE {tableExpression} (" +
+               $"{QuoteIdentifier(documentKindColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(storageScopeColumn)} nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentIdColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(kindKey)} AS {hash.Expression(QuoteIdentifier(documentKindColumn))} PERSISTED NOT NULL, " +
+               $"{QuoteIdentifier(scopeKey)} AS {hash.Expression(QuoteIdentifier(storageScopeColumn))} PERSISTED NOT NULL, " +
+               $"{QuoteIdentifier(idKey)} AS {hash.Expression(QuoteIdentifier(documentIdColumn))} PERSISTED NOT NULL, " +
+               $"PRIMARY KEY NONCLUSTERED ({QuoteIdentifier(kindKey)}, {QuoteIdentifier(scopeKey)}, {QuoteIdentifier(idKey)}));";
+    }
+
+    public override string DeleteByMutationSelection(
+        string tableExpression,
+        string alias,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"DELETE {alias} FROM {tableExpression} AS {alias} WHERE EXISTS (" +
+        $"SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+
+    public override string UpdateByMutationSelection(
+        string tableExpression,
+        string alias,
+        IReadOnlyList<string> assignments,
+        string selectionTableExpression,
+        string exactIdentityJoin) =>
+        $"UPDATE {alias} SET {string.Join(", ", assignments)} FROM {tableExpression} AS {alias} " +
+        $"WHERE EXISTS (SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+
+    public override async Task AcquireMutationOperationLockAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string operationLock,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DECLARE @result int;
+            EXEC @result = sys.sp_getapplock
+                @Resource = @operationLock,
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Transaction',
+                @LockTimeout = -1;
+            SELECT @result;
+            """;
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "@operationLock";
+        parameter.Value = operationLock;
+        command.Parameters.Add(parameter);
+        var result = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+        if (result < 0)
+        {
+            throw new InvalidOperationException(
+                $"SQL Server could not acquire bounded-mutation operation lock '{operationLock}'.");
+        }
+    }
 
     private static string JsonPath(string stablePath)
     {

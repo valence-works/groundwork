@@ -34,6 +34,127 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     private readonly PostgreSqlContainer container = fixture.Container;
 
     [Fact]
+    public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            PostgreSqlPhysicalMutationRuntime.Create,
+            PostgreSqlPhysicalQueryRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            "postgresql",
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            PostgreSqlPhysicalMutationRuntime.Create,
+            PostgreSqlPhysicalQueryRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            "postgresql",
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            "postgresql",
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            PostgreSqlPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        await AnalyzeRouteAsync(route);
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            PostgreSqlGroundworkCapabilities.Provider.Name,
+            "postgresql",
+            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
+
+        var plan = await ExplainAsync(selection, disableSequentialScan: true);
+
+        var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
+        Assert.True(plan.Contains(expectedIndex, StringComparison.Ordinal), plan);
+        Assert.DoesNotContain("Seq Scan", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public Task ConcurrentMaterializationAndAcknowledgementLossAreRestartSafe()
     {
         var connectionString = new NpgsqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 1 }.ConnectionString;
@@ -466,6 +587,12 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
             store, manifest, route, provider, "postgresql", query);
         await SeedPlanNoiseAsync(route);
+        await AnalyzeRouteAsync(route);
+        return await ExplainAsync(rendered, disableSequentialScan: false);
+    }
+
+    private async Task AnalyzeRouteAsync(ExecutableStorageRoute route)
+    {
         await using var connection = new NpgsqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         await using (var statistics = connection.CreateCommand())
@@ -474,6 +601,20 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 ? $"ANALYZE {Q(route.PrimaryStorage.Name.Identifier)};"
                 : $"ANALYZE {Q(route.PrimaryStorage.Name.Identifier)}; ANALYZE {Q(route.LinkedIndexStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync();
+        }
+    }
+
+    private async Task<string> ExplainAsync(
+        RelationalPhysicalQueryCommand rendered,
+        bool disableSequentialScan)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        if (disableSequentialScan)
+        {
+            await using var settings = connection.CreateCommand();
+            settings.CommandText = "SET enable_seqscan = off;";
+            await settings.ExecuteNonQueryAsync();
         }
         await using var command = connection.CreateCommand();
         command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";

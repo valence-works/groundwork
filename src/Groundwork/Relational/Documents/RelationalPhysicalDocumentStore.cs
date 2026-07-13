@@ -75,6 +75,9 @@ public abstract class RelationalPhysicalDocumentDialect
         string jsonPathParameter,
         string jsonValueParameter) =>
         throw new NotSupportedException("This relational provider does not support physical JSON transitions.");
+    public virtual object ConvertMutationJsonPath(string stablePath) =>
+        "$." + string.Join('.', stablePath.Split('.').Select(segment =>
+            $"\"{segment.Replace("\"", "\\\"", StringComparison.Ordinal)}\""));
     public virtual string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -119,6 +122,12 @@ public abstract class RelationalPhysicalDocumentDialect
         DbConnection connection,
         CancellationToken cancellationToken) =>
         connection.BeginTransactionAsync(cancellationToken);
+    public virtual Task AcquireMutationOperationLockAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string operationLock,
+        CancellationToken cancellationToken) =>
+        Task.CompletedTask;
 
     protected string Qualified(string? alias, string identifier) =>
         alias is null ? QuoteIdentifier(identifier) : $"{alias}.{QuoteIdentifier(identifier)}";
@@ -305,6 +314,13 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     internal string ManifestIdentity => manifest.Identity.Value;
 
+    internal StorageManifest BoundManifest => manifest;
+
+    internal bool IsBoundRoute(ExecutableStorageRoute route) =>
+        routes.TryGetValue(route.StorageUnit.Value, out var bound) &&
+        string.Equals(bound.Fingerprint, route.Fingerprint, StringComparison.Ordinal) &&
+        string.Equals(bound.DefinitionFingerprint, route.DefinitionFingerprint, StringComparison.Ordinal);
+
     internal Task<T> ExecutePhysicalQueryAsync<T>(Func<DbConnection, CancellationToken, Task<T>> action, CancellationToken cancellationToken) =>
         ExecuteAsync(action, cancellationToken);
 
@@ -428,6 +444,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal string JsonValue(string expression, string path) => dialect.JsonValue(expression, path);
     internal string SetJsonValue(string expression, string pathParameter, string valueParameter) =>
         dialect.SetJsonValue(expression, pathParameter, valueParameter);
+    internal object ConvertMutationJsonPath(string stablePath) =>
+        dialect.ConvertMutationJsonPath(stablePath);
     internal string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -473,6 +491,12 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         dialect.ExactIdentityPredicate(parts);
     internal string ExactPhysicalIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>
         dialect.ExactIdentityJoin(parts);
+    internal Task AcquireMutationOperationLockAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string operationLock,
+        CancellationToken cancellationToken) =>
+        dialect.AcquireMutationOperationLockAsync(connection, transaction, operationLock, cancellationToken);
 
     private async Task<DocumentStoreWriteResult> SaveCoreAsync(SaveDocumentRequest request, DbTransaction transaction, CancellationToken ct)
     {

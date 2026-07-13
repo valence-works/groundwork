@@ -1,7 +1,9 @@
 # Groundwork.SqlServer
 
 `SqlServerPhysicalSchemaExecutor`, `SqlServerPhysicalDocumentStore`, and
-`SqlServerPhysicalQueryRuntime` implement all three compiled physical storage forms. Schema
+`SqlServerPhysicalQueryRuntime` implement all three compiled physical storage forms.
+`SqlServerPhysicalMutationRuntime` executes declared bounded transitions and deletes with exact
+idempotent outcomes. Schema
 application uses session-scoped application locks and a transactional operation ledger; document and
 query operations use independent pooled sessions. Route-driven physical tables retain kind/id in
 binary-collated `NVARCHAR(450)` and scope in `NVARCHAR(128)`, with persisted SHA-256 `BINARY(32)`
@@ -23,6 +25,8 @@ latest-per-key indexes, durable operation tombstones, and bounded cleanup.
 - Supports equality, set-membership (`IN`), and case-insensitive `Contains` (LIKE) query operations over declared indexes.
 - Supports declared-index ordering and skip/take pagination (`OFFSET`/`FETCH`).
 - Maintains declared indexes transactionally with document writes.
+- Executes declared bounded mutations with transaction-owned operation locks, exact identity
+  selection, and durable replay evidence.
 - Enforces unique declared indexes with a filtered unique index.
 - Uses optimistic concurrency through expected document versions.
 - Exposes `SqlServerGroundworkCapabilities.Runtime()` and `SqlServerGroundworkCapabilities.Materialization()`.

@@ -3,6 +3,7 @@ using System.Globalization;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Provider.Relational;
+using Groundwork.Relational.Documents;
 using Groundwork.Relational.PhysicalStorage;
 using Groundwork.Relational.Physicalization;
 using Npgsql;
@@ -289,6 +290,20 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
                 PRIMARY KEY (manifest_id, provider_name)
             );
             """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, RelationalPhysicalStorageColumns.MutationOperationsTable, """
+            CREATE TABLE groundwork_document_mutation_operations (
+                manifest_id text COLLATE pg_catalog."C" NOT NULL,
+                provider_name text COLLATE pg_catalog."C" NOT NULL,
+                completed_provider_version text COLLATE pg_catalog."C" NOT NULL,
+                storage_unit text COLLATE pg_catalog."C" NOT NULL,
+                storage_scope text COLLATE pg_catalog."C" NOT NULL,
+                operation_id text COLLATE pg_catalog."C" NOT NULL,
+                request_fingerprint text COLLATE pg_catalog."C" NOT NULL,
+                affected_count bigint NOT NULL,
+                completed_utc timestamp with time zone NOT NULL,
+                PRIMARY KEY (manifest_id, provider_name, storage_unit, storage_scope, operation_id)
+            );
+            """, cancellationToken);
 
         await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks",
         [
@@ -311,6 +326,18 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
             new("provider_name", "text", false, "C", 2),
             new("target_fingerprint", "text", false, "C"),
             new("applied_state_json", "text", false, "C")
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, RelationalPhysicalStorageColumns.MutationOperationsTable,
+        [
+            new("manifest_id", "text", false, "C", 1),
+            new("provider_name", "text", false, "C", 2),
+            new("completed_provider_version", "text", false, "C"),
+            new("storage_unit", "text", false, "C", 3),
+            new("storage_scope", "text", false, "C", 4),
+            new("operation_id", "text", false, "C", 5),
+            new("request_fingerprint", "text", false, "C"),
+            new("affected_count", "bigint", false, null),
+            new("completed_utc", "timestamp with time zone", false, null)
         ], cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }

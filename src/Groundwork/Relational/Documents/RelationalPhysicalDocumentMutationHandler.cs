@@ -1,6 +1,8 @@
 using System.Collections.Frozen;
 using System.Data.Common;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
@@ -90,6 +92,11 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         return await store.ExecutePhysicalMutationAsync(
             async (connection, transaction, ct) =>
             {
+                await store.AcquireMutationOperationLockAsync(
+                    connection,
+                    transaction,
+                    OperationLock(mutation, plan, scope),
+                    ct);
                 var durable = await ReadOperationAsync(connection, transaction, mutation, plan, scope, ct);
                 if (durable is not null)
                 {
@@ -253,7 +260,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
     {
         var parameters = new List<(string Name, object? Value)>
         {
-            ("transitionPath", JsonPath(transition.Path)),
+            ("transitionPath", store.ConvertMutationJsonPath(transition.Path)),
             ("transitionJson", JsonValue(transition.TargetValue, transition.Field.ValueKind)),
             ("transitionUpdated", DateTimeOffset.UtcNow.ToUniversalTime().ToString("O"))
         };
@@ -366,7 +373,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         store.AddPhysicalParameter(command, "providerVersion", plan.Predicate.Provider.Version);
         store.AddPhysicalParameter(command, "fingerprint", fingerprint);
         store.AddPhysicalParameter(command, "affected", affectedCount);
-        store.AddPhysicalParameter(command, "completed", DateTimeOffset.UtcNow.ToUniversalTime().ToString("O"));
+        store.AddPhysicalParameter(command, "completed", DateTimeOffset.UtcNow);
         await command.ExecuteNonQueryAsync(ct);
     }
 
@@ -382,6 +389,23 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         store.AddPhysicalParameter(command, "storageScope", scope.StorageKey!);
         store.AddPhysicalParameter(command, "operationId", mutation.OperationId);
     }
+
+    private string OperationLock(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope)
+    {
+        var identity = string.Concat(
+            Encode(store.ManifestIdentity),
+            Encode(plan.Predicate.Provider.Name),
+            Encode(mutation.DocumentKind),
+            Encode(scope.StorageKey!),
+            Encode(mutation.OperationId));
+        return "groundwork:mutation:" +
+               Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+    }
+
+    private static string Encode(string value) => $"{value.Length}:{value}";
 
     private async Task DropSelectionAsync(
         DbConnection connection,
@@ -424,10 +448,6 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             new(route.LinkedRelationship.StorageScope.Identifier, linkedAlias, SelectionScope, selectionAlias),
             new(route.LinkedRelationship.DocumentId.Identifier, linkedAlias, SelectionId, selectionAlias)
         ]);
-
-    private static string JsonPath(string stablePath) =>
-        "$." + string.Join('.', stablePath.Split('.').Select(segment =>
-            $"\"{segment.Replace("\"", "\\\"")}\""));
 
     private static string JsonValue(string value, IndexValueKind kind) => kind switch
     {

@@ -376,6 +376,26 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
                 CONSTRAINT PK_groundwork_physical_schema_state PRIMARY KEY NONCLUSTERED (manifest_key, provider_key)
             );
             """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, RelationalPhysicalStorageColumns.MutationOperationsTable, """
+            CREATE TABLE groundwork_document_mutation_operations (
+                manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                completed_provider_version nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                storage_unit nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                storage_scope nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                operation_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                request_fingerprint nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                affected_count bigint NOT NULL,
+                completed_utc datetimeoffset(7) NOT NULL,
+                manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
+                provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
+                storage_unit_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), storage_unit))) PERSISTED NOT NULL,
+                storage_scope_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), storage_scope))) PERSISTED NOT NULL,
+                operation_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), operation_id))) PERSISTED NOT NULL,
+                CONSTRAINT PK_groundwork_document_mutation_operations PRIMARY KEY NONCLUSTERED (
+                    manifest_key, provider_key, storage_unit_key, storage_scope_key, operation_key)
+            );
+            """, cancellationToken);
 
         await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks",
         [
@@ -405,6 +425,23 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
             new("applied_state_json", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
             HashColumn("manifest_key", "manifest_id", 1),
             HashColumn("provider_key", "provider_name", 2)
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, RelationalPhysicalStorageColumns.MutationOperationsTable,
+        [
+            new("manifest_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("provider_name", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("completed_provider_version", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("storage_unit", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("storage_scope", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("operation_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("request_fingerprint", "nvarchar(128)", false, "Latin1_General_100_BIN2"),
+            new("affected_count", "bigint", false, null),
+            new("completed_utc", "datetimeoffset(7)", false, null),
+            HashColumn("manifest_key", "manifest_id", 1),
+            HashColumn("provider_key", "provider_name", 2),
+            HashColumn("storage_unit_key", "storage_unit", 3),
+            HashColumn("storage_scope_key", "storage_scope", 4),
+            HashColumn("operation_key", "operation_id", 5)
         ], cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }

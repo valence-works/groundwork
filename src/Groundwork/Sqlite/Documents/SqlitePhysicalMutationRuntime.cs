@@ -1,5 +1,6 @@
 using System.Data;
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Store;
@@ -23,30 +24,16 @@ public static class SqlitePhysicalMutationRuntime
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider,
-        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept)
-    {
-        ArgumentNullException.ThrowIfNull(store);
-        ArgumentNullException.ThrowIfNull(manifest);
-        ArgumentNullException.ThrowIfNull(route);
-        ArgumentNullException.ThrowIfNull(provider);
-        var storage = Storage(manifest, route);
-        var capabilities = SqlitePhysicalQueryRuntime.Capabilities(provider);
-        var compilation = Compile(route, storage, capabilities);
-        var handlers = capabilities.HandlerIdentities.Select(registration =>
-        {
-            var certifications = compilation.Plans
-                .Where(plan => plan.HandlerIdentity == registration.Value)
-                .Select(RelationalPhysicalDocumentMutationHandler.Certify)
-                .ToArray();
-            return (IPhysicalDocumentMutationHandler)new RelationalPhysicalDocumentMutationHandler(
-                registration.Value,
-                registration.Key,
-                store,
-                certifications,
-                intercept is null ? null : (point, _) => intercept(point));
-        }).ToArray();
-        return new PhysicalMutationDocumentStore(route, storage, capabilities, handlers);
-    }
+        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept) =>
+        RelationalPhysicalMutationRuntime.Create(
+            store,
+            manifest,
+            route,
+            provider,
+            SqliteGroundworkCapabilities.Provider.Name,
+            "sqlite",
+            CanonicalJsonValueKinds(provider),
+            intercept);
 
     internal static async Task<string> ExplainAsync(
         SqliteConnection connection,
@@ -58,19 +45,15 @@ public static class SqlitePhysicalMutationRuntime
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(connection);
-        var storage = Storage(manifest, route);
-        var capabilities = SqlitePhysicalQueryRuntime.Capabilities(provider);
-        var plan = Compile(route, storage, capabilities).Plans.Single(candidate =>
-            candidate.MutationIdentity == mutation.MutationIdentity);
-        var handler = new RelationalPhysicalDocumentMutationHandler(
-            plan.HandlerIdentity,
-            capabilities.HandlerIdentities.Single(item => item.Value == plan.HandlerIdentity).Key,
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
             store,
-            [RelationalPhysicalDocumentMutationHandler.Certify(plan)]);
-        var selection = handler.BuildSelectionCommand(
+            manifest,
+            route,
+            provider,
+            SqliteGroundworkCapabilities.Provider.Name,
+            "sqlite",
             mutation,
-            plan,
-            store.ResolveMutationScope(mutation.DocumentKind));
+            CanonicalJsonValueKinds(provider));
         if (connection.State != ConnectionState.Open)
             await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
@@ -89,22 +72,7 @@ public static class SqlitePhysicalMutationRuntime
         return string.Join(Environment.NewLine, details);
     }
 
-    private static StorageUnitPhysicalStorage Storage(StorageManifest manifest, ExecutableStorageRoute route) =>
-        manifest.StorageUnits.Single(candidate => candidate.Identity == route.StorageUnit).PhysicalStorage
-        ?? throw new InvalidOperationException($"Storage unit '{route.StorageUnit.Value}' has no physical mutation declarations.");
-
-    private static PhysicalMutationPlanCompilationResult Compile(
-        ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage,
-        PhysicalQueryPlannerCapabilities capabilities)
-    {
-        var compilation = PhysicalMutationPlanCompiler.Compile(route, storage, capabilities);
-        if (!compilation.IsValid)
-        {
-            throw new InvalidOperationException(string.Join(
-                Environment.NewLine,
-                compilation.Diagnostics.Select(item => $"{item.Code}: {item.Message}")));
-        }
-        return compilation;
-    }
+    private static IReadOnlySet<IndexValueKind> CanonicalJsonValueKinds(ProviderIdentity provider) =>
+        SqlitePhysicalQueryRuntime.Capabilities(provider)
+            .SourceValueKinds[PhysicalQuerySourceKind.PrimaryCanonicalJson];
 }

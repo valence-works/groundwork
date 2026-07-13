@@ -32,6 +32,126 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     private readonly MsSqlContainer container = fixture.Container;
 
     [Fact]
+    public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            SqlServerPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            SqlServerPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            SqlServerPhysicalMutationRuntime.Create,
+            SqlServerPhysicalQueryRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            SqlServerPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            SqlServerPhysicalMutationRuntime.Create,
+            SqlServerPhysicalQueryRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            SqlServerPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, access),
+            SqlServerPhysicalMutationRuntime.Create);
+
+    [Fact]
+    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            SqlServerGroundworkCapabilities.Provider.Name,
+            "sqlserver",
+            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
+
+        var plan = await ExplainAsync(selection, route);
+
+        var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
+        Assert.Contains(expectedIndex, plan, StringComparison.Ordinal);
+        Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public Task ConcurrentMaterializationAndAcknowledgementLossAreRestartSafe()
     {
         var connectionString = new SqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 1 }.ConnectionString;
@@ -628,6 +748,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
             store, manifest, route, provider, "sqlserver", query);
         await SeedPlanNoiseAsync(route);
+        return await ExplainAsync(rendered, route);
+    }
+
+    private async Task<string> ExplainAsync(
+        RelationalPhysicalQueryCommand rendered,
+        ExecutableStorageRoute route)
+    {
         await using var connection = new SqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         await using (var statistics = connection.CreateCommand())
@@ -637,8 +764,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                 : $"UPDATE STATISTICS {Q(route.PrimaryStorage.Name.Identifier)}; UPDATE STATISTICS {Q(route.LinkedIndexStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync();
         }
+        await using (var enable = connection.CreateCommand())
+        {
+            enable.CommandText = "SET STATISTICS XML ON;";
+            await enable.ExecuteNonQueryAsync();
+        }
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SET STATISTICS XML ON; {rendered.CommandText} SET STATISTICS XML OFF;";
+        command.CommandText = rendered.CommandText;
         foreach (var (name, value) in rendered.Parameters)
             command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
         var plans = new List<string>();
@@ -653,6 +785,10 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                         plans.Add(reader.GetValue(ordinal).ToString() ?? string.Empty);
                     }
         } while (await reader.NextResultAsync());
+        await reader.DisposeAsync();
+        await using var disable = connection.CreateCommand();
+        disable.CommandText = "SET STATISTICS XML OFF;";
+        await disable.ExecuteNonQueryAsync();
         return Assert.Single(plans);
     }
 

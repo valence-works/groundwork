@@ -1,7 +1,9 @@
 # Groundwork.PostgreSql
 
 `PostgreSqlPhysicalSchemaExecutor`, `PostgreSqlPhysicalDocumentStore`, and
-`PostgreSqlPhysicalQueryRuntime` implement all three compiled physical storage forms. Schema
+`PostgreSqlPhysicalQueryRuntime` implement all three compiled physical storage forms.
+`PostgreSqlPhysicalMutationRuntime` executes declared bounded transitions and deletes with exact
+idempotent outcomes. Schema
 application uses advisory locks and a transactional operation ledger; document and query operations
 use independent pooled sessions. Portable date-time projections use exact UTC ticks to avoid native
 microsecond rounding, and no client-side query fallback is available.
@@ -20,6 +22,8 @@ indexes, durable operation tombstones, and bounded `ctid` cleanup.
 - Supports equality, set-membership (`IN`), and case-insensitive `Contains` (ILIKE) query operations over declared indexes.
 - Supports declared-index ordering and skip/take pagination (`LIMIT`/`OFFSET`).
 - Maintains declared indexes transactionally with document writes.
+- Executes declared bounded mutations with transaction-scoped advisory locks, exact identity
+  selection, and durable replay evidence.
 - Enforces unique declared indexes with a partial unique index.
 - Uses optimistic concurrency through expected document versions.
 - Exposes `PostgreSqlGroundworkCapabilities.Runtime()` (advertising `IndexCapabilities.All` and the full portable query-operation set) and `PostgreSqlGroundworkCapabilities.Materialization()`.
