@@ -74,7 +74,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     private RelationalPhysicalQueryCommand RenderQuery(
         DocumentQuery query,
         PhysicalQueryPlan plan,
-        BuiltQuery built,
+        RelationalPhysicalQueryPredicate built,
         ExecutableStorageRoute route)
     {
         var parameters = built.Parameters
