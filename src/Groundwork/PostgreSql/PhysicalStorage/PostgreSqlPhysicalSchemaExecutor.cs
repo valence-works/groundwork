@@ -9,7 +9,7 @@ using Npgsql;
 
 namespace Groundwork.PostgreSql.PhysicalStorage;
 
-/// <summary>PostgreSQL physical-schema executor using pooled operation sessions and advisory locks.</summary>
+/// <summary>PostgreSQL physical-schema executor using one dedicated session for locking and schema transactions.</summary>
 public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalSchemaExecutor
 {
     public PostgreSqlPhysicalSchemaExecutor(string connectionString)
@@ -22,20 +22,12 @@ public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalS
         Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence,
         Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence)
         : base(
-            RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
             () => new NpgsqlConnection(LockConnectionString(connectionString)),
             new PostgreSqlPhysicalSchemaDialect(),
             beforeOperationEvidence,
             beforeAppliedStateFence)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
-    }
-
-    internal PostgreSqlPhysicalSchemaExecutor(
-        RelationalSessionFactory sessions,
-        Func<DbConnection> createLockConnection)
-        : base(sessions, createLockConnection, new PostgreSqlPhysicalSchemaDialect())
-    {
     }
 
     internal static long LockSessionId(IPhysicalSchemaApplicationLock applicationLock) =>
@@ -47,6 +39,9 @@ public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalS
 
 internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysicalSchemaDialect
 {
+    public override bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
+        connection.State != System.Data.ConnectionState.Open || exception is NpgsqlException and not PostgresException;
+
     public override string ProviderDisplayName => "PostgreSQL";
     public override string Q(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
@@ -268,16 +263,18 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
 
     public override async Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            CREATE TABLE IF NOT EXISTS groundwork_physical_schema_locks (
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks", """
+            CREATE TABLE groundwork_physical_schema_locks (
                 manifest_id text COLLATE pg_catalog."C" NOT NULL,
                 provider_name text COLLATE pg_catalog."C" NOT NULL,
                 owner_id text COLLATE pg_catalog."C" NOT NULL,
                 fence bigint NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
             );
-            CREATE TABLE IF NOT EXISTS groundwork_physical_schema_operations (
+            """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_operations", """
+            CREATE TABLE groundwork_physical_schema_operations (
                 manifest_id text COLLATE pg_catalog."C" NOT NULL,
                 provider_name text COLLATE pg_catalog."C" NOT NULL,
                 operation_id text COLLATE pg_catalog."C" NOT NULL,
@@ -285,15 +282,63 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
                 applied_utc timestamp with time zone NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name, operation_id)
             );
-            CREATE TABLE IF NOT EXISTS groundwork_physical_schema_state (
+            """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_state", """
+            CREATE TABLE groundwork_physical_schema_state (
                 manifest_id text COLLATE pg_catalog."C" NOT NULL,
                 provider_name text COLLATE pg_catalog."C" NOT NULL,
                 target_fingerprint text COLLATE pg_catalog."C" NOT NULL,
-                applied_state_json text NOT NULL,
+                applied_state_json text COLLATE pg_catalog."C" NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
             );
-            """;
-        await command.ExecuteNonQueryAsync(cancellationToken);
+            """, cancellationToken);
+
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks",
+        [
+            new("manifest_id", "text", false, "C", 1),
+            new("provider_name", "text", false, "C", 2),
+            new("owner_id", "text", false, "C"),
+            new("fence", "bigint", false, null)
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_operations",
+        [
+            new("manifest_id", "text", false, "C", 1),
+            new("provider_name", "text", false, "C", 2),
+            new("operation_id", "text", false, "C", 3),
+            new("operation_fingerprint", "text", false, "C"),
+            new("applied_utc", "timestamp with time zone", false, null)
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_state",
+        [
+            new("manifest_id", "text", false, "C", 1),
+            new("provider_name", "text", false, "C", 2),
+            new("target_fingerprint", "text", false, "C"),
+            new("applied_state_json", "text", false, "C")
+        ], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task EnsureInfrastructureTableAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        string createSql,
+        CancellationToken cancellationToken)
+    {
+        await using var inspect = Command(connection, transaction, """
+            SELECT c.relkind::text
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = current_schema() AND c.relname = @table;
+            """);
+        Add(inspect, "table", table);
+        var kind = await inspect.ExecuteScalarAsync(cancellationToken) as string;
+        if (kind is not null && !string.Equals(kind, "r", StringComparison.Ordinal))
+            throw new InvalidOperationException($"Physical-schema infrastructure object '{table}' must be an ordinary table.");
+        if (kind is not null)
+            return;
+        await using var create = Command(connection, transaction, createSql);
+        await create.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public override async Task<bool> TableExistsAsync(

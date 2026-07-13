@@ -10,7 +10,7 @@ using Microsoft.Data.SqlClient;
 
 namespace Groundwork.SqlServer.PhysicalStorage;
 
-/// <summary>SQL Server physical-schema executor using pooled operation sessions and session locks.</summary>
+/// <summary>SQL Server physical-schema executor using one dedicated session for locking and schema transactions.</summary>
 public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSchemaExecutor
 {
     public SqlServerPhysicalSchemaExecutor(string connectionString)
@@ -31,7 +31,6 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
         Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence,
         Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence)
         : base(
-            RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             () => new SqlConnection(LockConnectionString(connectionString)),
             new SqlServerPhysicalSchemaDialect(hash),
             beforeOperationEvidence,
@@ -40,23 +39,8 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
 
-    internal SqlServerPhysicalSchemaExecutor(
-        RelationalSessionFactory sessions,
-        Func<DbConnection> createLockConnection)
-        : this(sessions, createLockConnection, new SqlServerPhysicalIdentityHash())
-    {
-    }
-
     internal static long LockSessionId(IPhysicalSchemaApplicationLock applicationLock) =>
         ReadLockSessionId(applicationLock);
-
-    internal SqlServerPhysicalSchemaExecutor(
-        RelationalSessionFactory sessions,
-        Func<DbConnection> createLockConnection,
-        SqlServerPhysicalIdentityHash hash)
-        : base(sessions, createLockConnection, new SqlServerPhysicalSchemaDialect(hash))
-    {
-    }
 
     private static string LockConnectionString(string connectionString) =>
         new SqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString;
@@ -81,6 +65,8 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         identity.ExactPredicate(parts, Q, includeOriginal: false);
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is SqlException { Number: 2601 or 2627 };
+    public override bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
+        connection.State != System.Data.ConnectionState.Open || exception is SqlException { Class: >= 20 };
 
     public override string ProviderDisplayName => "SQL Server";
     public override string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
@@ -356,52 +342,104 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
 
     public override async Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            IF OBJECT_ID(N'groundwork_physical_schema_locks', N'U') IS NULL
-            BEGIN
-                CREATE TABLE groundwork_physical_schema_locks (
-                    manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    owner_id nvarchar(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    fence bigint NOT NULL,
-                    manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
-                    provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
-                    CONSTRAINT PK_groundwork_physical_schema_locks PRIMARY KEY NONCLUSTERED
-                        (manifest_key, provider_key)
-                );
-            END;
-            IF OBJECT_ID(N'groundwork_physical_schema_operations', N'U') IS NULL
-            BEGIN
-                CREATE TABLE groundwork_physical_schema_operations (
-                    manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    operation_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    operation_fingerprint nvarchar(128) NOT NULL,
-                    applied_utc datetimeoffset(7) NOT NULL,
-                    manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
-                    provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
-                    operation_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), operation_id))) PERSISTED NOT NULL,
-                    CONSTRAINT PK_groundwork_physical_schema_operations PRIMARY KEY NONCLUSTERED
-                        (manifest_key, provider_key, operation_key)
-                );
-            END;
-            IF OBJECT_ID(N'groundwork_physical_schema_state', N'U') IS NULL
-            BEGIN
-                CREATE TABLE groundwork_physical_schema_state (
-                    manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                    target_fingerprint nvarchar(128) NOT NULL,
-                    applied_state_json nvarchar(max) NOT NULL,
-                    manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
-                    provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
-                    CONSTRAINT PK_groundwork_physical_schema_state PRIMARY KEY NONCLUSTERED
-                        (manifest_key, provider_key)
-                );
-            END;
-            """;
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks", """
+            CREATE TABLE groundwork_physical_schema_locks (
+                manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                owner_id nvarchar(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                fence bigint NOT NULL,
+                manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
+                provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
+                CONSTRAINT PK_groundwork_physical_schema_locks PRIMARY KEY NONCLUSTERED (manifest_key, provider_key)
+            );
+            """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_operations", """
+            CREATE TABLE groundwork_physical_schema_operations (
+                manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                operation_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                operation_fingerprint nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                applied_utc datetimeoffset(7) NOT NULL,
+                manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
+                provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
+                operation_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), operation_id))) PERSISTED NOT NULL,
+                CONSTRAINT PK_groundwork_physical_schema_operations PRIMARY KEY NONCLUSTERED (manifest_key, provider_key, operation_key)
+            );
+            """, cancellationToken);
+        await EnsureInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_state", """
+            CREATE TABLE groundwork_physical_schema_state (
+                manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                target_fingerprint nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                applied_state_json nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
+                provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
+                CONSTRAINT PK_groundwork_physical_schema_state PRIMARY KEY NONCLUSTERED (manifest_key, provider_key)
+            );
+            """, cancellationToken);
+
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_locks",
+        [
+            new("manifest_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("provider_name", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("owner_id", "nvarchar(32)", false, "Latin1_General_100_BIN2"),
+            new("fence", "bigint", false, null),
+            HashColumn("manifest_key", "manifest_id", 1),
+            HashColumn("provider_key", "provider_name", 2)
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_operations",
+        [
+            new("manifest_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("provider_name", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("operation_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("operation_fingerprint", "nvarchar(128)", false, "Latin1_General_100_BIN2"),
+            new("applied_utc", "datetimeoffset(7)", false, null),
+            HashColumn("manifest_key", "manifest_id", 1),
+            HashColumn("provider_key", "provider_name", 2),
+            HashColumn("operation_key", "operation_id", 3)
+        ], cancellationToken);
+        await ValidateInfrastructureTableAsync(connection, transaction, "groundwork_physical_schema_state",
+        [
+            new("manifest_id", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("provider_name", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            new("target_fingerprint", "nvarchar(128)", false, "Latin1_General_100_BIN2"),
+            new("applied_state_json", "nvarchar(max)", false, "Latin1_General_100_BIN2"),
+            HashColumn("manifest_key", "manifest_id", 1),
+            HashColumn("provider_key", "provider_name", 2)
+        ], cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
+
+    private async Task EnsureInfrastructureTableAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        string createSql,
+        CancellationToken cancellationToken)
+    {
+        await using var inspect = Command(connection, transaction,
+            "SELECT type FROM sys.objects WHERE object_id = OBJECT_ID(@table);");
+        Add(inspect, "table", table);
+        var kind = await inspect.ExecuteScalarAsync(cancellationToken) as string;
+        if (kind is not null && !string.Equals(kind.Trim(), "U", StringComparison.Ordinal))
+            throw new InvalidOperationException($"Physical-schema infrastructure object '{table}' must be an ordinary table.");
+        if (kind is not null)
+            return;
+        await using var create = Command(connection, transaction, createSql);
+        await create.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private InfrastructureColumn HashColumn(string name, string retainedColumn, int primaryKeyOrder) =>
+        new(
+            name,
+            "binary(32)",
+            false,
+            null,
+            primaryKeyOrder,
+            IsComputed: true,
+            IsPersisted: true,
+            ComputedDefinition: $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {Q(retainedColumn)})))");
 
     public override async Task<bool> TableExistsAsync(
         DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken)
@@ -418,7 +456,7 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         await using var command = Command(connection, transaction, """
             SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable,
                    dc.definition,
-                   CASE WHEN c.collation_name = CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')) THEN NULL ELSE c.collation_name END,
+                   c.collation_name,
                    COALESCE(ic.key_ordinal, 0), c.is_computed, COALESCE(cc.is_persisted, 0), cc.definition
             FROM sys.columns c
             JOIN sys.types t ON t.user_type_id = c.user_type_id

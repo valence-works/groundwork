@@ -46,14 +46,15 @@ internal static class RelationalPhysicalServerAssertions
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         await terminateSession(readSessionId(staleLock));
-        await WaitForCancellationAsync(staleLock.OwnershipLost);
+        release.TrySetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => staleApplication);
+        Assert.True(staleLock.OwnershipLost.IsCancellationRequested);
+        Assert.Equal(0, await countOperationEvidence(operation.Identity, operation.Fingerprint));
+        Assert.False(await tableExists(model.Target.Routes.Single().PrimaryStorage.Name.Identifier));
+
         var successor = createExecutor(null, null);
         await using (var successorLock = await successor.AcquireApplicationLockAsync(model.Target.Identity, CancellationToken.None))
         {
-            release.TrySetResult();
-            await Assert.ThrowsAsync<InvalidOperationException>(() => staleApplication);
-            Assert.Equal(0, await countOperationEvidence(operation.Identity, operation.Fingerprint));
-            Assert.False(await tableExists(model.Target.Routes.Single().PrimaryStorage.Name.Identifier));
             var acknowledgement = await successor.ApplyOperationAsync(
                 model.Target.Identity,
                 operation,
@@ -110,25 +111,128 @@ internal static class RelationalPhysicalServerAssertions
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         await terminateSession(readSessionId(staleLock));
-        await WaitForCancellationAsync(staleLock.OwnershipLost);
+        release.TrySetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => stalePublish);
+        Assert.True(staleLock.OwnershipLost.IsCancellationRequested);
+        Assert.Equal(0, await countAppliedState(model.Target.ManifestIdentity.Value, model.Target.Provider.Name));
+
         await using (await createExecutor(null, null).AcquireApplicationLockAsync(model.Target.Identity, CancellationToken.None))
         {
-            release.TrySetResult();
-            await Assert.ThrowsAsync<InvalidOperationException>(() => stalePublish);
-            Assert.Equal(0, await countAppliedState(model.Target.ManifestIdentity.Value, model.Target.Provider.Name));
         }
         Assert.Equal(
             PhysicalSchemaApplicationOutcome.Applied,
             (await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor(null, null))).Outcome);
     }
 
-    private static async Task WaitForCancellationAsync(CancellationToken cancellationToken)
+    public static async Task LostBackfillLockCannotCommitDataOrEvidenceAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<
+            Func<PhysicalSchemaOperation, CancellationToken, Task>?,
+            Func<PhysicalSchemaAppliedState, CancellationToken, Task>?,
+            IPhysicalSchemaExecutor> createExecutor,
+        Func<Groundwork.Core.Manifests.StorageManifest, IReadOnlyList<ExecutableStorageRoute>, RelationalPhysicalDocumentStore> createStore,
+        Func<IPhysicalSchemaApplicationLock, long> readSessionId,
+        Func<long, Task> terminateSession,
+        Func<string, string, Task<long>> countOperationEvidence,
+        Func<string, string, Task<long>> countProjectedValues)
     {
-        if (cancellationToken.IsCancellationRequested)
-            return;
-        var canceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var registration = cancellationToken.Register(() => canceled.TrySetResult());
-        await canceled.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var initial = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+        var additive = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: true,
+            instance: instance,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, createExecutor(null, null));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await createStore(initial.Manifest, initial.Target.Routes).SaveAsync(
+            new SaveDocumentRequest(
+                "configurationDocument",
+                "backfill-lock-loss",
+                "1",
+                "{\"category\":\"tools\",\"priority\":42}",
+                0))).Status);
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = createExecutor(async (operation, _) =>
+        {
+            if (operation is not BackfillCanonicalJsonOperation)
+                return;
+            entered.TrySetResult();
+            await release.Task;
+        }, null);
+        await using var staleLock = await executor.AcquireApplicationLockAsync(additive.Target.Identity, CancellationToken.None);
+        var history = await executor.ReadHistoryAsync(additive.Target.Identity, staleLock, CancellationToken.None);
+        var plan = PhysicalSchemaDiffPlanner.Plan(additive.Target, history, DateTimeOffset.UtcNow);
+        Task<PhysicalSchemaOperationAcknowledgement>? staleBackfill = null;
+        BackfillCanonicalJsonOperation? backfill = null;
+        foreach (var operation in plan.Operations.Where(candidate => candidate is not RecordPhysicalSchemaAppliedStateOperation))
+        {
+            if (operation is BackfillCanonicalJsonOperation candidate)
+            {
+                backfill = candidate;
+                staleBackfill = executor.ApplyOperationAsync(
+                    additive.Target.Identity,
+                    operation,
+                    staleLock,
+                    CancellationToken.None).AsTask();
+                break;
+            }
+            await executor.ApplyOperationAsync(additive.Target.Identity, operation, staleLock, CancellationToken.None);
+        }
+        Assert.NotNull(backfill);
+        Assert.NotNull(staleBackfill);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await terminateSession(readSessionId(staleLock));
+        release.TrySetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => staleBackfill);
+        Assert.True(staleLock.OwnershipLost.IsCancellationRequested);
+        Assert.Equal(0, await countOperationEvidence(backfill.Identity, backfill.Fingerprint));
+        var route = additive.Target.Routes.Single();
+        var priority = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "priority");
+        var table = priority.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.PrimaryStorage.Name.Identifier
+            : route.LinkedIndexStorage!.Name.Identifier;
+        Assert.Equal(0, await countProjectedValues(table, priority.Column.Identifier));
+
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(additive.Target, createExecutor(null, null))).Outcome);
+        Assert.Equal(1, await countProjectedValues(table, priority.Column.Identifier));
+    }
+
+    public static async Task TerminatedApplicationLockDisposalIsIdempotentAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<IPhysicalSchemaApplicationLock, long> readSessionId,
+        Func<long, Task> terminateSession)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: true,
+            normalizer: normalizer);
+        var applicationLock = await createExecutor().AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None);
+
+        await terminateSession(readSessionId(applicationLock));
+        await Task.WhenAll(
+            applicationLock.DisposeAsync().AsTask(),
+            applicationLock.DisposeAsync().AsTask());
+
+        await using var successor = await createExecutor().AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     public static async Task ConcurrentMaterializationAndAcknowledgementLossAreRestartSafeAsync(

@@ -5,7 +5,6 @@ using System.Security.Cryptography;
 using System.Text;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
-using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.Physicalization;
 
@@ -19,28 +18,24 @@ namespace Groundwork.Relational.PhysicalStorage;
 public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
 {
     private const string BootstrapLockResource = "groundwork:physical:bootstrap";
-    private readonly RelationalSessionFactory sessions;
     private readonly Func<DbConnection> createLockConnection;
     private readonly RelationalServerPhysicalSchemaDialect dialect;
     private readonly Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence;
     private readonly Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence;
 
     public RelationalServerPhysicalSchemaExecutor(
-        RelationalSessionFactory sessions,
         Func<DbConnection> createLockConnection,
         RelationalServerPhysicalSchemaDialect dialect)
-        : this(sessions, createLockConnection, dialect, null, null)
+        : this(createLockConnection, dialect, null, null)
     {
     }
 
     protected RelationalServerPhysicalSchemaExecutor(
-        RelationalSessionFactory sessions,
         Func<DbConnection> createLockConnection,
         RelationalServerPhysicalSchemaDialect dialect,
         Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence,
         Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence)
     {
-        this.sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         this.createLockConnection = createLockConnection ?? throw new ArgumentNullException(nameof(createLockConnection));
         this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
         this.beforeOperationEvidence = beforeOperationEvidence;
@@ -98,10 +93,10 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         PhysicalSchemaTargetIdentity target,
         IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
-        await sessions.ExecuteAsync(async (connection, ct) =>
+        await RequireApplicationLock(applicationLock, target).ExecuteAsync(async (connection, ct) =>
         {
-            var lease = RequireApplicationLock(applicationLock, target);
             await using var transaction = await connection.BeginTransactionAsync(ct);
+            var lease = RequireApplicationLock(applicationLock, target);
             await dialect.AssertFenceAsync(connection, transaction, target, lease.Owner, lease.Fence, ct);
             await using var command = Command(connection, transaction, """
                 SELECT applied_state_json
@@ -122,7 +117,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         PhysicalSchemaOperation operation,
         IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
-        await sessions.ExecuteAsync(async (connection, ct) =>
+        await RequireApplicationLock(applicationLock, target).ExecuteAsync(async (connection, ct) =>
         {
             ArgumentNullException.ThrowIfNull(operation);
             var lease = RequireApplicationLock(applicationLock, target);
@@ -169,10 +164,13 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         PhysicalSchemaAppliedState state,
         string? expectedAppliedTargetFingerprint,
         IPhysicalSchemaApplicationLock applicationLock,
-        CancellationToken cancellationToken) =>
-        await sessions.ExecuteAsync(async (connection, ct) =>
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        await RequireApplicationLock(
+            applicationLock,
+            new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name)).ExecuteAsync(async (connection, ct) =>
         {
-            ArgumentNullException.ThrowIfNull(state);
             var lease = RequireApplicationLock(
                 applicationLock,
                 new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name));
@@ -222,6 +220,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             await transaction.CommitAsync(ct);
             return true;
         }, cancellationToken);
+    }
 
     private async Task ApplyOperationCoreAsync(
         DbConnection connection,
@@ -817,6 +816,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         private readonly string resource;
         private readonly CancellationTokenSource heartbeatStop = new();
         private readonly RelationalServerPhysicalSchemaDialect dialect;
+        private readonly SemaphoreSlim sessionGate = new(1, 1);
         private readonly CancellationTokenSource ownershipLost = new();
         private readonly Task heartbeat;
         private int disposed;
@@ -850,6 +850,36 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                                !ownershipLost.IsCancellationRequested &&
                                connection.State == ConnectionState.Open;
 
+        public async Task<T> ExecuteAsync<T>(
+            Func<DbConnection, CancellationToken, Task<T>> action,
+            CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+            await sessionGate.WaitAsync(cancellationToken);
+            try
+            {
+                if (Volatile.Read(ref disposed) != 0 || ownershipLost.IsCancellationRequested ||
+                    connection.State != ConnectionState.Open)
+                {
+                    throw new InvalidOperationException(
+                        $"Relational physical schema execution requires its active application lock for target '{Target}'.");
+                }
+
+                return await action(connection, cancellationToken);
+            }
+            catch (DbException exception) when (dialect.IsSessionTerminationException(exception, connection))
+            {
+                MarkOwnershipLost();
+                throw new InvalidOperationException(
+                    $"The relational physical-schema lock session for target '{Target}' was lost during schema execution.",
+                    exception);
+            }
+            finally
+            {
+                sessionGate.Release();
+            }
+        }
+
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0)
@@ -858,18 +888,42 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             await heartbeatStop.CancelAsync();
             try
             {
-                await heartbeat;
-                if (connection.State == ConnectionState.Open)
-                    await dialect.ReleaseApplicationLockAsync(connection, resource, CancellationToken.None);
-            }
-            catch when (ownershipLost.IsCancellationRequested)
-            {
-                // A dead lock session has already released its server-side ownership.
+                try
+                {
+                    await heartbeat;
+                }
+                catch
+                {
+                    MarkOwnershipLost();
+                }
+
+                await sessionGate.WaitAsync();
+                try
+                {
+                    if (connection.State == ConnectionState.Open)
+                        await dialect.ReleaseApplicationLockAsync(connection, resource, CancellationToken.None);
+                }
+                catch
+                {
+                    MarkOwnershipLost();
+                }
+                finally
+                {
+                    sessionGate.Release();
+                }
             }
             finally
             {
-                await connection.DisposeAsync();
+                try
+                {
+                    await connection.DisposeAsync();
+                }
+                catch
+                {
+                    MarkOwnershipLost();
+                }
                 heartbeatStop.Dispose();
+                sessionGate.Dispose();
                 ownershipLost.Dispose();
             }
         }
@@ -887,10 +941,18 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 while (!heartbeatStop.IsCancellationRequested)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(100), heartbeatStop.Token);
-                    if (!await dialect.VerifyApplicationLockAsync(connection, resource, heartbeatStop.Token))
+                    await sessionGate.WaitAsync(heartbeatStop.Token);
+                    try
                     {
-                        MarkOwnershipLost();
-                        return;
+                        if (!await dialect.VerifyApplicationLockAsync(connection, resource, heartbeatStop.Token))
+                        {
+                            MarkOwnershipLost();
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        sessionGate.Release();
                     }
                 }
             }
@@ -975,6 +1037,16 @@ public sealed record RelationalPhysicalIdentityLayout(
 /// <summary>Provider-owned SQL and metadata behavior behind the shared physical-schema executor.</summary>
 public abstract class RelationalServerPhysicalSchemaDialect
 {
+    protected sealed record InfrastructureColumn(
+        string Name,
+        string Type,
+        bool IsNullable,
+        string? Collation,
+        int PrimaryKeyOrder = 0,
+        bool IsComputed = false,
+        bool IsPersisted = false,
+        string? ComputedDefinition = null);
+
     public abstract string ProviderDisplayName { get; }
     public abstract string Q(string identifier);
     public abstract string EnvelopeType(RelationalEnvelopeColumnKind kind);
@@ -1015,6 +1087,8 @@ public abstract class RelationalServerPhysicalSchemaDialect
     }
     public virtual string? HashOnlyIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) => null;
     public virtual bool IsUniqueConstraintException(DbException exception) => false;
+    public virtual bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
+        connection.State != ConnectionState.Open;
     public abstract string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind);
     public virtual RelationalPhysicalIdentityLayout IdentityLayout(
         IReadOnlyList<RelationalPhysicalIdentityColumn> identityColumns,
@@ -1056,4 +1130,47 @@ public abstract class RelationalServerPhysicalSchemaDialect
     public abstract Task<bool> TableExistsAsync(DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken);
     public abstract Task<IReadOnlyDictionary<string, RelationalPhysicalColumnMetadata>> ReadColumnsAsync(DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken);
     public abstract Task<RelationalPhysicalIndexMetadata?> ReadIndexAsync(DbConnection connection, DbTransaction transaction, string table, string index, CancellationToken cancellationToken);
+
+    protected async Task ValidateInfrastructureTableAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        IReadOnlyList<InfrastructureColumn> expectedColumns,
+        CancellationToken cancellationToken)
+    {
+        var actualColumns = await ReadColumnsAsync(connection, transaction, table, cancellationToken);
+        if (actualColumns.Count != expectedColumns.Count ||
+            expectedColumns.Any(expected => !actualColumns.ContainsKey(expected.Name)))
+        {
+            throw new InvalidOperationException(
+                $"Physical-schema infrastructure table '{table}' does not contain the exact required column set.");
+        }
+
+        foreach (var expected in expectedColumns)
+        {
+            var actual = actualColumns[expected.Name];
+            if (!string.Equals(actual.Type, expected.Type, StringComparison.OrdinalIgnoreCase) ||
+                actual.IsNullable != expected.IsNullable ||
+                actual.DefaultValue is not null ||
+                !string.Equals(
+                    NormalizeCollationIdentity(actual.Collation),
+                    NormalizeCollationIdentity(expected.Collation),
+                    StringComparison.Ordinal) ||
+                actual.PrimaryKeyOrder != expected.PrimaryKeyOrder ||
+                actual.IsComputed != expected.IsComputed ||
+                actual.IsPersisted != expected.IsPersisted ||
+                !string.Equals(
+                    NormalizeComputedDefinition(actual.ComputedDefinition),
+                    NormalizeComputedDefinition(expected.ComputedDefinition),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Physical-schema infrastructure column '{table}.{expected.Name}' is incompatible " +
+                    $"(type '{actual.Type}', nullable '{actual.IsNullable}', default '{actual.DefaultValue ?? "<none>"}', " +
+                    $"collation '{actual.Collation ?? "<none>"}', primary-key order '{actual.PrimaryKeyOrder}', " +
+                    $"computed '{actual.IsComputed}', persisted '{actual.IsPersisted}', " +
+                    $"expression '{actual.ComputedDefinition ?? "<none>"}').");
+            }
+        }
+    }
 }

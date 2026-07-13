@@ -79,12 +79,72 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         }
     }
 
+    [Theory]
+    [InlineData(InfrastructureTamper.WrongObjectKind)]
+    [InlineData(InfrastructureTamper.ExtraOperationsColumn)]
+    [InlineData(InfrastructureTamper.MissingStateColumn)]
+    [InlineData(InfrastructureTamper.NullableLockOwner)]
+    [InlineData(InfrastructureTamper.WrongLockOwnerType)]
+    [InlineData(InfrastructureTamper.WrongStateCollation)]
+    [InlineData(InfrastructureTamper.SameNameCShadowCollation)]
+    [InlineData(InfrastructureTamper.MissingStatePrimaryKey)]
+    [InlineData(InfrastructureTamper.ReorderedOperationsPrimaryKey)]
+    public async Task Restart_rejects_malformed_infrastructure_before_target_fence_mutation(InfrastructureTamper tamper)
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var schema = $"groundwork_infrastructure_{suffix}";
+        await ExecuteAdminAsync($"CREATE SCHEMA {Q(schema)};");
+        var connectionString = new NpgsqlConnectionStringBuilder(container.GetConnectionString())
+        {
+            SearchPath = schema
+        }.ConnectionString;
+        try
+        {
+            var initial = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                PostgreSqlGroundworkCapabilities.Provider,
+                includePriority: true,
+                instance: $"initial-{suffix}",
+                normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+            await PhysicalSchemaApplication.ApplyAsync(initial.Target, new PostgreSqlPhysicalSchemaExecutor(connectionString));
+            await TamperInfrastructureAsync(connectionString, schema, tamper);
+
+            var rejected = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                PostgreSqlGroundworkCapabilities.Provider,
+                includePriority: true,
+                instance: $"rejected-{suffix}",
+                normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            {
+                await using var unused = await new PostgreSqlPhysicalSchemaExecutor(connectionString)
+                    .AcquireApplicationLockAsync(rejected.Target.Identity, CancellationToken.None);
+            });
+            Assert.Contains("Physical-schema infrastructure", exception.Message, StringComparison.Ordinal);
+            Assert.Equal(0, await CountFenceAsync(connectionString, rejected.Target.Identity));
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+            await ExecuteAdminAsync($"DROP SCHEMA {Q(schema)} CASCADE;");
+        }
+    }
+
     [Fact]
     public Task Application_lock_disposal_is_heartbeat_race_safe() =>
         RelationalPhysicalServerAssertions.ApplicationLockDisposalIsHeartbeatRaceSafeAsync(
             PostgreSqlGroundworkCapabilities.Provider,
             PostgreSqlGroundworkCapabilities.PhysicalNames,
             () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+
+    [Fact]
+    public Task Terminated_lock_backend_disposal_is_immediate_and_idempotent() =>
+        RelationalPhysicalServerAssertions.TerminatedApplicationLockDisposalIsIdempotentAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            PostgreSqlPhysicalSchemaExecutor.LockSessionId,
+            TerminateSessionAsync);
 
     [Fact]
     public async Task Exhausted_fence_fails_without_poisoning_the_session_lock()
@@ -133,6 +193,20 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PostgreSqlPhysicalSchemaExecutor.LockSessionId,
             TerminateSessionAsync,
             CountAppliedStateAsync);
+
+    [Fact]
+    public Task Terminated_lock_backend_cannot_commit_backfill_or_operation_evidence() =>
+        RelationalPhysicalServerAssertions.LostBackfillLockCannotCommitDataOrEvidenceAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            (beforeOperation, beforeState) => new PostgreSqlPhysicalSchemaExecutor(
+                container.GetConnectionString(), beforeOperation, beforeState),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            PostgreSqlPhysicalSchemaExecutor.LockSessionId,
+            TerminateSessionAsync,
+            CountOperationEvidenceAsync,
+            CountProjectedValuesAsync);
 
     [Fact]
     public Task DecimalLiveAndBackfillValuesUseTheSameNativeSemantics() =>
@@ -508,6 +582,76 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             manifestId,
             providerName);
 
+    private async Task<long> CountProjectedValuesAsync(string table, string column)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {Q(table)} WHERE {Q(column)} IS NOT NULL;";
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task<long> CountFenceAsync(string connectionString, PhysicalSchemaTargetIdentity target)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM groundwork_physical_schema_locks WHERE manifest_id = @manifestId AND provider_name = @providerName;";
+        command.Parameters.AddWithValue("manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("providerName", target.ProviderName);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task TamperInfrastructureAsync(
+        string connectionString,
+        string schema,
+        InfrastructureTamper tamper)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        var sql = tamper switch
+        {
+            InfrastructureTamper.WrongObjectKind => """
+                DROP TABLE groundwork_physical_schema_locks;
+                CREATE VIEW groundwork_physical_schema_locks AS
+                    SELECT NULL::text AS manifest_id, NULL::text AS provider_name WHERE false;
+                """,
+            InfrastructureTamper.ExtraOperationsColumn =>
+                "ALTER TABLE groundwork_physical_schema_operations ADD COLUMN unexpected integer NULL;",
+            InfrastructureTamper.MissingStateColumn =>
+                "ALTER TABLE groundwork_physical_schema_state DROP COLUMN applied_state_json;",
+            InfrastructureTamper.NullableLockOwner =>
+                "ALTER TABLE groundwork_physical_schema_locks ALTER COLUMN owner_id DROP NOT NULL;",
+            InfrastructureTamper.WrongLockOwnerType =>
+                "ALTER TABLE groundwork_physical_schema_locks ALTER COLUMN owner_id TYPE character varying(32);",
+            InfrastructureTamper.WrongStateCollation => $"""
+                CREATE COLLATION {Q(schema)}.gw_nondeterministic
+                    (provider = icu, locale = 'und-u-ks-level1', deterministic = false);
+                ALTER TABLE groundwork_physical_schema_state ALTER COLUMN target_fingerprint
+                    TYPE text COLLATE {Q(schema)}.gw_nondeterministic;
+                """,
+            InfrastructureTamper.SameNameCShadowCollation => $"""
+                CREATE COLLATION {Q(schema)}.{Q("C")}
+                    (provider = icu, locale = 'und-u-ks-level1', deterministic = false);
+                ALTER TABLE groundwork_physical_schema_locks DROP CONSTRAINT groundwork_physical_schema_locks_pkey;
+                ALTER TABLE groundwork_physical_schema_locks ALTER COLUMN manifest_id
+                    TYPE text COLLATE {Q(schema)}.{Q("C")};
+                ALTER TABLE groundwork_physical_schema_locks ADD PRIMARY KEY (manifest_id, provider_name);
+                """,
+            InfrastructureTamper.MissingStatePrimaryKey =>
+                "ALTER TABLE groundwork_physical_schema_state DROP CONSTRAINT groundwork_physical_schema_state_pkey;",
+            InfrastructureTamper.ReorderedOperationsPrimaryKey => """
+                ALTER TABLE groundwork_physical_schema_operations DROP CONSTRAINT groundwork_physical_schema_operations_pkey;
+                ALTER TABLE groundwork_physical_schema_operations
+                    ADD PRIMARY KEY (provider_name, manifest_id, operation_id);
+                """,
+            _ => throw new ArgumentOutOfRangeException(nameof(tamper), tamper, null)
+        };
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+
     private async Task<long> CountAsync(string sql, string first, string second)
     {
         await using var connection = new NpgsqlConnection(container.GetConnectionString());
@@ -520,4 +664,17 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     }
 
     private static string Q(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+
+    public enum InfrastructureTamper
+    {
+        WrongObjectKind,
+        ExtraOperationsColumn,
+        MissingStateColumn,
+        NullableLockOwner,
+        WrongLockOwnerType,
+        WrongStateCollation,
+        SameNameCShadowCollation,
+        MissingStatePrimaryKey,
+        ReorderedOperationsPrimaryKey
+    }
 }

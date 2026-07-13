@@ -22,7 +22,8 @@ internal static class RelationalPhysicalStorageTestModels
         IProviderPhysicalNameNormalizer? normalizer = null,
         bool categoryUnique = false,
         bool categoryNullable = false,
-        string documentKind = "configurationDocument")
+        string documentKind = "configurationDocument",
+        Func<PhysicalNameContext, string>? namePolicy = null)
     {
         var template = RelationalTestManifests.MetadataManifest();
         instance ??= Guid.NewGuid().ToString("N")[..8];
@@ -147,7 +148,7 @@ internal static class RelationalPhysicalStorageTestModels
         };
         var resolution = PhysicalStorageResolver.Resolve(
             manifest,
-            new DelegatePhysicalNamePolicy(context => $"gw_{instance}_{context.FeatureDefaultLogicalName}"),
+            new DelegatePhysicalNamePolicy(namePolicy ?? (context => $"gw_{instance}_{context.FeatureDefaultLogicalName}")),
             normalizer ?? ProviderPhysicalNameNormalizer.Identity);
         if (!resolution.IsValid)
             throw new InvalidOperationException(string.Join("; ", resolution.Diagnostics.Select(x => x.Message)));

@@ -78,12 +78,122 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         }
     }
 
+    [Theory]
+    [InlineData(InfrastructureTamper.WrongObjectKind)]
+    [InlineData(InfrastructureTamper.ExtraOperationsColumn)]
+    [InlineData(InfrastructureTamper.MissingStateColumn)]
+    [InlineData(InfrastructureTamper.NullableLockOwner)]
+    [InlineData(InfrastructureTamper.WrongLockOwnerType)]
+    [InlineData(InfrastructureTamper.WrongStateCollation)]
+    [InlineData(InfrastructureTamper.MissingStatePrimaryKey)]
+    [InlineData(InfrastructureTamper.ReorderedOperationsPrimaryKey)]
+    [InlineData(InfrastructureTamper.PlainHash)]
+    [InlineData(InfrastructureTamper.NonPersistedHash)]
+    [InlineData(InfrastructureTamper.WrongHashExpression)]
+    public async Task Restart_rejects_malformed_infrastructure_before_target_fence_mutation(InfrastructureTamper tamper)
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var database = $"groundwork_infrastructure_{suffix}";
+        await ExecuteAdminAsync($"CREATE DATABASE {Q(database)};");
+        var connectionString = new SqlConnectionStringBuilder(container.GetConnectionString())
+        {
+            InitialCatalog = database
+        }.ConnectionString;
+        try
+        {
+            var initial = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                SqlServerGroundworkCapabilities.Provider,
+                includePriority: true,
+                instance: $"initial-{suffix}",
+                normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+            await PhysicalSchemaApplication.ApplyAsync(initial.Target, new SqlServerPhysicalSchemaExecutor(connectionString));
+            await TamperInfrastructureAsync(connectionString, tamper);
+
+            var rejected = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                SqlServerGroundworkCapabilities.Provider,
+                includePriority: true,
+                instance: $"rejected-{suffix}",
+                normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            {
+                await using var unused = await new SqlServerPhysicalSchemaExecutor(connectionString)
+                    .AcquireApplicationLockAsync(rejected.Target.Identity, CancellationToken.None);
+            });
+            Assert.Contains("Physical-schema infrastructure", exception.Message, StringComparison.Ordinal);
+            if (tamper == InfrastructureTamper.NonPersistedHash)
+                Assert.Contains("persisted 'False'", exception.Message, StringComparison.Ordinal);
+            if (tamper == InfrastructureTamper.WrongHashExpression)
+                Assert.Contains("N'wrong'", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, await CountFenceAsync(connectionString, rejected.Target.Identity));
+        }
+        finally
+        {
+            SqlConnection.ClearAllPools();
+            await ExecuteAdminAsync(
+                $"ALTER DATABASE {Q(database)} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {Q(database)};");
+        }
+    }
+
+    [Fact]
+    public async Task Colliding_long_Unicode_table_prefixes_get_distinct_restart_safe_primary_key_names()
+    {
+        var sharedPrefix = new string('界', 125);
+        var firstTable = sharedPrefix + "一二三";
+        var secondTable = sharedPrefix + "四五六";
+        var first = CreateLongNamedModel("long-name-first", firstTable);
+        var second = CreateLongNamedModel("long-name-second", secondTable);
+        var connectionString = container.GetConnectionString();
+
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(first.Target, new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(second.Target, new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+
+        var firstConstraint = await ReadPrimaryKeyNameAsync(firstTable);
+        var secondConstraint = await ReadPrimaryKeyNameAsync(secondTable);
+        Assert.NotEqual(firstConstraint, secondConstraint);
+        Assert.True(firstConstraint.Length <= 128);
+        Assert.True(secondConstraint.Length <= 128);
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.NoChanges,
+            (await PhysicalSchemaApplication.ApplyAsync(first.Target, new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.NoChanges,
+            (await PhysicalSchemaApplication.ApplyAsync(second.Target, new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+
+        (Groundwork.Core.Manifests.StorageManifest Manifest, PhysicalSchemaTarget Target) CreateLongNamedModel(
+            string instance,
+            string table) =>
+            RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                SqlServerGroundworkCapabilities.Provider,
+                includePriority: false,
+                instance: instance,
+                normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+                namePolicy: context => context.ObjectKind == PhysicalObjectKind.PrimaryStorage
+                    ? table
+                    : $"gw_{instance}_{context.FeatureDefaultLogicalName}");
+    }
+
     [Fact]
     public Task Application_lock_disposal_is_heartbeat_race_safe() =>
         RelationalPhysicalServerAssertions.ApplicationLockDisposalIsHeartbeatRaceSafeAsync(
             SqlServerGroundworkCapabilities.Provider,
             SqlServerGroundworkCapabilities.PhysicalNames,
             () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+
+    [Fact]
+    public Task Terminated_lock_session_disposal_is_immediate_and_idempotent() =>
+        RelationalPhysicalServerAssertions.TerminatedApplicationLockDisposalIsIdempotentAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            SqlServerPhysicalSchemaExecutor.LockSessionId,
+            TerminateSessionAsync);
 
     [Fact]
     public async Task Exhausted_fence_fails_without_poisoning_the_session_lock()
@@ -138,6 +248,23 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             SqlServerPhysicalSchemaExecutor.LockSessionId,
             TerminateSessionAsync,
             CountAppliedStateAsync);
+
+    [Fact]
+    public Task Terminated_lock_session_cannot_commit_backfill_or_operation_evidence() =>
+        RelationalPhysicalServerAssertions.LostBackfillLockCannotCommitDataOrEvidenceAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            (beforeOperation, beforeState) => new SqlServerPhysicalSchemaExecutor(
+                container.GetConnectionString(),
+                new SqlServerPhysicalIdentityHash(),
+                beforeOperation,
+                beforeState),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            SqlServerPhysicalSchemaExecutor.LockSessionId,
+            TerminateSessionAsync,
+            CountOperationEvidenceAsync,
+            CountProjectedValuesAsync);
 
     [Fact]
     public Task DecimalLiveAndBackfillValuesUseTheSameNativeSemantics() =>
@@ -538,6 +665,16 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         await command.ExecuteNonQueryAsync();
     }
 
+    private async Task<string> ReadPrimaryKeyNameAsync(string table)
+    {
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID(@table) AND type = 'PK';";
+        command.Parameters.AddWithValue("@table", table);
+        return (string)(await command.ExecuteScalarAsync())!;
+    }
+
     private async Task ExecuteAdminAsync(string sql)
     {
         await using var connection = new SqlConnection(container.GetConnectionString());
@@ -587,6 +724,95 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         await add.ExecuteNonQueryAsync();
     }
 
+    private static async Task TamperInfrastructureAsync(string connectionString, InfrastructureTamper tamper)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        if (tamper == InfrastructureTamper.WrongObjectKind)
+        {
+            await ExecuteAsync(connection, """
+                DROP TABLE groundwork_physical_schema_locks;
+                EXEC(N'CREATE VIEW groundwork_physical_schema_locks AS
+                    SELECT CAST(NULL AS nvarchar(max)) AS manifest_id,
+                           CAST(NULL AS nvarchar(max)) AS provider_name WHERE 1 = 0;');
+                """);
+            return;
+        }
+
+        var sql = tamper switch
+        {
+            InfrastructureTamper.ExtraOperationsColumn =>
+                "ALTER TABLE groundwork_physical_schema_operations ADD unexpected int NULL;",
+            InfrastructureTamper.MissingStateColumn =>
+                "ALTER TABLE groundwork_physical_schema_state DROP COLUMN applied_state_json;",
+            InfrastructureTamper.NullableLockOwner =>
+                "ALTER TABLE groundwork_physical_schema_locks ALTER COLUMN owner_id nvarchar(32) COLLATE Latin1_General_100_BIN2 NULL;",
+            InfrastructureTamper.WrongLockOwnerType =>
+                "ALTER TABLE groundwork_physical_schema_locks ALTER COLUMN owner_id nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL;",
+            InfrastructureTamper.WrongStateCollation =>
+                "ALTER TABLE groundwork_physical_schema_state ALTER COLUMN target_fingerprint nvarchar(128) COLLATE Latin1_General_100_CI_AS NOT NULL;",
+            InfrastructureTamper.MissingStatePrimaryKey =>
+                $"ALTER TABLE groundwork_physical_schema_state DROP CONSTRAINT {Q(await PrimaryKeyAsync(connection, "groundwork_physical_schema_state"))};",
+            InfrastructureTamper.ReorderedOperationsPrimaryKey =>
+                $"ALTER TABLE groundwork_physical_schema_operations DROP CONSTRAINT {Q(await PrimaryKeyAsync(connection, "groundwork_physical_schema_operations"))}; " +
+                "ALTER TABLE groundwork_physical_schema_operations ADD CONSTRAINT PK_tampered_operations " +
+                "PRIMARY KEY NONCLUSTERED (provider_key, manifest_key, operation_key);",
+            InfrastructureTamper.PlainHash or InfrastructureTamper.NonPersistedHash or InfrastructureTamper.WrongHashExpression =>
+                await HashTamperSqlAsync(connection, tamper),
+            _ => throw new ArgumentOutOfRangeException(nameof(tamper), tamper, null)
+        };
+        await ExecuteAsync(connection, sql);
+
+        static async Task<string> PrimaryKeyAsync(SqlConnection connection, string table)
+        {
+            await using var read = connection.CreateCommand();
+            read.CommandText = "SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID(@table) AND type = 'PK';";
+            read.Parameters.AddWithValue("@table", table);
+            return (string)(await read.ExecuteScalarAsync())!;
+        }
+
+        static async Task<string> HashTamperSqlAsync(SqlConnection connection, InfrastructureTamper tamper)
+        {
+            var constraint = await PrimaryKeyAsync(connection, "groundwork_physical_schema_locks");
+            var definition = tamper switch
+            {
+                InfrastructureTamper.PlainHash =>
+                    "manifest_key binary(32) NOT NULL CONSTRAINT DF_tampered_manifest_key DEFAULT CONVERT(binary(32), 0x00)",
+                InfrastructureTamper.NonPersistedHash =>
+                    "manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id)))",
+                InfrastructureTamper.WrongHashExpression =>
+                    "manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), N'wrong'))) PERSISTED NOT NULL",
+                _ => throw new ArgumentOutOfRangeException(nameof(tamper), tamper, null)
+            };
+            var reapplyPrimaryKey = tamper == InfrastructureTamper.NonPersistedHash
+                ? string.Empty
+                : $"ALTER TABLE groundwork_physical_schema_locks ADD CONSTRAINT {Q(constraint)} " +
+                  "PRIMARY KEY NONCLUSTERED (manifest_key, provider_key);";
+            return $"ALTER TABLE groundwork_physical_schema_locks DROP CONSTRAINT {Q(constraint)}; " +
+                   "ALTER TABLE groundwork_physical_schema_locks DROP COLUMN manifest_key; " +
+                   $"ALTER TABLE groundwork_physical_schema_locks ADD {definition}; " +
+                   reapplyPrimaryKey;
+        }
+
+        static async Task ExecuteAsync(SqlConnection connection, string sql)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    private static async Task<long> CountFenceAsync(string connectionString, PhysicalSchemaTargetIdentity target)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT_BIG(*) FROM groundwork_physical_schema_locks WHERE manifest_id = @manifestId AND provider_name = @providerName;";
+        command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("@providerName", target.ProviderName);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
     private Task<long> CountOperationEvidenceAsync(string operationId, string fingerprint) =>
         CountAsync(
             "SELECT COUNT_BIG(*) FROM groundwork_physical_schema_operations WHERE operation_id = @first AND operation_fingerprint = @second;",
@@ -611,6 +837,9 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
 
     private Task<long> CountRowsAsync(string table) =>
         CountScalarAsync($"SELECT COUNT_BIG(*) FROM {Q(table)};");
+
+    private Task<long> CountProjectedValuesAsync(string table, string column) =>
+        CountScalarAsync($"SELECT COUNT_BIG(*) FROM {Q(table)} WHERE {Q(column)} IS NOT NULL;");
 
     private async Task<long> CountAsync(string sql, string first, string second)
     {
@@ -639,5 +868,20 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         PlainBinary,
         NonPersisted,
         WrongExpression
+    }
+
+    public enum InfrastructureTamper
+    {
+        WrongObjectKind,
+        ExtraOperationsColumn,
+        MissingStateColumn,
+        NullableLockOwner,
+        WrongLockOwnerType,
+        WrongStateCollation,
+        MissingStatePrimaryKey,
+        ReorderedOperationsPrimaryKey,
+        PlainHash,
+        NonPersistedHash,
+        WrongHashExpression
     }
 }
