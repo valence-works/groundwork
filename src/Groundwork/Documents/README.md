@@ -11,3 +11,8 @@ exact provider/route/object/index/field certifications; a source-wide capability
 authorize traffic. The explicit legacy handler certifies only single-field ordinary shapes the old
 provider contract can represent. See
 [`docs/bounded-physical-query-plans.md`](../../../docs/bounded-physical-query-plans.md).
+
+Named update/delete lifecycle work uses `BoundedMutationDeclaration` and
+`PhysicalMutationDocumentStore`. Mutation declarations reuse a scale-bearing bounded query as their
+closed selector and fix either a field transition or deletion at manifest construction time. See
+[`docs/bounded-document-mutations.md`](../../../docs/bounded-document-mutations.md).

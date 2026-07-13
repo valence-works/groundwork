@@ -71,6 +71,12 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         return $"json_extract({canonicalJsonExpression}, '{path.Replace("'", "''")}')";
     }
 
+    public override string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        $"json_set({canonicalJsonExpression}, {jsonPathParameter}, json({jsonValueParameter}))";
+
     public override string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -100,4 +106,9 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         $"{selectSql} LIMIT {takeParameter} OFFSET {skipParameter};";
 
     public override string ApplyFirst(string selectSql) => $"{selectSql} LIMIT 1;";
+
+    public override string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
+        indexIdentifier is null
+            ? $"{QuoteIdentifier(tableIdentifier)} {alias}"
+            : $"{QuoteIdentifier(tableIdentifier)} AS {alias} INDEXED BY {QuoteIdentifier(indexIdentifier)}";
 }

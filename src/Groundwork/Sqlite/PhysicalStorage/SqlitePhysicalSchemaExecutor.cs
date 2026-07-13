@@ -849,6 +849,24 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 applied_state_json TEXT NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
             );
+            CREATE TABLE IF NOT EXISTS groundwork_document_mutation_operations (
+                manifest_id TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                provider_version TEXT NOT NULL,
+                storage_unit TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                affected_count INTEGER NOT NULL,
+                completed_utc TEXT NOT NULL,
+                PRIMARY KEY (
+                    manifest_id,
+                    provider_name,
+                    provider_version,
+                    storage_unit,
+                    storage_scope,
+                    operation_id)
+            );
             """, null, ct);
     }
 

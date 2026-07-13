@@ -74,6 +74,7 @@ public enum StorageScopeOperation
     Load,
     Delete,
     Query,
+    Mutate,
     BeginUnitOfWork
 }
 

@@ -49,6 +49,11 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract int MaxParameters { get; }
     public abstract bool IsUniqueConstraintException(DbException exception);
     public abstract string JsonValue(string canonicalJsonExpression, string stablePath);
+    public virtual string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        throw new NotSupportedException("This relational provider does not support physical JSON transitions.");
     public virtual string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -63,6 +68,8 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract string StartsWith(string fieldExpression, string parameterExpression);
     public abstract string ApplyOffsetPage(string selectSql, string takeParameter, string skipParameter);
     public abstract string ApplyFirst(string selectSql);
+    public virtual string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
+        $"{QuoteIdentifier(tableIdentifier)} {alias}";
 
     protected string Qualified(string? alias, string identifier) =>
         alias is null ? QuoteIdentifier(identifier) : $"{alias}.{QuoteIdentifier(identifier)}";
@@ -220,8 +227,67 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal DocumentScopeSelection ResolveQueryScope(string documentKind) =>
         DocumentStoreScopeResolver.Resolve(GetUnit(documentKind), Access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
 
+    internal DocumentScopeSelection ResolveMutationScope(string documentKind) =>
+        DocumentStoreScopeResolver.Resolve(GetUnit(documentKind), Access, StorageScopeOperation.Mutate, scopeObserver);
+
+    internal string ManifestIdentity => manifest.Identity.Value;
+
     internal Task<T> ExecutePhysicalQueryAsync<T>(Func<DbConnection, CancellationToken, Task<T>> action, CancellationToken cancellationToken) =>
         ExecuteAsync(action, cancellationToken);
+
+    internal async Task<T> ExecutePhysicalMutationAsync<T>(
+        Func<DbConnection, DbTransaction, CancellationToken, Task<T>> action,
+        Func<CancellationToken, ValueTask>? beforeCommit,
+        Func<CancellationToken, ValueTask>? afterCommitBeforeAcknowledgement,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        if (sessionFactory is not null)
+        {
+            await using var unitOfWork = await sessionFactory.BeginUnitOfWorkAsync(cancellationToken);
+            var committed = false;
+            try
+            {
+                var result = await unitOfWork.Executor.ExecuteAsync(action, cancellationToken);
+                if (beforeCommit is not null)
+                    await beforeCommit(cancellationToken);
+                await unitOfWork.CommitAsync(cancellationToken);
+                committed = true;
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(cancellationToken);
+                return result;
+            }
+            catch
+            {
+                if (!committed)
+                    await unitOfWork.RollbackAsync(CancellationToken.None);
+                throw;
+            }
+        }
+
+        return await ExecuteAsync(async (current, ct) =>
+        {
+            await using var transaction = await current.BeginTransactionAsync(ct);
+            var committed = false;
+            try
+            {
+                var result = await action(current, transaction, ct);
+                if (beforeCommit is not null)
+                    await beforeCommit(ct);
+                await transaction.CommitAsync(ct);
+                committed = true;
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(ct);
+                return result;
+            }
+            catch
+            {
+                if (!committed)
+                    await transaction.RollbackAsync(CancellationToken.None);
+                throw;
+            }
+        }, cancellationToken);
+    }
 
     internal static DbCommand CreatePhysicalCommand(DbConnection connection, string sql, DbTransaction? transaction = null)
     {
@@ -241,6 +307,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     internal string Q(string identifier) => dialect.QuoteIdentifier(identifier);
     internal string JsonValue(string expression, string path) => dialect.JsonValue(expression, path);
+    internal string SetJsonValue(string expression, string pathParameter, string valueParameter) =>
+        dialect.SetJsonValue(expression, pathParameter, valueParameter);
     internal string NormalizeQueryExpression(
         string expression,
         PhysicalQueryFieldSource source,
@@ -257,6 +325,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal string StartsWith(string field, string parameter) => dialect.StartsWith(field, parameter);
     internal string ApplyOffsetPage(string sql, string take, string skip) => dialect.ApplyOffsetPage(sql, take, skip);
     internal string ApplyFirst(string sql) => dialect.ApplyFirst(sql);
+    internal string PhysicalQuerySource(string table, string alias, string? index) =>
+        dialect.QuerySource(table, alias, index);
     internal string ExactPhysicalIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         dialect.ExactIdentityPredicate(parts);
     internal string ExactPhysicalIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts) =>

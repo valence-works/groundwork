@@ -440,6 +440,207 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void NamedDeleteMutationCompilesFromAClosedBoundedPredicateAndInheritsRouteScope()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.PhysicalEntityTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var mutation = new BoundedMutationDeclaration(
+            "prune-by-stimulus-type",
+            "list-by-stimulus-type",
+            BoundedMutationAction.Delete());
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations: [mutation]);
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        var plan = Assert.Single(result.Plans);
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Equal("prune-by-stimulus-type", plan.MutationIdentity);
+        Assert.Equal(BoundedMutationActionKind.Delete, plan.Action.Kind);
+        Assert.Equal("list-by-stimulus-type", plan.Predicate.QueryIdentity);
+        Assert.Equal("test.PrimaryProjectedColumns", plan.HandlerIdentity);
+        Assert.Equal(fixture.Route.Fingerprint, plan.RouteFingerprint);
+        Assert.Equal(fixture.Route.ScopePolicy, plan.Predicate.Scope.Policy);
+        Assert.True(plan.Predicate.Scope.IsMandatory);
+    }
+
+    [Fact]
+    public void NamedTransitionFixesTheAllowedSourceAndTargetValuesAtCompileTime()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.PhysicalEntityTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var mutation = new BoundedMutationDeclaration(
+            "revoke-http-stimuli",
+            "list-by-stimulus-type",
+            BoundedMutationAction.Transition(
+                "stimulusType",
+                ["active", "inactive"],
+                "revoked"));
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations: [mutation]);
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        var transition = Assert.IsType<PhysicalTransitionMutationAction>(Assert.Single(result.Plans).Action);
+        Assert.Equal("stimulusType", transition.Path);
+        Assert.Equal(new[] { "active", "inactive" }, transition.AllowedSourceValues);
+        Assert.Equal("revoked", transition.TargetValue);
+        Assert.Equal(IndexValueKind.Keyword, transition.Field.ValueKind);
+        Assert.Equal(Assert.Single(fixture.Route.ProjectedColumns).Column.Identifier, transition.Field.Identifier);
+    }
+
+    [Fact]
+    public void MutationCompilationRejectsAnOrdinaryPredicateThatCouldScanWithoutAnIndex()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            BoundedQueryExecutionClass.Ordinary);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "unsafe-prune",
+                    "list-by-stimulus-type",
+                    BoundedMutationAction.Delete())
+            ]);
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-MUTATION-004" &&
+            diagnostic.Message.Contains("indexed", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task MutationRuntimeRejectsUndeclaredWorkBeforeDispatchingProviderIo()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.PhysicalEntityTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "prune-by-stimulus-type",
+                    "list-by-stimulus-type",
+                    BoundedMutationAction.Delete())
+            ]);
+        var capabilities = Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns);
+        var plan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            capabilities).Plans);
+        var handler = new RecordingMutationHandler(
+            plan.HandlerIdentity,
+            PhysicalQuerySourceKind.PrimaryProjectedColumns,
+            [new PhysicalMutationHandlerCertification(plan)]);
+        var mutations = new PhysicalMutationDocumentStore(
+            fixture.Route,
+            storage,
+            capabilities,
+            [handler]);
+
+        var completed = await mutations.ExecuteAsync(new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "operation-1",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))]));
+
+        Assert.Equal(BoundedMutationStatus.Completed, completed.Status);
+        Assert.Equal(3, completed.AffectedCount);
+        Assert.Equal(1, handler.ExecutionCount);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(new DocumentMutation(
+            "workflowTriggerBinding",
+            "undeclared-prune",
+            "operation-2")));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "operation-3",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("undeclaredPath", "http"))])));
+        Assert.Equal(1, handler.ExecutionCount);
+    }
+
+    [Fact]
+    public void MutationRequestFingerprintIsDeterministicForEquivalentSetPredicates()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.PhysicalEntityTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "prune-by-stimulus-type",
+                    "list-by-stimulus-type",
+                    BoundedMutationAction.Delete())
+            ]);
+        var plan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)).Plans);
+        var first = new DocumentMutation(
+            "workflowTriggerBinding",
+            plan.MutationIdentity,
+            "first",
+            [DocumentQueryClause.Of(DocumentQueryComparison.In("stimulusType", ["timer", "http", "http"]))]);
+        var equivalent = new DocumentMutation(
+            "workflowTriggerBinding",
+            plan.MutationIdentity,
+            "second",
+            [DocumentQueryClause.Of(DocumentQueryComparison.In("stimulusType", ["http", "timer"]))]);
+        var different = new DocumentMutation(
+            "workflowTriggerBinding",
+            plan.MutationIdentity,
+            "third",
+            [DocumentQueryClause.Of(DocumentQueryComparison.In("stimulusType", ["http"]))]);
+
+        var fingerprint = BoundedMutationRequestFingerprint.Create(first, plan, "tenant-a");
+
+        Assert.Equal(fingerprint, BoundedMutationRequestFingerprint.Create(equivalent, plan, "tenant-a"));
+        Assert.NotEqual(fingerprint, BoundedMutationRequestFingerprint.Create(different, plan, "tenant-a"));
+        Assert.NotEqual(fingerprint, BoundedMutationRequestFingerprint.Create(first, plan, "tenant-b"));
+    }
+
+    [Fact]
     public void LinkedIndexCannotCertifyScaleBearingNativePrimaryFieldHandler()
     {
         var fixture = CreateFixture(
@@ -1448,6 +1649,34 @@ public sealed class PhysicalQueryPlanCompilerTests
         {
             LastPlan = plan;
             return Task.FromResult(false);
+        }
+    }
+
+    private sealed class RecordingMutationHandler(
+        string identity,
+        PhysicalQuerySourceKind source,
+        IReadOnlyList<PhysicalMutationHandlerCertification> certifications) : IPhysicalDocumentMutationHandler
+    {
+        public string Identity { get; } = identity;
+        public PhysicalQuerySourceKind Source { get; } = source;
+        public IReadOnlySet<PortableQueryOperation> SupportedOperations { get; } =
+            Enum.GetValues<PortableQueryOperation>().ToHashSet();
+        public IReadOnlySet<BoundedMutationActionKind> SupportedActions { get; } =
+            Enum.GetValues<BoundedMutationActionKind>().ToHashSet();
+        public IReadOnlyDictionary<string, string> NativeFieldIdentifiers { get; } =
+            new Dictionary<string, string>();
+        public IReadOnlyList<PhysicalMutationHandlerCertification> Certifications { get; } = certifications;
+        public bool SupportsCompoundPredicates => true;
+        public bool SupportsDisjunction => true;
+        public int ExecutionCount { get; private set; }
+
+        public Task<BoundedMutationResult> ExecuteAsync(
+            DocumentMutation mutation,
+            PhysicalMutationPlan plan,
+            CancellationToken cancellationToken)
+        {
+            ExecutionCount++;
+            return Task.FromResult(BoundedMutationResult.Completed(3));
         }
     }
 

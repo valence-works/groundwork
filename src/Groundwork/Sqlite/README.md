@@ -20,6 +20,9 @@
   JSON, linked rows, and entity projections.
 - Executes exactly certified bounded physical query plans for filters, compound predicates,
   ordering, offset paging, count, any, and first, with explain-plan index conformance.
+- Executes named bounded transition/delete plans through server-side indexed selectors. Canonical
+  JSON, primary/linked projections, and the durable exact-count idempotency ledger commit atomically;
+  identical retries replay their original outcome and conflicting operation reuse is rejected.
 - Stores declared Decimal projections as checked fixed-scale integers (precision 1–18) and explicitly
   offset DateTime projections as UTC ticks. Original numeric lexemes are validated before CLR
   conversion, and date-time fractions beyond seven digits are rejected before parsing. Canonical

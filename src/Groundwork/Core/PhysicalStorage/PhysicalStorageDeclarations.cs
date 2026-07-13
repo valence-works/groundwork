@@ -62,7 +62,8 @@ public sealed record StorageUnitPhysicalStorage
         PhysicalStoragePolicy policy,
         IReadOnlyList<LogicalIndexDeclaration>? logicalIndexes = null,
         IReadOnlyList<BoundedQueryDeclaration>? boundedQueries = null,
-        IReadOnlyList<PhysicalObjectNameOverride>? nameOverrides = null)
+        IReadOnlyList<PhysicalObjectNameOverride>? nameOverrides = null,
+        IReadOnlyList<BoundedMutationDeclaration>? boundedMutations = null)
     {
         ProvisioningMode = provisioningMode;
         Policy = policy ?? throw new ArgumentNullException(nameof(policy));
@@ -76,6 +77,9 @@ public sealed record StorageUnitPhysicalStorage
             .OrderBy(x => x.ObjectKind)
             .ThenBy(x => x.FeatureDefaultLogicalName, StringComparer.Ordinal)
             .ToArray() ?? [];
+        BoundedMutations = boundedMutations?
+            .OrderBy(x => x.Identity, StringComparer.Ordinal)
+            .ToArray() ?? [];
     }
 
     public StorageUnitProvisioningMode ProvisioningMode { get; }
@@ -88,13 +92,16 @@ public sealed record StorageUnitPhysicalStorage
 
     public IReadOnlyList<PhysicalObjectNameOverride> NameOverrides { get; }
 
+    public IReadOnlyList<BoundedMutationDeclaration> BoundedMutations { get; }
+
     public bool Equals(StorageUnitPhysicalStorage? other) =>
         other is not null &&
         ProvisioningMode == other.ProvisioningMode &&
         Policy == other.Policy &&
         LogicalIndexes.SequenceEqual(other.LogicalIndexes) &&
         BoundedQueries.SequenceEqual(other.BoundedQueries) &&
-        NameOverrides.SequenceEqual(other.NameOverrides);
+        NameOverrides.SequenceEqual(other.NameOverrides) &&
+        BoundedMutations.SequenceEqual(other.BoundedMutations);
 
     public override int GetHashCode()
     {
@@ -107,8 +114,137 @@ public sealed record StorageUnitPhysicalStorage
             hash.Add(query);
         foreach (var nameOverride in NameOverrides)
             hash.Add(nameOverride);
+        foreach (var mutation in BoundedMutations)
+            hash.Add(mutation);
         return hash.ToHashCode();
     }
+}
+
+/// <summary>The closed set of effects available to a declared bounded mutation.</summary>
+public enum BoundedMutationActionKind
+{
+    Transition,
+    Delete
+}
+
+/// <summary>A fixed mutation effect selected by manifest code rather than runtime callers.</summary>
+public abstract class BoundedMutationAction : IEquatable<BoundedMutationAction>
+{
+    protected BoundedMutationAction(BoundedMutationActionKind kind) => Kind = kind;
+
+    public BoundedMutationActionKind Kind { get; }
+
+    public static BoundedMutationAction Delete() => new BoundedDeleteMutationAction();
+
+    public static BoundedMutationAction Transition(
+        string path,
+        IReadOnlyList<string> allowedSourceValues,
+        string targetValue) =>
+        new BoundedTransitionMutationAction(path, allowedSourceValues, targetValue);
+
+    public abstract bool Equals(BoundedMutationAction? other);
+
+    public override bool Equals(object? obj) => Equals(obj as BoundedMutationAction);
+
+    public abstract override int GetHashCode();
+}
+
+/// <summary>Deletes every document selected by the declaration's closed bounded predicate.</summary>
+public sealed class BoundedDeleteMutationAction() : BoundedMutationAction(BoundedMutationActionKind.Delete)
+{
+    public override bool Equals(BoundedMutationAction? other) => other is BoundedDeleteMutationAction;
+
+    public override int GetHashCode() => (int)Kind;
+}
+
+/// <summary>Changes one stable field only from the declared source values to one declared target.</summary>
+public sealed class BoundedTransitionMutationAction : BoundedMutationAction
+{
+    public BoundedTransitionMutationAction(
+        string path,
+        IReadOnlyList<string> allowedSourceValues,
+        string targetValue)
+        : base(BoundedMutationActionKind.Transition)
+    {
+        Path = string.IsNullOrWhiteSpace(path)
+            ? throw new ArgumentException("A transition stable path is required.", nameof(path))
+            : path;
+        AllowedSourceValues = Array.AsReadOnly(
+            (allowedSourceValues ?? throw new ArgumentNullException(nameof(allowedSourceValues)))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray());
+        if (AllowedSourceValues.Count == 0 || AllowedSourceValues.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("At least one non-empty transition source value is required.", nameof(allowedSourceValues));
+        TargetValue = string.IsNullOrWhiteSpace(targetValue)
+            ? throw new ArgumentException("A transition target value is required.", nameof(targetValue))
+            : targetValue;
+        if (AllowedSourceValues.Contains(TargetValue, StringComparer.Ordinal))
+            throw new ArgumentException("A transition target cannot also be an allowed source value.", nameof(targetValue));
+    }
+
+    public string Path { get; }
+
+    public IReadOnlyList<string> AllowedSourceValues { get; }
+
+    public string TargetValue { get; }
+
+    public override bool Equals(BoundedMutationAction? other) =>
+        other is BoundedTransitionMutationAction transition &&
+        Path == transition.Path &&
+        AllowedSourceValues.SequenceEqual(transition.AllowedSourceValues) &&
+        TargetValue == transition.TargetValue;
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Kind);
+        hash.Add(Path, StringComparer.Ordinal);
+        foreach (var source in AllowedSourceValues)
+            hash.Add(source, StringComparer.Ordinal);
+        hash.Add(TargetValue, StringComparer.Ordinal);
+        return hash.ToHashCode();
+    }
+}
+
+/// <summary>
+/// Binds a caller-visible mutation identity to one existing bounded-query declaration. The query
+/// supplies the closed predicate shape; the action supplies the only effect the caller may invoke.
+/// </summary>
+public sealed class BoundedMutationDeclaration : IEquatable<BoundedMutationDeclaration>
+{
+    public BoundedMutationDeclaration(
+        string identity,
+        string predicateQueryIdentity,
+        BoundedMutationAction action)
+    {
+        Identity = string.IsNullOrWhiteSpace(identity)
+            ? throw new ArgumentException("A bounded-mutation identity is required.", nameof(identity))
+            : identity;
+        PredicateQueryIdentity = string.IsNullOrWhiteSpace(predicateQueryIdentity)
+            ? throw new ArgumentException("A bounded predicate-query identity is required.", nameof(predicateQueryIdentity))
+            : predicateQueryIdentity;
+        Action = action ?? throw new ArgumentNullException(nameof(action));
+    }
+
+    public string Identity { get; }
+
+    public string PredicateQueryIdentity { get; }
+
+    public BoundedMutationAction Action { get; }
+
+    public bool Equals(BoundedMutationDeclaration? other) =>
+        other is not null &&
+        Identity == other.Identity &&
+        PredicateQueryIdentity == other.PredicateQueryIdentity &&
+        Action.Equals(other.Action);
+
+    public override bool Equals(object? obj) => Equals(obj as BoundedMutationDeclaration);
+
+    public override int GetHashCode() => HashCode.Combine(
+        StringComparer.Ordinal.GetHashCode(Identity),
+        StringComparer.Ordinal.GetHashCode(PredicateQueryIdentity),
+        Action);
 }
 
 /// <summary>A provider-neutral logical index whose fields are stable serialized paths.</summary>
