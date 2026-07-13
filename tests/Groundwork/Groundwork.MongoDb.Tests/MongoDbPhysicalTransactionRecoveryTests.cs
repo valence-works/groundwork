@@ -337,6 +337,25 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
         Assert.Equal(TransactionBoundary.CrossUnitAtomic, handle.Store.TransactionBoundary);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await handle.Store.SaveAsync(new SaveDocumentRequest(
             "workItem", "replica", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
+        Assert.NotNull(await handle.Store.LoadAsync("workItem", "replica"));
+        var query = new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
+        Assert.Equal("replica", Assert.Single((await handle.Store.QueryAsync(query)).Documents).Id);
+        Assert.Equal(1, await handle.Store.CountAsync(query.Select(BoundedQueryResultOperation.Count)));
+        Assert.True(await handle.Store.AnyAsync(query.Select(BoundedQueryResultOperation.Any)));
+        Assert.Equal("replica", (await handle.Store.FirstOrDefaultAsync(
+            query.Select(BoundedQueryResultOperation.First)))!.Id);
+        Assert.NotNull(await handle.Store.ExplainAsync(query));
+        await using (var transaction = await handle.Store.BeginAsync(DocumentCommitScope.Of("workItem")))
+        {
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+                "workItem", "replica-uow", "1", """{"status":"open","rank":2}""", ExpectedVersion: 0))).Status);
+            await transaction.CommitAsync();
+        }
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await handle.Store.DeleteAsync(new DeleteDocumentRequest(
+            "workItem", "replica", ExpectedVersion: 1))).Status);
     }
 
     [Fact]

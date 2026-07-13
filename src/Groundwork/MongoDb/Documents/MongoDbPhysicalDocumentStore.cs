@@ -91,11 +91,19 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             session => SaveCoreAsync(request, session, cancellationToken),
             cancellationToken);
 
-    public Task<DocumentEnvelope?> LoadAsync(
+    public async Task<DocumentEnvelope?> LoadAsync(
         string documentKind,
         string id,
-        CancellationToken cancellationToken = default) =>
-        LoadCoreAsync(documentKind, id, session: null, cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        _ = Route(documentKind);
+        _ = ResolveScope(Unit(documentKind), StorageScopeOperation.Load);
+        await transactionCapability.EnsureSupportedAsync(
+            [documentKind],
+            "physical storage",
+            cancellationToken);
+        return await LoadCoreAsync(documentKind, id, session: null, cancellationToken);
+    }
 
     public Task<DocumentStoreWriteResult> DeleteAsync(
         DeleteDocumentRequest request,
@@ -188,6 +196,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             },
             ["verbosity"] = "queryPlanner"
         };
+        await transactionCapability.EnsureSupportedAsync(
+            [query.DocumentKind],
+            "physical query explain",
+            cancellationToken);
         return await database.RunCommandAsync<BsonDocument>(command, cancellationToken: cancellationToken);
     }
 
@@ -1006,9 +1018,16 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         }
     }
 
-    public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        database.GetCollection<BsonDocument>(plan.LookupObject.Identifier)
-            .CountDocumentsAsync(BuildFilter(query, plan, scope(), storage, route), cancellationToken: cancellationToken);
+    public async Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        var filter = BuildFilter(query, plan, scope(), storage, route);
+        await transactionCapability.EnsureSupportedAsync(
+            [route.StorageUnit.Value],
+            "physical count query",
+            cancellationToken);
+        return await database.GetCollection<BsonDocument>(plan.LookupObject.Identifier)
+            .CountDocumentsAsync(filter, cancellationToken: cancellationToken);
+    }
 
     public async Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
@@ -1018,9 +1037,16 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         return result.Documents.FirstOrDefault();
     }
 
-    public async Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        await database.GetCollection<BsonDocument>(plan.LookupObject.Identifier)
-            .Find(BuildFilter(query, plan, scope(), storage, route)).Limit(1).AnyAsync(cancellationToken);
+    public async Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        var filter = BuildFilter(query, plan, scope(), storage, route);
+        await transactionCapability.EnsureSupportedAsync(
+            [route.StorageUnit.Value],
+            "physical existence query",
+            cancellationToken);
+        return await database.GetCollection<BsonDocument>(plan.LookupObject.Identifier)
+            .Find(filter).Limit(1).AnyAsync(cancellationToken);
+    }
 
     internal static FilterDefinition<BsonDocument> BuildFilter(
         DocumentQuery query,

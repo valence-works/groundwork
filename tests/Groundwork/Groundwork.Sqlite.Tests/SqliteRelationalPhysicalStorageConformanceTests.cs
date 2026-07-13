@@ -2,15 +2,65 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
+using Groundwork.Relational.Documents;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.PhysicalStorage;
 using Groundwork.TestInfrastructure;
 using Microsoft.Data.Sqlite;
+using Xunit;
 
 namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqliteRelationalPhysicalStorageConformanceTests : RelationalPhysicalStorageConformance
 {
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Caller_cancellation_after_non_success_cannot_prevent_rollback(
+        PhysicalStorageForm form)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var model = SqlitePhysicalSchemaExecutorTests.CreateModel(form, includePriority: true);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, new SqlitePhysicalSchemaExecutor(connection));
+        using var cancellation = new CancellationTokenSource();
+        var store = new RelationalPhysicalDocumentStore(
+            connection,
+            model.Manifest,
+            model.Target.Routes,
+            new SqlitePhysicalDocumentDialect(),
+            DocumentStoreAccess.Global,
+            _ =>
+            {
+                cancellation.Cancel();
+                return ValueTask.CompletedTask;
+            });
+        await using var transaction = await store.BeginAsync(
+            DocumentCommitScope.Of("configurationDocument"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "staged-before-cancellation",
+            "1",
+            "{\"category\":\"tools\",\"priority\":1}",
+            ExpectedVersion: 0))).Status);
+
+        var nonSuccess = await transaction.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "missing",
+            "1",
+            "{\"category\":\"tools\",\"priority\":1}",
+            ExpectedVersion: 1), cancellation.Token);
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.Equal(DocumentStoreWriteStatus.NotFound, nonSuccess.Status);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.RollbackAsync());
+        Assert.Null(await store.LoadAsync("configurationDocument", "staged-before-cancellation"));
+    }
+
     protected override async Task<RelationalPhysicalStorageFixture> CreateAsync(
         PhysicalStorageForm form,
         bool dedicatedWithoutLinked = false)

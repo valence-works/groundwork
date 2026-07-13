@@ -155,11 +155,21 @@ public sealed class MongoDbPhysicalTopologyTests : IAsyncLifetime
             "workItem", "save", "1", "{}")));
         await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.DeleteAsync(new DeleteDocumentRequest(
             "workItem", "delete")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.LoadAsync(
+            "workItem", "load"));
         await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.BeginAsync(DocumentCommitScope.Of("workItem")));
-        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(new DocumentQuery(
+        var query = new DocumentQuery(
             "workItem",
             "list-by-status",
-            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(query));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.CountAsync(
+            query.Select(BoundedQueryResultOperation.Count)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.AnyAsync(
+            query.Select(BoundedQueryResultOperation.Any)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.FirstOrDefaultAsync(
+            query.Select(BoundedQueryResultOperation.First)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.ExplainAsync(query));
         Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
 
         using var names = await database.ListCollectionNamesAsync();

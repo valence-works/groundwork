@@ -29,6 +29,7 @@ public static class MongoDbDocumentStoreFactory
         ArgumentNullException.ThrowIfNull(access);
         var validatedOptions = options ?? new MongoDbPhysicalDocumentStoreOptions();
         validatedOptions.Validate();
+        var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
 
         var client = new MongoClient(connectionString);
         var disposableClient = (object)client as IDisposable;
@@ -44,7 +45,6 @@ public static class MongoDbDocumentStoreFactory
                 documentKinds,
                 "physical storage",
                 cancellationToken);
-            var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
                 model,
                 transactionCapability,

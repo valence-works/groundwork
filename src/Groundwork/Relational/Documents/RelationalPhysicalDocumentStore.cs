@@ -48,6 +48,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     private readonly IReadOnlyDictionary<string, ExecutableStorageRoute> routes;
     private readonly RelationalPhysicalDocumentDialect dialect;
     private readonly IStorageScopeObserver scopeObserver;
+    private readonly Func<CancellationToken, ValueTask>? beforeNonSuccessAbort;
     private readonly SemaphoreSlim connectionGate = new(1, 1);
 
     public RelationalPhysicalDocumentStore(
@@ -59,6 +60,20 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         IStorageScopeObserver? scopeObserver = null)
         : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, manifest, routes, dialect, access, scopeObserver)
     {
+    }
+
+    internal RelationalPhysicalDocumentStore(
+        DbConnection connection,
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        RelationalPhysicalDocumentDialect dialect,
+        DocumentStoreAccess access,
+        Func<CancellationToken, ValueTask> beforeNonSuccessAbort,
+        IStorageScopeObserver? scopeObserver = null)
+        : this(connection, null, manifest, routes, dialect, access, scopeObserver)
+    {
+        this.beforeNonSuccessAbort = beforeNonSuccessAbort ??
+            throw new ArgumentNullException(nameof(beforeNonSuccessAbort));
     }
 
     public RelationalPhysicalDocumentStore(
@@ -521,7 +536,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                     (currentTransaction, ct) => store.SaveCoreAsync(request, currentTransaction, ct),
                     cancellationToken);
                 if (result.Status != DocumentStoreWriteStatus.Saved)
-                    await AbortAsync(cancellationToken);
+                    await AbortNonSuccessAsync(cancellationToken);
                 return result;
             }
             catch
@@ -540,7 +555,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                     (currentTransaction, ct) => store.DeleteCoreAsync(request, currentTransaction, ct),
                     cancellationToken);
                 if (result.Status != DocumentStoreWriteStatus.Deleted)
-                    await AbortAsync(cancellationToken);
+                    await AbortNonSuccessAsync(cancellationToken);
                 return result;
             }
             catch
@@ -605,6 +620,12 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             }
             try { await transaction!.RollbackAsync(cancellationToken); }
             finally { await CompleteDirectAsync(); }
+        }
+        private async Task AbortNonSuccessAsync(CancellationToken callerCancellationToken)
+        {
+            if (store.beforeNonSuccessAbort is not null)
+                await store.beforeNonSuccessAbort(callerCancellationToken);
+            await AbortAsync(CancellationToken.None);
         }
         private Task<T> ExecuteAsync<T>(
             Func<DbTransaction, CancellationToken, Task<T>> operation,

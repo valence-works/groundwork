@@ -415,7 +415,8 @@ public sealed class MongoDbPhysicalStorageModelTests
         var probes = 0;
         var sessions = 0;
         var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
-        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_direct_topology_gate");
+        var database = new MongoClient("mongodb://localhost/?serverSelectionTimeoutMS=10")
+            .GetDatabase("groundwork_direct_topology_gate");
         var capability = new MongoDbTransactionCapability(_ =>
         {
             Interlocked.Increment(ref probes);
@@ -441,15 +442,54 @@ public sealed class MongoDbPhysicalStorageModelTests
             "workItem", "save", "1", "{}")));
         await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.DeleteAsync(new DeleteDocumentRequest(
             "workItem", "delete")));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.LoadAsync(
+            "workItem", "load"));
         await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.BeginAsync(DocumentCommitScope.Of("workItem")));
-        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(new DocumentQuery(
+        var query = new DocumentQuery(
             "workItem",
             "list-by-status",
-            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.QueryAsync(query));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.CountAsync(
+            query.Select(BoundedQueryResultOperation.Count)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.AnyAsync(
+            query.Select(BoundedQueryResultOperation.Any)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.FirstOrDefaultAsync(
+            query.Select(BoundedQueryResultOperation.First)));
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() => store.ExplainAsync(query));
 
         Assert.Equal(TransactionBoundary.PerOperation, store.TransactionBoundary);
         Assert.Equal(1, probes);
         Assert.Equal(0, sessions);
+    }
+
+    [Fact]
+    public async Task Physical_factory_validates_the_compiled_model_before_probing_an_unreachable_server()
+    {
+        var manifest = Manifest();
+        var invalid = manifest with
+        {
+            StorageUnits = manifest.StorageUnits.Select(unit => unit.Identity.Value == "orders"
+                ? unit with
+                {
+                    PhysicalStorage = new StorageUnitPhysicalStorage(
+                        StorageUnitProvisioningMode.Declared,
+                        PhysicalStoragePolicy.Explicit(PhysicalTableDefinition.DedicatedDocumentTable(
+                            "groundwork_physical_schema_state")))
+                }
+                : unit).ToArray()
+        };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+                "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=10",
+                "groundwork_invalid_model_before_topology",
+                invalid,
+                MongoDbGroundworkCapabilities.Provider,
+                DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Contains("reserved collection", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("groundwork_physical_schema_state", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
