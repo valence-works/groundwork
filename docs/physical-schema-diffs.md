@@ -80,7 +80,9 @@ infer durable ledger ownership from mutable ambient executor state.
 An executor must apply `(operation identity, fingerprint)` idempotently. The same identity with a
 different fingerprint is a conflict. An acknowledgement means the operation is durably observable;
 if the acknowledgement is lost, retry reconciles the durable operation and returns the same
-identity/fingerprint without applying it twice.
+identity/fingerprint without replaying already-published work or non-idempotent DDL. An evidenced
+backfill is the exception: while its identity/fingerprint is absent from published applied state,
+retry reruns the idempotent projection so writes made after the unpublished attempt are not missed.
 
 The coordinator records target state only after every non-record operation returns the exact
 expected acknowledgement. Failure, cancellation, partial execution, or a mismatched

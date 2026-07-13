@@ -6,7 +6,9 @@ The relational runtime consumes the provider-neutral contracts described by
 [physical schema diffs](physical-schema-diffs.md) and
 [bounded physical query plans](bounded-physical-query-plans.md). It does not resolve names, choose
 a physical form, or infer maintenance/query paths again after `ExecutableStorageRoute` compilation.
-SQLite is the reference implementation; SQL Server and PostgreSQL remain #47, while MongoDB is #48.
+SQLite is the reference implementation. SQL Server and PostgreSQL use the same route-driven store,
+query, acknowledgement, CAS, backfill, and compatibility kernel with provider-owned DDL, metadata,
+locking, value, and explain adapters. MongoDB is tracked separately by #48.
 
 ## Schema application
 
@@ -112,3 +114,45 @@ adaptation. `RelationalPhysicalStorageConformance` is linked into both the SQLit
 relational-provider test projects so #47 inherits the forms, scope isolation, UoW, additive
 evolution/restart/lock, CRUD/OCC/query, and dedicated-without-linked contract. MongoDB has its
 distinct provider contract in #48.
+
+## SQL Server and PostgreSQL parity
+
+`RelationalServerPhysicalSchemaExecutor` keeps server-provider physical schema execution behind one
+deep relational interface. A provider/manifest application lease owns one dedicated, non-pooled
+connection and a SQL Server session application lock or PostgreSQL advisory lock. History reads,
+DDL/backfill operations, validation, applied-state recording, and their transactions all execute on
+that same lock-owning session. DDL/backfill and the matching semantic operation ledger row commit in
+one transaction; the returned acknowledgement is reread from durable storage so retry after
+response loss returns the database timestamp. An evidenced backfill is reconciled again only while
+its identity and fingerprint are absent from published applied state, so writes between an
+unpublished attempt and retry are projected without replaying already-published work.
+
+Both server providers inspect the live catalog rather than treating create-if-absent as compatibility
+evidence. Envelope types, nullability, collation, primary-key order, projected type/default/collation,
+and index ownership/uniqueness/order/direction must match the compiled route. Same-version semantic
+changes remain visible through route fingerprints and additive operations rebuild projected values
+from authoritative canonical JSON in bounded batches.
+
+SQL Server retains document kind and id as binary-collated `nvarchar(450)` values and scope as
+binary-collated `nvarchar(128)`. Persisted SHA-256 `binary(32)` provider-owned columns form the
+nonclustered physical primary key, while every exact lookup and linked join compares both the digest
+and retained original. A native key violation is probed by digest and a different retained identity
+raises `PhysicalIdentityHashCollisionException` rather than masquerading as optimistic concurrency.
+Provider-owned column names use the same deterministic 128-character normalizer as declared names,
+and a route whose visible column collides with one is rejected before use. PostgreSQL stores
+portable `DateTime` projections as UTC ticks because native timestamps round Groundwork's 100ns
+contract to microseconds; SQL Server uses `datetimeoffset(7)`. Both providers restrict portable
+`Decimal` projections to precision 1–28 with explicit scale, matching the exact CLR decimal
+conversion boundary used by live writes, backfills, defaults, and query parameters.
+`SqlServerGroundworkCapabilities.PhysicalNames` enforces SQL Server's 128-character identifier
+limit; `PostgreSqlGroundworkCapabilities.PhysicalNames` truncates on a UTF-8 rune boundary within
+PostgreSQL's 63-byte limit. Both append a deterministic semantic hash so long logical names do not
+silently collide, while the executor quotes every final provider identifier.
+
+`RelationalPhysicalQueryRuntime` derives every advertised source capability from an executable
+handler identity. SQL Server and PostgreSQL wrappers certify the exact route/object/index/field
+mapping and execute predicates, compound ordering, paging, count, any, and first server-side. Their
+container conformance captures the exact count command and parameters emitted by that runtime,
+without optimizer hints. SQL Server executes it with `SET STATISTICS XML ON` and inspects only the
+resulting actual-plan XML result set; PostgreSQL prefixes the same command with `EXPLAIN (FORMAT
+JSON)`. Both assert that the optimizer selected the declared physical index.

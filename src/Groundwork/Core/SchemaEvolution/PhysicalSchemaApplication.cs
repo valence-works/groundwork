@@ -6,7 +6,9 @@ namespace Groundwork.Core.SchemaEvolution;
 /// Reusing an identity with another fingerprint must raise
 /// <see cref="PhysicalSchemaFingerprintConflictException"/>. Returning an acknowledgement means
 /// the operation is durably observable; if acknowledgement delivery is lost after durability, a
-/// retry must return the same acknowledgement without applying the operation again.
+/// retry must return the same acknowledgement. An unpublished, idempotent operation may be
+/// reconciled before returning that acknowledgement when writes since the first attempt must be
+/// included; evidence already represented by published applied state remains a skip token.
 /// </summary>
 public interface IPhysicalSchemaExecutor
 {
@@ -110,10 +112,20 @@ public static class PhysicalSchemaApplication
         if (!plan.IsApplicable)
             return new PhysicalSchemaApplicationResult(PhysicalSchemaApplicationOutcome.Rejected, plan, null);
         if (plan.Operations.Count == 0)
+        {
+            var validation = new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+            var acknowledgement = await executor.ApplyOperationAsync(
+                target.Identity,
+                validation,
+                applicationLock,
+                applicationToken);
+            applicationToken.ThrowIfCancellationRequested();
+            EnsureAcknowledges(validation, acknowledgement);
             return new PhysicalSchemaApplicationResult(
                 PhysicalSchemaApplicationOutcome.NoChanges,
                 plan,
                 history.AppliedState);
+        }
 
         var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>();
         foreach (var operation in plan.Operations)
@@ -128,18 +140,7 @@ public static class PhysicalSchemaApplication
                 applicationLock,
                 applicationToken);
             applicationToken.ThrowIfCancellationRequested();
-            if (acknowledgement.Identity != operation.Identity)
-            {
-                throw new InvalidOperationException(
-                    $"Executor acknowledged operation '{acknowledgement.Identity}' while '{operation.Identity}' was expected.");
-            }
-            if (acknowledgement.Fingerprint != operation.Fingerprint)
-            {
-                throw new PhysicalSchemaFingerprintConflictException(
-                    operation.Identity,
-                    operation.Fingerprint,
-                    acknowledgement.Fingerprint);
-            }
+            EnsureAcknowledges(operation, acknowledgement);
             acknowledgements.Add(acknowledgement);
         }
 
@@ -155,5 +156,23 @@ public static class PhysicalSchemaApplication
             PhysicalSchemaApplicationOutcome.Applied,
             plan,
             appliedState);
+    }
+
+    private static void EnsureAcknowledges(
+        PhysicalSchemaOperation operation,
+        PhysicalSchemaOperationAcknowledgement acknowledgement)
+    {
+        if (acknowledgement.Identity != operation.Identity)
+        {
+            throw new InvalidOperationException(
+                $"Executor acknowledged operation '{acknowledgement.Identity}' while '{operation.Identity}' was expected.");
+        }
+        if (acknowledgement.Fingerprint != operation.Fingerprint)
+        {
+            throw new PhysicalSchemaFingerprintConflictException(
+                operation.Identity,
+                operation.Fingerprint,
+                acknowledgement.Fingerprint);
+        }
     }
 }

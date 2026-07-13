@@ -452,6 +452,79 @@ public sealed class SqlitePhysicalSchemaExecutorTests
     }
 
     [Fact]
+    public async Task UnpublishedBackfillAcknowledgementLossReplaysInterleavedWrites()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var initial = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+        var additive = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: true);
+        var executor = new SqlitePhysicalSchemaExecutor(connection);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, executor);
+        var oldRouteStore = new SqlitePhysicalDocumentStore(
+            connection,
+            initial.Manifest,
+            initial.Target.Routes,
+            DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("before-loss", 41))).Status);
+
+        var acknowledgementLosing = new BackfillAcknowledgementLosingExecutor(executor);
+        await Assert.ThrowsAsync<SimulatedBackfillAcknowledgementLossException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(
+                additive.Target,
+                acknowledgementLosing));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("between-attempts", 42))).Status);
+
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(additive.Target, executor)).Outcome);
+        var currentStore = new SqlitePhysicalDocumentStore(
+            connection,
+            additive.Manifest,
+            additive.Target.Routes,
+            DocumentStoreAccess.Global);
+        var queries = SqlitePhysicalQueryRuntime.Create(
+            currentStore,
+            additive.Manifest,
+            additive.Target.Routes.Single(),
+            additive.Target.Provider);
+        Assert.Equal(1, await CountPriorityAsync(queries, "41"));
+        Assert.Equal(1, await CountPriorityAsync(queries, "42"));
+        Assert.Equal(
+            PhysicalSchemaApplicationOutcome.NoChanges,
+            (await PhysicalSchemaApplication.ApplyAsync(additive.Target, executor)).Outcome);
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await oldRouteStore.SaveAsync(
+            Save("after-publication", 43))).Status);
+        await using (var applicationLock = await executor.AcquireApplicationLockAsync(
+                         additive.Target.Identity,
+                         CancellationToken.None))
+        {
+            var acknowledgement = await executor.ApplyOperationAsync(
+                additive.Target.Identity,
+                acknowledgementLosing.Backfill!,
+                applicationLock,
+                CancellationToken.None);
+            Assert.Equal(acknowledgementLosing.Acknowledgement, acknowledgement);
+        }
+        Assert.Equal(0, await CountPriorityAsync(queries, "43"));
+
+        static SaveDocumentRequest Save(string id, int priority) =>
+            new("configurationDocument", id, "1", $"{{\"category\":\"tools\",\"priority\":{priority}}}", 0);
+
+        static Task<long> CountPriorityAsync(IBoundedDocumentStore queries, string priority) =>
+            queries.CountAsync(new DocumentQuery(
+                "configurationDocument",
+                "find-by-category-priority",
+                [
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools")),
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("priority", priority))
+                ],
+                resultOperation: BoundedQueryResultOperation.Count));
+    }
+
+    [Fact]
     public async Task IncompatiblePreexistingPrimarySchemaIsRejectedWithoutAcknowledgement()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
