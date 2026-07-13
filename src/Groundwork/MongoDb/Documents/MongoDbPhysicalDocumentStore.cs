@@ -32,6 +32,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private readonly MongoDbPhysicalDocumentStoreOptions options;
     private readonly TimeProvider timeProvider;
     private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
+    private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
 
     public MongoDbPhysicalDocumentStore(
         IMongoDatabase database,
@@ -50,7 +51,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         IStorageScopeObserver? scopeObserver,
         MongoDbPhysicalDocumentStoreOptions? options,
         TimeProvider timeProvider,
-        MongoDbPhysicalDocumentStoreExecutionHooks? hooks)
+        MongoDbPhysicalDocumentStoreExecutionHooks? hooks,
+        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync = null)
     {
         ArgumentNullException.ThrowIfNull(database);
         this.database = database
@@ -63,6 +65,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         this.options.Validate();
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.hooks = hooks ?? MongoDbPhysicalDocumentStoreExecutionHooks.None;
+        this.startSessionAsync = startSessionAsync ??
+            (ct => this.database.Client.StartSessionAsync(cancellationToken: ct));
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
         queryStores = model.Routes.ToFrozenDictionary(
             route => route.StorageUnit.Value,
@@ -107,11 +111,19 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         foreach (var unit in units)
             ResolveScope(unit, StorageScopeOperation.BeginUnitOfWork);
 
-        var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
-        session.StartTransaction(new TransactionOptions(
-            ReadConcern.Snapshot,
-            writeConcern: WriteConcern.WMajority));
-        return new UnitOfWork(this, session, scope.Kinds);
+        var session = await startSessionAsync(cancellationToken);
+        try
+        {
+            session.StartTransaction(new TransactionOptions(
+                ReadConcern.Snapshot,
+                writeConcern: WriteConcern.WMajority));
+            return new UnitOfWork(this, session, scope);
+        }
+        catch
+        {
+            session.Dispose();
+            throw;
+        }
     }
 
     public Task<DocumentQueryResult> QueryAsync(DocumentQuery query, CancellationToken cancellationToken = default) =>
@@ -356,7 +368,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         for (var attempt = 1; ; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
+            using var session = await startSessionAsync(cancellationToken);
             session.StartTransaction(new TransactionOptions(
                 ReadConcern.Snapshot,
                 writeConcern: WriteConcern.WMajority));
@@ -725,12 +737,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private sealed class UnitOfWork(
         MongoDbPhysicalDocumentStore store,
         IClientSessionHandle session,
-        IReadOnlyList<string> documentKinds) : IDocumentUnitOfWork
+        DocumentCommitScope scope) : IDocumentUnitOfWork
     {
         private bool completed;
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(request.DocumentKind);
             try
             {
                 var result = await store.SaveCoreAsync(request, session, cancellationToken);
@@ -755,6 +768,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(request.DocumentKind);
             try
             {
                 var result = await store.DeleteCoreAsync(request, session, cancellationToken);
@@ -779,12 +793,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         public Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(documentKind);
             return store.LoadCoreAsync(documentKind, id, session, cancellationToken);
         }
         public async Task CommitAsync(CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            try { await store.CommitWithRetryAsync(session, documentKinds, cancellationToken); }
+            try { await store.CommitWithRetryAsync(session, scope.Kinds, cancellationToken); }
             finally { Complete(); }
         }
         public async Task RollbackAsync(CancellationToken cancellationToken = default)
@@ -839,6 +854,21 @@ internal sealed record MongoDbPhysicalDocumentStoreExecutionHooks(
         static (_, _, _) => ValueTask.CompletedTask;
 
     public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryPageRead { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryAttemptStarting { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryCountRead { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryPrimaryHydrationStarting { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryRetryDelayStarting { get; init; } =
+        static (_, _, _) => ValueTask.CompletedTask;
+
+    public Func<IClientSessionHandle, int, CancellationToken, ValueTask> QueryRetryDelayCompleted { get; init; } =
         static (_, _, _) => ValueTask.CompletedTask;
 
     public static MongoDbPhysicalDocumentStoreExecutionHooks None { get; } = new(
@@ -917,7 +947,9 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             session.StartTransaction(new TransactionOptions(ReadConcern.Snapshot));
             try
             {
+                await hooks.QueryAttemptStarting(session, attempt, cancellationToken);
                 var total = await collection.CountDocumentsAsync(session, filter, cancellationToken: cancellationToken);
+                await hooks.QueryCountRead(session, attempt, cancellationToken);
                 if (total == 0 || query.Take == 0)
                 {
                     await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
@@ -928,7 +960,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                 var found = await find.ToListAsync(cancellationToken);
                 await hooks.QueryPageRead(session, attempt, cancellationToken);
                 var documents = plan.RequiresPrimaryLookup
-                    ? await LoadPrimaryAsync(session, found, cancellationToken)
+                    ? await LoadPrimaryAsync(session, found, attempt, cancellationToken)
                     : found.Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
                 await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
                 return new DocumentQueryResult(documents, total);
@@ -943,7 +975,11 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                 {
                     throw;
                 }
+                await hooks.QueryRetryDelayStarting(session, attempt, cancellationToken);
                 await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(100, 2 << Math.Min(attempt, 5))), cancellationToken);
+                await hooks.QueryRetryDelayCompleted(session, attempt, cancellationToken);
+                if (timeProvider.GetElapsedTime(started) >= options.TransactionRetryTimeout)
+                    throw;
             }
             catch
             {
@@ -1028,6 +1064,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     private async Task<IReadOnlyList<DocumentEnvelope>> LoadPrimaryAsync(
         IClientSessionHandle session,
         IReadOnlyList<BsonDocument> linked,
+        int attempt,
         CancellationToken cancellationToken)
     {
         if (linked.Count == 0) return [];
@@ -1041,6 +1078,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         var filters = keys.Select(key => Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, key[route.Envelope.Id.Identifier]) &
                                          Builders<BsonDocument>.Filter.Eq(route.Envelope.DocumentKind.Identifier, key[route.Envelope.DocumentKind.Identifier]) &
                                          Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, key[route.Envelope.StorageScope.Identifier]));
+        await hooks.QueryPrimaryHydrationStarting(session, attempt, cancellationToken);
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .Find(session, Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);
         var byKey = primary.ToDictionary(document => Key(document, route.Envelope.Id.Identifier, route.Envelope.StorageScope.Identifier));

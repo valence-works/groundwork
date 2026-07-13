@@ -108,6 +108,28 @@ public abstract class RelationalPhysicalStorageConformance
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task UnitOfWorkRejectsKindsOutsideItsCommitScopeWithoutBecomingTerminal(PhysicalStorageForm form)
+    {
+        await using var fixture = await CreateAsync(form);
+        await using var transaction = await fixture.Documents.BeginAsync(
+            DocumentCommitScope.Of("configurationDocument"));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.SaveAsync(new SaveDocumentRequest(
+            "otherDocument", "outside-save", "1", "{}", ExpectedVersion: 0)));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.DeleteAsync(new DeleteDocumentRequest(
+            "otherDocument", "outside-delete")));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.LoadAsync("otherDocument", "outside-load"));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(
+            Save("inside", "tools", 0))).Status);
+        await transaction.CommitAsync();
+        Assert.NotNull(await fixture.Documents.LoadAsync("configurationDocument", "inside"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
     public async Task AdditiveEvolutionBackfillsRestartsAndUsesAnExclusiveApplicationLock(PhysicalStorageForm form)
     {
         await using var fixture = await CreateEvolutionAsync(form);

@@ -321,6 +321,23 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Physical_factory_accepts_a_replica_set_and_returns_a_working_store()
+    {
+        var databaseName = $"groundwork_replica_factory_{Guid.NewGuid():N}";
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+
+        await using var handle = await MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+            container.GetConnectionString(),
+            databaseName,
+            model.Manifest,
+            model.Provider,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await handle.Store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "replica", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
+    }
+
+    [Fact]
     public async Task Below_minimum_schema_lease_is_rejected_before_creating_database_state()
     {
         var database = Database();
@@ -528,6 +545,203 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
         await AssertTerminalAsync(transaction);
     }
 
+    [Fact]
+    public async Task Transient_primary_hydration_failure_retries_count_page_and_hydration_on_a_fresh_session()
+    {
+        var attempts = new ConcurrentQueue<IClientSessionHandle>();
+        var counts = 0;
+        var pages = 0;
+        var hydrations = 0;
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.SharedDocuments);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var writer = Store(database, model);
+        await writer.SaveAsync(new SaveDocumentRequest(
+            "workItem", "retry-query", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0));
+        var reader = Store(database, model, hooks: MongoDbPhysicalDocumentStoreExecutionHooks.None with
+        {
+            QueryAttemptStarting = (session, _, _) =>
+            {
+                attempts.Enqueue(session);
+                return ValueTask.CompletedTask;
+            },
+            QueryCountRead = (_, _, _) =>
+            {
+                Interlocked.Increment(ref counts);
+                return ValueTask.CompletedTask;
+            },
+            QueryPageRead = async (_, _, _) =>
+            {
+                if (Interlocked.Increment(ref pages) == 1)
+                {
+                    await ConfigureCommandFailureAsync(
+                        database,
+                        "find",
+                        new BsonDocument("times", 1),
+                        112,
+                        ["TransientTransactionError"]);
+                }
+            },
+            QueryPrimaryHydrationStarting = (_, _, _) =>
+            {
+                Interlocked.Increment(ref hydrations);
+                return ValueTask.CompletedTask;
+            }
+        });
+        try
+        {
+            var result = await reader.QueryAsync(new DocumentQuery(
+                "workItem",
+                "list-by-status",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]));
+
+            Assert.Equal(1, result.TotalCount);
+            Assert.Equal("retry-query", Assert.Single(result.Documents).Id);
+        }
+        finally
+        {
+            await DisableCommandFailureAsync(database);
+        }
+
+        Assert.Equal(2, attempts.Count);
+        Assert.Equal(2, attempts.Distinct(ReferenceEqualityComparer.Instance).Count());
+        Assert.Equal(2, counts);
+        Assert.Equal(2, pages);
+        Assert.Equal(2, hydrations);
+    }
+
+    [Fact]
+    public async Task Snapshot_query_does_not_start_an_attempt_after_the_elapsed_retry_budget()
+    {
+        var attempts = 0;
+        var timeProvider = new ManualRetryTimeProvider();
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        await Store(database, model).SaveAsync(new SaveDocumentRequest(
+            "workItem", "elapsed-query", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0));
+        var store = Store(
+            database,
+            model,
+            new MongoDbPhysicalDocumentStoreOptions
+            {
+                MaximumTransactionAttempts = 10,
+                TransactionRetryTimeout = TimeSpan.FromSeconds(1)
+            },
+            MongoDbPhysicalDocumentStoreExecutionHooks.None with
+            {
+                QueryAttemptStarting = (_, _, _) =>
+                {
+                    Interlocked.Increment(ref attempts);
+                    return ValueTask.CompletedTask;
+                },
+                QueryRetryDelayCompleted = (_, _, _) =>
+                {
+                    timeProvider.Advance(TimeSpan.FromSeconds(2));
+                    return ValueTask.CompletedTask;
+                }
+            },
+            timeProvider);
+        await ConfigureCommandFailureAsync(database, "find", "alwaysOn", 112, ["TransientTransactionError"]);
+        try
+        {
+            await Assert.ThrowsAnyAsync<MongoException>(() => store.QueryAsync(new DocumentQuery(
+                "workItem",
+                "list-by-status",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+        }
+        finally
+        {
+            await DisableCommandFailureAsync(database);
+        }
+
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public async Task Snapshot_query_retry_attempt_budget_terminates_persistent_failure()
+    {
+        var attempts = 0;
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        await Store(database, model).SaveAsync(new SaveDocumentRequest(
+            "workItem", "attempt-query", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0));
+        var store = Store(
+            database,
+            model,
+            new MongoDbPhysicalDocumentStoreOptions
+            {
+                MaximumTransactionAttempts = 2,
+                TransactionRetryTimeout = TimeSpan.FromMinutes(1)
+            },
+            MongoDbPhysicalDocumentStoreExecutionHooks.None with
+            {
+                QueryAttemptStarting = (_, _, _) =>
+                {
+                    Interlocked.Increment(ref attempts);
+                    return ValueTask.CompletedTask;
+                }
+            });
+        await ConfigureCommandFailureAsync(database, "find", "alwaysOn", 112, ["TransientTransactionError"]);
+        try
+        {
+            await Assert.ThrowsAnyAsync<MongoException>(() => store.QueryAsync(new DocumentQuery(
+                "workItem",
+                "list-by-status",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))])));
+        }
+        finally
+        {
+            await DisableCommandFailureAsync(database);
+        }
+
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task Snapshot_query_cancellation_during_retry_delay_starts_no_fresh_attempt()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var attempts = 0;
+        var retryDelayStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        await Store(database, model).SaveAsync(new SaveDocumentRequest(
+            "workItem", "cancel-query", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0));
+        var store = Store(database, model, hooks: MongoDbPhysicalDocumentStoreExecutionHooks.None with
+        {
+            QueryAttemptStarting = (_, _, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                return ValueTask.CompletedTask;
+            },
+            QueryRetryDelayStarting = async (_, _, cancellationToken) =>
+            {
+                retryDelayStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+        });
+        await ConfigureCommandFailureAsync(database, "find", "alwaysOn", 112, ["TransientTransactionError"]);
+        try
+        {
+            var query = store.QueryAsync(new DocumentQuery(
+                "workItem",
+                "list-by-status",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]), cancellation.Token);
+            await retryDelayStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => query);
+        }
+        finally
+        {
+            await DisableCommandFailureAsync(database);
+        }
+
+        Assert.Equal(1, attempts);
+    }
+
     private IMongoDatabase Database() =>
         new MongoClient(container.GetConnectionString()).GetDatabase($"groundwork_recovery_{Guid.NewGuid():N}");
 
@@ -535,14 +749,15 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
         IMongoDatabase database,
         MongoDbPhysicalStorageModel model,
         MongoDbPhysicalDocumentStoreOptions? options = null,
-        MongoDbPhysicalDocumentStoreExecutionHooks? hooks = null) =>
+        MongoDbPhysicalDocumentStoreExecutionHooks? hooks = null,
+        TimeProvider? timeProvider = null) =>
         new(
             database,
             model,
             DocumentStoreAccess.Scoped(new("tenant-a")),
             scopeObserver: null,
             options,
-            TimeProvider.System,
+            timeProvider ?? TimeProvider.System,
             hooks);
 
     private static MongoDbPhysicalStorageModel MultiKindModel()
@@ -626,4 +841,15 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
             { "configureFailPoint", "failCommand" },
             { "mode", "off" }
         });
+
+    private sealed class ManualRetryTimeProvider : TimeProvider
+    {
+        private long timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => Interlocked.Read(ref timestamp);
+
+        public void Advance(TimeSpan duration) => Interlocked.Add(ref timestamp, duration.Ticks);
+    }
 }

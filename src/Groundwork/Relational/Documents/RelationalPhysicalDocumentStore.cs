@@ -133,13 +133,13 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(units[0]));
 
         if (sessionFactory is not null)
-            return new UnitOfWork(this, await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
+            return new UnitOfWork(this, scope, await sessionFactory.BeginUnitOfWorkAsync(cancellationToken));
 
         await connectionGate.WaitAsync(cancellationToken);
         try
         {
             await EnsureOpenAsync(cancellationToken);
-            return new UnitOfWork(this, await connection!.BeginTransactionAsync(cancellationToken));
+            return new UnitOfWork(this, scope, await connection!.BeginTransactionAsync(cancellationToken));
         }
         catch
         {
@@ -486,25 +486,35 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     private sealed class UnitOfWork : IDocumentUnitOfWork
     {
         private readonly RelationalPhysicalDocumentStore store;
+        private readonly DocumentCommitScope scope;
         private readonly DbTransaction? transaction;
         private readonly RelationalUnitOfWork? ownedUnitOfWork;
         private bool completed;
 
-        public UnitOfWork(RelationalPhysicalDocumentStore store, DbTransaction transaction)
+        public UnitOfWork(
+            RelationalPhysicalDocumentStore store,
+            DocumentCommitScope scope,
+            DbTransaction transaction)
         {
             this.store = store;
+            this.scope = scope;
             this.transaction = transaction;
         }
 
-        public UnitOfWork(RelationalPhysicalDocumentStore store, RelationalUnitOfWork ownedUnitOfWork)
+        public UnitOfWork(
+            RelationalPhysicalDocumentStore store,
+            DocumentCommitScope scope,
+            RelationalUnitOfWork ownedUnitOfWork)
         {
             this.store = store;
+            this.scope = scope;
             this.ownedUnitOfWork = ownedUnitOfWork;
         }
 
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(request.DocumentKind);
             try
             {
                 var result = await ExecuteAsync(
@@ -523,6 +533,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(request.DocumentKind);
             try
             {
                 var result = await ExecuteAsync(
@@ -541,6 +552,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            scope.EnsureIncludes(documentKind);
             return await ExecuteAsync(
                 (currentTransaction, ct) => store.LoadCoreAsync(
                     currentTransaction.Connection!, documentKind, id, currentTransaction, ct),

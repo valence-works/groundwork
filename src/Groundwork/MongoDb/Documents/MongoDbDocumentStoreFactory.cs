@@ -1,10 +1,11 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Transactions;
 using Groundwork.Core.Validation;
+using Groundwork.Documents.Scoping;
 using Groundwork.Materialization;
 using Groundwork.MongoDb.Materialization;
-using Groundwork.Documents.Scoping;
-using Groundwork.Core.PhysicalStorage;
 using MongoDB.Driver;
 
 namespace Groundwork.MongoDb.Documents;
@@ -35,6 +36,17 @@ public static class MongoDbDocumentStoreFactory
         try
         {
             var database = client.GetDatabase(databaseName);
+            if (!await MongoDbTransactionTopology.SupportsTransactionsAsync(database, cancellationToken))
+            {
+                var documentKinds = manifest.StorageUnits
+                    .Select(unit => unit.Identity.Value)
+                    .Order(StringComparer.Ordinal)
+                    .ToArray();
+                throw new UnsupportedAtomicCommitException(
+                    documentKinds,
+                    $"MongoDB physical storage requires a replica set or sharded cluster, but the connected deployment is " +
+                    $"'{client.Cluster.Description.Type}'.");
+            }
             var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model, cancellationToken);
             return new MongoDbPhysicalDocumentStoreHandle(

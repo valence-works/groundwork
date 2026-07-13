@@ -11,8 +11,6 @@ using Groundwork.Documents.UnitOfWork;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
-using MongoDB.Driver.Core.Clusters;
-using MongoDB.Driver.Core.Servers;
 
 namespace Groundwork.MongoDb.Documents;
 
@@ -143,7 +141,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     }
 
     public TransactionBoundary TransactionBoundary =>
-        SupportsTransactions()
+        MongoDbTransactionTopology.IsKnownTransactionCapable(database.Client.Cluster.Description)
             ? TransactionBoundary.CrossUnitAtomic
             : TransactionBoundary.PerOperation;
 
@@ -158,7 +156,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(GetUnit(scope.Kinds[0])));
 
         var clusterType = database.Client.Cluster.Description.Type;
-        if (!await SupportsTransactionsAsync(cancellationToken))
+        if (!await MongoDbTransactionTopology.SupportsTransactionsAsync(database, cancellationToken))
             throw new UnsupportedAtomicCommitException(
                 scope.Kinds,
                 $"MongoDB multi-document transactions require a replica set or sharded cluster, but the connected deployment is '{clusterType}'.");
@@ -175,22 +173,6 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         }
 
         return new MongoDocumentUnitOfWork(this, session);
-    }
-
-    private bool SupportsTransactions() =>
-        database.Client.Cluster.Description.Type is ClusterType.ReplicaSet or ClusterType.Sharded ||
-        database.Client.Cluster.Description.Servers.Any(server =>
-            server.Type is ServerType.ReplicaSetPrimary or ServerType.ReplicaSetSecondary or ServerType.ShardRouter);
-
-    private async Task<bool> SupportsTransactionsAsync(CancellationToken cancellationToken)
-    {
-        if (SupportsTransactions())
-            return true;
-
-        var hello = await database.RunCommandAsync<BsonDocument>(
-            new BsonDocument("hello", 1),
-            cancellationToken: cancellationToken);
-        return hello.Contains("setName") || hello.GetValue("msg", BsonNull.Value) == "isdbgrid";
     }
 
     private static Task InsertOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, BsonDocument document, CancellationToken cancellationToken) =>

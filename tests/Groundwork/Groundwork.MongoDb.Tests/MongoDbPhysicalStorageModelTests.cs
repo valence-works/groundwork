@@ -1,4 +1,5 @@
 using System.Text;
+using System.Reflection;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
@@ -6,6 +7,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Bson;
@@ -307,6 +309,38 @@ public sealed class MongoDbPhysicalStorageModelTests
             "workItem", "list-by-enabled", [DocumentQueryClause.Of(comparison)])));
     }
 
+    [Fact]
+    public async Task Unit_of_work_disposes_an_owned_session_when_transaction_startup_fails()
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var database = new MongoClient("mongodb://localhost").GetDatabase("groundwork_session_disposal");
+        var session = DispatchProxy.Create<IClientSessionHandle, FailingSessionProxy>();
+        var proxy = (FailingSessionProxy)(object)session;
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            scopeObserver: null,
+            options: null,
+            TimeProvider.System,
+            hooks: null,
+            _ => Task.FromResult(session));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.BeginAsync(DocumentCommitScope.Of("workItem")));
+
+        Assert.Equal("transaction startup failed", exception.Message);
+        Assert.True(proxy.Disposed);
+    }
+
+    [Fact]
+    public void Transaction_topology_probe_distinguishes_standalone_replica_set_and_sharded_hello_evidence()
+    {
+        Assert.False(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("ok", 1)));
+        Assert.True(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("setName", "rs0")));
+        Assert.True(MongoDbTransactionTopology.IsHelloTransactionCapable(new BsonDocument("msg", "isdbgrid")));
+    }
+
     private static StorageManifest Manifest()
     {
         var shared = new SharedStorageBinding("runtime");
@@ -381,5 +415,22 @@ public sealed class MongoDbPhysicalStorageModelTests
             [unit],
             new HashSet<string>(),
             []));
+    }
+
+    private class FailingSessionProxy : DispatchProxy
+    {
+        public bool Disposed { get; private set; }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            if (targetMethod?.Name == nameof(IDisposable.Dispose))
+            {
+                Disposed = true;
+                return null;
+            }
+            if (targetMethod?.Name == nameof(IClientSessionHandle.StartTransaction))
+                throw new InvalidOperationException("transaction startup failed");
+            throw new NotSupportedException(targetMethod?.Name);
+        }
     }
 }

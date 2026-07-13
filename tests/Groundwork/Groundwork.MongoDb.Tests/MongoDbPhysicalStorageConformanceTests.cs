@@ -275,6 +275,34 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.Null(await store.LoadAsync("workItem", "one"));
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Unit_of_work_rejects_kinds_outside_its_commit_scope_without_becoming_terminal(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("workItem"));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.SaveAsync(new SaveDocumentRequest(
+            "otherItem", "outside-save", "1", "{}", ExpectedVersion: 0)));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.DeleteAsync(new DeleteDocumentRequest(
+            "otherItem", "outside-delete")));
+        await Assert.ThrowsAsync<ArgumentException>(() => transaction.LoadAsync("otherItem", "outside-load"));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem", "inside", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);
+        await transaction.CommitAsync();
+        Assert.NotNull(await store.LoadAsync("workItem", "inside"));
+    }
+
     [Fact]
     public async Task Unit_of_work_unique_write_error_returns_a_structured_conflict_and_is_terminal()
     {

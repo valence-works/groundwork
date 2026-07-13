@@ -32,9 +32,12 @@ transactional diagnostic-record provider.
   units of work atomically. Configurable attempt and elapsed-time budgets bound fresh-session body
   retries and same-session commit-only retries. Exhausted ambiguous commits raise provider-neutral
   acknowledgement-uncertain evidence instead of being misreported as conflicts. A non-successful or
-  failed explicit unit-of-work write aborts that unit and makes it terminal.
+  failed explicit unit-of-work write aborts that unit and makes it terminal. Document kinds outside
+  the immutable commit scope are rejected before database traffic without poisoning the unit.
 - Compiles `DocumentQuery` declarations through exact handler certifications; linked lookups and
-  native primary/entity lookups execute filtering, count, ordering, and paging in MongoDB.
+  native primary/entity lookups execute filtering, count, ordering, and paging in MongoDB. Count,
+  page, and linked-primary hydration share one snapshot attempt; transient failures retry the whole
+  attempt on a fresh session within the same attempt and elapsed-time budgets.
 - Exposes native `explain` evidence for the resolved collection and selected physical index.
 - Saves, loads, updates, deletes, and queries JSON document envelopes.
 - Supports equality, set-membership (`$in`), and case-insensitive `Contains` (regex) query operations over declared indexes.
@@ -76,4 +79,6 @@ defaults.
 - No Entity Framework dependency.
 - No host-specific dependency.
 - Standalone MongoDB deployments cannot serve atomic multi-object physical writes or the
-  diagnostic-record contract; use a replica set or sharded cluster.
+  diagnostic-record contract; use a replica set or sharded cluster. `CreatePhysicalAsync` probes
+  this requirement before compiling or materializing the physical model, so rejection creates no
+  database state.

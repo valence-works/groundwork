@@ -34,6 +34,11 @@ public interface IDocumentSessionFactory
 /// </summary>
 /// <remarks>
 /// <para>
+/// <b>Commit-scope contract:</b> save, delete, and load reject a document kind that was not named
+/// when the unit of work began. This argument rejection happens before database traffic and does not
+/// make the unit of work terminal; a subsequent in-scope operation may continue normally.
+/// </para>
+/// <para>
 /// <b>Staging:</b> each <see cref="SaveAsync"/>/<see cref="DeleteAsync"/> executes against the open
 /// unit of work and returns its <see cref="DocumentStoreWriteResult"/> immediately (including
 /// optimistic-concurrency <c>ConcurrencyConflict</c>/<c>NotFound</c> outcomes), so the caller can

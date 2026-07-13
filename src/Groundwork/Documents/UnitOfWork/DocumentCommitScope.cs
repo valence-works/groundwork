@@ -21,6 +21,21 @@ public sealed record DocumentCommitScope
     public IReadOnlyList<string> Kinds { get; }
 
     public static DocumentCommitScope Of(params string[] kinds) => new(kinds);
+
+    /// <summary>
+    /// Rejects an operation whose document kind is outside this immutable commit scope. Providers
+    /// call this before database traffic so a caller contract error does not poison the unit of work.
+    /// </summary>
+    public void EnsureIncludes(string documentKind)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(documentKind);
+        if (!Kinds.Contains(documentKind, StringComparer.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Document kind '{documentKind}' is outside the unit-of-work commit scope [{string.Join(", ", Kinds)}].",
+                nameof(documentKind));
+        }
+    }
 }
 
 internal static class DocumentKindSet

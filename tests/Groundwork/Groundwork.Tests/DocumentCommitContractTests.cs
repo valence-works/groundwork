@@ -17,6 +17,20 @@ public sealed class DocumentCommitContractTests
         Assert.Equal(["auditItem", "workItem"], scope.Kinds);
     }
 
+    [Fact]
+    public void Commit_scope_allowlist_uses_its_immutable_kind_snapshot()
+    {
+        var callerKinds = new List<string> { "workItem" };
+        var scope = new DocumentCommitScope(callerKinds);
+        callerKinds[0] = "replacement";
+
+        scope.EnsureIncludes("workItem");
+        var exception = Assert.Throws<ArgumentException>(() => scope.EnsureIncludes("replacement"));
+
+        Assert.Contains("outside the unit-of-work commit scope", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(["workItem"], scope.Kinds);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
