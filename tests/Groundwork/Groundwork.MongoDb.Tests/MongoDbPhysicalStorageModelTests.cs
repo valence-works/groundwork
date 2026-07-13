@@ -13,6 +13,7 @@ using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Events;
 using Xunit;
 
 namespace Groundwork.MongoDb.Tests;
@@ -463,6 +464,35 @@ public sealed class MongoDbPhysicalStorageModelTests
         Assert.Equal(0, sessions);
     }
 
+    [Theory]
+    [InlineData("save")]
+    [InlineData("delete")]
+    [InlineData("begin")]
+    public async Task Direct_physical_store_rejects_invalid_access_before_provider_traffic(string operation)
+    {
+        var (store, traffic) = TrafficObservedStore(DocumentStoreAccess.Global);
+
+        await Assert.ThrowsAsync<InvalidStorageScopeAccessException>(() =>
+            InvokePhysicalOperationAsync(store, operation, "workItem"));
+
+        traffic.AssertNone();
+    }
+
+    [Theory]
+    [InlineData("save")]
+    [InlineData("delete")]
+    [InlineData("begin")]
+    public async Task Direct_physical_store_rejects_unknown_kinds_before_provider_traffic(string operation)
+    {
+        var (store, traffic) = TrafficObservedStore(DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            InvokePhysicalOperationAsync(store, operation, "unknown"));
+
+        Assert.Contains("not declared", exception.Message, StringComparison.Ordinal);
+        traffic.AssertNone();
+    }
+
     [Fact]
     public async Task Physical_factory_validates_the_compiled_model_before_probing_an_unreachable_server()
     {
@@ -555,6 +585,58 @@ public sealed class MongoDbPhysicalStorageModelTests
                 PhysicalStoragePolicy.Explicit(definition))
         };
 
+    private static async Task InvokePhysicalOperationAsync(
+        MongoDbPhysicalDocumentStore store,
+        string operation,
+        string documentKind)
+    {
+        switch (operation)
+        {
+            case "save":
+                await store.SaveAsync(new SaveDocumentRequest(documentKind, "id", "1", "{}"));
+                break;
+            case "delete":
+                await store.DeleteAsync(new DeleteDocumentRequest(documentKind, "id"));
+                break;
+            case "begin":
+                await using (await store.BeginAsync(DocumentCommitScope.Of(documentKind)))
+                {
+                }
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(operation), operation, null);
+        }
+    }
+
+    private static (MongoDbPhysicalDocumentStore Store, ProviderTrafficProbe Traffic) TrafficObservedStore(
+        DocumentStoreAccess access)
+    {
+        var traffic = new ProviderTrafficProbe();
+        var settings = MongoClientSettings.FromConnectionString(
+            "mongodb://localhost/?serverSelectionTimeoutMS=10");
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(_ => traffic.RecordCommand());
+        var capability = new MongoDbTransactionCapability(_ =>
+        {
+            traffic.RecordProbe();
+            return Task.FromResult(false);
+        });
+        var store = new MongoDbPhysicalDocumentStore(
+            new MongoClient(settings).GetDatabase("groundwork_local_validation_before_provider_traffic"),
+            MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable),
+            access,
+            scopeObserver: null,
+            options: null,
+            TimeProvider.System,
+            hooks: null,
+            _ =>
+            {
+                traffic.RecordSession();
+                throw new InvalidOperationException("Session creation must not be reached.");
+            },
+            capability);
+        return (store, traffic);
+    }
+
     private static MongoDbPhysicalStorageModel NativeBooleanModel()
     {
         var logical = new LogicalIndexDeclaration(
@@ -626,6 +708,24 @@ public sealed class MongoDbPhysicalStorageModelTests
                 return null;
             }
             throw new NotSupportedException(targetMethod?.Name);
+        }
+    }
+
+    private sealed class ProviderTrafficProbe
+    {
+        private int probes;
+        private int sessions;
+        private int commands;
+
+        public void RecordProbe() => Interlocked.Increment(ref probes);
+        public void RecordSession() => Interlocked.Increment(ref sessions);
+        public void RecordCommand() => Interlocked.Increment(ref commands);
+
+        public void AssertNone()
+        {
+            Assert.Equal(0, probes);
+            Assert.Equal(0, sessions);
+            Assert.Equal(0, commands);
         }
     }
 }

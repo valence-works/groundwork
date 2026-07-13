@@ -85,33 +85,38 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     public Task<DocumentStoreWriteResult> SaveAsync(
         SaveDocumentRequest request,
-        CancellationToken cancellationToken = default) =>
-        ExecuteAtomicAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var (route, scope) = ResolveOperation(request.DocumentKind, StorageScopeOperation.Save);
+        return ExecuteAtomicAsync(
             [request.DocumentKind],
-            session => SaveCoreAsync(request, session, cancellationToken),
+            session => SaveCoreAsync(request, route, scope, session, cancellationToken),
             cancellationToken);
+    }
 
     public async Task<DocumentEnvelope?> LoadAsync(
         string documentKind,
         string id,
         CancellationToken cancellationToken = default)
     {
-        _ = Route(documentKind);
-        _ = ResolveScope(Unit(documentKind), StorageScopeOperation.Load);
+        var (route, scope) = ResolveOperation(documentKind, StorageScopeOperation.Load);
         await transactionCapability.EnsureSupportedAsync(
             [documentKind],
             "physical storage",
             cancellationToken);
-        return await LoadCoreAsync(documentKind, id, session: null, cancellationToken);
+        return await LoadCoreAsync(route, id, scope, session: null, cancellationToken);
     }
 
     public Task<DocumentStoreWriteResult> DeleteAsync(
         DeleteDocumentRequest request,
-        CancellationToken cancellationToken = default) =>
-        ExecuteAtomicAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var (route, scope) = ResolveOperation(request.DocumentKind, StorageScopeOperation.Delete);
+        return ExecuteAtomicAsync(
             [request.DocumentKind],
-            session => DeleteCoreAsync(request, session, cancellationToken),
+            session => DeleteCoreAsync(request, route, scope, session, cancellationToken),
             cancellationToken);
+    }
 
     public async Task<IDocumentUnitOfWork> BeginAsync(
         DocumentCommitScope scope,
@@ -121,9 +126,9 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         var units = scope.Kinds.Select(Unit).ToArray();
         if (units.Select(unit => unit.Tenancy.Kind).Distinct().Count() != 1)
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(units[0]));
-        await transactionCapability.EnsureSupportedAsync(scope.Kinds, "physical storage", cancellationToken);
         foreach (var unit in units)
             ResolveScope(unit, StorageScopeOperation.BeginUnitOfWork);
+        await transactionCapability.EnsureSupportedAsync(scope.Kinds, "physical storage", cancellationToken);
 
         var session = await startSessionAsync(cancellationToken);
         try
@@ -553,12 +558,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private async Task<DocumentStoreWriteResult> SaveCoreAsync(
         SaveDocumentRequest request,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope,
         IClientSessionHandle session,
         CancellationToken cancellationToken)
     {
-        var route = Route(request.DocumentKind);
-        var unit = Unit(request.DocumentKind);
-        var scope = ResolveScope(unit, StorageScopeOperation.Save);
         var current = await LoadDocumentAsync(route, request.Id, scope.StorageKey!, session, cancellationToken);
         if (current is not null && request.ExpectedVersion is not null && current[route.Envelope.Version.Identifier].ToInt64() != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
@@ -601,11 +605,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private async Task<DocumentStoreWriteResult> DeleteCoreAsync(
         DeleteDocumentRequest request,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope,
         IClientSessionHandle session,
         CancellationToken cancellationToken)
     {
-        var route = Route(request.DocumentKind);
-        var scope = ResolveScope(Unit(request.DocumentKind), StorageScopeOperation.Delete);
         var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
         if (request.ExpectedVersion is not null)
             filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
@@ -628,13 +632,12 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     }
 
     private async Task<DocumentEnvelope?> LoadCoreAsync(
-        string kind,
+        ExecutableStorageRoute route,
         string id,
+        DocumentScopeSelection scope,
         IClientSessionHandle? session,
         CancellationToken cancellationToken)
     {
-        var route = Route(kind);
-        var scope = ResolveScope(Unit(kind), StorageScopeOperation.Load);
         var document = await LoadDocumentAsync(route, id, scope.StorageKey!, session, cancellationToken);
         return document is null ? null : ReadEnvelope(route, document);
     }
@@ -752,6 +755,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private DocumentScopeSelection ResolveScope(StorageUnit unit, StorageScopeOperation operation, bool allowAcrossScopes = false) =>
         DocumentStoreScopeResolver.Resolve(unit, Access, operation, scopeObserver, allowAcrossScopes);
 
+    private (ExecutableStorageRoute Route, DocumentScopeSelection Scope) ResolveOperation(
+        string documentKind,
+        StorageScopeOperation operation) =>
+        (Route(documentKind), ResolveScope(Unit(documentKind), operation));
+
     private static StorageScopePolicy ScopePolicy(StorageUnit unit) =>
         unit.Tenancy.Kind == TenancyKind.Scoped ? StorageScopePolicy.Scoped : StorageScopePolicy.Global;
 
@@ -767,7 +775,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             scope.EnsureIncludes(request.DocumentKind);
             try
             {
-                var result = await store.SaveCoreAsync(request, session, cancellationToken);
+                var (route, selection) = store.ResolveOperation(request.DocumentKind, StorageScopeOperation.Save);
+                var result = await store.SaveCoreAsync(request, route, selection, session, cancellationToken);
                 if (result.Status != DocumentStoreWriteStatus.Saved)
                     await AbortAsync(CancellationToken.None);
                 return result;
@@ -792,7 +801,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             scope.EnsureIncludes(request.DocumentKind);
             try
             {
-                var result = await store.DeleteCoreAsync(request, session, cancellationToken);
+                var (route, selection) = store.ResolveOperation(request.DocumentKind, StorageScopeOperation.Delete);
+                var result = await store.DeleteCoreAsync(request, route, selection, session, cancellationToken);
                 if (result.Status != DocumentStoreWriteStatus.Deleted)
                     await AbortAsync(CancellationToken.None);
                 return result;
@@ -815,7 +825,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         {
             EnsureActive();
             scope.EnsureIncludes(documentKind);
-            return store.LoadCoreAsync(documentKind, id, session, cancellationToken);
+            var (route, selection) = store.ResolveOperation(documentKind, StorageScopeOperation.Load);
+            return store.LoadCoreAsync(route, id, selection, session, cancellationToken);
         }
         public async Task CommitAsync(CancellationToken cancellationToken = default)
         {
