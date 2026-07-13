@@ -19,6 +19,7 @@
     <Project Path="src/Groundwork/PostgreSql/Groundwork.PostgreSql.csproj" />
     <Project Path="src/Groundwork/Provider.Relational/Groundwork.Provider.Relational.csproj" />
     <Project Path="src/Groundwork/Relational/Groundwork.Relational.csproj" />
+    <Project Path="src/Groundwork/SchemaTool/Groundwork.SchemaTool.csproj" />
     <Project Path="src/Groundwork/SqlServer/Groundwork.SqlServer.csproj" />
     <Project Path="src/Groundwork/Sqlite/Groundwork.Sqlite.csproj" />
   </Folder>
@@ -30,6 +31,7 @@
     <Project Path="tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj" />
+    <Project Path="tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/Groundwork.SupportTickets/Groundwork.SupportTickets.csproj" />

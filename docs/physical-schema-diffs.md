@@ -100,4 +100,9 @@ compatibility-upgrade policy in #44.
 SQLite DDL translation, canonical-JSON rebuilds, validation, the durable operation ledger, and
 typed applied-state compare-and-swap are implemented by the
 [relational physical storage runtime](relational-physical-storage-runtime.md) in #46. SQL Server and
-PostgreSQL provider execution remain #47. MongoDB provider execution is #48. The migration CLI is #49.
+PostgreSQL provider execution are implemented by #47, MongoDB provider execution by #48, and the
+deployment CLI by #49.
+
+The completed CI/CD entry point is documented in the [Groundwork schema tool](schema-tool.md). It
+loads a Core-only manifest source, compiles the selected provider target, and reuses this exact
+locking, planning, acknowledgement, retry, and state-publication protocol.

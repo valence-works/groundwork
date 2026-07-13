@@ -22,6 +22,7 @@ the storage boundary and is never read from document JSON.
 - `Groundwork.SqlServer`: SQL Server materialization and document-store provider.
 - `Groundwork.PostgreSql`: PostgreSQL materialization and document-store provider.
 - `Groundwork.MongoDb`: MongoDB materialization, document-store, and transactional diagnostic-record provider.
+- `Groundwork.Tool`: explicit provider-neutral schema validation, planning, status, and application for CI/CD.
 
 ## Requirements
 
@@ -35,6 +36,7 @@ the storage boundary and is never read from document JSON.
 dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.DiagnosticRecords.Tests/Groundwork.DiagnosticRecords.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
+dotnet test tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj
 dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj
 npm --prefix samples/Groundwork.SupportTickets/Client run build
 ```
@@ -45,6 +47,10 @@ Provider integration suites can be run separately when Docker-backed databases a
 dotnet test tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj
 dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
 ```
+
+For explicit deployment-time schema planning and application, see the
+[Groundwork schema tool](docs/schema-tool.md). It supports stable human/JSON output and documented
+pipeline exit codes without introducing application-startup migration fallback.
 
 The support-ticket sample is an ASP.NET Core application backed by the same provider-neutral manifest used in its tests. It defaults to SQLite and can opt into optimized physicalization for every eligible index:
 

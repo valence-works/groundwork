@@ -70,6 +70,7 @@ jobs:
         run: |
           dotnet test tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj --configuration Release --no-build
           dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj --configuration Release --no-build
+          dotnet test tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj --configuration Release --no-build
           dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj --configuration Release --no-build
 
       - name: Pack
