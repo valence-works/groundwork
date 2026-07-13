@@ -7,6 +7,7 @@ on:
       - "benchmarks/Groundwork.PhysicalStorage.Benchmarks/**"
       - "src/Groundwork/**"
       - "tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/**"
+      - "Build.props"
       - "Directory.Build.props"
       - "Directory.Packages.props"
       - "Groundwork.slnx"
