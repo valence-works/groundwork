@@ -1,5 +1,11 @@
 # Groundwork.PostgreSql
 
+`PostgreSqlPhysicalSchemaExecutor`, `PostgreSqlPhysicalDocumentStore`, and
+`PostgreSqlPhysicalQueryRuntime` implement all three compiled physical storage forms. Schema
+application uses advisory locks and a transactional operation ledger; document and query operations
+use independent pooled sessions. Portable date-time projections use exact UTC ticks to avoid native
+microsecond rounding, and no client-side query fallback is available.
+
 `Groundwork.PostgreSql` provides PostgreSQL materialization and document-store operations for portable Groundwork documents.
 
 It also implements the provider-neutral diagnostic-record contract through

@@ -1,5 +1,11 @@
 # Groundwork.SqlServer
 
+`SqlServerPhysicalSchemaExecutor`, `SqlServerPhysicalDocumentStore`, and
+`SqlServerPhysicalQueryRuntime` implement all three compiled physical storage forms. Schema
+application uses session-scoped application locks and a transactional operation ledger; document and
+query operations use independent pooled sessions. Physical string identity is binary and no
+client-side query fallback is available.
+
 `Groundwork.SqlServer` provides SQL Server materialization and document-store operations for portable Groundwork documents.
 
 It also implements the provider-neutral diagnostic-record contract through

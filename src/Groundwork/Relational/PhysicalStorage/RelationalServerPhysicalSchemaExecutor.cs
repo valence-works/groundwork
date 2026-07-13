@@ -1,0 +1,689 @@
+using System.Data;
+using System.Data.Common;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
+using Groundwork.Provider.Relational;
+using Groundwork.Relational.Documents;
+using Groundwork.Relational.Physicalization;
+
+namespace Groundwork.Relational.PhysicalStorage;
+
+/// <summary>
+/// Shared server-relational executor for the physical-schema protocol. Provider dialects own DDL,
+/// metadata inspection, advisory locks, and native value adaptation; operation ordering, durable
+/// acknowledgements, CAS state, backfill, and exact compatibility checks remain common.
+/// </summary>
+public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
+{
+    private readonly RelationalSessionFactory sessions;
+    private readonly Func<DbConnection> createLockConnection;
+    private readonly RelationalServerPhysicalSchemaDialect dialect;
+
+    public RelationalServerPhysicalSchemaExecutor(
+        RelationalSessionFactory sessions,
+        Func<DbConnection> createLockConnection,
+        RelationalServerPhysicalSchemaDialect dialect)
+    {
+        this.sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
+        this.createLockConnection = createLockConnection ?? throw new ArgumentNullException(nameof(createLockConnection));
+        this.dialect = dialect ?? throw new ArgumentNullException(nameof(dialect));
+    }
+
+    public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
+        PhysicalSchemaTargetIdentity target,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        var connection = createLockConnection()
+            ?? throw new InvalidOperationException("The physical-schema lock connection factory returned null.");
+        try
+        {
+            if (connection.State != ConnectionState.Open)
+                await connection.OpenAsync(cancellationToken);
+            var resource = LockResource(target);
+            await dialect.AcquireApplicationLockAsync(connection, resource, cancellationToken);
+            await dialect.EnsureInfrastructureAsync(connection, cancellationToken);
+            return new ApplicationLock(target, connection, resource, dialect);
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
+    }
+
+    public async ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
+        PhysicalSchemaTargetIdentity target,
+        CancellationToken cancellationToken) =>
+        await sessions.ExecuteAsync(async (connection, ct) =>
+        {
+            await using var command = Command(connection, null, """
+                SELECT applied_state_json
+                FROM groundwork_physical_schema_state
+                WHERE manifest_id = @manifestId AND provider_name = @providerName;
+                """);
+            Add(command, "manifestId", target.ManifestIdentity.Value);
+            Add(command, "providerName", target.ProviderName);
+            var json = await command.ExecuteScalarAsync(ct) as string;
+            return json is null
+                ? PhysicalSchemaHistoryState.Empty
+                : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
+        }, cancellationToken);
+
+    public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
+        PhysicalSchemaTargetIdentity target,
+        PhysicalSchemaOperation operation,
+        CancellationToken cancellationToken) =>
+        await sessions.ExecuteAsync(async (connection, ct) =>
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            var prior = await ReadOperationAsync(connection, transaction, target, operation.Identity, ct);
+            if (prior is not null)
+            {
+                if (!string.Equals(prior.Value.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
+                    throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, prior.Value.Fingerprint);
+                await transaction.CommitAsync(ct);
+                return new PhysicalSchemaOperationAcknowledgement(operation.Identity, prior.Value.Fingerprint, prior.Value.AppliedAt);
+            }
+
+            await ApplyOperationCoreAsync(connection, transaction, operation, ct);
+            var appliedAt = DateTimeOffset.UtcNow;
+            await using (var command = Command(connection, transaction, """
+                INSERT INTO groundwork_physical_schema_operations
+                    (manifest_id, provider_name, operation_id, operation_fingerprint, applied_utc)
+                VALUES (@manifestId, @providerName, @identity, @fingerprint, @appliedUtc);
+                """))
+            {
+                Add(command, "manifestId", target.ManifestIdentity.Value);
+                Add(command, "providerName", target.ProviderName);
+                Add(command, "identity", operation.Identity);
+                Add(command, "fingerprint", operation.Fingerprint);
+                Add(command, "appliedUtc", appliedAt);
+                await command.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+            var durable = await ReadOperationAsync(connection, null, target, operation.Identity, ct)
+                ?? throw new InvalidOperationException($"Physical operation '{operation.Identity}' was not durably recorded.");
+            if (!string.Equals(durable.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
+                throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, durable.Fingerprint);
+            return new PhysicalSchemaOperationAcknowledgement(operation.Identity, durable.Fingerprint, durable.AppliedAt);
+        }, cancellationToken);
+
+    public async ValueTask RecordAppliedStateAsync(
+        PhysicalSchemaAppliedState state,
+        string? expectedAppliedTargetFingerprint,
+        CancellationToken cancellationToken) =>
+        await sessions.ExecuteAsync(async (connection, ct) =>
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            var current = await ReadTargetFingerprintAsync(connection, transaction, state.ManifestIdentity.Value, state.Provider.Name, ct);
+            if (current == state.TargetFingerprint)
+            {
+                await transaction.CommitAsync(ct);
+                return true;
+            }
+            if (!string.Equals(current, expectedAppliedTargetFingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Physical schema applied-state compare-and-swap failed. Expected '{expectedAppliedTargetFingerprint ?? "<empty>"}', found '{current ?? "<empty>"}'.");
+            }
+
+            var sql = current is null
+                ? """
+                  INSERT INTO groundwork_physical_schema_state
+                      (manifest_id, provider_name, target_fingerprint, applied_state_json)
+                  VALUES (@manifestId, @providerName, @fingerprint, @json);
+                  """
+                : """
+                  UPDATE groundwork_physical_schema_state
+                  SET target_fingerprint = @fingerprint, applied_state_json = @json
+                  WHERE manifest_id = @manifestId AND provider_name = @providerName
+                    AND target_fingerprint = @expected;
+                  """;
+            await using var command = Command(connection, transaction, sql);
+            Add(command, "manifestId", state.ManifestIdentity.Value);
+            Add(command, "providerName", state.Provider.Name);
+            Add(command, "fingerprint", state.TargetFingerprint);
+            Add(command, "json", PhysicalSchemaAppliedStateSerializer.Serialize(state));
+            if (current is not null)
+                Add(command, "expected", expectedAppliedTargetFingerprint!);
+            if (await command.ExecuteNonQueryAsync(ct) != 1)
+                throw new InvalidOperationException("Physical schema applied-state compare-and-swap lost a concurrent update.");
+            await transaction.CommitAsync(ct);
+            return true;
+        }, cancellationToken);
+
+    private async Task ApplyOperationCoreAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        PhysicalSchemaOperation operation,
+        CancellationToken ct)
+    {
+        switch (operation)
+        {
+            case CreatePrimaryStorageOperation create:
+                await CreatePrimaryAsync(connection, transaction, create.Route, ct);
+                break;
+            case CreatePhysicalEntityStorageOperation create:
+                await CreatePrimaryAsync(connection, transaction, create.Route, ct);
+                break;
+            case CreateLinkedStorageOperation create:
+                await CreateLinkedAsync(connection, transaction, create.Route, ct);
+                break;
+            case AddProjectedColumnOperation add:
+                RelationalPhysicalStorageColumns.Validate(add.Route);
+                await AddColumnAsync(connection, transaction, add.Storage.Name.Identifier, add.Column, ct);
+                break;
+            case FinalizeProjectedColumnOperation finalize:
+                RelationalPhysicalStorageColumns.Validate(finalize.Route);
+                await FinalizeColumnAsync(connection, transaction, finalize.Storage.Name.Identifier, finalize.Column, ct);
+                break;
+            case CreatePhysicalIndexOperation create:
+                RelationalPhysicalStorageColumns.Validate(create.Route);
+                await CreateIndexAsync(connection, transaction, create.Route, create.Storage.Name.Identifier, create.Index, ct);
+                break;
+            case BackfillCanonicalJsonOperation backfill:
+                if (backfill.Route is not null)
+                    RelationalPhysicalStorageColumns.Validate(backfill.Route);
+                await BackfillAsync(connection, transaction, backfill, ct);
+                break;
+            case ValidatePhysicalSchemaOperation validate:
+                await ValidateAsync(connection, transaction, validate, ct);
+                break;
+            default:
+                throw new InvalidOperationException($"{dialect.ProviderDisplayName} cannot execute physical schema operation '{operation.Kind}'.");
+        }
+    }
+
+    private async Task CreatePrimaryAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
+    {
+        RelationalPhysicalStorageColumns.Validate(route);
+        var envelope = route.Envelope;
+        var columns = new[]
+        {
+            dialect.EnvelopeColumn(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+            dialect.EnvelopeColumn(envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+            dialect.EnvelopeColumn(envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id),
+            dialect.EnvelopeColumn(envelope.SchemaVersion.Identifier, RelationalEnvelopeColumnKind.SchemaVersion),
+            dialect.EnvelopeColumn(envelope.Version.Identifier, RelationalEnvelopeColumnKind.Version),
+            dialect.EnvelopeColumn(envelope.CanonicalJson.Identifier, RelationalEnvelopeColumnKind.CanonicalJson),
+            dialect.EnvelopeColumn(RelationalPhysicalStorageColumns.CreatedUtc, RelationalEnvelopeColumnKind.Timestamp),
+            dialect.EnvelopeColumn(RelationalPhysicalStorageColumns.UpdatedUtc, RelationalEnvelopeColumnKind.Timestamp)
+        };
+        if (!await dialect.TableExistsAsync(connection, transaction, route.PrimaryStorage.Name.Identifier, ct))
+        {
+            await ExecuteAsync(connection, transaction, dialect.CreateTableSql(
+                route.PrimaryStorage.Name.Identifier,
+                columns,
+                route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray()), ct);
+        }
+        await ValidatePrimaryAsync(connection, transaction, route, ct);
+    }
+
+    private async Task CreateLinkedAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
+    {
+        var relationship = route.LinkedRelationship!;
+        var key = route.AuxiliaryKey ?? throw new InvalidOperationException("Linked storage requires an auxiliary key.");
+        var columns = new[]
+        {
+            dialect.EnvelopeColumn(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+            dialect.EnvelopeColumn(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+            dialect.EnvelopeColumn(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id)
+        };
+        var table = route.LinkedIndexStorage!.Name.Identifier;
+        if (!await dialect.TableExistsAsync(connection, transaction, table, ct))
+            await ExecuteAsync(connection, transaction, dialect.CreateTableSql(table, columns, key.Columns.Select(column => column.Identifier).ToArray()), ct);
+        await ValidateLinkedAsync(connection, transaction, route, ct);
+    }
+
+    private async Task AddColumnAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        ExecutableProjectedColumnRoute column,
+        CancellationToken ct)
+    {
+        dialect.Validate(column.Definition);
+        var existing = await dialect.ReadColumnsAsync(connection, transaction, table, ct);
+        var staged = column.Definition.IsNullable ? column.Definition : column.Definition with { IsNullable = true };
+        if (!existing.ContainsKey(column.Column.Identifier))
+            await ExecuteAsync(connection, transaction, dialect.AddColumnSql(table, column.Column.Identifier, staged), ct);
+        await ValidateProjectedColumnAsync(connection, transaction, table, column.Column.Identifier, staged, ct);
+    }
+
+    private async Task FinalizeColumnAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        ExecutableProjectedColumnRoute column,
+        CancellationToken ct)
+    {
+        if (column.Definition.IsNullable)
+        {
+            await ValidateProjectedColumnAsync(connection, transaction, table, column.Column.Identifier, column.Definition, ct);
+            return;
+        }
+        var columns = await dialect.ReadColumnsAsync(connection, transaction, table, ct);
+        if (!columns.TryGetValue(column.Column.Identifier, out var found))
+            throw new InvalidOperationException($"Projected column '{table}.{column.Column.Identifier}' is missing.");
+        if (!found.IsNullable)
+        {
+            await ValidateProjectedColumnAsync(connection, transaction, table, column.Column.Identifier, column.Definition, ct);
+            return;
+        }
+        await using (var count = Command(connection, transaction,
+                         $"SELECT COUNT(*) FROM {dialect.Q(table)} WHERE {dialect.Q(column.Column.Identifier)} IS NULL;"))
+        {
+            if (Convert.ToInt64(await count.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) != 0)
+                throw new InvalidDataException($"Projected column '{table}.{column.Column.Identifier}' cannot be made required because canonical backfill left null values.");
+        }
+        await ExecuteAsync(connection, transaction, dialect.FinalizeColumnSql(table, column.Column.Identifier, column.Definition), ct);
+        await ValidateProjectedColumnAsync(connection, transaction, table, column.Column.Identifier, column.Definition, ct);
+    }
+
+    private async Task CreateIndexAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        ExecutableStorageRoute route,
+        string table,
+        ExecutablePhysicalIndexRoute index,
+        CancellationToken ct)
+    {
+        var nullableColumns = NullableIndexColumns(route, index);
+        var existing = await dialect.ReadIndexAsync(connection, transaction, table, index.Name.Identifier, ct);
+        if (existing is null)
+            await ExecuteAsync(connection, transaction, dialect.CreateIndexSql(table, index, nullableColumns), ct);
+        await ValidateIndexAsync(connection, transaction, route, table, index, ct);
+    }
+
+    private async Task BackfillAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        BackfillCanonicalJsonOperation operation,
+        CancellationToken ct)
+    {
+        var route = operation.Route ?? throw new InvalidOperationException($"{dialect.ProviderDisplayName} physical backfill requires an executable route.");
+        if (operation.Target == ExecutableStorageObjectRole.PrimaryStorage)
+        {
+            var selected = SelectBackfillColumns(route, operation, ExecutableStorageObjectRole.PrimaryStorage);
+            await ForEachCanonicalDocumentBatchAsync(connection, transaction, route, ct, async document =>
+            {
+                if (selected.Length == 0)
+                    return;
+                var values = RelationalPhysicalProjectionValues.Read(document.CanonicalJson, selected);
+                var assignments = string.Join(", ", selected.Select((column, index) => $"{dialect.Q(column.Column.Identifier)} = @v{index}"));
+                await using var command = Command(connection, transaction,
+                    $"UPDATE {dialect.Q(route.PrimaryStorage.Name.Identifier)} SET {assignments} WHERE " +
+                    $"{dialect.Q(route.Discriminator.Column.Identifier)} = @kind AND " +
+                    $"{dialect.Q(route.ScopeKey.Column.Identifier)} = @scope AND {dialect.Q(route.Envelope.Id.Identifier)} = @id;");
+                for (var index = 0; index < selected.Length; index++)
+                    Add(command, $"v{index}", dialect.ConvertStorageValue(values[selected[index].Definition.LogicalName], selected[index].Definition));
+                Add(command, "kind", route.Discriminator.Value);
+                Add(command, "scope", document.Scope);
+                Add(command, "id", document.Id);
+                if (await command.ExecuteNonQueryAsync(ct) != 1)
+                    throw new InvalidOperationException($"Canonical backfill lost document '{document.Id}' in scope '{document.Scope}'.");
+            });
+            return;
+        }
+
+        var relationship = route.LinkedRelationship!;
+        var linked = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage).ToArray();
+        await ForEachCanonicalDocumentBatchAsync(connection, transaction, route, ct, async document =>
+        {
+            var values = RelationalPhysicalProjectionValues.Read(document.CanonicalJson, linked);
+            var relationColumns = new[]
+            {
+                relationship.DocumentKind.Identifier,
+                relationship.StorageScope.Identifier,
+                relationship.DocumentId.Identifier
+            };
+            var insertColumns = relationColumns.Concat(linked.Select(column => column.Column.Identifier)).ToArray();
+            await using var command = Command(connection, transaction, dialect.UpsertLinkedSql(
+                route.LinkedIndexStorage!.Name.Identifier,
+                insertColumns,
+                route.AuxiliaryKey!.Columns.Select(column => column.Identifier).ToArray(),
+                linked.Select(column => column.Column.Identifier).ToArray()));
+            Add(command, "v0", route.Discriminator.Value);
+            Add(command, "v1", document.Scope);
+            Add(command, "v2", document.Id);
+            for (var index = 0; index < linked.Length; index++)
+                Add(command, $"v{index + 3}", dialect.ConvertStorageValue(values[linked[index].Definition.LogicalName], linked[index].Definition));
+            await command.ExecuteNonQueryAsync(ct);
+        });
+    }
+
+    private async Task ForEachCanonicalDocumentBatchAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        ExecutableStorageRoute route,
+        CancellationToken ct,
+        Func<CanonicalDocument, Task> action)
+    {
+        const int batchSize = 256;
+        string? afterScope = null;
+        string? afterId = null;
+        while (true)
+        {
+            var batch = new List<CanonicalDocument>(batchSize);
+            await using (var command = Command(connection, transaction, dialect.SelectCanonicalBatchSql(route, batchSize, afterScope is not null)))
+            {
+                Add(command, "kind", route.Discriminator.Value);
+                if (afterScope is not null)
+                {
+                    Add(command, "afterScope", afterScope);
+                    Add(command, "afterId", afterId!);
+                }
+                await using var reader = await command.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    batch.Add(new CanonicalDocument(reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+            }
+            foreach (var document in batch)
+                await action(document);
+            if (batch.Count < batchSize)
+                return;
+            afterScope = batch[^1].Scope;
+            afterId = batch[^1].Id;
+        }
+    }
+
+    private async Task ValidateAsync(DbConnection connection, DbTransaction transaction, ValidatePhysicalSchemaOperation operation, CancellationToken ct)
+    {
+        foreach (var route in operation.Routes)
+        {
+            RelationalPhysicalStorageColumns.Validate(route);
+            await ValidatePrimaryAsync(connection, transaction, route, ct);
+            if (route.LinkedIndexStorage is not null)
+                await ValidateLinkedAsync(connection, transaction, route, ct);
+            foreach (var column in route.ProjectedColumns)
+            {
+                var table = column.Target == ExecutableStorageObjectRole.PrimaryStorage
+                    ? route.PrimaryStorage.Name.Identifier
+                    : route.LinkedIndexStorage!.Name.Identifier;
+                await ValidateProjectedColumnAsync(connection, transaction, table, column.Column.Identifier, column.Definition, ct);
+            }
+            foreach (var index in route.Indexes)
+            {
+                var table = index.Target == ExecutableStorageObjectRole.PrimaryStorage
+                    ? route.PrimaryStorage.Name.Identifier
+                    : route.LinkedIndexStorage!.Name.Identifier;
+                await ValidateIndexAsync(connection, transaction, route, table, index, ct);
+            }
+        }
+    }
+
+    private Task ValidatePrimaryAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
+    {
+        var envelope = route.Envelope;
+        return ValidateTableAsync(connection, transaction, route.PrimaryStorage.Name.Identifier,
+        [
+            Envelope(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+            Envelope(envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+            Envelope(envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id),
+            Envelope(envelope.SchemaVersion.Identifier, RelationalEnvelopeColumnKind.SchemaVersion),
+            Envelope(envelope.Version.Identifier, RelationalEnvelopeColumnKind.Version),
+            Envelope(envelope.CanonicalJson.Identifier, RelationalEnvelopeColumnKind.CanonicalJson),
+            Envelope(RelationalPhysicalStorageColumns.CreatedUtc, RelationalEnvelopeColumnKind.Timestamp),
+            Envelope(RelationalPhysicalStorageColumns.UpdatedUtc, RelationalEnvelopeColumnKind.Timestamp)
+        ], route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray(), ct);
+
+        ExpectedColumn Envelope(string name, RelationalEnvelopeColumnKind kind) =>
+            new(name, dialect.EnvelopeType(kind), false, null, dialect.EnvelopeCollation(kind));
+    }
+
+    private Task ValidateLinkedAsync(DbConnection connection, DbTransaction transaction, ExecutableStorageRoute route, CancellationToken ct)
+    {
+        var relationship = route.LinkedRelationship!;
+        return ValidateTableAsync(connection, transaction, route.LinkedIndexStorage!.Name.Identifier,
+        [
+            Envelope(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
+            Envelope(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
+            Envelope(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id)
+        ], route.AuxiliaryKey!.Columns.Select(column => column.Identifier).ToArray(), ct);
+
+        ExpectedColumn Envelope(string name, RelationalEnvelopeColumnKind kind) =>
+            new(name, dialect.EnvelopeType(kind), false, null, dialect.EnvelopeCollation(kind));
+    }
+
+    private async Task ValidateTableAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        IReadOnlyList<ExpectedColumn> expected,
+        IReadOnlyList<string> primaryKey,
+        CancellationToken ct)
+    {
+        var actual = await dialect.ReadColumnsAsync(connection, transaction, table, ct);
+        foreach (var desired in expected)
+            EnsureColumnCompatible(table, desired, actual.GetValueOrDefault(desired.Name));
+        var actualKey = actual.Values.Where(column => column.PrimaryKeyOrder > 0)
+            .OrderBy(column => column.PrimaryKeyOrder).Select(column => column.Name).ToArray();
+        if (!actualKey.SequenceEqual(primaryKey, StringComparer.Ordinal))
+            throw new InvalidOperationException($"Physical table '{table}' has primary key ({string.Join(", ", actualKey)}) but requires ({string.Join(", ", primaryKey)}).");
+    }
+
+    private async Task ValidateProjectedColumnAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string table,
+        string column,
+        ProjectedColumnDefinition definition,
+        CancellationToken ct)
+    {
+        dialect.Validate(definition);
+        var actual = await dialect.ReadColumnsAsync(connection, transaction, table, ct);
+        EnsureColumnCompatible(table, new ExpectedColumn(
+            column,
+            dialect.ProjectedType(definition),
+            definition.IsNullable,
+            dialect.NormalizeDefault(definition),
+            dialect.ProjectedCollation(definition)), actual.GetValueOrDefault(column));
+    }
+
+    private async Task ValidateIndexAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        ExecutableStorageRoute route,
+        string table,
+        ExecutablePhysicalIndexRoute expected,
+        CancellationToken ct)
+    {
+        var actual = await dialect.ReadIndexAsync(connection, transaction, table, expected.Name.Identifier, ct)
+            ?? throw new InvalidOperationException($"Physical index '{expected.Name.Identifier}' is missing from '{table}'.");
+        var expectedFilter = dialect.IndexFilter(expected, NullableIndexColumns(route, expected));
+        if (actual.IsUnique != expected.IsUnique || actual.Columns.Count != expected.Columns.Count ||
+            !string.Equals(actual.Filter, expectedFilter, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Physical index '{expected.Name.Identifier}' has incompatible uniqueness, filter, or column count.");
+        for (var index = 0; index < expected.Columns.Count; index++)
+        {
+            if (actual.Columns[index].Name != expected.Columns[index].Column.Identifier ||
+                actual.Columns[index].Direction != expected.Columns[index].Direction)
+                throw new InvalidOperationException($"Physical index '{expected.Name.Identifier}' column {index} does not match the compiled route.");
+        }
+    }
+
+    private static void EnsureColumnCompatible(string table, ExpectedColumn expected, RelationalPhysicalColumnMetadata? actual)
+    {
+        if (actual is null)
+            throw new InvalidOperationException($"Physical column '{table}.{expected.Name}' is missing.");
+        if (!string.Equals(actual.Type, expected.Type, StringComparison.OrdinalIgnoreCase) ||
+            actual.IsNullable != expected.IsNullable ||
+            !string.Equals(actual.DefaultValue, expected.DefaultValue, StringComparison.Ordinal) ||
+            !string.Equals(actual.Collation, expected.Collation, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Physical column '{table}.{expected.Name}' is incompatible with the compiled route " +
+                $"(type '{actual.Type}', nullable '{actual.IsNullable}', default '{actual.DefaultValue ?? "<none>"}', collation '{actual.Collation ?? "<default>"}').");
+        }
+    }
+
+    private async Task<(string Fingerprint, DateTimeOffset AppliedAt)?> ReadOperationAsync(
+        DbConnection connection,
+        DbTransaction? transaction,
+        PhysicalSchemaTargetIdentity target,
+        string identity,
+        CancellationToken ct)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT operation_fingerprint, applied_utc
+            FROM groundwork_physical_schema_operations
+            WHERE manifest_id = @manifestId AND provider_name = @providerName AND operation_id = @identity;
+            """);
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        Add(command, "identity", identity);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return null;
+        var applied = reader.GetValue(1) switch
+        {
+            DateTimeOffset dateTimeOffset => dateTimeOffset,
+            DateTime dateTime => new DateTimeOffset(DateTime.SpecifyKind(dateTime, DateTimeKind.Utc)),
+            var value => DateTimeOffset.Parse(Convert.ToString(value, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture)
+        };
+        return (reader.GetString(0), applied);
+    }
+
+    private static async Task<string?> ReadTargetFingerprintAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string manifestId,
+        string providerName,
+        CancellationToken ct)
+    {
+        await using var command = Command(connection, transaction,
+            "SELECT target_fingerprint FROM groundwork_physical_schema_state WHERE manifest_id = @manifestId AND provider_name = @providerName;");
+        Add(command, "manifestId", manifestId);
+        Add(command, "providerName", providerName);
+        return await command.ExecuteScalarAsync(ct) as string;
+    }
+
+    private static DbCommand Command(DbConnection connection, DbTransaction? transaction, string sql)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        return command;
+    }
+
+    private static void Add(DbCommand command, string name, object? value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = $"@{name}";
+        parameter.Value = value ?? DBNull.Value;
+        command.Parameters.Add(parameter);
+    }
+
+    private static async Task ExecuteAsync(DbConnection connection, DbTransaction transaction, string sql, CancellationToken ct)
+    {
+        await using var command = Command(connection, transaction, sql);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    private static ExecutableProjectedColumnRoute[] SelectBackfillColumns(
+        ExecutableStorageRoute route,
+        BackfillCanonicalJsonOperation operation,
+        ExecutableStorageObjectRole target) =>
+        route.ProjectedColumns.Where(column =>
+                column.Target == target &&
+                (operation.SubjectKind != CanonicalJsonBackfillSubjectKind.ProjectedColumn ||
+                 column.Definition.LogicalName == operation.SubjectIdentity))
+            .ToArray();
+
+    private static string[] NullableIndexColumns(ExecutableStorageRoute route, ExecutablePhysicalIndexRoute index)
+    {
+        var indexed = index.Columns.Select(column => column.Column.Identifier).ToHashSet(StringComparer.Ordinal);
+        return route.ProjectedColumns
+            .Where(column => column.Target == index.Target && column.Definition.IsNullable && indexed.Contains(column.Column.Identifier))
+            .Select(column => column.Column.Identifier)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static string LockResource(PhysicalSchemaTargetIdentity target)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(target.ToString()));
+        return $"groundwork:physical:{Convert.ToHexString(hash).ToLowerInvariant()}";
+    }
+
+    private sealed class ApplicationLock(
+        PhysicalSchemaTargetIdentity target,
+        DbConnection connection,
+        string resource,
+        RelationalServerPhysicalSchemaDialect dialect) : IPhysicalSchemaApplicationLock
+    {
+        private int disposed;
+        public PhysicalSchemaTargetIdentity Target { get; } = target;
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+            try { await dialect.ReleaseApplicationLockAsync(connection, resource, CancellationToken.None); }
+            finally { await connection.DisposeAsync(); }
+        }
+    }
+
+    private sealed record CanonicalDocument(string Scope, string Id, string CanonicalJson);
+    private sealed record ExpectedColumn(string Name, string Type, bool IsNullable, string? DefaultValue, string? Collation);
+}
+
+public enum RelationalEnvelopeColumnKind
+{
+    DocumentKind,
+    StorageScope,
+    Id,
+    SchemaVersion,
+    Version,
+    CanonicalJson,
+    Timestamp
+}
+
+public sealed record RelationalPhysicalColumnMetadata(
+    string Name,
+    string Type,
+    bool IsNullable,
+    string? DefaultValue,
+    string? Collation,
+    int PrimaryKeyOrder);
+
+public sealed record RelationalPhysicalIndexColumnMetadata(string Name, PhysicalSortDirection Direction);
+
+public sealed record RelationalPhysicalIndexMetadata(
+    bool IsUnique,
+    IReadOnlyList<RelationalPhysicalIndexColumnMetadata> Columns,
+    string? Filter);
+
+/// <summary>Provider-owned SQL and metadata behavior behind the shared physical-schema executor.</summary>
+public abstract class RelationalServerPhysicalSchemaDialect
+{
+    public abstract string ProviderDisplayName { get; }
+    public abstract string Q(string identifier);
+    public abstract string EnvelopeType(RelationalEnvelopeColumnKind kind);
+    public abstract string? EnvelopeCollation(RelationalEnvelopeColumnKind kind);
+    public abstract string ProjectedType(ProjectedColumnDefinition definition);
+    public abstract string? Collation(string? portableCollation);
+    public virtual string? ProjectedCollation(ProjectedColumnDefinition definition) =>
+        definition.Type is PortablePhysicalType.String or PortablePhysicalType.Json
+            ? Collation(definition.Collation)
+            : null;
+    public abstract string? NormalizeDefault(ProjectedColumnDefinition definition);
+    public abstract string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind);
+    public abstract string CreateTableSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> primaryKey);
+    public abstract string AddColumnSql(string table, string column, ProjectedColumnDefinition definition);
+    public abstract string FinalizeColumnSql(string table, string column, ProjectedColumnDefinition definition);
+    public abstract string? IndexFilter(ExecutablePhysicalIndexRoute index, IReadOnlyList<string> nullableColumns);
+    public abstract string CreateIndexSql(string table, ExecutablePhysicalIndexRoute index, IReadOnlyList<string> nullableColumns);
+    public abstract string UpsertLinkedSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> keyColumns, IReadOnlyList<string> updateColumns);
+    public abstract string SelectCanonicalBatchSql(ExecutableStorageRoute route, int batchSize, bool hasCursor);
+    public abstract object? ConvertStorageValue(object? value, ProjectedColumnDefinition definition);
+    public abstract void Validate(ProjectedColumnDefinition definition);
+    public abstract Task AcquireApplicationLockAsync(DbConnection connection, string resource, CancellationToken cancellationToken);
+    public abstract Task ReleaseApplicationLockAsync(DbConnection connection, string resource, CancellationToken cancellationToken);
+    public abstract Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken);
+    public abstract Task<bool> TableExistsAsync(DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken);
+    public abstract Task<IReadOnlyDictionary<string, RelationalPhysicalColumnMetadata>> ReadColumnsAsync(DbConnection connection, DbTransaction transaction, string table, CancellationToken cancellationToken);
+    public abstract Task<RelationalPhysicalIndexMetadata?> ReadIndexAsync(DbConnection connection, DbTransaction transaction, string table, string index, CancellationToken cancellationToken);
+}
