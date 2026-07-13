@@ -46,7 +46,7 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
         new SqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString;
 }
 
-internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDialect
+internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDialect
 {
     private readonly SqlServerPhysicalIdentity identity;
 

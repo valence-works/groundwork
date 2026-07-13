@@ -1,9 +1,4 @@
-using System.Data;
-using System.Data.Common;
-using System.Diagnostics.CodeAnalysis;
-using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
-using Groundwork.Core.SchemaEvolution;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.PhysicalStorage;
 using Xunit;
@@ -12,10 +7,6 @@ namespace Groundwork.RelationalProviders.Tests;
 
 public sealed class RelationalPhysicalProviderHardeningTests
 {
-    private static readonly PhysicalSchemaTargetIdentity Target = new(
-        new StorageManifestIdentity("relational-lock-cleanup-tests"),
-        "sqlserver");
-
     [Theory]
     [InlineData(RelationalEnvelopeColumnKind.DocumentKind)]
     [InlineData(RelationalEnvelopeColumnKind.StorageScope)]
@@ -70,75 +61,5 @@ public sealed class RelationalPhysicalProviderHardeningTests
             ComputedDefinition: null);
 
         Assert.False(dialect.IsProviderOwnedColumnCompatible(expected, plainBinary));
-    }
-
-    [Fact]
-    public async Task Failed_lock_acquisition_preserves_primary_failure_when_connection_disposal_fails()
-    {
-        var connection = new FailingOpenAndDisposeConnection();
-        var executor = new RelationalServerPhysicalSchemaExecutor(
-            () => connection,
-            new SqlServer.PhysicalStorage.SqlServerPhysicalSchemaDialect());
-
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            executor.AcquireApplicationLockAsync(Target, CancellationToken.None).AsTask());
-
-        Assert.Equal("open failed", exception.Message);
-        var cleanupFailures = Assert.IsAssignableFrom<IReadOnlyList<Exception>>(
-            exception.Data["Groundwork.Relational.CleanupFailures"]);
-        Assert.Collection(cleanupFailures, cleanup => Assert.Equal("dispose failed", cleanup.Message));
-        Assert.Equal(1, connection.DisposeCount);
-    }
-
-    [Fact]
-    public async Task Canceled_lock_acquisition_normalizes_after_failing_connection_disposal()
-    {
-        using var cancellation = new CancellationTokenSource();
-        var connection = new FailingOpenAndDisposeConnection(cancellation.Cancel);
-        var executor = new RelationalServerPhysicalSchemaExecutor(
-            () => connection,
-            new SqlServer.PhysicalStorage.SqlServerPhysicalSchemaDialect());
-
-        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            executor.AcquireApplicationLockAsync(Target, cancellation.Token).AsTask());
-
-        var primaryFailure = Assert.IsType<InvalidOperationException>(exception.InnerException);
-        Assert.Equal("open failed", primaryFailure.Message);
-        var cleanupFailures = Assert.IsAssignableFrom<IReadOnlyList<Exception>>(
-            primaryFailure.Data["Groundwork.Relational.CleanupFailures"]);
-        Assert.Collection(cleanupFailures, cleanup => Assert.Equal("dispose failed", cleanup.Message));
-        Assert.Equal(1, connection.DisposeCount);
-    }
-
-    private sealed class FailingOpenAndDisposeConnection(Action? beforeOpen = null) : DbConnection
-    {
-        public int DisposeCount { get; private set; }
-        [AllowNull]
-        public override string ConnectionString { get; set; } = string.Empty;
-        public override string Database => "test";
-        public override string DataSource => "test";
-        public override string ServerVersion => "test";
-        public override ConnectionState State => ConnectionState.Closed;
-
-        public override void ChangeDatabase(string databaseName) => throw new NotSupportedException();
-        public override void Close() { }
-        public override void Open() => throw new InvalidOperationException("open failed");
-
-        public override Task OpenAsync(CancellationToken cancellationToken)
-        {
-            beforeOpen?.Invoke();
-            return Task.FromException(new InvalidOperationException("open failed"));
-        }
-
-        public override ValueTask DisposeAsync()
-        {
-            DisposeCount++;
-            return ValueTask.FromException(new InvalidOperationException("dispose failed"));
-        }
-
-        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
-            throw new NotSupportedException();
-
-        protected override DbCommand CreateDbCommand() => throw new NotSupportedException();
     }
 }

@@ -60,10 +60,19 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             {
                 await dialect.EnsureInfrastructureAsync(connection, cancellationToken);
             }
-            finally
+            catch (Exception exception)
             {
-                await dialect.ReleaseApplicationLockAsync(connection, BootstrapLockResource, CancellationToken.None);
+                try
+                {
+                    await dialect.ReleaseApplicationLockAsync(connection, BootstrapLockResource, CancellationToken.None);
+                }
+                catch (Exception cleanupFailure)
+                {
+                    RelationalCleanupFailures.Attach(exception, cleanupFailure);
+                }
+                throw;
             }
+            await dialect.ReleaseApplicationLockAsync(connection, BootstrapLockResource, CancellationToken.None);
             var resource = LockResource(target);
             await dialect.AcquireApplicationLockAsync(connection, resource, cancellationToken);
             acquiredResource = resource;
