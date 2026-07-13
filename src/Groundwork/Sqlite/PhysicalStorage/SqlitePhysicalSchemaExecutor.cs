@@ -17,7 +17,7 @@ namespace Groundwork.Sqlite.PhysicalStorage;
 /// acknowledgements and the complete typed applied snapshot are stored separately so a retry can
 /// reconcile acknowledgement loss without claiming an unapplied target.
 /// </summary>
-public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
+public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhysicalSchemaHistoryInspector
 {
     private static readonly ConcurrentDictionary<PhysicalSchemaTargetIdentity, SemaphoreSlim> ApplicationLocks = new();
     private readonly SqliteConnection connection;
@@ -72,6 +72,36 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 ? PhysicalSchemaHistoryState.Empty
                 : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
         }, cancellationToken);
+
+    public async ValueTask<PhysicalSchemaInspectionResult> InspectHistoryAsync(
+        PhysicalSchemaTarget target,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        var builder = new SqliteConnectionStringBuilder(connection.ConnectionString);
+        if (string.Equals(builder.DataSource, ":memory:", StringComparison.Ordinal))
+        {
+            return await WithConnectionAsync(
+                ct => ReadAndValidateInspectedHistoryAsync(this, connection, target, ct),
+                cancellationToken);
+        }
+
+        builder.Mode = SqliteOpenMode.ReadOnly;
+        await using var inspection = new SqliteConnection(builder.ConnectionString);
+        try
+        {
+            await inspection.OpenAsync(cancellationToken);
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode == 14)
+        {
+            return new PhysicalSchemaInspectionResult(PhysicalSchemaHistoryState.Empty, IsAppliedSchemaValid: true);
+        }
+        return await ReadAndValidateInspectedHistoryAsync(
+            new SqlitePhysicalSchemaExecutor(inspection),
+            inspection,
+            target,
+            cancellationToken);
+    }
 
     public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
         PhysicalSchemaTargetIdentity target,
@@ -820,6 +850,50 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 PRIMARY KEY (manifest_id, provider_name)
             );
             """, null, ct);
+    }
+
+    private static async Task<PhysicalSchemaInspectionResult> ReadAndValidateInspectedHistoryAsync(
+        SqlitePhysicalSchemaExecutor inspector,
+        SqliteConnection inspection,
+        PhysicalSchemaTarget target,
+        CancellationToken cancellationToken)
+    {
+        await using (var exists = inspection.CreateCommand())
+        {
+            exists.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groundwork_physical_schema_state';";
+            if (Convert.ToInt64(await exists.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) == 0)
+                return new PhysicalSchemaInspectionResult(PhysicalSchemaHistoryState.Empty, IsAppliedSchemaValid: true);
+        }
+
+        await using var command = inspection.CreateCommand();
+        command.CommandText = """
+            SELECT applied_state_json
+            FROM groundwork_physical_schema_state
+            WHERE manifest_id = @manifestId AND provider_name = @providerName;
+            """;
+        command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("@providerName", target.Provider.Name);
+        var json = await command.ExecuteScalarAsync(cancellationToken) as string;
+        var history = json is null
+            ? PhysicalSchemaHistoryState.Empty
+            : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
+        var isAppliedSchemaValid = true;
+        if (history.AppliedState is { } appliedState)
+        {
+            try
+            {
+                await using var transaction = await inspection.BeginTransactionAsync(cancellationToken);
+                await inspector.ValidateAsync(
+                    ValidatePhysicalSchemaOperation.ForAppliedState(appliedState),
+                    transaction,
+                    cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                isAppliedSchemaValid = false;
+            }
+        }
+        return new PhysicalSchemaInspectionResult(history, isAppliedSchemaValid);
     }
 
     private async Task<(string Fingerprint, DateTimeOffset AppliedAt)?> ReadOperationAsync(

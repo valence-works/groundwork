@@ -328,6 +328,30 @@ public sealed class ValidatePhysicalSchemaOperation : PhysicalSchemaOperation
         RouteFingerprints = Array.AsReadOnly(Routes.Select(route => route.Fingerprint).ToArray());
     }
 
+    public static ValidatePhysicalSchemaOperation ForTarget(PhysicalSchemaTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        return new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+    }
+
+    public static ValidatePhysicalSchemaOperation ForAppliedState(PhysicalSchemaAppliedState appliedState)
+    {
+        ArgumentNullException.ThrowIfNull(appliedState);
+        var routes = appliedState.Snapshot.Routes.Select(snapshot =>
+        {
+            var route = ExecutableStorageRouteSerializer.Deserialize(snapshot.CanonicalRouteJson);
+            if (route.StorageUnit != snapshot.StorageUnit ||
+                route.DefinitionFingerprint != snapshot.DefinitionFingerprint ||
+                route.Fingerprint != snapshot.RouteFingerprint)
+            {
+                throw new InvalidOperationException(
+                    "Applied physical schema route identity does not match its canonical snapshot.");
+            }
+            return route;
+        }).ToArray();
+        return new ValidatePhysicalSchemaOperation(appliedState.TargetFingerprint, routes);
+    }
+
     public string TargetFingerprint { get; }
 
     public IReadOnlyList<ExecutableStorageRoute> Routes { get; }

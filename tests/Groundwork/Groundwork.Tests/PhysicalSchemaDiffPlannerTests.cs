@@ -278,10 +278,13 @@ public sealed class PhysicalSchemaDiffPlannerTests
         Assert.False(string.IsNullOrWhiteSpace(applied.Snapshot.CanonicalJson));
     }
 
-    [Fact]
-    public void AppliedStateRoundTripsThroughCanonicalDurableSerialization()
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public void AppliedStateRoundTripsThroughCanonicalDurableSerialization(PhysicalStorageForm form)
     {
-        var target = CreateTarget(PhysicalStorageForm.PhysicalEntityTable, includeSecondProjection: true);
+        var target = CreateTarget(form, includeSecondProjection: true);
         var plan = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, PlannedAt);
         var applied = Complete(plan);
 
@@ -297,6 +300,10 @@ public sealed class PhysicalSchemaDiffPlannerTests
         Assert.Equal(applied.Snapshot.CanonicalJson, restored.Snapshot.CanonicalJson);
         Assert.Equal(applied.AppliedOperations, restored.AppliedOperations);
         Assert.Equal(json, PhysicalSchemaAppliedStateSerializer.Serialize(restored));
+
+        var validation = ValidatePhysicalSchemaOperation.ForAppliedState(restored);
+        Assert.Equal(restored.TargetFingerprint, validation.TargetFingerprint);
+        Assert.Equal(target.Routes, validation.Routes);
 
         var restart = PhysicalSchemaDiffPlanner.Plan(
             target,

@@ -77,6 +77,17 @@ the version remains durable evidence and a version change produces validation/re
 The immutable target identity is also passed to every executor operation; implementations must not
 infer durable ledger ownership from mutable ambient executor state.
 
+The coordinator evaluates an optional exact-plan authorization callback after planning and while the
+same lease remains held. A rejection returns the plan and authorization diagnostics without applying
+an operation or recording state; an approval executes that exact plan before releasing the lease.
+This is the concurrency boundary used by CLI safe/authorized modes and prevents an unlocked
+authorize-then-replan race. Separately, `IPhysicalSchemaHistoryInspector` provides a non-mutating,
+point-in-time history read for live readiness validation. Inspection never authorizes application;
+it validates the physical objects described by the durable applied-route snapshot even when the
+desired target fingerprint differs, then reports the desired diff from that same history. Desired
+operations are never inspection input and cannot be executed by validation. Apply always rereads
+under the exclusion lease.
+
 An executor must apply `(operation identity, fingerprint)` idempotently. The same identity with a
 different fingerprint is a conflict. An acknowledgement means the operation is durably observable;
 if the acknowledgement is lost, retry reconciles the durable operation and returns the same
@@ -100,4 +111,9 @@ compatibility-upgrade policy in #44.
 SQLite DDL translation, canonical-JSON rebuilds, validation, the durable operation ledger, and
 typed applied-state compare-and-swap are implemented by the
 [relational physical storage runtime](relational-physical-storage-runtime.md) in #46. SQL Server and
-PostgreSQL provider execution remain #47. MongoDB provider execution is #48. The migration CLI is #49.
+PostgreSQL provider execution are implemented by #47, MongoDB provider execution by #48, and the
+deployment CLI by #49.
+
+The completed CI/CD entry point is documented in the [Groundwork schema tool](schema-tool.md). It
+loads a Core-only manifest source, compiles the selected provider target, and reuses this exact
+locking, planning, acknowledgement, retry, and state-publication protocol.
