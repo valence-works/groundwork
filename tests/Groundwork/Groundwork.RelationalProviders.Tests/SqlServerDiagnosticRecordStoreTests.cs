@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Xml.Linq;
 using Groundwork.DiagnosticRecords;
 using Groundwork.DiagnosticRecords.Relational;
@@ -14,23 +15,23 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
     ServerDiagnosticRecordStoreConformanceTests,
     IAsyncLifetime
 {
-    private readonly List<SqlServerDiagnosticRecordStoreFixture> fixtures = [];
+    private string? fixtureConnectionString;
+    private SqlServerDiagnosticRecordStoreFixture? fixture;
 
-    public Task InitializeAsync() => Task.CompletedTask;
+    public async Task InitializeAsync()
+    {
+        fixtureConnectionString = await container.CreateDatabaseAsync();
+        fixture = await SqlServerDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString);
+    }
 
     public async Task DisposeAsync()
     {
-        foreach (var fixture in fixtures)
-            await container.DropDatabaseAsync(fixture.ConnectionString);
+        if (fixtureConnectionString is not null)
+            await container.DropDatabaseAsync(fixtureConnectionString);
     }
 
-    protected override IServerDiagnosticRecordStoreConformanceFixture CreateServerFixture()
-    {
-        var connectionString = container.CreateDatabaseAsync().GetAwaiter().GetResult();
-        var fixture = new SqlServerDiagnosticRecordStoreFixture(connectionString);
-        fixtures.Add(fixture);
-        return fixture;
-    }
+    protected override IServerDiagnosticRecordStoreConformanceFixture CreateServerFixture() =>
+        fixture ?? throw new InvalidOperationException("The SQL Server diagnostic fixture has not been initialized.");
 
     [Fact]
     public async Task Materializer_uses_native_binary_utf8_text_and_all_durable_tables()
@@ -79,6 +80,69 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
             await container.DropDatabaseAsync(connectionString);
         }
     }
+
+    [Fact]
+    public async Task Concurrent_database_lifecycles_are_isolated_and_leave_no_databases_behind()
+    {
+        const int workerCount = 4;
+        const int iterationsPerWorker = 4;
+        var databaseNames = new ConcurrentBag<string>();
+        using var stressTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var workers = Enumerable.Range(0, workerCount).Select(async _ =>
+        {
+            try
+            {
+                for (var iteration = 0; iteration < iterationsPerWorker; iteration++)
+                {
+                    var connectionString = await container.CreateDatabaseAsync(cancellationToken: stressTimeout.Token);
+                    var databaseName = new SqlConnectionStringBuilder(connectionString).InitialCatalog;
+                    databaseNames.Add(databaseName);
+                    try
+                    {
+                        await using var connection = new SqlConnection(connectionString);
+                        await connection.OpenAsync(stressTimeout.Token);
+                        await using var command = connection.CreateCommand();
+                        command.CommandText = """
+                            SELECT DB_NAME(), is_read_committed_snapshot_on
+                            FROM sys.databases
+                            WHERE name = DB_NAME();
+                            """;
+                        await using var reader = await command.ExecuteReaderAsync(stressTimeout.Token);
+
+                        Assert.True(await reader.ReadAsync(stressTimeout.Token));
+                        Assert.Equal(databaseName, reader.GetString(0));
+                        Assert.True(reader.GetBoolean(1));
+                    }
+                    finally
+                    {
+                        await container.DropDatabaseAsync(connectionString);
+                    }
+                }
+            }
+            catch
+            {
+                await stressTimeout.CancelAsync();
+                throw;
+            }
+        }).ToArray();
+
+        await Task.WhenAll(workers);
+
+        Assert.Equal(workerCount * iterationsPerWorker, databaseNames.Distinct(StringComparer.Ordinal).Count());
+        await using var master = new SqlConnection(container.ConnectionString);
+        await master.OpenAsync(stressTimeout.Token);
+        await using var leaked = master.CreateCommand();
+        var parameters = databaseNames.Select((name, index) =>
+        {
+            var parameter = leaked.Parameters.AddWithValue($"@name{index}", name);
+            return parameter.ParameterName;
+        });
+        leaked.CommandText = $"SELECT COUNT(*) FROM sys.databases WHERE name IN ({string.Join(", ", parameters)});";
+
+        Assert.Equal(0, Convert.ToInt32(
+            await leaked.ExecuteScalarAsync(stressTimeout.Token),
+            System.Globalization.CultureInfo.InvariantCulture));
+    }
 }
 
 internal sealed class SqlServerDiagnosticRecordStoreFixture : IServerDiagnosticRecordStoreConformanceFixture
@@ -90,11 +154,20 @@ internal sealed class SqlServerDiagnosticRecordStoreFixture : IServerDiagnosticR
     private bool planSeeded;
     private bool latestPlanNoiseSeeded;
 
-    public SqlServerDiagnosticRecordStoreFixture(string connectionString)
+    private SqlServerDiagnosticRecordStoreFixture(string connectionString)
     {
         ConnectionString = connectionString;
         sessions = RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString));
-        SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString).GetAwaiter().GetResult();
+    }
+
+    public static async Task<SqlServerDiagnosticRecordStoreFixture> CreateAsync(
+        string connectionString,
+        CancellationToken cancellationToken = default)
+    {
+        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(
+            connectionString,
+            cancellationToken: cancellationToken);
+        return new(connectionString);
     }
 
     public string ConnectionString { get; }
