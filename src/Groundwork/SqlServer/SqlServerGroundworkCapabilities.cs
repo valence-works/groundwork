@@ -15,6 +15,19 @@ public static class SqlServerGroundworkCapabilities
     private static readonly IReadOnlySet<ConcurrencyKind> ConcurrencyModes =
         Enum.GetValues<ConcurrencyKind>().ToHashSet();
 
+    private static readonly IReadOnlySet<IndexValueKind> IndexValueKinds =
+        new HashSet<IndexValueKind>
+        {
+            IndexValueKind.String,
+            IndexValueKind.Number,
+            IndexValueKind.Boolean,
+            IndexValueKind.DateTime,
+            IndexValueKind.Keyword
+        };
+
+    private static readonly IReadOnlySet<MissingValueBehavior> MissingValueBehaviors =
+        Enum.GetValues<MissingValueBehavior>().ToHashSet();
+
     private static readonly IReadOnlySet<MaterializationOperationKind> MaterializationOperations =
         Enum.GetValues<MaterializationOperationKind>().ToHashSet();
 
@@ -31,7 +44,11 @@ public static class SqlServerGroundworkCapabilities
             provider,
             new HashSet<CapabilityId>(),
             new HashSet<CapabilityId>(),
-            IndexCapabilities.All,
+            new IndexCapabilities(
+                IndexValueKinds,
+                SupportsUniqueIndexes: true,
+                SupportsSortableIndexes: true,
+                MissingValueBehaviors),
             QueryOperations,
             ConcurrencyModes,
             []);

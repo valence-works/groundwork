@@ -44,6 +44,23 @@ public sealed class RelationalPhysicalProviderDialectTests
     }
 
     [Fact]
+    public void Sql_server_reports_the_logical_index_kinds_served_by_its_bounded_key_validator()
+    {
+        var valueKinds = SqlServerGroundworkCapabilities.Runtime().Indexes.SupportedValueKinds;
+
+        Assert.Equal(
+            new[]
+            {
+                IndexValueKind.String,
+                IndexValueKind.Number,
+                IndexValueKind.Boolean,
+                IndexValueKind.DateTime,
+                IndexValueKind.Keyword
+            },
+            valueKinds.Order());
+    }
+
+    [Fact]
     public void Sql_server_uses_binary_identity_and_projection_collation()
     {
         var dialect = new SqlServerPhysicalSchemaDialect();
@@ -56,6 +73,22 @@ public sealed class RelationalPhysicalProviderDialectTests
         Assert.Equal("Latin1_General_100_BIN2", dialect.ProjectedCollation(projected));
         Assert.Contains("COLLATE Latin1_General_100_BIN2", dialect.EnvelopeColumn("id", RelationalEnvelopeColumnKind.Id));
         Assert.Contains("PRIMARY KEY NONCLUSTERED", dialect.CreateTableSql("records", ["[id] nvarchar(450) NOT NULL"], ["id"]));
+    }
+
+    [Fact]
+    public void Sql_server_primary_key_constraint_names_do_not_collide_for_long_table_names()
+    {
+        var dialect = new SqlServerPhysicalSchemaDialect();
+        var commonPrefix = new string('x', 127);
+
+        var first = ReadConstraintName(dialect.CreateTableSql(
+            commonPrefix + "a", ["[id] int NOT NULL"], ["id"]));
+        var second = ReadConstraintName(dialect.CreateTableSql(
+            commonPrefix + "b", ["[id] int NOT NULL"], ["id"]));
+
+        Assert.True(first.Length <= 128);
+        Assert.True(second.Length <= 128);
+        Assert.NotEqual(first, second);
     }
 
     [Fact]
@@ -116,6 +149,168 @@ public sealed class RelationalPhysicalProviderDialectTests
 
         Assert.Contains("gw_hidden_collision_id_key", exception.Message, StringComparison.Ordinal);
         Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(PortablePhysicalType.String)]
+    [InlineData(PortablePhysicalType.Binary)]
+    public void Sql_server_rejects_max_length_physical_index_keys_before_ddl(PortablePhysicalType type)
+    {
+        var route = SqlServerRouteWithIndexedCategory(
+            new ProjectedColumnDefinition("category", "category", type));
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new SqlServerPhysicalSchemaDialect().ValidateRoute(route));
+
+        Assert.Contains("by-category", exception.Message, StringComparison.Ordinal);
+        Assert.Contains($"bounded {type}", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(850, true)]
+    [InlineData(851, false)]
+    public void Sql_server_enforces_the_1700_byte_physical_index_key_boundary_for_unicode_strings(
+        int length,
+        bool supported)
+    {
+        var route = SqlServerRouteWithIndexedCategory(
+            new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String, Length: length));
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
+    }
+
+    [Theory]
+    [InlineData(722, true)]
+    [InlineData(723, false)]
+    public void Sql_server_counts_the_physical_storage_scope_prefix_toward_index_key_width(
+        int stringLength,
+        bool supported)
+    {
+        var route = SqlServerRouteWithIndexedCategory(
+            new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String, Length: stringLength),
+            includeStorageScope: true);
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
+    }
+
+    [Theory]
+    [InlineData(400, true)]
+    [InlineData(401, false)]
+    public void Sql_server_counts_a_physical_discriminator_prefix_toward_index_key_width(
+        int stringLength,
+        bool supported)
+    {
+        var category = new ProjectedColumnDefinition(
+            "category", "category", PortablePhysicalType.String, Length: stringLength);
+        var route = SqlServerRouteWithIndex([category], ["document_kind", "category"]);
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
+    }
+
+    [Theory]
+    [InlineData(1700, true)]
+    [InlineData(1701, false)]
+    public void Sql_server_supports_only_bounded_binary_keys_within_the_1700_byte_limit(
+        int length,
+        bool supported)
+    {
+        var route = SqlServerRouteWithIndexedCategory(
+            new ProjectedColumnDefinition("category", "category", PortablePhysicalType.Binary, Length: length));
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
+    }
+
+    [Fact]
+    public void Sql_server_rejects_json_physical_index_keys_before_ddl()
+    {
+        var route = SqlServerRouteWithIndexedCategory(
+            new ProjectedColumnDefinition("category", "category", PortablePhysicalType.Json));
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new SqlServerPhysicalSchemaDialect().ValidateRoute(route));
+
+        Assert.Contains("by-category", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Json", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(PortablePhysicalType.String)]
+    [InlineData(PortablePhysicalType.Int32)]
+    [InlineData(PortablePhysicalType.Int64)]
+    [InlineData(PortablePhysicalType.Decimal)]
+    [InlineData(PortablePhysicalType.Boolean)]
+    [InlineData(PortablePhysicalType.DateTime)]
+    [InlineData(PortablePhysicalType.Guid)]
+    [InlineData(PortablePhysicalType.Binary)]
+    public void Sql_server_accepts_each_supported_bounded_physical_index_key_type(PortablePhysicalType type)
+    {
+        var definition = type switch
+        {
+            PortablePhysicalType.String or PortablePhysicalType.Binary =>
+                new ProjectedColumnDefinition("category", "category", type, Length: 1),
+            PortablePhysicalType.Decimal =>
+                new ProjectedColumnDefinition("category", "category", type, Precision: 28, Scale: 4),
+            _ => new ProjectedColumnDefinition("category", "category", type)
+        };
+        var route = SqlServerRouteWithIndexedCategory(definition);
+
+        new SqlServerPhysicalSchemaDialect().ValidateRoute(route);
+    }
+
+    [Theory]
+    [InlineData(848, true)]
+    [InlineData(849, false)]
+    public void Sql_server_counts_fixed_width_projected_columns_toward_compound_index_keys(
+        int stringLength,
+        bool supported)
+    {
+        var definitions = new ProjectedColumnDefinition[]
+        {
+            new("category", "category", PortablePhysicalType.String, Length: stringLength),
+            new("rank", "rank", PortablePhysicalType.Int32)
+        };
+        var route = SqlServerRouteWithIndex(definitions, ["category", "rank"]);
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
+    }
+
+    [Theory]
+    [InlineData(32, true)]
+    [InlineData(33, false)]
+    public void Sql_server_enforces_the_32_column_physical_index_key_limit(int columnCount, bool supported)
+    {
+        var definitions = Enumerable.Range(0, columnCount)
+            .Select(index => index == 0
+                ? new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String, Length: 1)
+                : new ProjectedColumnDefinition($"key-{index}", $"key{index}", PortablePhysicalType.Int32))
+            .ToArray();
+        var route = SqlServerRouteWithIndex(definitions, definitions.Select(x => x.LogicalName).ToArray());
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        if (supported)
+            dialect.ValidateRoute(route);
+        else
+            Assert.Throws<InvalidOperationException>(() => dialect.ValidateRoute(route));
     }
 
     [Fact]
@@ -227,5 +422,66 @@ public sealed class RelationalPhysicalProviderDialectTests
         Assert.Equal(
             "jsonb_extract_path_text((p.canonical_json)::jsonb, 'a,b', 'quote''s')",
             dialect.JsonValue("p.canonical_json", "a,b.quote's"));
+    }
+
+    private static ExecutableStorageRoute SqlServerRouteWithIndexedCategory(
+        ProjectedColumnDefinition definition,
+        bool includeStorageScope = false)
+        => SqlServerRouteWithIndex([definition], [definition.LogicalName], includeStorageScope);
+
+    private static ExecutableStorageRoute SqlServerRouteWithIndex(
+        IReadOnlyList<ProjectedColumnDefinition> definitions,
+        IReadOnlyList<string> indexColumns,
+        bool includeStorageScope = false)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false);
+        var unit = model.Manifest.StorageUnits.Single();
+        var physicalStorage = unit.PhysicalStorage!;
+        var table = PhysicalTableDefinition.PhysicalEntityTable(
+            "configuration_entities",
+            definitions,
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    "by-category",
+                    (includeStorageScope ? new[] { "storage_scope" } : [])
+                    .Concat(indexColumns)
+                    .Select((column, order) => new PhysicalIndexColumnDefinition(column, order))
+                    .ToArray())
+            ]);
+        var manifest = model.Manifest with
+        {
+            StorageUnits =
+            [
+                unit with
+                {
+                    PhysicalStorage = new StorageUnitPhysicalStorage(
+                        physicalStorage.ProvisioningMode,
+                        PhysicalStoragePolicy.Explicit(table),
+                        logicalIndexes: [],
+                        boundedQueries: [],
+                        nameOverrides: physicalStorage.NameOverrides)
+                }
+            ]
+        };
+        var resolution = PhysicalStorageResolver.Resolve(
+            manifest,
+            new DelegatePhysicalNamePolicy(context => $"gw_key_test_{context.FeatureDefaultLogicalName}"),
+            SqlServerGroundworkCapabilities.PhysicalNames);
+        Assert.True(resolution.IsValid, string.Join("; ", resolution.Diagnostics.Select(x => x.Message)));
+        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
+        Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(x => x.Message)));
+        return compilation.Routes.Single();
+    }
+
+    private static string ReadConstraintName(string createTableSql)
+    {
+        const string marker = "CONSTRAINT [";
+        var start = createTableSql.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
+        var end = createTableSql.IndexOf(']', start);
+        return createTableSql[start..end];
     }
 }
