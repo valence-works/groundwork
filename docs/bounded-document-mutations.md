@@ -48,10 +48,11 @@ A provider mutation handler must:
    handler capabilities;
 2. evaluate every range, status, and relationship predicate on the server through the compiled
    physical query plan;
-3. select stable physical document identities before changing any row;
+3. establish one transaction-stable mutation set, either by provider-local identity materialization
+   or by using the same provider-native set-based selector for every affected physical object;
 4. change the canonical document, primary projections, linked projections/index rows, and durable
    operation ledger in one transaction;
-5. return the exact selected identity count;
+5. return the exact primary physical affected count and reject mismatched linked/projection counts;
 6. persist a canonical request fingerprint with that count;
 7. return `Replayed` with the original count for an identical retry, and throw
    `BoundedMutationOperationConflictException` when an operation identity is reused for a different
@@ -100,5 +101,18 @@ cancellation/failure rollback, restart and rolling-upgrade acknowledgement-loss 
 plan evidence for the declared selector index. SQLite additionally covers direct-connection writer
 serialization and cleanup-failure preservation.
 
-MongoDB must implement the same provider-neutral contract and conformance scenarios through its
-native transaction, mutation, ledger, and explain facilities.
+## MongoDB set-based execution
+
+MongoDB stores the physical canonical document as addressable BSON and serializes standard JSON on
+read. Provider-owned, route-scoped typed mutation mirrors are written to primary and linked
+documents during every save. Materialization creates deterministic compound mutation indexes over discriminator, scope,
+and the declared logical-index paths on both collections. A bounded mutation can therefore execute
+one `UpdateMany` or `DeleteMany` against each physical object without loading document identities or
+issuing per-document writes. Transitions update canonical BSON, native BSON, typed mirrors, ordinary
+projections, and versions in the same transaction as the durable operation outcome.
+
+MongoDB's canonical boundary retains JSON number lexemes that exceed BSON's native numeric envelope
+through a provider-owned raw-number tag and emits them as standard JSON numbers on read. Original
+JSON whitespace is not retained. Replica-set or sharded-cluster transaction support is required and
+is checked before ledger or document I/O. Native `explain` evidence must select the provider-owned
+primary mutation index rather than a collection scan.

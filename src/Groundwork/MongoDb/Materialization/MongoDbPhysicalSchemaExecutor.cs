@@ -657,7 +657,8 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         {
             foreach (var document in cursor.Current)
             {
-                var canonicalJson = document.GetValue(route.Envelope.CanonicalJson.Identifier).AsString;
+                var canonicalJson = MongoDbCanonicalJson.Serialize(
+                    document.GetValue(route.Envelope.CanonicalJson.Identifier));
                 if (beforeBackfillWrite is not null)
                     await beforeBackfillWrite(cancellationToken);
                 if (operation.Target == ExecutableStorageObjectRole.PrimaryStorage)

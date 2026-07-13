@@ -1,6 +1,5 @@
 using System.Collections.Frozen;
-using System.Text.Json;
-using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
@@ -100,21 +99,25 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
                     return BoundedMutationResult.Replayed(durable.Value.AffectedCount);
                 }
 
-                var identities = await SelectAsync(session, mutation, plan, scope, ct);
-                if (plan.Action is PhysicalDeleteMutationAction)
-                    await DeleteAsync(session, identities, ct);
-                else
-                    await TransitionAsync(session, identities, (PhysicalTransitionMutationAction)plan.Action, ct);
+                var affected = plan.Action is PhysicalDeleteMutationAction
+                    ? await DeleteAsync(session, mutation, plan, scope, ct)
+                    : await TransitionAsync(
+                        session,
+                        mutation,
+                        plan,
+                        scope,
+                        (PhysicalTransitionMutationAction)plan.Action,
+                        ct);
                 await RecordOperationAsync(
                     session,
                     mutation,
                     plan,
                     scope,
                     fingerprint,
-                    identities.Count,
+                    affected,
                     ct);
                 completed = true;
-                return BoundedMutationResult.Completed(identities.Count);
+                return BoundedMutationResult.Completed(affected);
             },
             intercept is null
                 ? null
@@ -129,115 +132,101 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
             cancellationToken);
     }
 
-    internal FilterDefinition<BsonDocument> BuildSelectionFilter(
+    internal FilterDefinition<BsonDocument> BuildPrimaryFilter(
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
         DocumentScopeSelection scope) =>
-        MongoDbPhysicalQueryHandler.BuildFilter(
-            PredicateQuery(mutation, plan),
-            plan.Predicate,
-            scope,
-            storage,
-            route);
+        BuildMutationFilter(mutation, plan, scope, linked: false);
 
-    private async Task<IReadOnlyList<DocumentIdentity>> SelectAsync(
+    internal FilterDefinition<BsonDocument> BuildLinkedFilter(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope) =>
+        BuildMutationFilter(mutation, plan, scope, linked: true);
+
+    private async Task<long> DeleteAsync(
         IClientSessionHandle session,
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
         DocumentScopeSelection scope,
         CancellationToken cancellationToken)
     {
-        var selected = await store.Database
-            .GetCollection<BsonDocument>(plan.Predicate.LookupObject.Identifier)
-            .Find(session, BuildSelectionFilter(mutation, plan, scope))
-            .ToListAsync(cancellationToken);
-        var identities = plan.Predicate.RequiresPrimaryLookup
-            ? selected.Select(document => new DocumentIdentity(
-                document[route.LinkedRelationship!.StorageScope.Identifier].AsString,
-                document[route.LinkedRelationship.DocumentId.Identifier].AsString))
-            : selected.Select(document => new DocumentIdentity(
-                document[route.Envelope.StorageScope.Identifier].AsString,
-                document[route.Envelope.Id.Identifier].AsString));
-        return identities.Distinct().ToArray();
-    }
-
-    private async Task DeleteAsync(
-        IClientSessionHandle session,
-        IReadOnlyList<DocumentIdentity> identities,
-        CancellationToken cancellationToken)
-    {
-        if (identities.Count == 0)
-            return;
+        long? linkedCount = null;
         if (route.LinkedIndexStorage is not null)
         {
             var linked = await store.Database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
                 .DeleteManyAsync(
                     session,
-                    LinkedIdentityFilter(identities),
+                    BuildLinkedFilter(mutation, plan, scope),
                     options: null,
                     cancellationToken);
-            EnsureExactPhysicalCount("linked delete", identities.Count, linked.DeletedCount);
+            linkedCount = linked.DeletedCount;
         }
         var primary = await store.Database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .DeleteManyAsync(
                 session,
-                PrimaryIdentityFilter(identities),
+                BuildPrimaryFilter(mutation, plan, scope),
                 options: null,
                 cancellationToken);
-        EnsureExactPhysicalCount("primary delete", identities.Count, primary.DeletedCount);
+        if (linkedCount is { } actual)
+            EnsureExactPhysicalCount("linked delete", primary.DeletedCount, actual);
+        return primary.DeletedCount;
     }
 
-    private async Task TransitionAsync(
+    private async Task<long> TransitionAsync(
         IClientSessionHandle session,
-        IReadOnlyList<DocumentIdentity> identities,
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope,
         PhysicalTransitionMutationAction transition,
         CancellationToken cancellationToken)
     {
-        if (identities.Count == 0)
-            return;
-        var primary = store.Database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
-        var documents = await primary.Find(session, PrimaryIdentityFilter(identities)).ToListAsync(cancellationToken);
-        EnsureExactPhysicalCount("primary transition selection", identities.Count, documents.Count);
         var nativeValue = NativeValue(transition);
-        var primaryProjection = route.ProjectedColumns
+        var primaryUpdates = new List<UpdateDefinition<BsonDocument>>
+        {
+            Builders<BsonDocument>.Update.Set(
+                $"{route.Envelope.CanonicalJson.Identifier}.{transition.Path}",
+                nativeValue),
+            Builders<BsonDocument>.Update.Set(
+                $"{MongoDbPhysicalStorageFields.NativeContent}.{transition.Path}",
+                nativeValue),
+            Builders<BsonDocument>.Update.Set(
+                MongoDbPhysicalMutationStorage.Field(route.StorageUnit, transition.Path),
+                MongoDbPhysicalMutationStorage.QueryValue(
+                    route,
+                    transition.Path,
+                    transition.Field.ValueKind,
+                    transition.TargetValue)),
+            Builders<BsonDocument>.Update.Inc(route.Envelope.Version.Identifier, 1L),
+            Builders<BsonDocument>.Update.Set(
+                MongoDbPhysicalStorageFields.UpdatedAt,
+                DateTime.UtcNow)
+        };
+        primaryUpdates.AddRange(route.ProjectedColumns
             .Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage &&
                              column.Definition.Path == transition.Path)
-            .ToArray();
-        foreach (var document in documents)
-        {
-            var updates = new List<UpdateDefinition<BsonDocument>>
-            {
-                Builders<BsonDocument>.Update.Set(
-                    route.Envelope.CanonicalJson.Identifier,
-                    SetCanonicalValue(
-                        document[route.Envelope.CanonicalJson.Identifier].AsString,
-                        transition)),
-                Builders<BsonDocument>.Update.Set(
-                    $"{MongoDbPhysicalStorageFields.NativeContent}.{transition.Path}",
-                    nativeValue),
-                Builders<BsonDocument>.Update.Inc(route.Envelope.Version.Identifier, 1L),
-                Builders<BsonDocument>.Update.Set(
-                    MongoDbPhysicalStorageFields.UpdatedAt,
-                    DateTime.UtcNow)
-            };
-            updates.AddRange(primaryProjection.Select(projection =>
-                Builders<BsonDocument>.Update.Set(
-                    projection.Column.Identifier,
-                    MongoDbPhysicalProjectionValues.ParseQueryValue(projection, transition.TargetValue))));
-            var result = await primary.UpdateOneAsync(
+            .Select(projection => Builders<BsonDocument>.Update.Set(
+                projection.Column.Identifier,
+                MongoDbPhysicalProjectionValues.ParseQueryValue(projection, transition.TargetValue))));
+        var primary = await store.Database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .UpdateManyAsync(
                 session,
-                Builders<BsonDocument>.Filter.Eq(
-                    MongoDbPhysicalStorageFields.Id,
-                    document[MongoDbPhysicalStorageFields.Id]),
-                Builders<BsonDocument>.Update.Combine(updates),
+                BuildPrimaryFilter(mutation, plan, scope),
+                Builders<BsonDocument>.Update.Combine(primaryUpdates),
                 cancellationToken: cancellationToken);
-            EnsureExactPhysicalCount("primary transition", 1, result.MatchedCount);
-        }
+        EnsureExactPhysicalCount("primary transition modification", primary.MatchedCount, primary.ModifiedCount);
 
         if (route.LinkedIndexStorage is null)
-            return;
+            return primary.MatchedCount;
         var linkedUpdates = new List<UpdateDefinition<BsonDocument>>
         {
+            Builders<BsonDocument>.Update.Set(
+                MongoDbPhysicalMutationStorage.Field(route.StorageUnit, transition.Path),
+                MongoDbPhysicalMutationStorage.QueryValue(
+                    route,
+                    transition.Path,
+                    transition.Field.ValueKind,
+                    transition.TargetValue)),
             Builders<BsonDocument>.Update.Inc(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, 1L)
         };
         linkedUpdates.AddRange(route.ProjectedColumns
@@ -249,10 +238,86 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         var linked = await store.Database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
             .UpdateManyAsync(
                 session,
-                LinkedIdentityFilter(identities),
+                BuildLinkedFilter(mutation, plan, scope),
                 Builders<BsonDocument>.Update.Combine(linkedUpdates),
                 cancellationToken: cancellationToken);
-        EnsureExactPhysicalCount("linked transition", identities.Count, linked.MatchedCount);
+        EnsureExactPhysicalCount("linked transition", primary.MatchedCount, linked.MatchedCount);
+        EnsureExactPhysicalCount("linked transition modification", linked.MatchedCount, linked.ModifiedCount);
+        return primary.MatchedCount;
+    }
+
+    private FilterDefinition<BsonDocument> BuildMutationFilter(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope,
+        bool linked)
+    {
+        var query = PredicateQuery(mutation, plan);
+        var discriminator = linked
+            ? route.LinkedRelationship!.DocumentKind.Identifier
+            : route.Envelope.DocumentKind.Identifier;
+        var scopeField = linked
+            ? route.LinkedRelationship!.StorageScope.Identifier
+            : route.Envelope.StorageScope.Identifier;
+        string Field(string path) => linked
+            ? MongoDbPhysicalMutationStorage.LinkedField(route, path)
+            : MongoDbPhysicalMutationStorage.PrimaryField(route, path);
+        var filters = new List<FilterDefinition<BsonDocument>>
+        {
+            Builders<BsonDocument>.Filter.Eq(discriminator, route.Discriminator.Value),
+            Builders<BsonDocument>.Filter.Eq(scopeField, scope.StorageKey)
+        };
+        var logicalIndex = storage.LogicalIndexes.Single(index =>
+            index.Identity == plan.Predicate.LogicalIndexIdentity);
+        if (logicalIndex.MissingValueBehavior == MissingValueBehavior.Excluded)
+        {
+            filters.AddRange(MongoDbPhysicalMutationStorage.IndexPaths(
+                    storage,
+                    storage.BoundedQueries.Single(candidate => candidate.Identity == plan.Predicate.QueryIdentity))
+                .Select(path => Builders<BsonDocument>.Filter.Exists(Field(path), true)));
+        }
+        foreach (var clause in query.Clauses)
+        {
+            filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
+            {
+                var predicate = plan.Predicate.Predicates.Single(candidate =>
+                    candidate.Path == comparison.Path);
+                return Comparison(comparison, Field(comparison.Path), predicate.Field.ValueKind);
+            })));
+        }
+        return Builders<BsonDocument>.Filter.And(filters);
+    }
+
+    private FilterDefinition<BsonDocument> Comparison(
+        DocumentQueryComparison comparison,
+        string field,
+        IndexValueKind valueKind)
+    {
+        BsonValue ToValue(string? value) => MongoDbPhysicalMutationStorage.QueryValue(
+            route,
+            comparison.Path,
+            valueKind,
+            value);
+        var value = comparison.Values.Count == 0 ? BsonNull.Value : ToValue(comparison.Values[0]);
+        return comparison.Operator switch
+        {
+            QueryComparisonOperator.Equal => Builders<BsonDocument>.Filter.Eq(field, value),
+            QueryComparisonOperator.NotEqual => Builders<BsonDocument>.Filter.Ne(field, value),
+            QueryComparisonOperator.In => comparison.Values.Count == 0
+                ? Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true)
+                : Builders<BsonDocument>.Filter.In(field, comparison.Values.Select(ToValue)),
+            QueryComparisonOperator.Contains => Builders<BsonDocument>.Filter.Regex(
+                field,
+                new BsonRegularExpression(Regex.Escape(comparison.Values[0]!), "i")),
+            QueryComparisonOperator.StartsWith => Builders<BsonDocument>.Filter.Regex(
+                field,
+                new BsonRegularExpression("^" + Regex.Escape(comparison.Values[0]!), "i")),
+            QueryComparisonOperator.GreaterThan => Builders<BsonDocument>.Filter.Gt(field, value),
+            QueryComparisonOperator.GreaterThanOrEqual => Builders<BsonDocument>.Filter.Gte(field, value),
+            QueryComparisonOperator.LessThan => Builders<BsonDocument>.Filter.Lt(field, value),
+            QueryComparisonOperator.LessThanOrEqual => Builders<BsonDocument>.Filter.Lte(field, value),
+            _ => throw new ArgumentOutOfRangeException(nameof(comparison), comparison.Operator, null)
+        };
     }
 
     private async Task<(string Fingerprint, long AffectedCount)?> ReadOperationAsync(
@@ -306,22 +371,6 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
             ["operation_id"] = mutation.OperationId
         };
 
-    private FilterDefinition<BsonDocument> PrimaryIdentityFilter(
-        IReadOnlyList<DocumentIdentity> identities) =>
-        Builders<BsonDocument>.Filter.Or(identities.Select(identity =>
-            Builders<BsonDocument>.Filter.Eq(route.Envelope.DocumentKind.Identifier, route.Discriminator.Value) &
-            Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, identity.Scope) &
-            Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, identity.Id)));
-
-    private FilterDefinition<BsonDocument> LinkedIdentityFilter(
-        IReadOnlyList<DocumentIdentity> identities) =>
-        Builders<BsonDocument>.Filter.Or(identities.Select(identity =>
-            Builders<BsonDocument>.Filter.Eq(
-                route.LinkedRelationship!.DocumentKind.Identifier,
-                route.Discriminator.Value) &
-            Builders<BsonDocument>.Filter.Eq(route.LinkedRelationship.StorageScope.Identifier, identity.Scope) &
-            Builders<BsonDocument>.Filter.Eq(route.LinkedRelationship.DocumentId.Identifier, identity.Id)));
-
     private static DocumentQuery PredicateQuery(DocumentMutation mutation, PhysicalMutationPlan plan)
     {
         var clauses = mutation.Clauses.ToList();
@@ -340,36 +389,13 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
     }
 
     private static BsonValue NativeValue(PhysicalTransitionMutationAction transition) =>
-        BsonDocument.Parse($"{{\"value\":{CanonicalJsonValue(transition)}}}")["value"];
-
-    private static string SetCanonicalValue(
-        string canonicalJson,
-        PhysicalTransitionMutationAction transition)
-    {
-        var root = JsonNode.Parse(canonicalJson) as JsonObject
-            ?? throw new InvalidDataException("A physical document mutation requires a JSON object document.");
-        var segments = transition.Path.Split(
-            '.',
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (segments.Length == 0)
-            throw new InvalidDataException("A physical document mutation path cannot be empty.");
-        var current = root;
-        foreach (var segment in segments[..^1])
-        {
-            current = current[segment] as JsonObject
-                ?? throw new InvalidDataException(
-                    $"Physical document mutation path '{transition.Path}' does not resolve to an object.");
-        }
-        current[segments[^1]] = JsonNode.Parse(CanonicalJsonValue(transition));
-        return root.ToJsonString();
-    }
+        MongoDbCanonicalJson.Parse($"{{\"value\":{CanonicalJsonValue(transition)}}}")["value"];
 
     private static string CanonicalJsonValue(PhysicalTransitionMutationAction transition) =>
         transition.Field.ValueKind switch
         {
-            IndexValueKind.Boolean => JsonSerializer.Serialize(bool.Parse(transition.TargetValue)),
-            IndexValueKind.Number => transition.TargetValue,
-            _ => JsonSerializer.Serialize(transition.TargetValue)
+            IndexValueKind.Boolean or IndexValueKind.Number => transition.TargetValue,
+            _ => System.Text.Json.JsonSerializer.Serialize(transition.TargetValue)
         };
 
     private static void EnsureExactPhysicalCount(string operation, long expected, long actual)
@@ -380,6 +406,4 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
                 $"MongoDB bounded mutation {operation} affected {actual} physical rows; expected exactly {expected}.");
         }
     }
-
-    private readonly record struct DocumentIdentity(string Scope, string Id);
 }

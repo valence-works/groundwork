@@ -207,6 +207,7 @@ internal static class MongoDbPhysicalStorageFields
     {
         Id,
         NativeContent,
+        Documents.MongoDbPhysicalMutationStorage.Root,
         CreatedAt,
         UpdatedAt,
         Incarnation
@@ -215,6 +216,7 @@ internal static class MongoDbPhysicalStorageFields
     public static IReadOnlySet<string> LinkedReserved { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         Id,
+        Documents.MongoDbPhysicalMutationStorage.Root,
         LinkedPrimaryVersion,
         Incarnation
     }.ToFrozenSet(StringComparer.Ordinal);

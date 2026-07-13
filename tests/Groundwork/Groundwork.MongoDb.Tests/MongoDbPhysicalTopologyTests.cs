@@ -176,6 +176,32 @@ public sealed class MongoDbPhysicalTopologyTests : IAsyncLifetime
         Assert.Empty(await names.ToListAsync());
     }
 
+    [Fact]
+    public async Task Bounded_mutation_rejects_standalone_before_ledger_or_document_io()
+    {
+        var databaseName = $"gw_st_mut_{Guid.NewGuid():N}";
+        var database = Database(databaseName);
+        var model = MongoDbBoundedMutationTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var mutations = MongoDbPhysicalMutationRuntime.Create(
+            store,
+            model.Manifest,
+            Assert.Single(model.Routes),
+            model.Provider);
+
+        await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
+            mutations.ExecuteAsync(new DocumentMutation(
+                "workItem",
+                "revoke-pending",
+                "standalone-reject")));
+
+        using var names = await database.ListCollectionNamesAsync();
+        Assert.Empty(await names.ToListAsync());
+    }
+
     private IMongoDatabase Database(string name) =>
         new MongoClient(container.GetConnectionString()).GetDatabase(name);
 }
