@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.Physicalization;
 
@@ -79,12 +80,19 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 {
                     await dialect.ReleaseApplicationLockAsync(connection, acquiredResource, CancellationToken.None);
                 }
-                catch
+                catch (Exception cleanupFailure)
                 {
-                    // Preserve the acquisition failure; disposing the session is the final lock release.
+                    RelationalCleanupFailures.Attach(exception, cleanupFailure);
                 }
             }
-            await connection.DisposeAsync();
+            try
+            {
+                await connection.DisposeAsync();
+            }
+            catch (Exception cleanupFailure)
+            {
+                RelationalCleanupFailures.Attach(exception, cleanupFailure);
+            }
             if (cancellationToken.IsCancellationRequested && exception is not OperationCanceledException)
             {
                 throw new OperationCanceledException(
