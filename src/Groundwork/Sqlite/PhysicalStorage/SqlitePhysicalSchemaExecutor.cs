@@ -852,7 +852,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             CREATE TABLE IF NOT EXISTS {{RelationalPhysicalStorageColumns.MutationOperationsTable}} (
                 manifest_id TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
-                provider_version TEXT NOT NULL,
+                completed_provider_version TEXT NOT NULL,
                 storage_unit TEXT NOT NULL,
                 storage_scope TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -862,7 +862,6 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 PRIMARY KEY (
                     manifest_id,
                     provider_name,
-                    provider_version,
                     storage_unit,
                     storage_scope,
                     operation_id)

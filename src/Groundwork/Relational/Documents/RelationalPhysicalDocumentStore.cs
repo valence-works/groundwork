@@ -94,6 +94,10 @@ public abstract class RelationalPhysicalDocumentDialect
         string exactIdentityJoin) =>
         $"UPDATE {tableExpression} AS {alias} SET {string.Join(", ", assignments)} " +
         $"WHERE EXISTS (SELECT 1 FROM {selectionTableExpression} AS s WHERE {exactIdentityJoin});";
+    public virtual ValueTask<DbTransaction> BeginMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken) =>
+        connection.BeginTransactionAsync(cancellationToken);
 
     protected string Qualified(string? alias, string identifier) =>
         alias is null ? QuoteIdentifier(identifier) : $"{alias}.{QuoteIdentifier(identifier)}";
@@ -263,13 +267,15 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         Func<DbConnection, DbTransaction, CancellationToken, Task<T>> action,
         Func<CancellationToken, ValueTask>? beforeCommit,
         Func<CancellationToken, ValueTask>? afterCommitBeforeAcknowledgement,
+        Func<CancellationToken, ValueTask>? beforeRollback,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(action);
         if (sessionFactory is not null)
         {
-            await using var unitOfWork = await sessionFactory.BeginUnitOfWorkAsync(cancellationToken);
+            var unitOfWork = await sessionFactory.BeginUnitOfWorkAsync(cancellationToken);
             var committed = false;
+            Exception? primaryFailure = null;
             try
             {
                 var result = await unitOfWork.Executor.ExecuteAsync(action, cancellationToken);
@@ -281,18 +287,35 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                     await afterCommitBeforeAcknowledgement(cancellationToken);
                 return result;
             }
-            catch
+            catch (Exception exception)
             {
+                primaryFailure = exception;
                 if (!committed)
-                    await unitOfWork.RollbackAsync(CancellationToken.None);
+                {
+                    try
+                    {
+                        if (beforeRollback is not null)
+                            await beforeRollback(CancellationToken.None);
+                        await unitOfWork.RollbackAsync(CancellationToken.None);
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        RelationalCleanupFailures.Attach(exception, cleanupFailure);
+                    }
+                }
                 throw;
+            }
+            finally
+            {
+                await DisposeMutationResourceAsync(unitOfWork, primaryFailure);
             }
         }
 
         return await ExecuteAsync(async (current, ct) =>
         {
-            await using var transaction = await current.BeginTransactionAsync(ct);
+            var transaction = await dialect.BeginMutationTransactionAsync(current, ct);
             var committed = false;
+            Exception? primaryFailure = null;
             try
             {
                 var result = await action(current, transaction, ct);
@@ -304,13 +327,43 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                     await afterCommitBeforeAcknowledgement(ct);
                 return result;
             }
-            catch
+            catch (Exception exception)
             {
+                primaryFailure = exception;
                 if (!committed)
-                    await transaction.RollbackAsync(CancellationToken.None);
+                {
+                    try
+                    {
+                        if (beforeRollback is not null)
+                            await beforeRollback(CancellationToken.None);
+                        await transaction.RollbackAsync(CancellationToken.None);
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        RelationalCleanupFailures.Attach(exception, cleanupFailure);
+                    }
+                }
                 throw;
             }
+            finally
+            {
+                await DisposeMutationResourceAsync(transaction, primaryFailure);
+            }
         }, cancellationToken);
+    }
+
+    private static async ValueTask DisposeMutationResourceAsync(
+        IAsyncDisposable resource,
+        Exception? primaryFailure)
+    {
+        try
+        {
+            await resource.DisposeAsync();
+        }
+        catch (Exception cleanupFailure) when (primaryFailure is not null)
+        {
+            RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+        }
     }
 
     internal static DbCommand CreatePhysicalCommand(DbConnection connection, string sql, DbTransaction? transaction = null)

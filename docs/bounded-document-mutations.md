@@ -52,9 +52,16 @@ A provider mutation handler must:
    `BoundedMutationOperationConflictException` when an operation identity is reused for a different
    request.
 
-The request fingerprint includes the compiled route and predicate fingerprints, provider identity,
+The request fingerprint includes the provider-neutral compiled route and predicate semantics,
 storage unit, route-derived scope, mutation identity, fixed action, and canonicalized clauses.
-Clause order, comparison order inside an OR clause, and IN-value order do not change its value.
+Provider implementation name/version and handler identity are deliberately excluded: a retry after
+a rolling provider upgrade must resolve the same durable operation. Clause order, comparison order
+inside an OR clause, and IN-value order do not change the fingerprint.
+
+The durable ledger key is manifest identity, provider name, storage unit, route-derived scope, and
+operation identity. Provider version is retained only as completion evidence, not as operation
+identity, so a version upgrade replays the original exact result instead of executing the mutation
+again.
 
 ## Relational reference execution
 
@@ -65,11 +72,14 @@ identity boundary prevents a linked-row change from changing which primary rows 
 operation.
 
 SQLite is the reference provider slice. Its runtime binds a compiled indexed plan with `INDEXED BY`,
-updates canonical JSON with `json_set`, and provisions
+updates canonical JSON with `json_set`, starts direct-connection mutation transactions at SQLite's
+immediate writer boundary, and provisions
 `groundwork_document_mutation_operations` alongside the physical-schema infrastructure. Conformance
-coverage includes exact delete/transition counts, compound equality/range selection, scope
-isolation, concurrent retry, deterministic conflict, cancellation/failure rollback, lost
-acknowledgement recovery, and `EXPLAIN QUERY PLAN` index use.
+coverage includes exact delete/transition identity joins for shared-document, dedicated-document,
+and physical-entity storage, compound equality/range selection, scope isolation, concurrent retry
+across session factories and direct connections, deterministic conflict, cancellation/failure and
+cleanup-failure rollback, rolling-upgrade acknowledgement-loss recovery, and `EXPLAIN QUERY PLAN`
+index use.
 
 SQL Server, PostgreSQL, and MongoDB must implement the same provider-neutral contract and
 conformance scenarios through their native transaction, mutation, ledger, and explain facilities.

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
@@ -16,6 +17,12 @@ namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqliteBoundedMutationTests
 {
+    [Fact]
+    public void Reusable_relational_mutation_handler_is_not_a_public_provider_capability_surface()
+    {
+        Assert.False(typeof(RelationalPhysicalDocumentMutationHandler).IsPublic);
+    }
+
     [Fact]
     public async Task Delete_is_bounded_exact_idempotent_and_rejects_operation_reuse()
     {
@@ -53,6 +60,31 @@ public sealed class SqliteBoundedMutationTests
         Assert.Equal(2, await fixture.CountAsync("revoked"));
         Assert.Equal(0, await fixture.CountAsync("pending"));
         Assert.Equal(1, await fixture.CountAsync("active"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Physical_storage_forms_execute_exact_transition_and_delete_mutations(
+        PhysicalStorageForm form)
+    {
+        await using var fixture = await CreateAsync(form: form);
+        await fixture.SaveAsync("pending", "pending");
+        await fixture.SaveAsync("stale", "stale");
+        await fixture.SaveAsync("current", "current");
+
+        var transitioned = await fixture.Mutations.ExecuteAsync(Transition($"{form}-transition"));
+        var deleted = await fixture.Mutations.ExecuteAsync(Delete($"{form}-delete", "stale"));
+
+        Assert.Equal(new BoundedMutationResult(BoundedMutationStatus.Completed, 1), transitioned);
+        Assert.Equal(new BoundedMutationResult(BoundedMutationStatus.Completed, 1), deleted);
+        Assert.Equal("revoked", Category((await fixture.Documents.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+        Assert.Null(await fixture.Documents.LoadAsync(DocumentKind, "stale"));
+        Assert.Equal("current", Category((await fixture.Documents.LoadAsync(DocumentKind, "current"))!.ContentJson));
+        Assert.Equal(1, await fixture.CountAsync("revoked"));
+        Assert.Equal(0, await fixture.CountAsync("pending"));
+        Assert.Equal(0, await fixture.CountAsync("stale"));
+        Assert.Equal(1, await fixture.CountAsync("current"));
     }
 
     [Fact]
@@ -98,6 +130,54 @@ public sealed class SqliteBoundedMutationTests
         Assert.Equal(
             new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
             await restarted.ExecuteAsync(Transition("rollback-1")));
+    }
+
+    [Fact]
+    public async Task Rollback_failure_is_attached_without_replacing_the_primary_mutation_failure()
+    {
+        await using var fixture = await CreateAsync(point => point switch
+        {
+            RelationalPhysicalMutationExecutionPoint.BeforeCommit =>
+                ValueTask.FromException(new SimulatedMutationFailureException()),
+            RelationalPhysicalMutationExecutionPoint.BeforeRollback =>
+                ValueTask.FromException(new SimulatedRollbackFailureException()),
+            _ => ValueTask.CompletedTask
+        });
+        await fixture.SaveAsync("pending", "pending");
+
+        var exception = await Assert.ThrowsAsync<SimulatedMutationFailureException>(() =>
+            fixture.Mutations.ExecuteAsync(Transition("rollback-failure-1")));
+
+        var cleanupFailures = Assert.IsType<List<Exception>>(
+            exception.Data["Groundwork.Relational.CleanupFailures"]);
+        Assert.IsType<SimulatedRollbackFailureException>(Assert.Single(cleanupFailures));
+        Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(Transition("rollback-failure-1")));
+    }
+
+    [Fact]
+    public async Task Rollback_failure_is_attached_without_replacing_cancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var fixture = await CreateAsync(point => point switch
+        {
+            RelationalPhysicalMutationExecutionPoint.BeforeCommit => CancelMutation(cancellation),
+            RelationalPhysicalMutationExecutionPoint.BeforeRollback =>
+                ValueTask.FromException(new SimulatedRollbackFailureException()),
+            _ => ValueTask.CompletedTask
+        });
+        await fixture.SaveAsync("pending", "pending");
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Mutations.ExecuteAsync(Transition("rollback-cancellation-1")));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        var cleanupFailures = Assert.IsType<List<Exception>>(
+            exception.Data["Groundwork.Relational.CleanupFailures"]);
+        Assert.IsType<SimulatedRollbackFailureException>(Assert.Single(cleanupFailures));
+        Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "pending"))!.ContentJson));
     }
 
     [Fact]
@@ -227,6 +307,66 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Fact]
+    public async Task Provider_upgrade_after_acknowledgement_loss_replays_the_durable_outcome()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-mutation-{Guid.NewGuid():N}.db");
+        try
+        {
+            var (manifest, target) = CreateModel();
+            var route = target.Routes.Single();
+            var request = Transition("rolling-upgrade-ack-loss-1");
+            var firstProvider = new ProviderIdentity(target.Provider.Name, "1.0.0");
+            var upgradedProvider = new ProviderIdentity(target.Provider.Name, "2.0.0");
+            await using (var firstConnection = new SqliteConnection($"Data Source={databasePath}"))
+            {
+                await firstConnection.OpenAsync();
+                await PhysicalSchemaApplication.ApplyAsync(
+                    target,
+                    new SqlitePhysicalSchemaExecutor(firstConnection));
+                var firstStore = new SqlitePhysicalDocumentStore(
+                    firstConnection,
+                    manifest,
+                    target.Routes,
+                    DocumentStoreAccess.Global);
+                await SaveAsync(firstStore, "pending", "pending", 1);
+                var mutations = SqlitePhysicalMutationRuntime.Create(
+                    firstStore,
+                    manifest,
+                    route,
+                    firstProvider,
+                    point => point == RelationalPhysicalMutationExecutionPoint.AfterCommitBeforeAcknowledgement
+                        ? ValueTask.FromException(new SimulatedMutationAcknowledgementLossException())
+                        : ValueTask.CompletedTask);
+
+                await Assert.ThrowsAsync<SimulatedMutationAcknowledgementLossException>(() =>
+                    mutations.ExecuteAsync(request));
+            }
+
+            await using var restartedConnection = new SqliteConnection($"Data Source={databasePath}");
+            await restartedConnection.OpenAsync();
+            var restartedStore = new SqlitePhysicalDocumentStore(
+                restartedConnection,
+                manifest,
+                target.Routes,
+                DocumentStoreAccess.Global);
+
+            var replay = await SqlitePhysicalMutationRuntime.Create(
+                    restartedStore,
+                    manifest,
+                    route,
+                    upgradedProvider)
+                .ExecuteAsync(request);
+
+            Assert.Equal(new BoundedMutationResult(BoundedMutationStatus.Replayed, 1), replay);
+            Assert.Equal("revoked", Category((await restartedStore.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
     public async Task Concurrent_retry_of_one_operation_returns_one_result_and_one_exact_replay()
     {
         await using var fixture = await CreateAsync();
@@ -285,6 +425,65 @@ public sealed class SqliteBoundedMutationTests
                 [BoundedMutationStatus.Completed, BoundedMutationStatus.Replayed],
                 results.Select(result => result.Status).Order().ToArray());
             Assert.All(results, result => Assert.Equal(5, result.AffectedCount));
+            var query = SqlitePhysicalQueryRuntime.Create(firstStore, manifest, route, target.Provider);
+            Assert.Equal(5, await query.CountAsync(new DocumentQuery(
+                DocumentKind,
+                "list-by-category",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "revoked"))],
+                resultOperation: BoundedQueryResultOperation.Count)));
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task Concurrent_retry_across_direct_file_connections_is_serialized_by_the_writer_boundary()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-mutation-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Default Timeout=5";
+        try
+        {
+            var (manifest, target) = CreateModel();
+            await using var firstConnection = new SqliteConnection(connectionString);
+            await using var secondConnection = new SqliteConnection(connectionString);
+            await firstConnection.OpenAsync();
+            await secondConnection.OpenAsync();
+            await PhysicalSchemaApplication.ApplyAsync(
+                target,
+                new SqlitePhysicalSchemaExecutor(firstConnection));
+            var route = target.Routes.Single();
+            var firstStore = new SqlitePhysicalDocumentStore(
+                firstConnection,
+                manifest,
+                target.Routes,
+                DocumentStoreAccess.Global);
+            var secondStore = new SqlitePhysicalDocumentStore(
+                secondConnection,
+                manifest,
+                target.Routes,
+                DocumentStoreAccess.Global);
+            for (var index = 0; index < 5; index++)
+                await SaveAsync(firstStore, $"pending-{index}", "pending", 1);
+            var request = Transition("direct-connection-concurrent-1");
+
+            var results = await Task.WhenAll(
+                SqlitePhysicalMutationRuntime.Create(firstStore, manifest, route, target.Provider)
+                    .ExecuteAsync(request),
+                SqlitePhysicalMutationRuntime.Create(secondStore, manifest, route, target.Provider)
+                    .ExecuteAsync(request));
+
+            Assert.Equal(
+                [BoundedMutationStatus.Completed, BoundedMutationStatus.Replayed],
+                results.Select(result => result.Status).Order().ToArray());
+            Assert.All(results, result => Assert.Equal(5, result.AffectedCount));
+            var query = SqlitePhysicalQueryRuntime.Create(firstStore, manifest, route, target.Provider);
+            Assert.Equal(5, await query.CountAsync(new DocumentQuery(
+                DocumentKind,
+                "list-by-category",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "revoked"))],
+                resultOperation: BoundedQueryResultOperation.Count)));
         }
         finally
         {
@@ -347,14 +546,21 @@ public sealed class SqliteBoundedMutationTests
     private static string Category(string json) =>
         JsonDocument.Parse(json).RootElement.GetProperty("category").GetString()!;
 
+    private static ValueTask CancelMutation(CancellationTokenSource cancellation)
+    {
+        cancellation.Cancel();
+        return ValueTask.FromCanceled(cancellation.Token);
+    }
+
     private static async Task<Fixture> CreateAsync(
-        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null)
+        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null,
+        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable)
     {
         var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
         try
         {
-            var (manifest, target) = CreateModel();
+            var (manifest, target) = CreateModel(form: form);
             await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
             var route = target.Routes.Single();
             var documents = new SqlitePhysicalDocumentStore(
@@ -378,10 +584,11 @@ public sealed class SqliteBoundedMutationTests
     }
 
     private static (Groundwork.Core.Manifests.StorageManifest Manifest, PhysicalSchemaTarget Target) CreateModel(
-        bool scoped = false)
+        bool scoped = false,
+        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable)
     {
         var (template, _) = SqlitePhysicalSchemaExecutorTests.CreateModel(
-            PhysicalStorageForm.DedicatedDocumentTable,
+            form,
             includePriority: true,
             scoped: scoped);
         var unit = template.StorageUnits.Single();
@@ -491,6 +698,8 @@ public sealed class SqliteBoundedMutationTests
     private sealed class SimulatedMutationFailureException : Exception;
 
     private sealed class SimulatedMutationAcknowledgementLossException : Exception;
+
+    private sealed class SimulatedRollbackFailureException : Exception;
 
     private static async Task SaveAsync(
         SqlitePhysicalDocumentStore documents,

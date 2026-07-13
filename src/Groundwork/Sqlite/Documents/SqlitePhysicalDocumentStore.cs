@@ -122,4 +122,13 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         $"{QuoteIdentifier(storageScopeColumn)} TEXT NOT NULL, " +
         $"{QuoteIdentifier(documentIdColumn)} TEXT NOT NULL, " +
         $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) WITHOUT ROWID;";
+
+    public override ValueTask<DbTransaction> BeginMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult<DbTransaction>(
+            ((SqliteConnection)connection).BeginTransaction(deferred: false));
+    }
 }

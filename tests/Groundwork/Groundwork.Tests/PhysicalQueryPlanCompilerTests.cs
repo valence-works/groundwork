@@ -641,6 +641,48 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void MutationRequestFingerprintIsStableAcrossProviderVersionUpgrades()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.PhysicalEntityTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "prune-by-stimulus-type",
+                    "list-by-stimulus-type",
+                    BoundedMutationAction.Delete())
+            ]);
+        var firstPlan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(
+                new ProviderIdentity("test-provider", "1.0.0"),
+                PhysicalQuerySourceKind.PrimaryProjectedColumns)).Plans);
+        var upgradedPlan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(
+                new ProviderIdentity("test-provider", "2.0.0"),
+                PhysicalQuerySourceKind.PrimaryProjectedColumns)).Plans);
+        var mutation = new DocumentMutation(
+            "workflowTriggerBinding",
+            firstPlan.MutationIdentity,
+            "rolling-upgrade",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))]);
+
+        Assert.Equal(
+            BoundedMutationRequestFingerprint.Create(mutation, firstPlan, "tenant-a"),
+            BoundedMutationRequestFingerprint.Create(mutation, upgradedPlan, "tenant-a"));
+    }
+
+    [Fact]
     public void LinkedIndexCannotCertifyScaleBearingNativePrimaryFieldHandler()
     {
         var fixture = CreateFixture(
@@ -1524,14 +1566,30 @@ public sealed class PhysicalQueryPlanCompilerTests
         });
 
     private static PhysicalQueryPlannerCapabilities Capabilities(params PhysicalQuerySourceKind[] sources) =>
-        CapabilitiesWithPaging(true, true, sources);
+        Capabilities(new ProviderIdentity("test-provider", "1.0.0"), sources);
+
+    private static PhysicalQueryPlannerCapabilities Capabilities(
+        ProviderIdentity provider,
+        params PhysicalQuerySourceKind[] sources) =>
+        CapabilitiesWithPaging(provider, true, true, sources);
 
     private static PhysicalQueryPlannerCapabilities CapabilitiesWithPaging(
         bool supportsKeysetPaging,
         bool supportsLatestPerKey,
         params PhysicalQuerySourceKind[] sources) =>
-        new(
+        CapabilitiesWithPaging(
             new ProviderIdentity("test-provider", "1.0.0"),
+            supportsKeysetPaging,
+            supportsLatestPerKey,
+            sources);
+
+    private static PhysicalQueryPlannerCapabilities CapabilitiesWithPaging(
+        ProviderIdentity provider,
+        bool supportsKeysetPaging,
+        bool supportsLatestPerKey,
+        params PhysicalQuerySourceKind[] sources) =>
+        new(
+            provider,
             sources,
             Enum.GetValues<PortableQueryOperation>().ToHashSet(),
             sources.ToDictionary(source => source, source => $"test.{source}"),

@@ -13,6 +13,7 @@ namespace Groundwork.Relational.Documents;
 internal enum RelationalPhysicalMutationExecutionPoint
 {
     BeforeCommit,
+    BeforeRollback,
     AfterCommitBeforeAcknowledgement
 }
 
@@ -20,7 +21,7 @@ internal enum RelationalPhysicalMutationExecutionPoint
 /// Relational executor for one certified bounded mutation source. Selection is rendered by the
 /// bounded-query SQL builder into a transaction-local identity table before any row is changed.
 /// </summary>
-public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumentMutationHandler
+internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumentMutationHandler
 {
     private const string SelectionTable = "groundwork_bounded_mutation_selection";
     private const string SelectionKind = "document_kind";
@@ -31,7 +32,7 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
     private readonly RelationalPhysicalDocumentQueryHandler predicateBuilder;
     private readonly Func<RelationalPhysicalMutationExecutionPoint, CancellationToken, ValueTask>? intercept;
 
-    public RelationalPhysicalDocumentMutationHandler(
+    internal RelationalPhysicalDocumentMutationHandler(
         string identity,
         PhysicalQuerySourceKind source,
         RelationalPhysicalDocumentStore store,
@@ -137,10 +138,13 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
                 : ct => completed
                     ? intercept(RelationalPhysicalMutationExecutionPoint.AfterCommitBeforeAcknowledgement, ct)
                     : ValueTask.CompletedTask,
+            beforeRollback: intercept is null
+                ? null
+                : ct => intercept(RelationalPhysicalMutationExecutionPoint.BeforeRollback, ct),
             cancellationToken);
     }
 
-    public static PhysicalMutationHandlerCertification Certify(PhysicalMutationPlan plan) => new(plan);
+    internal static PhysicalMutationHandlerCertification Certify(PhysicalMutationPlan plan) => new(plan);
 
     internal RelationalPhysicalQueryCommand BuildSelectionCommand(
         DocumentMutation mutation,
@@ -338,7 +342,7 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
             $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
-            "WHERE manifest_id = @manifestId AND provider_name = @providerName AND provider_version = @providerVersion " +
+            "WHERE manifest_id = @manifestId AND provider_name = @providerName " +
             "AND storage_unit = @storageUnit AND storage_scope = @storageScope AND operation_id = @operationId;",
             transaction);
         AddOperationIdentity(command, mutation, plan, scope);
@@ -359,10 +363,11 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
             $"INSERT INTO {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
-            "(manifest_id, provider_name, provider_version, storage_unit, storage_scope, operation_id, request_fingerprint, affected_count, completed_utc) " +
+            "(manifest_id, provider_name, completed_provider_version, storage_unit, storage_scope, operation_id, request_fingerprint, affected_count, completed_utc) " +
             "VALUES (@manifestId, @providerName, @providerVersion, @storageUnit, @storageScope, @operationId, @fingerprint, @affected, @completed);",
             transaction);
         AddOperationIdentity(command, mutation, plan, scope);
+        store.AddPhysicalParameter(command, "providerVersion", plan.Predicate.Provider.Version);
         store.AddPhysicalParameter(command, "fingerprint", fingerprint);
         store.AddPhysicalParameter(command, "affected", affectedCount);
         store.AddPhysicalParameter(command, "completed", DateTimeOffset.UtcNow.ToUniversalTime().ToString("O"));
@@ -377,7 +382,6 @@ public sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocumen
     {
         store.AddPhysicalParameter(command, "manifestId", store.ManifestIdentity);
         store.AddPhysicalParameter(command, "providerName", plan.Predicate.Provider.Name);
-        store.AddPhysicalParameter(command, "providerVersion", plan.Predicate.Provider.Version);
         store.AddPhysicalParameter(command, "storageUnit", mutation.DocumentKind);
         store.AddPhysicalParameter(command, "storageScope", scope.StorageKey!);
         store.AddPhysicalParameter(command, "operationId", mutation.OperationId);

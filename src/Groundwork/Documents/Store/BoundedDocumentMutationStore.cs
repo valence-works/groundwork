@@ -126,16 +126,41 @@ public static class BoundedMutationRequestFingerprint
             .Order(StringComparer.Ordinal);
         var canonical = string.Join(
             "\u001c",
-            Encode(plan.RouteFingerprint),
-            Encode(plan.Predicate.Fingerprint),
-            Encode(plan.Predicate.Provider.Name),
-            Encode(plan.Predicate.Provider.Version),
+            CanonicalPlan(plan),
             Encode(mutation.DocumentKind),
             Encode(mutation.MutationIdentity),
             Encode(storageScope),
             action,
             string.Join("\u001b", clauses));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+    }
+
+    private static string CanonicalPlan(PhysicalMutationPlan plan)
+    {
+        var predicate = plan.Predicate;
+        var predicates = predicate.Predicates
+            .Select(item => string.Join(
+                "\u0018",
+                Encode(item.Path),
+                string.Join("\u0017", item.Operations.Order().Select(operation => ((int)operation).ToString(
+                    System.Globalization.CultureInfo.InvariantCulture)))))
+            .Order(StringComparer.Ordinal);
+        return string.Join(
+            "\u0016",
+            Encode(plan.RouteFingerprint),
+            Encode(predicate.StorageUnit.Value),
+            Encode(predicate.QueryIdentity),
+            Encode(predicate.LogicalIndexIdentity),
+            string.Join("\u0015", predicate.LogicalIndexPaths.Select(Encode)),
+            ((int)predicate.Form).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ((int)predicate.AccessKind).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ((int)predicate.Scope.Policy).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            predicate.Scope.IsMandatory ? "1" : "0",
+            predicate.Scope.UsesGlobalSentinel ? "1" : "0",
+            string.Join("\u0014", predicates),
+            string.Join("\u0013", predicate.RequiredEqualityPrefixPaths.Select(Encode)),
+            predicate.SupportsDisjunction ? "1" : "0",
+            predicate.IsScaleBearing ? "1" : "0");
     }
 
     private static string CanonicalComparison(DocumentQueryComparison comparison)
