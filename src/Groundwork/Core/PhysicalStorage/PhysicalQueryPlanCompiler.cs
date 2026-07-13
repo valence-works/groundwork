@@ -1,6 +1,7 @@
 using System.Collections.Frozen;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Queries;
+using Groundwork.Core.Scoping;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -469,6 +470,14 @@ public static class PhysicalQueryPlanCompiler
             ResolveField(route, source, field.Path, logicalIndex.GetValueKind(field.Path), capabilities),
             field.Direction,
             IsIdentityTieBreak: false)).ToList();
+        if (route.ScopePolicy == StorageScopePolicy.Scoped && order.All(item => item.Path != "storageScope"))
+        {
+            order.Add(new PhysicalQueryOrder(
+                "storageScope",
+                ResolveField(route, source, "storageScope", IndexValueKind.Keyword, capabilities),
+                PhysicalSortDirection.Ascending,
+                IsIdentityTieBreak: true));
+        }
         if (order.All(item => item.Path != "id"))
         {
             order.Add(new PhysicalQueryOrder(

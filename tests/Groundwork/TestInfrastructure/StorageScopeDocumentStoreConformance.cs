@@ -102,6 +102,40 @@ public static class StorageScopeDocumentStoreConformance
         }
         Assert.Null(await a.LoadAsync(kind, rolledBackId));
 
+        var scopeValidatedId = $"scope-validated-{suffix}";
+        await using (var unitOfWork = await a.BeginAsync(DocumentCommitScope.Of(kind)))
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "undeclared-kind", $"outside-save-{suffix}", "1", "{}")));
+            await Assert.ThrowsAsync<ArgumentException>(() => unitOfWork.DeleteAsync(new DeleteDocumentRequest(
+                "undeclared-kind", $"outside-delete-{suffix}")));
+            await Assert.ThrowsAsync<ArgumentException>(() => unitOfWork.LoadAsync(
+                "undeclared-kind", $"outside-load-{suffix}"));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                kind, scopeValidatedId, "1", $$"""{"key":"scope-validated-{{suffix}}"}"""))).Status);
+            await unitOfWork.CommitAsync();
+        }
+        Assert.NotNull(await a.LoadAsync(kind, scopeValidatedId));
+
+        var poisonedId = $"poisoned-{suffix}";
+        await using (var unitOfWork = await a.BeginAsync(DocumentCommitScope.Of(kind)))
+        {
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                kind, poisonedId, "1", $$"""{"key":"poisoned-{{suffix}}"}"""))).Status);
+            Assert.Equal(DocumentStoreWriteStatus.NotFound, (await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                kind, $"missing-{suffix}", "1", "{}", ExpectedVersion: 1))).Status);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.CommitAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.RollbackAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.LoadAsync(kind, sharedId));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.DeleteAsync(new DeleteDocumentRequest(
+                kind, sharedId)));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unitOfWork.SaveAsync(new SaveDocumentRequest(
+                kind, $"after-poison-{suffix}", "1", "{}")));
+        }
+        Assert.Null(await a.LoadAsync(kind, poisonedId));
+
         var restarted = await createStore(manifest, aAccess);
         Assert.NotNull(await restarted.LoadAsync(kind, sharedId));
 

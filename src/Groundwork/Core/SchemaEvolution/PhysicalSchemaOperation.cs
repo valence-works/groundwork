@@ -513,6 +513,7 @@ internal static class PhysicalSchemaOperationCanonicalizer
                 index.Name.Identifier,
                 index.Target.ToString(),
                 index.IsUnique.ToString(CultureInfo.InvariantCulture),
+                index.MissingValueBehavior.ToString(),
                 index.Definition.SchemaVersion.ToString(CultureInfo.InvariantCulture),
                 index.Definition.Evolution?.RequiresBackfill.ToString(CultureInfo.InvariantCulture),
                 index.Definition.Evolution?.IsDestructive.ToString(CultureInfo.InvariantCulture),

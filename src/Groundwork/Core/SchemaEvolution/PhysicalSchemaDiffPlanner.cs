@@ -261,6 +261,9 @@ public static class PhysicalSchemaDiffPlanner
         PhysicalSchemaOperationKind.CreatePhysicalEntityStorage => 0,
         PhysicalSchemaOperationKind.CreateLinkedStorage => 1,
         PhysicalSchemaOperationKind.AddProjectedColumn => 2,
+        // Existing canonical documents must be projected and required fields finalized before
+        // unique indexes are created. Linked index backfills run after creation only to reconcile
+        // the complete aggregate under the now-validated index definition.
         PhysicalSchemaOperationKind.BackfillCanonicalJson => operation is BackfillCanonicalJsonOperation
         {
             SubjectKind: CanonicalJsonBackfillSubjectKind.ProjectedColumn

@@ -54,9 +54,11 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
 
     public async ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
         PhysicalSchemaTargetIdentity target,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await WithConnectionAsync(async ct =>
         {
+            RequireApplicationLock(applicationLock, target);
             await using var command = connection.CreateCommand();
             command.CommandText = """
                 SELECT applied_state_json
@@ -74,10 +76,12 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
     public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
         PhysicalSchemaTargetIdentity target,
         PhysicalSchemaOperation operation,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await WithConnectionAsync(async ct =>
         {
             ArgumentNullException.ThrowIfNull(target);
+            RequireApplicationLock(applicationLock, target);
             var prior = await ReadOperationAsync(target, operation.Identity, ct);
             if (prior is not null)
             {
@@ -115,9 +119,13 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
     public async ValueTask RecordAppliedStateAsync(
         PhysicalSchemaAppliedState state,
         string? expectedAppliedTargetFingerprint,
+        IPhysicalSchemaApplicationLock applicationLock,
         CancellationToken cancellationToken) =>
         await WithConnectionAsync(async ct =>
         {
+            RequireApplicationLock(
+                applicationLock,
+                new PhysicalSchemaTargetIdentity(state.ManifestIdentity, state.Provider.Name));
             await using var transaction = await connection.BeginTransactionAsync(ct);
             var current = await ReadTargetFingerprintAsync(state.ManifestIdentity.Value, state.Provider.Name, transaction, ct);
             if (current == state.TargetFingerprint)
@@ -970,10 +978,26 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
         _ => "TEXT"
     };
 
+    private static void RequireApplicationLock(
+        IPhysicalSchemaApplicationLock applicationLock,
+        PhysicalSchemaTargetIdentity expectedTarget)
+    {
+        ArgumentNullException.ThrowIfNull(applicationLock);
+        if (applicationLock is not ApplicationLock sqliteLock ||
+            sqliteLock.Target != expectedTarget ||
+            !sqliteLock.IsOwned)
+        {
+            throw new InvalidOperationException(
+                $"SQLite physical schema execution requires its active application lock for target '{expectedTarget}'.");
+        }
+    }
+
     private sealed class ApplicationLock(PhysicalSchemaTargetIdentity target, Action release) : IPhysicalSchemaApplicationLock
     {
         private int disposed;
         public PhysicalSchemaTargetIdentity Target { get; } = target;
+        public CancellationToken OwnershipLost => CancellationToken.None;
+        public bool IsOwned => Volatile.Read(ref disposed) == 0;
         public ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref disposed, 1) == 0)

@@ -100,6 +100,24 @@ same-version restart-safe canonical-JSON backfill, durable fingerprints/CAS, and
 evidence. SQL Server and PostgreSQL conformance remain #47, MongoDB conformance remains #48, and
 CLI execution remains #49.
 
+MongoDB provider progress: [issue #48](https://github.com/valence-works/Groundwork/issues/48)
+implements all three forms from resolved executable routes. Shared collections use kind/scope keys
+and unit-owned linked projections, dedicated collections remain type-specific, and entity documents
+carry authoritative canonical JSON plus rebuildable in-primary fields. Native scoped compound,
+unique, and ordered indexes, exact bounded-query handler certifications, native explain evidence,
+renewable generation-fenced application locking, atomically fenced operation/applied-state
+evidence, same-version conflict detection, incarnation-safe restart backfill, replica-set
+transactions with structured same-identity conflict convergence, terminal failed units of work,
+unpublished-attempt backfill recovery, and concurrent materialization are covered by MongoDB
+container conformance. Factory and direct physical entry points share a cached transaction-topology
+gate, standalone deployments are rejected before schema or session side effects, and incompatible
+view, time-series, or capped namespaces fail creation/final/restart validation. Across conventional
+and physical relational/MongoDB stores, immutable commit-scope preconditions remain nonterminal,
+while every in-scope save/delete failure or non-success atomically rolls back and terminally poisons
+that unit of work.
+Keyset/latest physical-query certification remains a deliberate fail-fast gap rather than an
+advertised capability.
+
 Diagnostic-record observability progress: [issue #57](https://github.com/valence-works/Groundwork/issues/57)
 defines one versioned provider-neutral trace and metric boundary around append, query, inspect, and
 trim and wires it into SQLite, SQL Server, PostgreSQL, and MongoDB. The contract records bounded

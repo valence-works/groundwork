@@ -139,6 +139,8 @@ public sealed class ExecutablePhysicalIndexRoute : IEquatable<ExecutablePhysical
 
     public bool IsUnique => Definition.IsUnique;
 
+    public Groundwork.Core.Indexing.MissingValueBehavior MissingValueBehavior => Definition.MissingValueBehavior;
+
     public bool Equals(ExecutablePhysicalIndexRoute? other) =>
         other is not null &&
         Definition.Equals(other.Definition) &&

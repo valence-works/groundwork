@@ -418,8 +418,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
 
         await using var firstLock = await executor.AcquireApplicationLockAsync(first.Identity, CancellationToken.None);
         await using var secondLock = await executor.AcquireApplicationLockAsync(second.Identity, CancellationToken.None);
-        await executor.ApplyOperationAsync(first.Identity, firstOperation, CancellationToken.None);
-        await executor.ApplyOperationAsync(second.Identity, secondOperation, CancellationToken.None);
+        await executor.ApplyOperationAsync(first.Identity, firstOperation, firstLock, CancellationToken.None);
+        await executor.ApplyOperationAsync(second.Identity, secondOperation, secondLock, CancellationToken.None);
 
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(DISTINCT manifest_id) FROM groundwork_physical_schema_operations;";
@@ -436,7 +436,11 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         var operation = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, DateTimeOffset.UtcNow)
             .Operations.First(candidate => candidate is not RecordPhysicalSchemaAppliedStateOperation);
         await using (var applicationLock = await executor.AcquireApplicationLockAsync(target.Identity, CancellationToken.None))
-            _ = await executor.ApplyOperationAsync(target.Identity, operation, CancellationToken.None);
+            _ = await executor.ApplyOperationAsync(
+                target.Identity,
+                operation,
+                applicationLock,
+                CancellationToken.None);
 
         var restarted = await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
 

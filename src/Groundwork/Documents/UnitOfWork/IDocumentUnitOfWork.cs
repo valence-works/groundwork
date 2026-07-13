@@ -34,23 +34,27 @@ public interface IDocumentSessionFactory
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Staging:</b> each <see cref="SaveAsync"/>/<see cref="DeleteAsync"/> executes against the open
-/// unit of work and returns its <see cref="DocumentStoreWriteResult"/> immediately (including
-/// optimistic-concurrency <c>ConcurrencyConflict</c>/<c>NotFound</c> outcomes), so the caller can
-/// decide whether to continue, <see cref="CommitAsync"/>, or <see cref="RollbackAsync"/>.
+/// <b>Commit-scope contract:</b> save, delete, and load reject a document kind that was not named
+/// when the unit of work began. This argument rejection happens before database traffic and does not
+/// make the unit of work terminal; a subsequent in-scope operation may continue normally.
 /// </para>
 /// <para>
-/// <b>All-or-nothing contract:</b> nothing is durable until <see cref="CommitAsync"/>. To honour
-/// all-or-nothing semantics the caller must roll back when any staged operation reports a non-success
-/// status (a status other than <see cref="DocumentStoreWriteStatus.Saved"/> or
-/// <see cref="DocumentStoreWriteStatus.Deleted"/>). If a staged operation throws, or the unit of work
-/// is disposed without committing, it is rolled back.
+/// <b>Staging:</b> each <see cref="SaveAsync"/>/<see cref="DeleteAsync"/> executes against the open
+/// unit of work and returns its <see cref="DocumentStoreWriteResult"/> immediately. A non-success
+/// outcome (including optimistic-concurrency <c>ConcurrencyConflict</c>/<c>NotFound</c>) atomically
+/// rolls back and terminally poisons that unit of work; the caller must begin a new unit of work.
+/// </para>
+/// <para>
+/// <b>All-or-nothing contract:</b> nothing is durable until <see cref="CommitAsync"/>. A non-successful
+/// or failed save/delete rolls back the complete transaction before returning or throwing. Disposing
+/// without committing also rolls back.
 /// </para>
 /// <para>
 /// <b>Failure contract:</b> some providers (for example PostgreSQL) abort the whole transaction when a
-/// single statement fails at the database level; after such a failure the only valid next step is
-/// <see cref="RollbackAsync"/>/dispose. <see cref="CommitAsync"/> surfaces any commit-time failure as
-/// an exception, leaving nothing durable.
+/// single statement fails at the database level. Groundwork therefore makes every failed or
+/// non-successful save/delete terminal consistently across providers. <see cref="CommitAsync"/>,
+/// <see cref="RollbackAsync"/>, and further operations reject the completed unit. Commit-time failures
+/// surface as exceptions and leave the unit terminal.
 /// </para>
 /// </remarks>
 public interface IDocumentUnitOfWork : IAsyncDisposable
@@ -64,7 +68,11 @@ public interface IDocumentUnitOfWork : IAsyncDisposable
     /// <summary>Reads a document through the unit of work (sees this unit of work's uncommitted writes).</summary>
     Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default);
 
-    /// <summary>Atomically commits every staged operation. Throws if the commit cannot be honoured.</summary>
+    /// <summary>
+    /// Atomically commits every staged operation. Throws if the commit cannot be honoured. A
+    /// <see cref="DocumentCommitAcknowledgementUncertainException"/> means the commit may be durable
+    /// and callers must reconcile rather than repeat the transaction blindly.
+    /// </summary>
     Task CommitAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Discards every staged operation.</summary>

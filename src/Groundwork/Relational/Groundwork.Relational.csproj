@@ -7,6 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Groundwork.Sqlite.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Core\Groundwork.Core.csproj" />
     <ProjectReference Include="..\Documents\Groundwork.Documents.csproj" />
     <ProjectReference Include="..\Materialization\Groundwork.Materialization.csproj" />

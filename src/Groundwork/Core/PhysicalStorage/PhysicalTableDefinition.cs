@@ -1,3 +1,5 @@
+using Groundwork.Core.Indexing;
+
 namespace Groundwork.Core.PhysicalStorage;
 
 /// <summary>The portable data type of a projected physical column.</summary>
@@ -88,7 +90,8 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         bool isUnique = false,
         int schemaVersion = 1,
         PhysicalEvolutionMetadata? evolution = null,
-        PhysicalIndexStorageTarget target = PhysicalIndexStorageTarget.FormDefault)
+        PhysicalIndexStorageTarget target = PhysicalIndexStorageTarget.FormDefault,
+        MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded)
     {
         LogicalName = logicalName;
         Columns = Array.AsReadOnly(columns?
@@ -99,6 +102,7 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         SchemaVersion = schemaVersion;
         Evolution = evolution;
         Target = target;
+        MissingValueBehavior = missingValueBehavior;
     }
 
     public string LogicalName { get; }
@@ -113,6 +117,9 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
 
     public PhysicalIndexStorageTarget Target { get; }
 
+    /// <summary>Controls whether absent logical value fields participate in this physical index.</summary>
+    public MissingValueBehavior MissingValueBehavior { get; }
+
     public bool Equals(PhysicalIndexDefinition? other) =>
         other is not null &&
         LogicalName == other.LogicalName &&
@@ -120,7 +127,8 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         IsUnique == other.IsUnique &&
         SchemaVersion == other.SchemaVersion &&
         Evolution == other.Evolution &&
-        Target == other.Target;
+        Target == other.Target &&
+        MissingValueBehavior == other.MissingValueBehavior;
 
     public override bool Equals(object? obj) => Equals(obj as PhysicalIndexDefinition);
 
@@ -134,6 +142,7 @@ public sealed class PhysicalIndexDefinition : IEquatable<PhysicalIndexDefinition
         hash.Add(SchemaVersion);
         hash.Add(Evolution);
         hash.Add(Target);
+        hash.Add(MissingValueBehavior);
         return hash.ToHashCode();
     }
 }

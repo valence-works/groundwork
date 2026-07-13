@@ -1,8 +1,5 @@
 using Groundwork.DiagnosticRecords;
-using MongoDB.Bson;
 using MongoDB.Driver;
-using MongoDB.Driver.Core.Clusters;
-using MongoDB.Driver.Core.Servers;
 
 namespace Groundwork.MongoDb.DiagnosticRecords;
 
@@ -21,8 +18,12 @@ public static class MongoDbDiagnosticRecordStoreFactory
         try
         {
             var database = client.GetDatabase(databaseName);
-            await database.RunCommandAsync<BsonDocument>(new BsonDocument("ping", 1), cancellationToken: cancellationToken);
-            EnsureTransactionCapable(client.Cluster.Description);
+            if (!await MongoDbTransactionTopology.SupportsTransactionsAsync(database, cancellationToken))
+            {
+                throw new NotSupportedException(
+                    $"MongoDB diagnostic records require multi-document transactions; deployment type " +
+                    $"'{client.Cluster.Description.Type}' is unsupported. Configure a replica set or sharded cluster.");
+            }
             await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, definition, cancellationToken);
             return new(client, new(database, definition, timeProvider));
         }
@@ -33,17 +34,6 @@ public static class MongoDbDiagnosticRecordStoreFactory
         }
     }
 
-    internal static void EnsureTransactionCapable(ClusterDescription cluster)
-    {
-        var transactionCapable = cluster.Type is ClusterType.ReplicaSet or ClusterType.Sharded ||
-                                 cluster.Servers.Any(server => server.Type is
-                                     ServerType.ReplicaSetPrimary or
-                                     ServerType.ReplicaSetSecondary or
-                                     ServerType.ShardRouter);
-        if (!transactionCapable)
-            throw new NotSupportedException(
-                $"MongoDB diagnostic records require multi-document transactions; deployment type '{cluster.Type}' is unsupported. Configure a replica set or sharded cluster.");
-    }
 }
 
 public sealed class MongoDbDiagnosticRecordStoreHandle(

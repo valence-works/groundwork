@@ -162,6 +162,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteStartObject();
             writer.WriteString("logicalName", index.LogicalName);
             writer.WriteBoolean("unique", index.IsUnique);
+            writer.WriteString("missingValueBehavior", index.MissingValueBehavior.ToString());
             writer.WriteString("target", index.Target.ToString());
             writer.WriteNumber("schemaVersion", index.SchemaVersion);
             WriteEvolution(writer, index.Evolution);

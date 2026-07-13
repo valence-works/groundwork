@@ -280,6 +280,16 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore
         return handler.AnyAsync(query, plan, cancellationToken);
     }
 
+    /// <summary>
+    /// Validates the complete runtime query shape through the same path used by execution and
+    /// returns the immutable physical plan. Provider-native explain APIs use this method so they
+    /// cannot explain a query that normal execution would reject.
+    /// </summary>
+    public PhysicalQueryPlan ResolvePlan(
+        DocumentQuery query,
+        BoundedQueryResultOperation operation = BoundedQueryResultOperation.Documents) =>
+        Resolve(query, operation).Plan;
+
     private (PhysicalQueryPlan Plan, IPhysicalDocumentQueryHandler Handler) Resolve(
         DocumentQuery query,
         BoundedQueryResultOperation operation)

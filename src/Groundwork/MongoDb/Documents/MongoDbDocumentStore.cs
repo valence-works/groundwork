@@ -11,8 +11,6 @@ using Groundwork.Documents.UnitOfWork;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
-using MongoDB.Driver.Core.Clusters;
-using MongoDB.Driver.Core.Servers;
 
 namespace Groundwork.MongoDb.Documents;
 
@@ -22,6 +20,8 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private readonly StorageManifest manifest;
     private readonly DocumentStoreAccess access;
     private readonly IStorageScopeObserver scopeObserver;
+    private readonly Func<CancellationToken, Task<bool>> supportsTransactionsAsync;
+    private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
 
     public DocumentStoreAccess Access => access;
 
@@ -30,11 +30,26 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         StorageManifest manifest,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
+        : this(database, manifest, access, scopeObserver, null, null)
+    {
+    }
+
+    internal MongoDbDocumentStore(
+        IMongoDatabase database,
+        StorageManifest manifest,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver,
+        Func<CancellationToken, Task<bool>>? supportsTransactionsAsync,
+        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync)
     {
         this.database = database ?? throw new ArgumentNullException(nameof(database));
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         this.access = access ?? throw new ArgumentNullException(nameof(access));
         this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
+        this.supportsTransactionsAsync = supportsTransactionsAsync ??
+            (ct => MongoDbTransactionTopology.SupportsTransactionsAsync(this.database, ct));
+        this.startSessionAsync = startSessionAsync ??
+            (ct => this.database.Client.StartSessionAsync(cancellationToken: ct));
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
     }
 
@@ -143,12 +158,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     }
 
     public TransactionBoundary TransactionBoundary =>
-        SupportsTransactions()
+        MongoDbTransactionTopology.IsKnownTransactionCapable(database.Client.Cluster.Description)
             ? TransactionBoundary.CrossUnitAtomic
             : TransactionBoundary.PerOperation;
 
     public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(scope);
         var units = scope.Kinds.Select(GetUnit).ToArray();
         if (units.Select(ScopePolicy).Distinct().Count() != 1)
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(units[0]));
@@ -158,12 +174,12 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             throw DocumentStoreScopeResolver.RejectMixedUnitOfWork(scopeObserver, ScopePolicy(GetUnit(scope.Kinds[0])));
 
         var clusterType = database.Client.Cluster.Description.Type;
-        if (!await SupportsTransactionsAsync(cancellationToken))
+        if (!await supportsTransactionsAsync(cancellationToken))
             throw new UnsupportedAtomicCommitException(
                 scope.Kinds,
                 $"MongoDB multi-document transactions require a replica set or sharded cluster, but the connected deployment is '{clusterType}'.");
 
-        var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
+        var session = await startSessionAsync(cancellationToken);
         try
         {
             session.StartTransaction();
@@ -173,24 +189,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             session.Dispose();
             throw new UnsupportedAtomicCommitException(scope.Kinds, exception.Message);
         }
+        catch
+        {
+            session.Dispose();
+            throw;
+        }
 
-        return new MongoDocumentUnitOfWork(this, session);
-    }
-
-    private bool SupportsTransactions() =>
-        database.Client.Cluster.Description.Type is ClusterType.ReplicaSet or ClusterType.Sharded ||
-        database.Client.Cluster.Description.Servers.Any(server =>
-            server.Type is ServerType.ReplicaSetPrimary or ServerType.ReplicaSetSecondary or ServerType.ShardRouter);
-
-    private async Task<bool> SupportsTransactionsAsync(CancellationToken cancellationToken)
-    {
-        if (SupportsTransactions())
-            return true;
-
-        var hello = await database.RunCommandAsync<BsonDocument>(
-            new BsonDocument("hello", 1),
-            cancellationToken: cancellationToken);
-        return hello.Contains("setName") || hello.GetValue("msg", BsonNull.Value) == "isdbgrid";
+        return new MongoDocumentUnitOfWork(this, session, scope);
     }
 
     private static Task InsertOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, BsonDocument document, CancellationToken cancellationToken) =>
@@ -475,29 +480,57 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private static bool IsDuplicateKey(MongoWriteException exception) =>
         exception.WriteError?.Code == 11000;
 
-    private sealed class MongoDocumentUnitOfWork(MongoDbDocumentStore store, IClientSessionHandle session) : IDocumentUnitOfWork
+    private sealed class MongoDocumentUnitOfWork(
+        MongoDbDocumentStore store,
+        IClientSessionHandle session,
+        DocumentCommitScope commitScope) : IDocumentUnitOfWork
     {
         private bool completed;
 
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            var unit = store.GetUnit(request.DocumentKind);
-            var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
-            return await store.SaveCoreAsync(unit, request, scope, session, cancellationToken);
+            commitScope.EnsureIncludes(request.DocumentKind);
+            try
+            {
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
+                var result = await store.SaveCoreAsync(unit, request, scope, session, cancellationToken);
+                if (result.Status != DocumentStoreWriteStatus.Saved)
+                    await AbortAsync(CancellationToken.None);
+                return result;
+            }
+            catch
+            {
+                await AbortAsync(CancellationToken.None);
+                throw;
+            }
         }
 
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            var unit = store.GetUnit(request.DocumentKind);
-            var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
-            return await store.DeleteCoreAsync(unit, request, scope, session, cancellationToken);
+            commitScope.EnsureIncludes(request.DocumentKind);
+            try
+            {
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
+                var result = await store.DeleteCoreAsync(unit, request, scope, session, cancellationToken);
+                if (result.Status != DocumentStoreWriteStatus.Deleted)
+                    await AbortAsync(CancellationToken.None);
+                return result;
+            }
+            catch
+            {
+                await AbortAsync(CancellationToken.None);
+                throw;
+            }
         }
 
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            commitScope.EnsureIncludes(documentKind);
             var unit = store.GetUnit(documentKind);
             var scope = store.ResolveScope(unit, StorageScopeOperation.Load);
             return await store.LoadCoreAsync(unit, id, scope, session, cancellationToken);
@@ -519,14 +552,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         public async Task RollbackAsync(CancellationToken cancellationToken = default)
         {
             EnsureActive();
-            try
-            {
-                await session.AbortTransactionAsync(cancellationToken);
-            }
-            finally
-            {
-                Complete();
-            }
+            await AbortAsync(cancellationToken);
         }
 
         public async ValueTask DisposeAsync()
@@ -556,6 +582,26 @@ public sealed class MongoDbDocumentStore : IDocumentStore
 
             completed = true;
             session.Dispose();
+        }
+
+        private async Task AbortAsync(CancellationToken cancellationToken)
+        {
+            if (completed)
+                return;
+
+            try
+            {
+                if (session.IsInTransaction)
+                    await session.AbortTransactionAsync(cancellationToken);
+            }
+            catch (MongoException)
+            {
+                // A failed write or non-success result already makes the unit of work terminal.
+            }
+            finally
+            {
+                Complete();
+            }
         }
 
         private void EnsureActive()
