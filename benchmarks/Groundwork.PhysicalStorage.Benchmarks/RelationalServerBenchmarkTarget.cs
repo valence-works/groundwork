@@ -154,17 +154,28 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
         return Task.CompletedTask;
     }
 
-    private protected RelationalPhysicalQueryCommand RenderQuery(DocumentQuery query)
+    private protected RelationalPhysicalQueryCommand RenderPlan(BenchmarkPlanRequest request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        var query = Query(request.Skip, request.Take, request.Ordered);
         var store = CreateStore(Model.Manifest, Model.Target.Routes, DocumentStoreAccess.Scoped(new("tenant-a")));
-        return RelationalPhysicalQueryRuntime.BuildQueryCommand(
-            store,
-            Model.Manifest,
-            Model.Route,
-            GroundworkProvider,
-            HandlerPrefix,
-            query,
-            CanonicalJsonValueKinds);
+        return request.Operation == NativePlanOperation.Selection
+            ? RelationalPhysicalQueryRuntime.BuildQueryCommand(
+                store,
+                Model.Manifest,
+                Model.Route,
+                GroundworkProvider,
+                HandlerPrefix,
+                query,
+                CanonicalJsonValueKinds)
+            : RelationalPhysicalQueryRuntime.BuildCountCommand(
+                store,
+                Model.Manifest,
+                Model.Route,
+                GroundworkProvider,
+                HandlerPrefix,
+                query.Select(BoundedQueryResultOperation.Count),
+                CanonicalJsonValueKinds);
     }
 
     protected abstract Task CreateIsolationBoundaryAsync(CancellationToken cancellationToken);

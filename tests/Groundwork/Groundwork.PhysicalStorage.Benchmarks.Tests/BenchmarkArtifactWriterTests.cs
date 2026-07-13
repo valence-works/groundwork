@@ -58,6 +58,42 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Evidence_uses_honest_net_growth_names_and_empty_plan_arrays_for_mutations()
+    {
+        var layout = new ArtifactLayout(root);
+        var benchmarkCase = new BenchmarkCase(
+            BenchmarkProvider.Sqlite,
+            PhysicalStorageForm.PhysicalEntityTable,
+            BenchmarkWorkload.Insert);
+        var before = new StorageSnapshot(100, 10, 1, 0, new Dictionary<string, long>());
+        var after = new StorageSnapshot(500, 20, 5, 0, new Dictionary<string, long>());
+        var sample = new BenchmarkSample(
+            0, 4, 1_000, 40, 4, 200, 4, before, after, new Dictionary<string, long>());
+        var report = new BenchmarkRunReport(
+            BenchmarkProfiles.SchemaVersion,
+            "test-run",
+            BenchmarkRunMode.Smoke,
+            [new BenchmarkCaseResult(
+                benchmarkCase,
+                new CorrectnessGateResult(true, true, true, true, true),
+                [],
+                BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
+                [sample])],
+            [],
+            new BaselineEligibility(false, ["Smoke runs are not promotable."]));
+
+        await using (var writer = new BenchmarkArtifactWriter(layout))
+            await writer.WriteReportAsync(report, CancellationToken.None);
+
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(layout.ElsaMigrationEvidenceJson));
+        var evidenceCase = document.RootElement.GetProperty("cases")[0];
+        Assert.Equal(2, evidenceCase.GetProperty("netStorageGrowthBytesPerLogicalPayloadByte").GetDouble());
+        Assert.Equal(1, evidenceCase.GetProperty("netPhysicalRowGrowthPerLogicalMutation").GetDouble());
+        Assert.Empty(evidenceCase.GetProperty("planArtifacts").EnumerateArray());
+        Assert.False(evidenceCase.TryGetProperty("writeAmplificationBytesPerLogicalByte", out _));
+    }
+
+    [Fact]
     public async Task Complete_run_directory_round_trips_with_baseline_provenance()
     {
         var layout = new ArtifactLayout(root);

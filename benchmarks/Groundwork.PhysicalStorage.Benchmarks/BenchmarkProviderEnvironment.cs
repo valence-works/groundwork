@@ -5,7 +5,22 @@ using Testcontainers.PostgreSql;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
 
-public sealed class BenchmarkProviderEnvironment : IAsyncDisposable
+internal interface IBenchmarkProviderEnvironment : IAsyncDisposable
+{
+    Task StartAsync(
+        IReadOnlyList<BenchmarkProvider> providers,
+        bool allowContainers,
+        CancellationToken cancellationToken);
+
+    IPhysicalStorageBenchmarkTarget CreateTarget(
+        BenchmarkProvider provider,
+        PhysicalStorageForm form,
+        string instance,
+        string scratchDirectory,
+        int migrationDatasetSize);
+}
+
+public sealed class BenchmarkProviderEnvironment : IBenchmarkProviderEnvironment
 {
     public const string SqlServerImage = "mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04";
     public const string PostgreSqlImage = "postgres:17.6-alpine3.22";

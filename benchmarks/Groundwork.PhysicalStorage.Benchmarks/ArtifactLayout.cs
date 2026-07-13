@@ -28,12 +28,12 @@ public sealed class ArtifactLayout
             throw new InvalidOperationException($"Benchmark output directory '{Root}' is not empty.");
     }
 
-    public string Plan(BenchmarkCase benchmarkCase, string extension) => Path.Combine(
+    public string Plan(BenchmarkCase benchmarkCase, NativePlanOperation operation, string extension) => Path.Combine(
         Root,
         "plans",
         benchmarkCase.Provider.ToString().ToLowerInvariant(),
         benchmarkCase.StorageForm.ToString().ToLowerInvariant(),
-        $"{benchmarkCase.Workload.ToString().ToLowerInvariant()}.{extension.TrimStart('.')}");
+        $"{benchmarkCase.Workload.ToString().ToLowerInvariant()}-{operation.ToString().ToLowerInvariant()}.{extension.TrimStart('.')}");
 
     public void CreateDirectories()
     {
@@ -43,7 +43,7 @@ public sealed class ArtifactLayout
                      MachineMetadata, ProviderMetadata, Configuration,
                      Plan(new BenchmarkCase(BenchmarkProvider.Sqlite,
                          Groundwork.Core.PhysicalStorage.PhysicalStorageForm.SharedDocuments,
-                         BenchmarkWorkload.IndexedQuery), "txt")
+                         BenchmarkWorkload.IndexedQuery), NativePlanOperation.Selection, "txt")
                  })
         {
             Directory.CreateDirectory(Path.GetDirectoryName(file)!);

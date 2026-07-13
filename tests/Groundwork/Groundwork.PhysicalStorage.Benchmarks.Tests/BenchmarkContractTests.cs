@@ -46,8 +46,35 @@ public sealed class BenchmarkContractTests
         Assert.EndsWith("metadata/machine.json", layout.MachineMetadata, StringComparison.Ordinal);
         Assert.Equal("reports/summary.json", layout.RelativePath(layout.SummaryJson));
         Assert.EndsWith(
-            "plans/postgresql/physicalentitytable/indexedquery.json",
-            layout.Plan(benchmarkCase, "json"),
+            "plans/postgresql/physicalentitytable/indexedquery-selection.json",
+            layout.Plan(benchmarkCase, NativePlanOperation.Selection, "json"),
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Native_plan_requests_cover_only_the_six_exact_timed_query_shapes()
+    {
+        var requests = BenchmarkPlanRequests.ForWorkloads(Enum.GetValues<BenchmarkWorkload>());
+
+        Assert.Collection(
+            requests,
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.IndexedQuery, NativePlanOperation.Selection, Ordered: false, Skip: null, Take: 20),
+                request),
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.IndexedQuery, NativePlanOperation.Count, Ordered: false, Skip: null, Take: 20),
+                request),
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.MixedCompoundOrdering, NativePlanOperation.Selection, Ordered: true, Skip: null, Take: 20),
+                request),
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.MixedCompoundOrdering, NativePlanOperation.Count, Ordered: true, Skip: null, Take: 20),
+                request),
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.PaginationAndCount, NativePlanOperation.Selection, Ordered: true, Skip: 7, Take: 20),
+                request),
+            request => Assert.Equal(
+                new BenchmarkPlanRequest(BenchmarkWorkload.PaginationAndCount, NativePlanOperation.Count, Ordered: true, Skip: 7, Take: 20),
+                request));
     }
 }

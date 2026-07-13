@@ -18,14 +18,17 @@ public sealed class SqliteBenchmarkTargetTests : IAsyncDisposable
         await target.SeedAsync(BenchmarkProfiles.ReproducibleSeed, 40, CancellationToken.None);
 
         var correctness = await target.RunCorrectnessGateAsync(CancellationToken.None);
-        var plan = await target.RunNativePlanGateAsync(CancellationToken.None);
+        var plans = await target.RunNativePlanGatesAsync(
+            BenchmarkPlanRequests.ForWorkloads([BenchmarkWorkload.IndexedQuery]),
+            CancellationToken.None);
 
         Assert.True(correctness.ScopeIsolation);
         Assert.True(correctness.OptimisticConcurrency);
         Assert.True(correctness.UnitOfWorkRollback);
         Assert.True(correctness.BoundedQuery);
         Assert.True(correctness.MixedOrdering);
-        Assert.Contains(plan.IndexName, plan.NativePlan, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, plans.Count);
+        Assert.All(plans, plan => Assert.Contains(plan.IndexName, plan.NativePlan, StringComparison.OrdinalIgnoreCase));
     }
 
     [Theory]

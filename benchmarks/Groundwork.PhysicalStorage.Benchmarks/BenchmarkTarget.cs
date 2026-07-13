@@ -2,7 +2,41 @@ using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
 
+public enum NativePlanOperation
+{
+    Selection,
+    Count
+}
+
+public sealed record BenchmarkPlanRequest(
+    BenchmarkWorkload Workload,
+    NativePlanOperation Operation,
+    bool Ordered,
+    int? Skip,
+    int? Take);
+
+public static class BenchmarkPlanRequests
+{
+    private static readonly IReadOnlyList<BenchmarkPlanRequest> Canonical =
+    [
+        new(BenchmarkWorkload.IndexedQuery, NativePlanOperation.Selection, Ordered: false, Skip: null, Take: 20),
+        new(BenchmarkWorkload.IndexedQuery, NativePlanOperation.Count, Ordered: false, Skip: null, Take: 20),
+        new(BenchmarkWorkload.MixedCompoundOrdering, NativePlanOperation.Selection, Ordered: true, Skip: null, Take: 20),
+        new(BenchmarkWorkload.MixedCompoundOrdering, NativePlanOperation.Count, Ordered: true, Skip: null, Take: 20),
+        new(BenchmarkWorkload.PaginationAndCount, NativePlanOperation.Selection, Ordered: true, Skip: 7, Take: 20),
+        new(BenchmarkWorkload.PaginationAndCount, NativePlanOperation.Count, Ordered: true, Skip: 7, Take: 20)
+    ];
+
+    public static IReadOnlyList<BenchmarkPlanRequest> ForWorkloads(IEnumerable<BenchmarkWorkload> workloads)
+    {
+        ArgumentNullException.ThrowIfNull(workloads);
+        var selected = workloads.ToHashSet();
+        return Canonical.Where(request => selected.Contains(request.Workload)).ToArray();
+    }
+}
+
 public sealed record NativePlanEvidence(
+    BenchmarkPlanRequest Request,
     string Provider,
     string StorageForm,
     string QueryIdentity,
@@ -35,7 +69,9 @@ public interface IPhysicalStorageBenchmarkTarget : IAsyncDisposable
     Task InitializeAsync(CancellationToken cancellationToken);
     Task SeedAsync(int seed, int count, CancellationToken cancellationToken);
     Task<CorrectnessGateResult> RunCorrectnessGateAsync(CancellationToken cancellationToken);
-    Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken);
+    Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken);
     Task PrepareWorkloadAsync(BenchmarkWorkload workload, int totalIterations, int operationsPerIteration, CancellationToken cancellationToken);
     Task PrepareIterationAsync(BenchmarkWorkload workload, int iteration, CancellationToken cancellationToken);
     Task<WorkloadExecution> ExecuteAsync(BenchmarkWorkload workload, int iteration, int operations, int concurrency, CancellationToken cancellationToken);

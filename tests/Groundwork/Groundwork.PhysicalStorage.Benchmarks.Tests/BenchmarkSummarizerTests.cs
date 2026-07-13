@@ -24,8 +24,8 @@ public sealed class BenchmarkSummarizerTests
         Assert.Equal(30, summary.AllocatedBytesPerOperation);
         Assert.Equal(0.6, summary.RoundTripsPerOperation);
         Assert.Equal(400, summary.StorageGrowthBytes);
-        Assert.Equal(2, summary.WriteAmplificationBytesPerLogicalByte);
-        Assert.Equal(1, summary.PhysicalRowsPerLogicalMutation);
+        Assert.Equal(2, summary.NetStorageGrowthBytesPerLogicalPayloadByte);
+        Assert.Equal(1, summary.NetPhysicalRowGrowthPerLogicalMutation);
         Assert.Equal(0.6, summary.ProviderWorkPerOperation["commands"]);
 
         var json = JsonSerializer.Serialize(samples[0], BenchmarkJson.Options);

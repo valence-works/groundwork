@@ -16,17 +16,18 @@ Before timing, every selected provider and storage form must prove:
 
 1. storage-scope isolation, optimistic concurrency, unit-of-work rollback, bounded query/count
    agreement, and mixed-direction ordering; and
-2. selection of the declared index through provider-native `EXPLAIN`, `STATISTICS XML`, or MongoDB
-   `explain`, with full scans rejected.
+2. on a separately initialized and identically seeded disposable target, selection of the declared
+   index through provider-native `EXPLAIN`, `STATISTICS XML`, or MongoDB `explain`, with full scans
+   rejected for every applicable timed selection and count shape.
 
 The backfill workload has an additional post-measurement check. Outside the timed region, it uses
 the additive model to run the bounded query and directly queries the newly projected `category`
 field. Both counts must match the seeded migration row count.
 
-The SQL Server plan gate temporarily adds internally consistent plan-only documents outside the
-timed workload, refreshes statistics, captures the native plan, then removes those documents and
-refreshes statistics again. This keeps smoke-profile optimizer decisions representative without
-changing measured workload data.
+After the identical deterministic seed, a plan target may add internally consistent plan-only
+documents to reach a provider-specific optimizer floor and refresh statistics. SQL Server removes
+its larger temporary set after capture. Each plan target is disposable and distinct from the
+measured database, so optimizer assistance cannot mutate measured workload data or statistics.
 
 These are harness correctness gates only. Passing them does not make performance evidence complete.
 
@@ -135,9 +136,10 @@ across those normalized **batch means**:
 
 They are not percentiles of individual-operation latency because the harness does not record an
 individual latency distribution. Reports also contain aggregate throughput, allocation per
-operation, observable round trips, storage growth, write amplification, physical rows per logical
-mutation, provider work signals, and native-plan evidence where observable. A missing round-trip
-signal is `null`, never zero.
+operation, observable round trips, net storage growth per logical payload byte, net physical-row
+growth per logical mutation, provider work signals, and native-plan evidence where observable. These
+are net cardinality/storage ratios, not database write-amplification measurements. A missing
+round-trip signal is `null`, never zero.
 
 Regression comparisons remain available as diagnostic scaffolding. Current scheduled evidence is
 explicitly incompatible with gating because its evidence readiness is insufficient and its baseline
@@ -150,8 +152,8 @@ manifest.json
 metadata/configuration.json
 metadata/machine.json
 metadata/providers.json
-plans/<provider>/<form>/<workload>.<native-extension>
-plans/<provider>/<form>/<workload>.<native-extension>.assertions.json
+plans/<provider>/<form>/<workload>-<selection|count>.<native-extension>
+plans/<provider>/<form>/<workload>-<selection|count>.<native-extension>.assertions.json
 raw/measurements.jsonl
 reports/summary.json
 reports/summary.md

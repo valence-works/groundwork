@@ -41,9 +41,11 @@ public sealed class PostgreSqlBenchmarkTarget(
     protected override string HandlerPrefix => "postgresql";
     protected override string ConnectionString => connectionString;
 
-    public override async Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken)
+    public override async Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken)
     {
-        var rendered = RenderQuery(Query(take: 20));
+        await EnsurePlanScaleAsync(10_000, cancellationToken);
         await using var connection = new NpgsqlConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using (var statistics = connection.CreateCommand())
@@ -53,23 +55,30 @@ public sealed class PostgreSqlBenchmarkTarget(
                 : $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)}; ANALYZE {Q(Model.Route.LinkedIndexStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync(cancellationToken);
         }
-        await using var command = connection.CreateCommand();
-        command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";
-        foreach (var (name, value) in rendered.Parameters)
-            command.Parameters.AddWithValue(name, value ?? DBNull.Value);
-        var plan = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
         var indexName = Model.Route.Indexes.Single().Name.Identifier;
-        if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
-            plan.Contains("\"Node Type\": \"Seq Scan\"", StringComparison.OrdinalIgnoreCase))
+        var evidence = new List<NativePlanEvidence>(requests.Count);
+        foreach (var request in requests)
         {
-            throw new InvalidOperationException(
-                $"PostgreSQL native-plan gate rejected the scale-bearing query. Expected index '{indexName}'.{Environment.NewLine}{plan}");
+            var rendered = RenderPlan(request);
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";
+            foreach (var (name, value) in rendered.Parameters)
+                command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+            var plan = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
+            if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
+                plan.Contains("\"Node Type\": \"Seq Scan\"", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"PostgreSQL native-plan gate rejected {request.Workload}/{request.Operation}. Expected index '{indexName}'.{Environment.NewLine}{plan}");
+            }
+            evidence.Add(new NativePlanEvidence(
+                request,
+                Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
+                (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
+                indexName, plan,
+                ["declared index is selected", "Seq Scan is absent", "query shape is rendered by the certified production handler"]));
         }
-        return new NativePlanEvidence(
-            Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
-            (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
-            indexName, plan,
-            ["declared index is selected", "Seq Scan is absent", "query is rendered by the certified production handler"]);
+        return evidence;
     }
 
     public override async Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken)

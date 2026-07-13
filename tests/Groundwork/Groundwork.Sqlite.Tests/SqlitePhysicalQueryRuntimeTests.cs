@@ -4,6 +4,7 @@ using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
+using Groundwork.Relational.Documents;
 using Groundwork.Sqlite.Documents;
 using Groundwork.Sqlite.PhysicalStorage;
 using Microsoft.Data.Sqlite;
@@ -13,6 +14,35 @@ namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqlitePhysicalQueryRuntimeTests
 {
+    [Fact]
+    public async Task Linked_index_count_command_does_not_join_the_primary_envelope_table()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            resultOperation: BoundedQueryResultOperation.Count);
+
+        var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
+            store,
+            manifest,
+            route,
+            target.Provider,
+            "sqlite",
+            query);
+
+        Assert.Contains(route.LinkedIndexStorage!.Name.Identifier, rendered.CommandText, StringComparison.Ordinal);
+        Assert.DoesNotContain(route.PrimaryStorage.Name.Identifier, rendered.CommandText, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]

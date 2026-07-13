@@ -54,8 +54,11 @@ public static class BaselineEligibilityEvaluator
             diagnostics.Add($"Future baseline activation also requires exactly {BenchmarkProfiles.Scheduled.MeasurementIterations} measured samples per scaffold case.");
         if (cases.Any(result => !AllPassed(result.Correctness)))
             diagnostics.Add("Future baseline activation also requires all correctness gates to pass.");
-        if (cases.Any(result => string.IsNullOrWhiteSpace(result.PlanArtifact)))
-            diagnostics.Add("Future baseline activation also requires native plan evidence for every case.");
+        if (cases.Any(result =>
+                result.PlanArtifacts.Count != BenchmarkPlanRequests.ForWorkloads([result.Case.Workload]).Count ||
+                result.PlanArtifacts.Any(string.IsNullOrWhiteSpace) ||
+                result.PlanArtifacts.Distinct(StringComparer.Ordinal).Count() != result.PlanArtifacts.Count))
+            diagnostics.Add("Future baseline activation also requires every applicable native query-plan shape and no plans on non-query cases.");
 
         return new BaselineEligibility(false, diagnostics);
     }

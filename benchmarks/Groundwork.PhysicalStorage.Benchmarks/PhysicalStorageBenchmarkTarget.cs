@@ -69,10 +69,16 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     public async Task<CorrectnessGateResult> RunCorrectnessGateAsync(CancellationToken cancellationToken)
     {
         const string sharedId = "gate-same-id";
+        const string tenantBSentinelId = "gate-tenant-b-open-sentinel";
         RequireStatus(await TenantA.SaveAsync(Save(sharedId, Payload("open", 9, "gate")), cancellationToken),
             DocumentStoreWriteStatus.Saved, "tenant A gate insert");
         RequireStatus(await TenantB.SaveAsync(Save(sharedId, Payload("closed", 3, "gate")), cancellationToken),
             DocumentStoreWriteStatus.Saved, "tenant B gate insert");
+        RequireStatus(await TenantB.SaveAsync(
+                Save(tenantBSentinelId, Payload("open", int.MaxValue, "tenant-b-scope-sentinel")),
+                cancellationToken),
+            DocumentStoreWriteStatus.Saved,
+            "tenant B bounded-query sentinel insert");
         var tenantA = await TenantA.LoadAsync(BenchmarkModelFactory.DocumentKind, sharedId, cancellationToken);
         var tenantB = await TenantB.LoadAsync(BenchmarkModelFactory.DocumentKind, sharedId, cancellationToken);
         var scopeIsolation = tenantA?.ContentJson.Contains("\"open\"", StringComparison.Ordinal) == true &&
@@ -105,20 +111,22 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         if (!rollbackWorked)
             throw new InvalidOperationException("Correctness gate failed: rolled-back write is visible.");
 
-        var query = Query(skip: 0, take: Math.Min(25, Math.Max(1, seededCount)));
+        var expectedTenantAOpenCount = (seededCount + 1L) / 2L + 1L;
+        var query = Query(skip: 0, take: (int)Math.Min(25, Math.Max(1, expectedTenantAOpenCount)));
         var page = await QueriesA.QueryAsync(query, cancellationToken);
         var count = await QueriesA.CountAsync(query.Select(BoundedQueryResultOperation.Count), cancellationToken);
+        BoundedScopeGate.EnsureExpectedTenantPage(page, count, expectedTenantAOpenCount, tenantBSentinelId);
         var ranks = page.Documents.Select(document => ReadRank(document.ContentJson)).ToArray();
         var mixedOrder = ranks.SequenceEqual(ranks.OrderDescending());
-        if (page.TotalCount <= 0 || count != page.TotalCount)
-            throw new InvalidOperationException("Correctness gate failed: bounded query count and page disagree.");
         if (!mixedOrder)
             throw new InvalidOperationException("Correctness gate failed: compound descending rank order is not preserved.");
 
         return new CorrectnessGateResult(true, true, true, true, true);
     }
 
-    public abstract Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken);
+    public abstract Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken);
 
     public virtual async Task PrepareWorkloadAsync(
         BenchmarkWorkload workload,
@@ -188,6 +196,28 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     }
 
     protected virtual Task ResetClientStateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    protected async Task EnsurePlanScaleAsync(int minimumRows, CancellationToken cancellationToken)
+    {
+        if (minimumRows <= seededCount)
+            return;
+        const int batchSize = 1_000;
+        for (var offset = seededCount; offset < minimumRows; offset += batchSize)
+        {
+            await using var unitOfWork = await TenantA.BeginAsync(
+                DocumentCommitScope.Of(BenchmarkModelFactory.DocumentKind),
+                cancellationToken);
+            for (var index = offset; index < Math.Min(minimumRows, offset + batchSize); index++)
+            {
+                RequireStatus(await unitOfWork.SaveAsync(
+                        Save($"plan-scale-{index:D8}", Payload("__groundwork_plan_noise__", index, "plan-scale")),
+                        cancellationToken),
+                    DocumentStoreWriteStatus.Saved,
+                    "plan-scale insert");
+            }
+            await unitOfWork.CommitAsync(cancellationToken);
+        }
+    }
 
     protected abstract Task<WorkloadExecution> ExecuteBackfillMigrationAsync(CancellationToken cancellationToken);
 

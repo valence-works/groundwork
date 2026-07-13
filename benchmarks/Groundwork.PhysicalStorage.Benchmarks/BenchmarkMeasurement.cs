@@ -34,8 +34,8 @@ public sealed record BenchmarkCaseSummary(
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
     long? StorageGrowthBytes,
-    double? WriteAmplificationBytesPerLogicalByte,
-    double? PhysicalRowsPerLogicalMutation,
+    double? NetStorageGrowthBytesPerLogicalPayloadByte,
+    double? NetPhysicalRowGrowthPerLogicalMutation,
     IReadOnlyDictionary<string, double> ProviderWorkPerOperation);
 
 public static class BenchmarkSummarizer

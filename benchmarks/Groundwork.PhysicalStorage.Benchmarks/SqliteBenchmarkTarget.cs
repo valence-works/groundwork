@@ -64,23 +64,18 @@ public sealed class SqliteBenchmarkTarget(
         OpenStores();
     }
 
-    public override async Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken)
+    public override async Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken)
     {
+        await EnsurePlanScaleAsync(10_000, cancellationToken);
         var store = CreateStore(DocumentStoreAccess.Scoped(new("tenant-a")));
-        var query = Query(take: 20);
-        var rendered = RelationalPhysicalQueryRuntime.BuildQueryCommand(
-            store,
-            model.Manifest,
-            model.Route,
-            model.Target.Provider,
-            "sqlite",
-            query,
-            new HashSet<Groundwork.Core.Indexing.IndexValueKind>
-            {
-                Groundwork.Core.Indexing.IndexValueKind.String,
-                Groundwork.Core.Indexing.IndexValueKind.Keyword,
-                Groundwork.Core.Indexing.IndexValueKind.Boolean
-            });
+        var canonicalJsonValueKinds = new HashSet<Groundwork.Core.Indexing.IndexValueKind>
+        {
+            Groundwork.Core.Indexing.IndexValueKind.String,
+            Groundwork.Core.Indexing.IndexValueKind.Keyword,
+            Groundwork.Core.Indexing.IndexValueKind.Boolean
+        };
         await using var connection = new SqliteConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using (var analyze = connection.CreateCommand())
@@ -88,38 +83,51 @@ public sealed class SqliteBenchmarkTarget(
             analyze.CommandText = "ANALYZE;";
             await analyze.ExecuteNonQueryAsync(cancellationToken);
         }
-        await using var command = connection.CreateCommand();
-        command.CommandText = $"EXPLAIN QUERY PLAN {rendered.CommandText}";
-        foreach (var (name, value) in rendered.Parameters)
-            command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
-        var lines = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-            lines.Add(reader.GetString(3));
-        var plan = string.Join(Environment.NewLine, lines);
         var indexName = model.Route.Indexes.Single().Name.Identifier;
-        if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
-            !plan.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) ||
-            plan.Contains("SCAN ", StringComparison.OrdinalIgnoreCase))
+        var evidence = new List<NativePlanEvidence>(requests.Count);
+        foreach (var request in requests)
         {
-            throw new InvalidOperationException(
-                $"SQLite native-plan gate rejected the scale-bearing query. Expected index '{indexName}'.{Environment.NewLine}{plan}");
+            var query = Query(request.Skip, request.Take, request.Ordered);
+            var rendered = request.Operation == NativePlanOperation.Selection
+                ? RelationalPhysicalQueryRuntime.BuildQueryCommand(
+                    store, model.Manifest, model.Route, model.Target.Provider, "sqlite", query, canonicalJsonValueKinds)
+                : RelationalPhysicalQueryRuntime.BuildCountCommand(
+                    store, model.Manifest, model.Route, model.Target.Provider, "sqlite",
+                    query.Select(BoundedQueryResultOperation.Count), canonicalJsonValueKinds);
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"EXPLAIN QUERY PLAN {rendered.CommandText}";
+            foreach (var (name, value) in rendered.Parameters)
+                command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
+            var lines = new List<string>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                lines.Add(reader.GetString(3));
+            var plan = string.Join(Environment.NewLine, lines);
+            if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
+                !plan.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) ||
+                plan.Contains("SCAN ", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"SQLite native-plan gate rejected {request.Workload}/{request.Operation}. Expected index '{indexName}'.{Environment.NewLine}{plan}");
+            }
+            evidence.Add(new NativePlanEvidence(
+                request,
+                Provider.ToString(),
+                StorageForm.ToString(),
+                BenchmarkModelFactory.QueryIdentity,
+                (model.Route.LinkedIndexStorage ?? model.Route.PrimaryStorage).Name.Identifier,
+                indexName,
+                plan,
+                [
+                    "indexed SEARCH is present",
+                    $"index {indexName} is selected",
+                    "full SCAN is absent",
+                    plan.Contains("USE TEMP B-TREE", StringComparison.OrdinalIgnoreCase)
+                        ? "ordering remains server-side with a temporary B-tree for the stable identity suffix"
+                        : "ordering is satisfied directly by the selected index"
+                ]));
         }
-        return new NativePlanEvidence(
-            Provider.ToString(),
-            StorageForm.ToString(),
-            BenchmarkModelFactory.QueryIdentity,
-            (model.Route.LinkedIndexStorage ?? model.Route.PrimaryStorage).Name.Identifier,
-            indexName,
-            plan,
-            [
-                "indexed SEARCH is present",
-                $"index {indexName} is selected",
-                "full SCAN is absent",
-                plan.Contains("USE TEMP B-TREE", StringComparison.OrdinalIgnoreCase)
-                    ? "ordering remains server-side with a temporary B-tree for the stable identity suffix"
-                    : "ordering is satisfied directly by the selected index"
-            ]);
+        return evidence;
     }
 
     public override async Task PrepareIterationAsync(

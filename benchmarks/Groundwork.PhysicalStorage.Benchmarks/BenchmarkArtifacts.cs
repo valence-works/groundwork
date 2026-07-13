@@ -54,7 +54,7 @@ public sealed record RawBenchmarkRecord(BenchmarkCase Case, BenchmarkSample Samp
 public sealed record BenchmarkCaseResult(
     BenchmarkCase Case,
     CorrectnessGateResult Correctness,
-    string PlanArtifact,
+    IReadOnlyList<string> PlanArtifacts,
     BenchmarkCaseSummary Summary,
     IReadOnlyList<BenchmarkSample> Samples);
 
@@ -78,9 +78,9 @@ public sealed record ElsaMigrationEvidenceCase(
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
     long? StorageGrowthBytes,
-    double? WriteAmplificationBytesPerLogicalByte,
-    double? PhysicalRowsPerLogicalMutation,
-    string PlanArtifact);
+    double? NetStorageGrowthBytesPerLogicalPayloadByte,
+    double? NetPhysicalRowGrowthPerLogicalMutation,
+    IReadOnlyList<string> PlanArtifacts);
 
 public enum BenchmarkEvidenceReadiness
 {
@@ -122,9 +122,9 @@ public sealed record ElsaMigrationEvidenceReport(
                 result.Summary.AllocatedBytesPerOperation,
                 result.Summary.RoundTripsPerOperation,
                 result.Summary.StorageGrowthBytes,
-                result.Summary.WriteAmplificationBytesPerLogicalByte,
-                result.Summary.PhysicalRowsPerLogicalMutation,
-                result.PlanArtifact))
+                result.Summary.NetStorageGrowthBytesPerLogicalPayloadByte,
+                result.Summary.NetPhysicalRowGrowthPerLogicalMutation,
+                result.PlanArtifacts))
             .OrderBy(result => result.CaseIdentity, StringComparer.Ordinal)
             .ToArray(),
         report.Regressions);
@@ -189,13 +189,20 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         NativePlanEvidence evidence,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(benchmarkCase);
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (benchmarkCase.Workload != evidence.Request.Workload)
+        {
+            throw new InvalidOperationException(
+                $"Plan evidence for '{evidence.Request.Workload}' cannot be written for case '{benchmarkCase.Identity}'.");
+        }
         var extension = benchmarkCase.Provider switch
         {
             BenchmarkProvider.SqlServer => "xml",
             BenchmarkProvider.PostgreSql or BenchmarkProvider.MongoDb => "json",
             _ => "txt"
         };
-        var path = Layout.Plan(benchmarkCase, extension);
+        var path = Layout.Plan(benchmarkCase, evidence.Request.Operation, extension);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, evidence.NativePlan, cancellationToken);
         await WriteJsonAsync(path + ".assertions.json", evidence, cancellationToken);
@@ -305,7 +312,7 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         builder.AppendLine($"Mode: `{report.Mode}`");
         builder.AppendLine($"Baseline eligible: `{report.BaselineEligibility.Eligible}`");
         builder.AppendLine();
-        builder.AppendLine("| Provider | Form | Workload | normalized batch p50 (ms/op) | normalized batch p95 (ms/op) | normalized batch p99 (ms/op) | ops/s | B/op | round trips/op | storage delta | write amp | plan |");
+        builder.AppendLine("| Provider | Form | Workload | normalized batch p50 (ms/op) | normalized batch p95 (ms/op) | normalized batch p99 (ms/op) | ops/s | B/op | round trips/op | storage delta | net storage/logical payload | plan |");
         builder.AppendLine("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         foreach (var result in report.Cases.OrderBy(result => result.Case.Identity, StringComparer.Ordinal))
         {
@@ -315,8 +322,8 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
                 $"{summary.NormalizedBatchLatencyP50NanosecondsPerOperation / 1_000_000:F3} | {summary.NormalizedBatchLatencyP95NanosecondsPerOperation / 1_000_000:F3} | " +
                 $"{summary.NormalizedBatchLatencyP99NanosecondsPerOperation / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
                 $"{summary.AllocatedBytesPerOperation:F1} | {Format(summary.RoundTripsPerOperation)} | " +
-                $"{Format(summary.StorageGrowthBytes)} | {Format(summary.WriteAmplificationBytesPerLogicalByte)} | " +
-                $"[{Path.GetFileName(result.PlanArtifact)}](../{result.PlanArtifact}) |");
+                $"{Format(summary.StorageGrowthBytes)} | {Format(summary.NetStorageGrowthBytesPerLogicalPayloadByte)} | " +
+                $"{FormatPlans(result.PlanArtifacts)} |");
         }
         builder.AppendLine();
         builder.AppendLine("`null`/blank round-trip values mean no explicit, diagnostic-command, or database-client-activity signal was observable; raw provider-work flags identify the signal source when one was available.");
@@ -346,6 +353,9 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
 
     private static string Format(double? value) => value?.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
     private static string Format(long? value) => value?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+    private static string FormatPlans(IReadOnlyList<string> plans) => plans.Count == 0
+        ? string.Empty
+        : string.Join("<br>", plans.Select(plan => $"[{Path.GetFileName(plan)}](../{plan})"));
 }
 
 public static class BenchmarkMetadata

@@ -186,7 +186,7 @@ public sealed class BaselineCompatibilityEvaluatorTests
                         null,
                         null,
                         null,
-                        $"plans/{benchmarkCase.Provider}/{benchmarkCase.StorageForm}/indexed-query.txt"))
+                        [$"plans/{benchmarkCase.Provider}/{benchmarkCase.StorageForm}/indexed-query.txt"]))
                     .ToArray()
                 : [],
             []);

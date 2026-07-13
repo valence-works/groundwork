@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
 
@@ -16,9 +17,23 @@ public sealed record BenchmarkRunResult(
     BenchmarkRunReport Report,
     bool ConfirmedRegression);
 
-public sealed class BenchmarkRunner(Action<string>? progress = null)
+public sealed class BenchmarkRunner
 {
-    private readonly Action<string> progress = progress ?? (_ => { });
+    private readonly Action<string> progress;
+    private readonly Func<IBenchmarkProviderEnvironment> environmentFactory;
+
+    public BenchmarkRunner(Action<string>? progress = null)
+        : this(progress, static () => new BenchmarkProviderEnvironment())
+    {
+    }
+
+    internal BenchmarkRunner(
+        Action<string>? progress,
+        Func<IBenchmarkProviderEnvironment> environmentFactory)
+    {
+        this.progress = progress ?? (_ => { });
+        this.environmentFactory = environmentFactory ?? throw new ArgumentNullException(nameof(environmentFactory));
+    }
 
     public async Task<BenchmarkRunResult> RunAsync(
         BenchmarkRunRequest request,
@@ -42,10 +57,11 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
         var layout = new ArtifactLayout(runDirectory);
         layout.RequireEmptyOutput();
         await using var writer = new BenchmarkArtifactWriter(layout);
-        await using var environment = new BenchmarkProviderEnvironment();
+        await using var environment = environmentFactory();
         using var signals = new DatabaseSignalCollector();
         var started = DateTimeOffset.UtcNow;
         var planArtifacts = new List<string>();
+        var casePlanArtifacts = new Dictionary<(BenchmarkProvider, PhysicalStorageForm, BenchmarkWorkload), List<string>>();
         var caseResults = new List<BenchmarkCaseResult>();
         var providerMetadata = new List<BenchmarkProviderMetadata>();
         var manifest = new BenchmarkRunManifest(
@@ -86,7 +102,39 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                 foreach (var form in request.Configuration.StorageForms)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var instance = $"p{(int)provider}_f{(int)form}_{BenchmarkProfiles.ReproducibleSeed}";
+                    var instancePrefix = $"r{nonce}_p{(int)provider}_f{(int)form}";
+                    var planRequests = BenchmarkPlanRequests.ForWorkloads(request.Workloads);
+                    if (planRequests.Count > 0)
+                    {
+                        var planInstance = $"{instancePrefix}_plan";
+                        await using var planTarget = environment.CreateTarget(
+                            provider,
+                            form,
+                            planInstance,
+                            scratch,
+                            request.Configuration.MigrationDatasetSize);
+                        progress($"[{provider}/{form}] materializing isolated native-plan target");
+                        await planTarget.InitializeAsync(cancellationToken);
+                        await planTarget.SeedAsync(
+                            request.Configuration.Seed,
+                            request.Configuration.DatasetSize,
+                            cancellationToken);
+                        var evidence = await planTarget.RunNativePlanGatesAsync(planRequests, cancellationToken);
+                        if (evidence.Count != planRequests.Count || !evidence.Select(item => item.Request).SequenceEqual(planRequests))
+                            throw new InvalidOperationException($"[{provider}/{form}] native-plan evidence did not match the requested typed shapes.");
+                        foreach (var item in evidence)
+                        {
+                            var planCase = new BenchmarkCase(provider, form, item.Request.Workload);
+                            var isolatedPlanArtifact = await writer.WritePlanAsync(planCase, item, cancellationToken);
+                            planArtifacts.Add(isolatedPlanArtifact);
+                            var key = (provider, form, item.Request.Workload);
+                            if (!casePlanArtifacts.TryGetValue(key, out var artifacts))
+                                casePlanArtifacts.Add(key, artifacts = []);
+                            artifacts.Add(isolatedPlanArtifact);
+                        }
+                    }
+
+                    var instance = $"{instancePrefix}_measure";
                     await using var target = environment.CreateTarget(
                         provider,
                         form,
@@ -100,10 +148,6 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                         request.Configuration.DatasetSize,
                         cancellationToken);
                     var correctness = await target.RunCorrectnessGateAsync(cancellationToken);
-                    var planEvidence = await target.RunNativePlanGateAsync(cancellationToken);
-                    var planCase = new BenchmarkCase(provider, form, BenchmarkWorkload.IndexedQuery);
-                    var planArtifact = await writer.WritePlanAsync(planCase, planEvidence, cancellationToken);
-                    planArtifacts.Add(planArtifact);
                     providerMetadata.Add(new BenchmarkProviderMetadata(
                         provider,
                         target.ProviderVersion,
@@ -151,6 +195,10 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                                 cancellationToken);
                             var elapsedTicks = Stopwatch.GetTimestamp() - timestamp;
                             var signalSnapshot = measurement.Complete();
+                            QueryBranchEvidence.EnsureObserved(
+                                workload,
+                                request.Configuration.OperationsPerIteration,
+                                execution.RoundTrips ?? signalSnapshot.ObservableRoundTrips);
                             var allocatedBytes = Math.Max(0, GC.GetTotalAllocatedBytes(precise: false) - allocatedBefore);
                             await target.ValidateIterationAsync(workload, cancellationToken);
                             var storageAfter = capturesStorage
@@ -173,7 +221,9 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                         caseResults.Add(new BenchmarkCaseResult(
                             benchmarkCase,
                             correctness,
-                            planArtifact,
+                            casePlanArtifacts.TryGetValue((provider, form, workload), out var applicablePlans)
+                                ? applicablePlans.ToArray()
+                                : [],
                             BenchmarkSummarizer.Summarize(benchmarkCase.Identity, samples),
                             samples));
                     }

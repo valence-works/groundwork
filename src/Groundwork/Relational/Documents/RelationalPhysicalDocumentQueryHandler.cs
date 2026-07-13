@@ -43,11 +43,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            var built = Build(query, plan, route);
-            var total = await CountCoreAsync(connection, built, ct);
+            var total = await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult([], total);
 
+            var built = Build(query, plan, route, requiresPrimaryLookup: true);
             var rendered = RenderQuery(query, plan, built, route);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
             AddParameters(command, rendered.Parameters);
@@ -60,15 +60,15 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
         store.ExecutePhysicalQueryAsync((connection, ct) =>
-            CountCoreAsync(connection, Build(query, plan, store.GetRoute(query.DocumentKind)), ct), cancellationToken);
+            CountCoreAsync(connection, Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false), ct), cancellationToken);
 
     internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
-        RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind)));
+        RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false));
 
     internal RelationalPhysicalQueryCommand BuildQueryCommand(DocumentQuery query, PhysicalQueryPlan plan)
     {
         var route = store.GetRoute(query.DocumentKind);
-        return RenderQuery(query, plan, Build(query, plan, route), route);
+        return RenderQuery(query, plan, Build(query, plan, route, requiresPrimaryLookup: true), route);
     }
 
     private RelationalPhysicalQueryCommand RenderQuery(
@@ -96,7 +96,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            var built = Build(query, plan, route);
+            var built = Build(query, plan, route, requiresPrimaryLookup: true);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, store.ApplyFirst(
                 $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"));
             AddParameters(command, built.Parameters);
@@ -107,7 +107,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            var built = Build(query, plan, store.GetRoute(query.DocumentKind));
+            var built = Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: true);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
                 connection,
                 store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"));
@@ -142,7 +142,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         DocumentQuery query,
         PhysicalQueryPlan plan,
         DocumentScopeSelection scope) =>
-        Build(query, plan, store.GetRoute(query.DocumentKind), scope);
+        Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: true, fixedScope: scope);
 
     private async Task<long> CountCoreAsync(DbConnection connection, RelationalPhysicalQueryPredicate built, CancellationToken ct)
     {
@@ -159,6 +159,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         DocumentQuery query,
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
+        bool requiresPrimaryLookup,
         DocumentScopeSelection? fixedScope = null)
     {
         if (query.Continuation is not null)
@@ -167,7 +168,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             throw new NotSupportedException("This relational handler profile does not certify latest-per-key selection.");
 
         var linked = plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary;
-        var from = linked
+        var needsPrimaryJoin = linked && (requiresPrimaryLookup || PredicateFields(plan)
+            .Any(field => field.Target == ExecutableStorageObjectRole.PrimaryStorage));
+        var from = linked && needsPrimaryJoin
             ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)} " +
               $"JOIN {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", null)} ON " +
               store.ExactPhysicalIdentityJoin(
@@ -176,7 +179,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                   new(route.Envelope.StorageScope.Identifier, "p", route.LinkedRelationship.StorageScope.Identifier, "l"),
                   new(route.Envelope.Id.Identifier, "p", route.LinkedRelationship.DocumentId.Identifier, "l")
               ])
-            : $"FROM {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", plan.IndexName?.Identifier)}";
+            : linked
+                ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)}"
+                : $"FROM {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", plan.IndexName?.Identifier)}";
         var parameters = new List<(string Name, object? Value)>();
         var predicates = new List<string>();
         var scope = fixedScope ?? store.ResolveQueryScope(query.DocumentKind);
@@ -209,6 +214,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         }
         return new RelationalPhysicalQueryPredicate($"{from} WHERE {string.Join(" AND ", predicates)}", parameters);
     }
+
+    private static IEnumerable<PhysicalQueryField> PredicateFields(PhysicalQueryPlan plan) =>
+        new[] { plan.Scope.Field, plan.Discriminator }
+            .Concat(plan.Predicates.Select(predicate => predicate.Field));
 
     private string Comparison(
         PhysicalQueryPlan plan,

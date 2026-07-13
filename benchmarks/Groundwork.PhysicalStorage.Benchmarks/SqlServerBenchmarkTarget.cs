@@ -22,7 +22,7 @@ public sealed class SqlServerBenchmarkTarget(
         instance,
         migrationDatasetSize)
 {
-    private const int PrimaryPlanNoiseRows = 4096;
+    private const int PrimaryPlanNoiseRows = 65_536;
     private const int LinkedPlanNoiseRows = 65_536;
     private readonly string serverConnectionString = serverConnectionString;
     private readonly string databaseName = $"groundwork_bench_{instance}_{storageForm}".ToLowerInvariant();
@@ -43,36 +43,53 @@ public sealed class SqlServerBenchmarkTarget(
     protected override string HandlerPrefix => "sqlserver";
     protected override string ConnectionString => connectionString;
 
-    public override async Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken)
+    public override async Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken)
     {
-        var rendered = RenderQuery(Query(take: 20));
         await using var connection = new SqlConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
         var noise = await SeedPlanNoiseAsync(connection, cancellationToken);
-        string plan;
+        var indexName = Model.Route.Indexes.Single().Name.Identifier;
+        var evidence = new List<NativePlanEvidence>(requests.Count);
         try
         {
             await UpdateStatisticsAsync(connection, cancellationToken);
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"SET STATISTICS XML ON; {rendered.CommandText} SET STATISTICS XML OFF;";
-            foreach (var (name, value) in rendered.Parameters)
-                command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            var plans = await SqlServerShowplanReader.ReadAsync(reader, cancellationToken);
-            plan = plans.SingleOrDefault() ?? throw new InvalidOperationException("SQL Server returned no native XML plan.");
+            foreach (var request in requests)
+            {
+                var rendered = RenderPlan(request);
+                await using var command = connection.CreateCommand();
+                command.CommandText = $"SET STATISTICS XML ON; {rendered.CommandText} SET STATISTICS XML OFF;";
+                foreach (var (name, value) in rendered.Parameters)
+                    command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                var plans = await SqlServerShowplanReader.ReadAsync(reader, cancellationToken);
+                var plan = plans.SingleOrDefault() ?? throw new InvalidOperationException(
+                    $"SQL Server returned no native XML plan for {request.Workload}/{request.Operation}.");
+                try
+                {
+                    SqlServerShowplanReader.EnsureScaleBearingIndex(plan, indexName);
+                }
+                catch (InvalidOperationException exception)
+                {
+                    throw new InvalidOperationException(
+                        $"SQL Server native-plan gate rejected {request.Workload}/{request.Operation}.",
+                        exception);
+                }
+                evidence.Add(new NativePlanEvidence(
+                    request,
+                    Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
+                    (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
+                    indexName, plan,
+                    ["declared index is selected", "table and index scans are absent", "query shape is rendered by the certified production handler"]));
+            }
         }
         finally
         {
             await RemovePlanNoiseAsync(connection, noise, CancellationToken.None);
             await UpdateStatisticsAsync(connection, CancellationToken.None);
         }
-        var indexName = Model.Route.Indexes.Single().Name.Identifier;
-        SqlServerShowplanReader.EnsureScaleBearingIndex(plan, indexName);
-        return new NativePlanEvidence(
-            Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
-            (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
-            indexName, plan,
-            ["declared index is selected", "table and index scans are absent", "query is rendered by the certified production handler"]);
+        return evidence;
     }
 
     public override async Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken)

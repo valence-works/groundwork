@@ -5,14 +5,11 @@ on:
     paths:
       - ".github/workflows/physical-storage-benchmarks.yml"
       - "benchmarks/Groundwork.PhysicalStorage.Benchmarks/**"
-      - "src/Groundwork/Core/**"
-      - "src/Groundwork/Documents/**"
-      - "src/Groundwork/Relational/**"
-      - "src/Groundwork/Sqlite/**"
-      - "src/Groundwork/SqlServer/**"
-      - "src/Groundwork/PostgreSql/**"
-      - "src/Groundwork/MongoDb/**"
+      - "src/Groundwork/**"
       - "tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/**"
+      - "Directory.Build.props"
+      - "Directory.Packages.props"
+      - "Groundwork.slnx"
   schedule:
     - cron: "17 2 * * 1"
   workflow_dispatch:

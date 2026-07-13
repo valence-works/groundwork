@@ -58,7 +58,7 @@
         "normalizedBatchLatencyP99NanosecondsPerOperation",
         "throughputOperationsPerSecond",
         "allocatedBytesPerOperation",
-        "planArtifact"
+        "planArtifacts"
       ],
       "properties": {
         "caseIdentity": { "type": "string", "minLength": 1 },
@@ -72,9 +72,13 @@
         "allocatedBytesPerOperation": { "type": "number", "minimum": 0 },
         "roundTripsPerOperation": { "type": ["number", "null"], "minimum": 0 },
         "storageGrowthBytes": { "type": ["integer", "null"], "minimum": 0 },
-        "writeAmplificationBytesPerLogicalByte": { "type": ["number", "null"], "minimum": 0 },
-        "physicalRowsPerLogicalMutation": { "type": ["number", "null"], "minimum": 0 },
-        "planArtifact": { "type": "string", "minLength": 1 }
+        "netStorageGrowthBytesPerLogicalPayloadByte": { "type": ["number", "null"], "minimum": 0 },
+        "netPhysicalRowGrowthPerLogicalMutation": { "type": ["number", "null"], "minimum": 0 },
+        "planArtifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
       }
     },
     "regression": {

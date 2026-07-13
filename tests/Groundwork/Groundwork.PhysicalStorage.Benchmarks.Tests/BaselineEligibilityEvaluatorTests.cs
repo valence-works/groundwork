@@ -61,7 +61,9 @@ public sealed class BaselineEligibilityEvaluatorTests
         return new BenchmarkCaseResult(
             benchmarkCase,
             new CorrectnessGateResult(true, true, true, true, true),
-            $"plans/{benchmarkCase.Identity}.json",
+            BenchmarkPlanRequests.ForWorkloads([benchmarkCase.Workload])
+                .Select(request => $"plans/{benchmarkCase.Identity}-{request.Operation}.json")
+                .ToArray(),
             BenchmarkSummarizer.Summarize(benchmarkCase.Identity, samples),
             samples);
     }

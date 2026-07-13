@@ -54,24 +54,39 @@ public sealed class MongoDbBenchmarkTarget(
         ProviderVersion = buildInfo.GetValue("version", "unknown").AsString;
     }
 
-    public override async Task<NativePlanEvidence> RunNativePlanGateAsync(CancellationToken cancellationToken)
+    public override async Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
+        IReadOnlyList<BenchmarkPlanRequest> requests,
+        CancellationToken cancellationToken)
     {
-        var planDocument = await tenantAHandle!.Store.ExplainAsync(Query(take: 20), cancellationToken);
-        var plan = planDocument.ToJson(new MongoDB.Bson.IO.JsonWriterSettings { Indent = true });
         var route = Model.Routes.Single();
         var indexName = route.Indexes.Single().Name.Identifier;
-        if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
-            !plan.Contains("IXSCAN", StringComparison.OrdinalIgnoreCase) ||
-            plan.Contains("COLLSCAN", StringComparison.OrdinalIgnoreCase))
+        var evidence = new List<NativePlanEvidence>(requests.Count);
+        foreach (var request in requests)
         {
-            throw new InvalidOperationException(
-                $"MongoDB native-plan gate rejected the scale-bearing query. Expected IXSCAN '{indexName}'.{Environment.NewLine}{plan}");
+            var query = Query(request.Skip, request.Take, request.Ordered);
+            var planDocument = request.Operation == NativePlanOperation.Selection
+                ? await tenantAHandle!.Store.ExplainAsync(query, cancellationToken)
+                : await tenantAHandle!.Store.ExplainCountAsync(
+                    query.Select(BoundedQueryResultOperation.Count), cancellationToken);
+            var plan = planDocument.ToJson(new MongoDB.Bson.IO.JsonWriterSettings { Indent = true });
+            try
+            {
+                MongoWinningPlanInspector.EnsureIndexScan(planDocument, indexName);
+            }
+            catch (InvalidOperationException exception)
+            {
+                throw new InvalidOperationException(
+                    $"MongoDB native-plan gate rejected {request.Workload}/{request.Operation}. Expected IXSCAN '{indexName}'.{Environment.NewLine}{plan}",
+                    exception);
+            }
+            evidence.Add(new NativePlanEvidence(
+                request,
+                Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
+                (route.LinkedIndexStorage ?? route.PrimaryStorage).Name.Identifier,
+                indexName, plan,
+                ["winningPlan contains IXSCAN", $"winningPlan selects index {indexName}", "winningPlan contains no COLLSCAN"]));
         }
-        return new NativePlanEvidence(
-            Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
-            (route.LinkedIndexStorage ?? route.PrimaryStorage).Name.Identifier,
-            indexName, plan,
-            ["IXSCAN is present", $"index {indexName} is selected", "COLLSCAN is absent"]);
+        return evidence;
     }
 
     public override async Task PrepareIterationAsync(
