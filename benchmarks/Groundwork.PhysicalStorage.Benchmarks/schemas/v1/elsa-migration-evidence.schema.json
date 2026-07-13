@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/elsa-migration-evidence.schema.json",
+  "title": "Elsa Groundwork migration evidence report v1 (insufficient evidence)",
+  "description": "Groundwork-only benchmark evidence that cannot make an Elsa migration or baseline-promotion decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "mode",
+    "readiness",
+    "elsaEfOracleRequired",
+    "baselineEligibility",
+    "regressionSignalDetected",
+    "confirmationRunSuggested",
+    "remainingAcceptanceWork",
+    "cases",
+    "regressions"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
+    "runId": { "type": "string", "minLength": 1 },
+    "mode": { "enum": ["smoke", "scheduled"] },
+    "readiness": { "const": "insufficient" },
+    "elsaEfOracleRequired": { "const": true },
+    "baselineEligibility": { "$ref": "#/$defs/eligibility" },
+    "regressionSignalDetected": { "type": "boolean" },
+    "confirmationRunSuggested": { "type": "boolean" },
+    "remainingAcceptanceWork": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "cases": { "type": "array", "items": { "$ref": "#/$defs/case" } },
+    "regressions": { "type": "array", "items": { "$ref": "#/$defs/regression" } }
+  },
+  "$defs": {
+    "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eligible", "diagnostics"],
+      "properties": {
+        "eligible": { "const": false },
+        "diagnostics": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "caseIdentity",
+        "provider",
+        "storageForm",
+        "workload",
+        "normalizedBatchLatencyP50NanosecondsPerOperation",
+        "normalizedBatchLatencyP95NanosecondsPerOperation",
+        "normalizedBatchLatencyP99NanosecondsPerOperation",
+        "throughputOperationsPerSecond",
+        "allocatedBytesPerOperation",
+        "planArtifacts"
+      ],
+      "properties": {
+        "caseIdentity": { "type": "string", "minLength": 1 },
+        "provider": { "enum": ["sqlite", "sqlServer", "postgreSql", "mongoDb"] },
+        "storageForm": { "enum": ["sharedDocuments", "dedicatedDocumentTable", "physicalEntityTable"] },
+        "workload": { "type": "string", "minLength": 1 },
+        "normalizedBatchLatencyP50NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyP95NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyP99NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "throughputOperationsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
+        "allocatedBytesPerOperation": { "type": "number", "minimum": 0 },
+        "roundTripsPerOperation": { "type": ["number", "null"], "minimum": 0 },
+        "storageGrowthBytes": { "type": ["integer", "null"], "minimum": 0 },
+        "netStorageGrowthBytesPerLogicalPayloadByte": { "type": ["number", "null"], "minimum": 0 },
+        "netPhysicalRowGrowthPerLogicalMutation": { "type": ["number", "null"], "minimum": 0 },
+        "planArtifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "regression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caseIdentity", "isComparable", "requiresConfirmation", "metrics", "diagnostics", "regressed"],
+      "properties": {
+        "caseIdentity": { "type": "string", "minLength": 1 },
+        "isComparable": { "type": "boolean" },
+        "requiresConfirmation": { "type": "boolean" },
+        "metrics": { "type": "array", "items": { "$ref": "#/$defs/metric" } },
+        "diagnostics": { "type": "array", "items": { "type": "string" } },
+        "regressed": { "type": "boolean" }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "direction",
+        "baseline",
+        "candidate",
+        "ratio",
+        "lowerConfidenceRatio",
+        "upperConfidenceRatio",
+        "budget",
+        "regressed"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "direction": { "enum": ["lowerIsBetter", "higherIsBetter"] },
+        "baseline": { "type": "number" },
+        "candidate": { "type": "number" },
+        "ratio": { "type": "number" },
+        "lowerConfidenceRatio": { "type": "number" },
+        "upperConfidenceRatio": { "type": "number" },
+        "budget": { "type": "number", "minimum": 0 },
+        "regressed": { "type": "boolean" }
+      }
+    }
+  }
+}

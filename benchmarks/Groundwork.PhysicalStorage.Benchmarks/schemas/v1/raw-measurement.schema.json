@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/raw-measurement.schema.json",
+  "title": "Groundwork physical-storage raw measurement record v1",
+  "description": "Each line in raw/measurements.jsonl is one object conforming to this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["case", "sample"],
+  "properties": {
+    "case": { "$ref": "#/$defs/case" },
+    "sample": { "$ref": "#/$defs/sample" }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "storageForm", "workload", "identity"],
+      "properties": {
+        "provider": { "enum": ["sqlite", "sqlServer", "postgreSql", "mongoDb"] },
+        "storageForm": { "enum": ["sharedDocuments", "dedicatedDocumentTable", "physicalEntityTable"] },
+        "workload": {
+          "enum": [
+            "clientResetPointReadBatch",
+            "reusedClientPointReadBatch",
+            "indexedQuery",
+            "mixedCompoundOrdering",
+            "insert",
+            "update",
+            "delete",
+            "unitOfWork",
+            "concurrentCreate",
+            "optimisticConcurrency",
+            "paginationAndCount",
+            "backfillMigration",
+            "clientRestartValidation",
+            "storageGrowth"
+          ]
+        },
+        "identity": { "type": "string", "minLength": 1 }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "iteration",
+        "operations",
+        "elapsedNanoseconds",
+        "allocatedBytes",
+        "logicalPayloadBytes",
+        "logicalMutations",
+        "providerWork",
+        "normalizedBatchLatencyNanosecondsPerOperation",
+        "throughputOperationsPerSecond",
+        "allocatedBytesPerOperation"
+      ],
+      "properties": {
+        "iteration": { "type": "integer", "minimum": 0 },
+        "operations": { "type": "integer", "minimum": 1 },
+        "elapsedNanoseconds": { "type": "integer", "minimum": 1 },
+        "allocatedBytes": { "type": "integer", "minimum": 0 },
+        "roundTrips": { "type": ["integer", "null"], "minimum": 0 },
+        "logicalPayloadBytes": { "type": "integer", "minimum": 0 },
+        "logicalMutations": { "type": "integer", "minimum": 0 },
+        "storageBefore": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
+        "storageAfter": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
+        "providerWork": { "$ref": "#/$defs/integerMap" },
+        "normalizedBatchLatencyNanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "throughputOperationsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
+        "allocatedBytesPerOperation": { "type": "number", "minimum": 0 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["totalBytes", "indexBytes", "primaryRows", "linkedRows", "providerValues"],
+      "properties": {
+        "totalBytes": { "type": "integer", "minimum": 0 },
+        "indexBytes": { "type": "integer", "minimum": 0 },
+        "primaryRows": { "type": "integer", "minimum": 0 },
+        "linkedRows": { "type": "integer", "minimum": 0 },
+        "providerValues": { "$ref": "#/$defs/integerMap" }
+      }
+    },
+    "integerMap": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" }
+    }
+  }
+}

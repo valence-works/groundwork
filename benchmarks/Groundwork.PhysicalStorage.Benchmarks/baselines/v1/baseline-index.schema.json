@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/baseline-index.schema.json",
+  "title": "Groundwork physical-storage future baseline registry scaffold v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "status", "baselines"],
+  "properties": {
+    "$schema": { "type": "string", "minLength": 1 },
+    "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
+    "status": { "const": "scaffolding-no-approved-baselines" },
+    "baselines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "artifactUri",
+          "gitCommit",
+          "capturedAtUtc",
+          "machineFingerprint",
+          "evidenceReport",
+          "approvedBy",
+          "approvedAtUtc"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "artifactUri": { "type": "string", "minLength": 1 },
+          "gitCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+          "capturedAtUtc": { "type": "string", "format": "date-time" },
+          "machineFingerprint": { "type": "string", "minLength": 1 },
+          "evidenceReport": { "type": "string", "minLength": 1 },
+          "approvedBy": { "type": "string", "minLength": 1 },
+          "approvedAtUtc": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

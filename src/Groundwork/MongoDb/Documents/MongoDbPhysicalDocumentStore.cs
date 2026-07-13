@@ -176,29 +176,61 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     /// <summary>Returns native MongoDB explain evidence for the exact compiled bounded query.</summary>
     public Task<BsonDocument> ExplainAsync(DocumentQuery query, CancellationToken cancellationToken = default)
     {
-        return ExplainCoreAsync(query, cancellationToken);
+        return ExplainCoreAsync(query, count: false, cancellationToken);
     }
 
-    private async Task<BsonDocument> ExplainCoreAsync(DocumentQuery query, CancellationToken cancellationToken)
+    /// <summary>Returns native MongoDB explain evidence for the exact compiled bounded count query.</summary>
+    public Task<BsonDocument> ExplainCountAsync(DocumentQuery query, CancellationToken cancellationToken = default)
+    {
+        return ExplainCoreAsync(query, count: true, cancellationToken);
+    }
+
+    private async Task<BsonDocument> ExplainCoreAsync(
+        DocumentQuery query,
+        bool count,
+        CancellationToken cancellationToken)
     {
         var route = Route(query.DocumentKind);
         var physical = model.StorageByStorageUnit[query.DocumentKind];
-        var plan = QueryStore(query.DocumentKind).ResolvePlan(query);
+        var plan = QueryStore(query.DocumentKind).ResolvePlan(
+            query,
+            count ? BoundedQueryResultOperation.Count : BoundedQueryResultOperation.Documents);
         var scope = ResolveScope(Unit(query.DocumentKind), StorageScopeOperation.Query, allowAcrossScopes: true);
         var filter = MongoDbPhysicalQueryHandler.BuildFilter(query, plan, scope, physical, route);
         var sort = MongoDbPhysicalQueryHandler.BuildSort(query, plan);
-        var command = new BsonDocument
-        {
-            ["explain"] = new BsonDocument
+        var renderedFilter = filter.Render(new RenderArgs<BsonDocument>(
+            database.GetCollection<BsonDocument>(plan.LookupObject.Identifier).DocumentSerializer,
+            BsonSerializer.SerializerRegistry));
+        var explainedCommand = count
+            ? new BsonDocument
+            {
+                ["aggregate"] = plan.LookupObject.Identifier,
+                ["pipeline"] = new BsonArray
+                {
+                    new BsonDocument("$match", renderedFilter),
+                    new BsonDocument("$group", new BsonDocument
+                    {
+                        ["_id"] = 1,
+                        ["n"] = new BsonDocument("$sum", 1)
+                    })
+                },
+                ["cursor"] = new BsonDocument()
+            }
+            : new BsonDocument
             {
                 ["find"] = plan.LookupObject.Identifier,
-                ["filter"] = filter.Render(new RenderArgs<BsonDocument>(
-                    database.GetCollection<BsonDocument>(plan.LookupObject.Identifier).DocumentSerializer,
-                    BsonSerializer.SerializerRegistry)),
+                ["filter"] = renderedFilter,
                 ["sort"] = sort.Render(new RenderArgs<BsonDocument>(
                     database.GetCollection<BsonDocument>(plan.LookupObject.Identifier).DocumentSerializer,
                     BsonSerializer.SerializerRegistry))
-            },
+            };
+        if (!count && query.Skip is { } skip)
+            explainedCommand["skip"] = skip;
+        if (!count && query.Take is { } take)
+            explainedCommand["limit"] = take;
+        var command = new BsonDocument
+        {
+            ["explain"] = explainedCommand,
             ["verbosity"] = "queryPlanner"
         };
         await transactionCapability.EnsureSupportedAsync(

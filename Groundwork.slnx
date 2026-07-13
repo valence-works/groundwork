@@ -23,6 +23,9 @@
     <Project Path="src/Groundwork/SqlServer/Groundwork.SqlServer.csproj" />
     <Project Path="src/Groundwork/Sqlite/Groundwork.Sqlite.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Groundwork.PhysicalStorage.Benchmarks/Groundwork.PhysicalStorage.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/tests/" />
   <Folder Name="/tests/Groundwork/">
     <Project Path="tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj" />
@@ -31,6 +34,7 @@
     <Project Path="tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj" />
+    <Project Path="tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/Groundwork.PhysicalStorage.Benchmarks.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.SchemaTool.ProviderTests/Groundwork.SchemaTool.ProviderTests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj" />
   </Folder>
