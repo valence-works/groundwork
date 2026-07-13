@@ -14,23 +14,23 @@ public sealed class PostgreSqlDiagnosticRecordStoreTests(PostgreSqlDiagnosticCon
     ServerDiagnosticRecordStoreConformanceTests,
     IAsyncLifetime
 {
-    private readonly List<PostgreSqlDiagnosticRecordStoreFixture> fixtures = [];
+    private string? fixtureConnectionString;
+    private PostgreSqlDiagnosticRecordStoreFixture? fixture;
 
-    public Task InitializeAsync() => Task.CompletedTask;
+    public async Task InitializeAsync()
+    {
+        fixtureConnectionString = await container.CreateSchemaAsync();
+        fixture = await PostgreSqlDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString);
+    }
 
     public async Task DisposeAsync()
     {
-        foreach (var fixture in fixtures)
-            await container.DropSchemaAsync(fixture.ConnectionString);
+        if (fixtureConnectionString is not null)
+            await container.DropSchemaAsync(fixtureConnectionString);
     }
 
-    protected override IServerDiagnosticRecordStoreConformanceFixture CreateServerFixture()
-    {
-        var connectionString = container.CreateSchemaAsync().GetAwaiter().GetResult();
-        var fixture = new PostgreSqlDiagnosticRecordStoreFixture(connectionString);
-        fixtures.Add(fixture);
-        return fixture;
-    }
+    protected override IServerDiagnosticRecordStoreConformanceFixture CreateServerFixture() =>
+        fixture ?? throw new InvalidOperationException("The PostgreSQL diagnostic fixture has not been initialized.");
 
     [Fact]
     public async Task Materializer_uses_native_binary_text_and_all_durable_tables()
@@ -71,11 +71,20 @@ internal sealed class PostgreSqlDiagnosticRecordStoreFixture : IServerDiagnostic
     private readonly SemaphoreSlim planSeedGate = new(1, 1);
     private bool planSeeded;
 
-    public PostgreSqlDiagnosticRecordStoreFixture(string connectionString)
+    private PostgreSqlDiagnosticRecordStoreFixture(string connectionString)
     {
         ConnectionString = connectionString;
         sessions = RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString));
-        PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString).GetAwaiter().GetResult();
+    }
+
+    public static async Task<PostgreSqlDiagnosticRecordStoreFixture> CreateAsync(
+        string connectionString,
+        CancellationToken cancellationToken = default)
+    {
+        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(
+            connectionString,
+            cancellationToken: cancellationToken);
+        return new(connectionString);
     }
 
     public string ConnectionString { get; }
