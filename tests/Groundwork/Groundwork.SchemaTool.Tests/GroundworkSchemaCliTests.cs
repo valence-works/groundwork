@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
@@ -42,6 +43,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal("1", root.GetProperty("schemaVersion").GetString());
         Assert.Equal("validate", root.GetProperty("command").GetString());
         Assert.Equal("ready", root.GetProperty("outcome").GetString());
+        Assert.Equal("live", root.GetProperty("inspectionMode").GetString());
         Assert.Equal("groundwork-sqlite", root.GetProperty("provider").GetProperty("name").GetString());
         Assert.Equal("schema-tool-tests", root.GetProperty("target").GetProperty("manifestIdentity").GetString());
         Assert.Equal(0, root.GetProperty("diagnostics").GetArrayLength());
@@ -53,17 +55,56 @@ public sealed class GroundworkSchemaCliTests : IDisposable
                     name.GetProperty("identifier").GetString() == "id");
     }
 
+    [Fact]
+    public async Task Offline_validation_is_explicit_and_does_not_require_provider_connectivity()
+    {
+        var database = Path.Combine(directory, "offline-must-not-exist.db");
+        var arguments = Arguments("validate", database).ToList();
+        var connection = arguments.IndexOf("--connection");
+        arguments.RemoveRange(connection, 2);
+        arguments.Add("--offline");
+
+        var exit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
+        using var report = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.Success, exit);
+        Assert.Equal("offline", report.RootElement.GetProperty("inspectionMode").GetString());
+        Assert.False(File.Exists(database));
+        Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
+    public async Task Offline_validation_rejects_all_provider_connection_input()
+    {
+        var database = Path.Combine(directory, "offline-database-input.db");
+        var arguments = Arguments("validate", database).ToList();
+        var connection = arguments.IndexOf("--connection");
+        arguments.RemoveRange(connection, 2);
+        var outputOption = arguments.IndexOf("--output");
+        arguments.RemoveRange(outputOption, 2);
+        arguments.AddRange(["--database", "provider-database", "--offline"]);
+
+        var exit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
+
+        Assert.Equal(SchemaToolExitCodes.InvalidInvocation, exit);
+        Assert.Contains("Offline validation cannot accept connection input.", error.ToString(), StringComparison.Ordinal);
+        Assert.False(File.Exists(database));
+    }
+
     [Theory]
     [InlineData("sqlite", "groundwork-sqlite")]
     [InlineData("sqlserver", "groundwork-sqlserver")]
     [InlineData("postgresql", "groundwork-postgresql")]
     [InlineData("mongodb", "groundwork-mongodb")]
-    public async Task Validate_composes_every_available_provider_without_provider_types_in_the_manifest_source(
+    public async Task Offline_validate_composes_every_available_provider_without_provider_types_in_the_manifest_source(
         string provider,
         string expectedIdentity)
     {
         var database = Path.Combine(directory, $"{provider}-must-not-exist.db");
-        var arguments = Arguments("validate", database, provider: provider);
+        var arguments = Arguments("validate", database, provider: provider).ToList();
+        var connection = arguments.IndexOf("--connection");
+        arguments.RemoveRange(connection, 2);
+        arguments.Add("--offline");
 
         var exit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
         using var report = ParseOutput();
@@ -136,10 +177,12 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     public async Task Apply_materializes_sqlite_and_restart_reports_no_changes()
     {
         var database = Path.Combine(directory, "apply.db");
-        var arguments = Arguments("apply", database);
+        var arguments = Arguments("apply", database).Concat(["--safe"]).ToArray();
 
         var firstExit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
         using var first = ParseOutput();
+        var validateExit = await GroundworkSchemaCli.RunAsync(Arguments("validate", database), output, error);
+        using var validate = ParseOutput();
         var secondExit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
         using var second = ParseOutput();
 
@@ -148,6 +191,11 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.True(first.RootElement.GetProperty("targetMutated").GetBoolean());
         Assert.Equal(0, first.RootElement.GetProperty("pendingOperations").GetArrayLength());
         Assert.True(first.RootElement.GetProperty("appliedOperations").GetArrayLength() > 0);
+        Assert.Equal(SchemaToolExitCodes.Success, validateExit);
+        Assert.Equal("live", validate.RootElement.GetProperty("inspectionMode").GetString());
+        Assert.Equal(0, validate.RootElement.GetProperty("pendingOperations").GetArrayLength());
+        Assert.True(validate.RootElement.GetProperty("appliedOperations").GetArrayLength() > 0);
+        Assert.False(validate.RootElement.GetProperty("targetMutated").GetBoolean());
         Assert.Equal(SchemaToolExitCodes.Success, secondExit);
         Assert.Equal("ready", second.RootElement.GetProperty("outcome").GetString());
         Assert.False(second.RootElement.GetProperty("targetMutated").GetBoolean());
@@ -157,12 +205,48 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Live_validate_reports_physical_drift_without_repairing_it()
+    {
+        var database = Path.Combine(directory, "drift.db");
+        var applyExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var applied = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, applyExit);
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DROP INDEX \"by-category\";";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var validateExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("validate", database),
+            output,
+            error);
+        using var validation = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, validateExit);
+        Assert.Equal("blocked", validation.RootElement.GetProperty("outcome").GetString());
+        Assert.Equal(
+            "GW-CLI-012",
+            Assert.Single(validation.RootElement.GetProperty("diagnostics").EnumerateArray()).GetProperty("code").GetString());
+        Assert.False(await IndexExistsAsync(database, "by-category"));
+        Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
     public async Task Apply_requires_exact_destructive_and_semantic_authorization_before_target_operations()
     {
         var database = Path.Combine(directory, "authorization.db");
-        var arguments = Arguments("apply", database, typeof(AuthorizationManifestSource));
+        var safe = Arguments("apply", database, typeof(AuthorizationManifestSource))
+            .Concat(["--safe"])
+            .ToArray();
 
-        var blockedExit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
+        var blockedExit = await GroundworkSchemaCli.RunAsync(safe, output, error);
         using var blocked = ParseOutput();
 
         Assert.Equal(SchemaToolExitCodes.AuthorizationRequired, blockedExit);
@@ -170,8 +254,40 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal(2, blocked.RootElement.GetProperty("diagnostics").GetArrayLength());
         Assert.False(await TableExistsAsync(database, "schema_tool_documents"));
 
-        var authorized = arguments
-            .Concat(["--authorize-destructive", "--authorize-semantic", "reclassify-v2"])
+        var planExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("plan", database, typeof(AuthorizationManifestSource)),
+            output,
+            error);
+        using var plan = ParseOutput();
+        var planFingerprint = plan.RootElement.GetProperty("planFingerprint").GetString()!;
+        var destructiveOperation = plan.RootElement.GetProperty("pendingOperations")
+            .EnumerateArray()
+            .Single(operation => operation.GetProperty("kind").GetString() == "CreatePhysicalEntityStorage")
+            .GetProperty("identity")
+            .GetString()!;
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, planExit);
+
+        var stale = Arguments("apply", database, typeof(AuthorizationManifestSource))
+            .Concat([
+                "--expected-plan", new string('0', 64),
+                "--allow-destructive", destructiveOperation,
+                "--allow-semantic", "reclassify-v2"
+            ])
+            .ToArray();
+        var staleExit = await GroundworkSchemaCli.RunAsync(stale, output, error);
+        using var staleReport = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.AuthorizationRequired, staleExit);
+        Assert.Contains(
+            staleReport.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-CLI-011");
+        Assert.False(await TableExistsAsync(database, "schema_tool_documents"));
+
+        var authorized = Arguments("apply", database, typeof(AuthorizationManifestSource))
+            .Concat([
+                "--expected-plan", planFingerprint,
+                "--allow-destructive", destructiveOperation,
+                "--allow-semantic", "reclassify-v2"
+            ])
             .ToArray();
         var appliedExit = await GroundworkSchemaCli.RunAsync(authorized, output, error);
         using var applied = ParseOutput();
@@ -180,13 +296,26 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal("applied", applied.RootElement.GetProperty("outcome").GetString());
         Assert.True(await TableExistsAsync(database, "schema_tool_documents"));
 
-        var restartExit = await GroundworkSchemaCli.RunAsync(arguments, output, error);
+        var restartExit = await GroundworkSchemaCli.RunAsync(safe, output, error);
         using var restart = ParseOutput();
         Assert.Equal(SchemaToolExitCodes.Success, restartExit);
         Assert.Equal("ready", restart.RootElement.GetProperty("outcome").GetString());
         Assert.False(restart.RootElement.GetProperty("authorization").GetProperty("destructiveRequired").GetBoolean());
         Assert.Equal(0, restart.RootElement.GetProperty("authorization").GetProperty("semanticRequired").GetArrayLength());
         Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
+    public async Task Apply_requires_safe_or_exact_plan_bound_authorization_mode()
+    {
+        var database = Path.Combine(directory, "mode-required.db");
+
+        var exit = await GroundworkSchemaCli.RunAsync(Arguments("apply", database), output, error);
+        using var report = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.InvalidInvocation, exit);
+        Assert.Equal("GW-CLI-001", Assert.Single(report.RootElement.GetProperty("diagnostics").EnumerateArray()).GetProperty("code").GetString());
+        Assert.False(File.Exists(database));
     }
 
     [Fact]
@@ -228,7 +357,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         cancellation.Cancel();
 
         var exit = await GroundworkSchemaCli.RunAsync(
-            Arguments("apply", database),
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
             output,
             error,
             cancellation.Token);
@@ -245,7 +374,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     public async Task Apply_has_no_implicit_connection_or_startup_fallback()
     {
         var database = Path.Combine(directory, "must-not-fallback.db");
-        var arguments = Arguments("apply", database).ToList();
+        var arguments = Arguments("apply", database).Concat(["--safe"]).ToList();
         var option = arguments.IndexOf("--connection");
         arguments.RemoveRange(option, 2);
 
@@ -287,6 +416,20 @@ public sealed class GroundworkSchemaCliTests : IDisposable
 
         Assert.Equal(SchemaToolExitCodes.Success, exit);
         Assert.StartsWith(expected, output.ToString(), StringComparison.Ordinal);
+        Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
+    public async Task Version_reports_the_exact_package_informational_version()
+    {
+        var expected = typeof(GroundworkSchemaCli).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!
+            .InformationalVersion.Split('+', 2)[0];
+
+        var exit = await GroundworkSchemaCli.RunAsync(["--version"], output, error);
+
+        Assert.Equal(SchemaToolExitCodes.Success, exit);
+        Assert.Equal($"Groundwork.Tool {expected}{Environment.NewLine}", output.ToString());
         Assert.Equal(string.Empty, error.ToString());
     }
 
@@ -364,6 +507,16 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @name;";
         command.Parameters.AddWithValue("@name", table);
+        return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
+    }
+
+    private static async Task<bool> IndexExistsAsync(string database, string index)
+    {
+        await using var connection = new SqliteConnection($"Data Source={database}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = @name;";
+        command.Parameters.AddWithValue("@name", index);
         return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
     }
 

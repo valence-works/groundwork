@@ -64,7 +64,12 @@ jobs:
         run: dotnet restore Groundwork.slnx
 
       - name: Build
-        run: dotnet build Groundwork.slnx --configuration Release --no-restore
+        run: >-
+          dotnet build Groundwork.slnx
+          --configuration Release
+          --no-restore
+          /p:Version=${{ steps.version.outputs.version }}
+          /p:PackageVersion=${{ steps.version.outputs.version }}
 
       - name: Test core packages
         run: |
@@ -72,6 +77,15 @@ jobs:
           dotnet test tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj --configuration Release --no-build
           dotnet test tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj --configuration Release --no-build
           dotnet test samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj --configuration Release --no-build
+
+      - name: Test schema tool provider parity
+        timeout-minutes: 20
+        run: >-
+          dotnet test
+          tests/Groundwork/Groundwork.SchemaTool.ProviderTests/Groundwork.SchemaTool.ProviderTests.csproj
+          --configuration Release
+          --no-build
+          --filter Category=SchemaToolProviderParity
 
       - name: Pack
         shell: bash
@@ -84,6 +98,21 @@ jobs:
               --output artifacts/packages \
               /p:PackageVersion=${{ steps.version.outputs.version }}
           done < <(find src/Groundwork -name '*.csproj' -print0 | sort -z)
+
+      - name: Verify packed tool version
+        shell: bash
+        run: |
+          dotnet tool install \
+            --tool-path artifacts/tool-smoke \
+            --add-source artifacts/packages \
+            --version "${{ steps.version.outputs.version }}" \
+            Groundwork.Tool
+          expected="Groundwork.Tool ${{ steps.version.outputs.version }}"
+          actual="$(artifacts/tool-smoke/groundwork --version)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Expected '$expected', got '$actual'." >&2
+            exit 1
+          fi
 
       - name: Publish to Feedz.io
         env:

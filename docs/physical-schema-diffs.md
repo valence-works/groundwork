@@ -77,6 +77,14 @@ the version remains durable evidence and a version change produces validation/re
 The immutable target identity is also passed to every executor operation; implementations must not
 infer durable ledger ownership from mutable ambient executor state.
 
+The coordinator evaluates an optional exact-plan authorization callback after planning and while the
+same lease remains held. A rejection returns the plan and authorization diagnostics without applying
+an operation or recording state; an approval executes that exact plan before releasing the lease.
+This is the concurrency boundary used by CLI safe/authorized modes and prevents an unlocked
+authorize-then-replan race. Separately, `IPhysicalSchemaHistoryInspector` provides a non-mutating,
+point-in-time history read for live readiness validation. Inspection never authorizes application;
+apply always rereads under the exclusion lease.
+
 An executor must apply `(operation identity, fingerprint)` idempotently. The same identity with a
 different fingerprint is a conflict. An acknowledgement means the operation is durably observable;
 if the acknowledgement is lost, retry reconciles the durable operation and returns the same

@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Reflection;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Validation;
 
 namespace Groundwork.SchemaTool;
 
@@ -23,7 +25,10 @@ public static class GroundworkSchemaCli
         }
         if (arguments.Count == 1 && arguments[0] == "--version")
         {
-            var version = typeof(GroundworkSchemaCli).Assembly.GetName().Version?.ToString(3) ?? "unknown";
+            var version = typeof(GroundworkSchemaCli).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion.Split('+', 2)[0]
+                ?? "unknown";
             await output.WriteLineAsync($"Groundwork.Tool {version}");
             return SchemaToolExitCodes.Success;
         }
@@ -71,23 +76,36 @@ public static class GroundworkSchemaCli
             var namePolicy = source.CreateNamePolicy()
                 ?? throw new SchemaToolConfigurationException("GW-CLI-004", "Manifest source returned a null naming policy.");
             var compilation = SchemaToolTargetCompiler.Compile(manifest, namePolicy, parsedOptions.Provider);
-            if (parsedOptions.Command == SchemaToolCommand.Validate)
-            {
-                var validation = SchemaToolReport.Validate(compilation.Target, compilation.Diagnostics);
-                await SchemaToolReportWriter.WriteAsync(validation, parsedOptions.Output, output);
-                return validation.Diagnostics.Any(item => item.IsError)
-                    ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
-                    : Finish(SchemaToolExitCodes.Success, "ready");
-            }
-
             if (!compilation.IsValid)
             {
-                var invalid = SchemaToolReport.Validate(compilation.Target, compilation.Diagnostics) with
+                var invalid = SchemaToolReport.Validate(
+                    compilation.Target,
+                    compilation.Diagnostics,
+                    PhysicalSchemaHistoryState.Empty,
+                    parsedOptions.Command == SchemaToolCommand.Validate
+                        ? parsedOptions.Offline ? "offline" : "live"
+                        : "offline") with
                 {
-                    Command = parsedOptions.Command.ToString().ToLowerInvariant()
+                    Command = parsedOptions.Command.ToString().ToLowerInvariant(),
+                    InspectionMode = parsedOptions.Command == SchemaToolCommand.Validate
+                        ? parsedOptions.Offline ? "offline" : "live"
+                        : null
                 };
                 await SchemaToolReportWriter.WriteAsync(invalid, parsedOptions.Output, output);
                 return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
+            }
+
+            if (parsedOptions.Command == SchemaToolCommand.Validate && parsedOptions.Offline)
+            {
+                var offline = SchemaToolReport.Validate(
+                    compilation.Target,
+                    compilation.Diagnostics,
+                    PhysicalSchemaHistoryState.Empty,
+                    "offline");
+                await SchemaToolReportWriter.WriteAsync(offline, parsedOptions.Output, output);
+                return offline.Diagnostics.Any(item => item.IsError)
+                    ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
+                    : Finish(SchemaToolExitCodes.Success, "ready");
             }
 
             var connectionString = ResolveConnection(parsedOptions);
@@ -95,41 +113,68 @@ public static class GroundworkSchemaCli
                 parsedOptions.Provider,
                 connectionString,
                 parsedOptions.Database);
+            if (parsedOptions.Command == SchemaToolCommand.Validate)
+            {
+                PhysicalSchemaHistoryState inspectedHistory;
+                try
+                {
+                    inspectedHistory = await provider.Inspector.InspectHistoryAsync(
+                        compilation.Target!,
+                        cancellationToken);
+                }
+                catch (InvalidOperationException)
+                {
+                    var drift = SchemaToolReport.Validate(
+                        compilation.Target,
+                        compilation.Diagnostics.Concat(
+                        [
+                            GroundworkDiagnostic.Error(
+                                "GW-CLI-012",
+                                "Live provider state is incompatible with the recorded physical-schema target.",
+                                "providerState")
+                        ]).ToArray(),
+                        PhysicalSchemaHistoryState.Empty,
+                        "live");
+                    await SchemaToolReportWriter.WriteAsync(drift, parsedOptions.Output, output);
+                    return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
+                }
+                var validation = SchemaToolReport.Validate(
+                    compilation.Target,
+                    compilation.Diagnostics,
+                    inspectedHistory,
+                    "live");
+                await SchemaToolReportWriter.WriteAsync(validation, parsedOptions.Output, output);
+                return validation.Diagnostics.Any(item => item.IsError)
+                    ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
+                    : Finish(SchemaToolExitCodes.Success, "ready");
+            }
+
+            if (parsedOptions.Command == SchemaToolCommand.Apply)
+            {
+                var application = await PhysicalSchemaApplication.ApplyAsync(
+                    compilation.Target!,
+                    provider.Executor,
+                    planAuthorization: plan => SchemaToolAuthorization.Evaluate(
+                        compilation.Target!,
+                        plan,
+                        parsedOptions),
+                    cancellationToken: cancellationToken);
+                var applied = SchemaToolReport.FromApplication(application);
+                await SchemaToolReportWriter.WriteAsync(applied, parsedOptions.Output, output);
+                return application.Outcome switch
+                {
+                    PhysicalSchemaApplicationOutcome.Rejected =>
+                        Finish(SchemaToolExitCodes.ValidationFailed, "blocked"),
+                    PhysicalSchemaApplicationOutcome.AuthorizationRequired =>
+                        Finish(SchemaToolExitCodes.AuthorizationRequired, "authorization-required"),
+                    _ => Finish(SchemaToolExitCodes.Success, applied.Outcome)
+                };
+            }
+
             var (history, plan) = await ReadPlanAsync(
                 compilation.Target!,
                 provider.Executor,
                 cancellationToken);
-            if (parsedOptions.Command == SchemaToolCommand.Apply)
-            {
-                if (!plan.IsApplicable)
-                {
-                    var blocked = SchemaToolReport.FromPlan("apply", compilation.Target!, history, plan);
-                    await SchemaToolReportWriter.WriteAsync(blocked, parsedOptions.Output, output);
-                    return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
-                }
-
-                var missingAuthorization = SchemaToolAuthorization.FindMissing(plan.Operations, parsedOptions);
-                if (missingAuthorization.Count != 0)
-                {
-                    var unauthorized = SchemaToolAuthorization.Report(
-                        compilation.Target!,
-                        history,
-                        plan,
-                        missingAuthorization);
-                    await SchemaToolReportWriter.WriteAsync(unauthorized, parsedOptions.Output, output);
-                    return Finish(SchemaToolExitCodes.AuthorizationRequired, "authorization-required");
-                }
-
-                var application = await PhysicalSchemaApplication.ApplyAsync(
-                    compilation.Target!,
-                    provider.Executor,
-                    cancellationToken: cancellationToken);
-                var applied = SchemaToolReport.FromApplication(application);
-                await SchemaToolReportWriter.WriteAsync(applied, parsedOptions.Output, output);
-                return application.Outcome == PhysicalSchemaApplicationOutcome.Rejected
-                    ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
-                    : Finish(SchemaToolExitCodes.Success, applied.Outcome);
-            }
 
             var report = SchemaToolReport.FromPlan(
                 parsedOptions.Command.ToString().ToLowerInvariant(),
@@ -201,8 +246,11 @@ public static class GroundworkSchemaCli
 
         Output and authorization:
           --output <human|json>       Human output is the default
-          --authorize-destructive     Approve declared destructive work
-          --authorize-semantic <id>   Approve one declared semantic migration identity
+          --offline                   Validate manifest/routes without provider inspection
+          --safe                      Apply only additive/approved-backfill work
+          --expected-plan <hash>      Bind authorized apply to one exact locked plan
+          --allow-destructive <op>    Approve one exact destructive operation identity
+          --allow-semantic <id>       Approve one semantic migration identity
 
         Source selection:
           --manifest-type <name>      Required when the assembly contains multiple sources

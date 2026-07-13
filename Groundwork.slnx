@@ -31,6 +31,7 @@
     <Project Path="tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj" />
+    <Project Path="tests/Groundwork/Groundwork.SchemaTool.ProviderTests/Groundwork.SchemaTool.ProviderTests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">

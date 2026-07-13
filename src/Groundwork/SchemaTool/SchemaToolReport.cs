@@ -10,6 +10,7 @@ namespace Groundwork.SchemaTool;
 internal sealed record SchemaToolReport(
     string Command,
     string Outcome,
+    string? InspectionMode,
     PhysicalSchemaTarget? Target,
     string? PlanFingerprint,
     string? AppliedTargetFingerprint,
@@ -20,20 +21,23 @@ internal sealed record SchemaToolReport(
 {
     public static SchemaToolReport Validate(
         PhysicalSchemaTarget? target,
-        IReadOnlyList<GroundworkDiagnostic> diagnostics)
+        IReadOnlyList<GroundworkDiagnostic> diagnostics,
+        PhysicalSchemaHistoryState history,
+        string inspectionMode)
     {
         var plan = target is null
             ? null
-            : PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, DateTimeOffset.UnixEpoch);
+            : PhysicalSchemaDiffPlanner.Plan(target, history, DateTimeOffset.UnixEpoch);
         var combined = diagnostics.Concat(plan?.Diagnostics ?? []).ToArray();
         return new SchemaToolReport(
             "validate",
             combined.Any(item => item.IsError) ? "blocked" : "ready",
+            inspectionMode,
             target,
-            plan is null ? null : Fingerprint(target!, null, plan.Operations),
-            null,
+            plan is null ? null : Fingerprint(target!, history.AppliedState?.TargetFingerprint, plan.Operations),
+            history.AppliedState?.TargetFingerprint,
             plan?.Operations ?? [],
-            [],
+            history.AppliedState?.AppliedOperations ?? [],
             combined,
             Mutated: false);
     }
@@ -52,6 +56,7 @@ internal sealed record SchemaToolReport(
         return new SchemaToolReport(
             command,
             outcome,
+            null,
             target,
             Fingerprint(target, history.AppliedState?.TargetFingerprint, plan.Operations),
             history.AppliedState?.TargetFingerprint,
@@ -68,20 +73,23 @@ internal sealed record SchemaToolReport(
             PhysicalSchemaApplicationOutcome.Applied => "applied",
             PhysicalSchemaApplicationOutcome.NoChanges => "ready",
             PhysicalSchemaApplicationOutcome.Rejected => "blocked",
+            PhysicalSchemaApplicationOutcome.AuthorizationRequired => "authorization-required",
             _ => throw new ArgumentOutOfRangeException(nameof(result))
         };
+        var authorizationRequired = result.Outcome == PhysicalSchemaApplicationOutcome.AuthorizationRequired;
         return new SchemaToolReport(
             "apply",
             outcome,
+            null,
             result.Plan.Target,
             Fingerprint(
                 result.Plan.Target,
                 result.Plan.ExpectedAppliedTargetFingerprint,
                 result.Plan.Operations),
             result.AppliedState?.TargetFingerprint,
-            [],
+            authorizationRequired ? result.Plan.Operations : [],
             result.AppliedState?.AppliedOperations ?? [],
-            result.Plan.Diagnostics,
+            result.Plan.Diagnostics.Concat(result.AuthorizationDiagnostics).ToArray(),
             Mutated: result.Outcome == PhysicalSchemaApplicationOutcome.Applied);
     }
 
@@ -93,6 +101,7 @@ internal sealed record SchemaToolReport(
         new(
             command,
             outcome,
+            InspectionMode: null,
             Target: null,
             PlanFingerprint: null,
             AppliedTargetFingerprint: null,
@@ -135,6 +144,8 @@ internal static class SchemaToolReportWriter
     private static async Task WriteHumanAsync(SchemaToolReport report, TextWriter writer)
     {
         await writer.WriteLineAsync($"Groundwork schema {report.Command}: {report.Outcome}");
+        if (report.InspectionMode is not null)
+            await writer.WriteLineAsync($"Inspection mode: {report.InspectionMode}");
         if (report.Target is not null)
         {
             await writer.WriteLineAsync($"Provider: {report.Target.Provider.Name}@{report.Target.Provider.Version}");
@@ -154,6 +165,7 @@ internal static class SchemaToolReportWriter
         writer.WriteString("schemaVersion", "1");
         writer.WriteString("command", report.Command);
         writer.WriteString("outcome", report.Outcome);
+        WriteNullable(writer, "inspectionMode", report.InspectionMode);
         writer.WritePropertyName("provider");
         writer.WriteStartObject();
         if (report.Target is null)
@@ -288,10 +300,16 @@ internal static class SchemaToolReportWriter
     private static void WriteAuthorization(Utf8JsonWriter writer, SchemaToolReport report)
     {
         var destructive = SchemaToolAuthorization.RequiresDestructive(report.PendingOperations);
+        var destructiveOperations = SchemaToolAuthorization.DestructiveOperationIdentities(report.PendingOperations);
         var semantic = SchemaToolAuthorization.SemanticIdentities(report.PendingOperations);
         writer.WritePropertyName("authorization");
         writer.WriteStartObject();
         writer.WriteBoolean("destructiveRequired", destructive);
+        writer.WritePropertyName("destructiveOperationsRequired");
+        writer.WriteStartArray();
+        foreach (var identity in destructiveOperations)
+            writer.WriteStringValue(identity);
+        writer.WriteEndArray();
         writer.WritePropertyName("semanticRequired");
         writer.WriteStartArray();
         foreach (var identity in semantic)

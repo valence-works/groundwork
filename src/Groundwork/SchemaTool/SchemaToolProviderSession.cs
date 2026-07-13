@@ -20,6 +20,10 @@ internal sealed class SchemaToolProviderSession : IAsyncDisposable
 
     public IPhysicalSchemaExecutor Executor { get; }
 
+    public IPhysicalSchemaHistoryInspector Inspector =>
+        Executor as IPhysicalSchemaHistoryInspector
+        ?? throw new InvalidOperationException("The selected provider does not support non-mutating physical-schema inspection.");
+
     public static SchemaToolProviderSession Create(
         string provider,
         string connectionString,

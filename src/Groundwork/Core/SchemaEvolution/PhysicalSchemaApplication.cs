@@ -1,3 +1,5 @@
+using Groundwork.Core.Validation;
+
 namespace Groundwork.Core.SchemaEvolution;
 
 /// <summary>
@@ -65,13 +67,31 @@ public enum PhysicalSchemaApplicationOutcome
 {
     Applied,
     NoChanges,
-    Rejected
+    Rejected,
+    AuthorizationRequired
 }
 
 public sealed record PhysicalSchemaApplicationResult(
     PhysicalSchemaApplicationOutcome Outcome,
     PhysicalSchemaDiffPlan Plan,
-    PhysicalSchemaAppliedState? AppliedState);
+    PhysicalSchemaAppliedState? AppliedState)
+{
+    public IReadOnlyList<GroundworkDiagnostic> AuthorizationDiagnostics { get; init; } = [];
+}
+
+/// <summary>
+/// Result of evaluating one exact plan while its provider/manifest application lock is held.
+/// A denied result prevents every operation and applied-state write for that plan.
+/// </summary>
+public sealed record PhysicalSchemaPlanAuthorization(
+    bool IsAuthorized,
+    IReadOnlyList<GroundworkDiagnostic> Diagnostics)
+{
+    public static PhysicalSchemaPlanAuthorization Allow { get; } = new(true, []);
+
+    public static PhysicalSchemaPlanAuthorization Deny(IReadOnlyList<GroundworkDiagnostic> diagnostics) =>
+        new(false, diagnostics ?? throw new ArgumentNullException(nameof(diagnostics)));
+}
 
 /// <summary>
 /// Safe application coordinator. It never records a target snapshot until every non-recording
@@ -84,6 +104,7 @@ public static class PhysicalSchemaApplication
         IPhysicalSchemaExecutor executor,
         TimeProvider? timeProvider = null,
         LegacyPhysicalSchemaHistoryPolicy legacyHistoryPolicy = LegacyPhysicalSchemaHistoryPolicy.RejectEntriesWithoutAppliedSnapshot,
+        Func<PhysicalSchemaDiffPlan, PhysicalSchemaPlanAuthorization>? planAuthorization = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(target);
@@ -111,6 +132,17 @@ public static class PhysicalSchemaApplication
             legacyHistoryPolicy);
         if (!plan.IsApplicable)
             return new PhysicalSchemaApplicationResult(PhysicalSchemaApplicationOutcome.Rejected, plan, null);
+        var authorization = planAuthorization?.Invoke(plan) ?? PhysicalSchemaPlanAuthorization.Allow;
+        if (!authorization.IsAuthorized)
+        {
+            return new PhysicalSchemaApplicationResult(
+                PhysicalSchemaApplicationOutcome.AuthorizationRequired,
+                plan,
+                history.AppliedState)
+            {
+                AuthorizationDiagnostics = authorization.Diagnostics
+            };
+        }
         if (plan.Operations.Count == 0)
         {
             var validation = new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);

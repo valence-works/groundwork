@@ -328,6 +328,12 @@ public sealed class ValidatePhysicalSchemaOperation : PhysicalSchemaOperation
         RouteFingerprints = Array.AsReadOnly(Routes.Select(route => route.Fingerprint).ToArray());
     }
 
+    public static ValidatePhysicalSchemaOperation ForTarget(PhysicalSchemaTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        return new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+    }
+
     public string TargetFingerprint { get; }
 
     public IReadOnlyList<ExecutableStorageRoute> Routes { get; }

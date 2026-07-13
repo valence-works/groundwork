@@ -29,7 +29,9 @@ Use the same Groundwork release version for `Groundwork.Tool`, `Groundwork.Core`
 provider package. A manifest-source assembly is loaded into the tool process and therefore must be
 binary-compatible with that tool release. Pin the tool version in the tool manifest, update it with
 the application's Groundwork packages, and run `validate` after every version change. Provider
-identity and provider package version are part of every plan and its target fingerprint.
+identity and provider package version are part of every plan and its target fingerprint. `--version`
+reports the exact installed package version, including a preview suffix, so pipelines can assert the
+tool/package match before loading application code.
 
 ## Expose the provider-neutral manifest
 
@@ -62,6 +64,14 @@ dotnet groundwork validate \
   --manifest-assembly ./bin/Release/net10.0/Application.dll \
   --manifest-type ApplicationSchema \
   --provider sqlite \
+  --connection-env GROUNDWORK_DEPLOYMENT_CONNECTION \
+  --output json
+
+dotnet groundwork validate \
+  --manifest-assembly ./bin/Release/net10.0/Application.dll \
+  --manifest-type ApplicationSchema \
+  --provider sqlite \
+  --offline \
   --output json
 
 dotnet groundwork plan \
@@ -83,15 +93,22 @@ dotnet groundwork apply \
   --manifest-type ApplicationSchema \
   --provider sqlite \
   --connection-env GROUNDWORK_DEPLOYMENT_CONNECTION \
+  --safe \
   --output json
 ```
 
-`validate` compiles the manifest and desired provider target without opening a database or mutating
-provider state. `plan` and `status` read durable applied state under the provider/manifest exclusion
-lock; an executor may establish its provider-owned lock/history infrastructure while doing so, but
-neither command applies target operations. `apply` first reads and authorizes the current plan, then
-delegates execution, retry, cancellation, acknowledgement-loss recovery, and applied-state
-publication to #44's `PhysicalSchemaApplication` and provider executor.
+Live `validate` is the default. It opens the selected provider, performs a point-in-time read of
+durable applied state, and computes readiness without acquiring the application lock, creating
+Groundwork infrastructure, recording evidence, or changing target objects. `validate --offline` is
+the explicitly separate manifest/route compilation mode and accepts no connection input. Because a
+live validation is intentionally non-locking, deployment still recomputes and authorizes the exact
+plan under the application lock.
+
+`plan` and `status` read durable applied state under the provider/manifest exclusion lock; an
+executor may establish its provider-owned lock/history infrastructure while doing so, but neither
+command applies target operations. `apply` reads, authorizes, and executes one exact plan without
+releasing that lock between those phases. Execution, retry, cancellation, acknowledgement-loss
+recovery, and applied-state publication remain #44's `PhysicalSchemaApplication` protocol.
 
 MongoDB requires `--database` unless the connection URI already contains the database name.
 `--connection` is supported for non-interactive runners, but `--connection-env` is preferred because
@@ -100,18 +117,27 @@ value are never emitted.
 
 ## Authorization
 
-Apply refuses target operations carrying destructive or semantic evolution metadata until the
-matching approvals are explicit:
+Safe application is explicit and refuses every operation carrying destructive or semantic evolution
+metadata:
 
 ```bash
-dotnet groundwork apply \
-  ... \
-  --authorize-destructive \
-  --authorize-semantic reclassify-v2
+dotnet groundwork apply ... --safe
 ```
 
-`--authorize-semantic` is repeatable and identities must match exactly. Authorization does not turn
-an unsupported transform into a supported one: a projected field declared
+For an authorized plan, first retain the `planFingerprint` and exact destructive operation identities
+from `plan --output json`, then bind approval to that plan:
+
+```bash
+dotnet groundwork apply ... \
+  --expected-plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --allow-destructive create-physical-entity-storage:documents:example:0123456789abcdef \
+  --allow-semantic reclassify-v2
+```
+
+`--allow-destructive` and `--allow-semantic` are repeatable and match exact identities. A stale
+`--expected-plan` is rejected after the provider lock is acquired and before any target operation;
+approval can never authorize a different plan observed after an unlocked preflight. Authorization
+does not turn an unsupported transform into a supported one: a projected field declared
 `SemanticMigrationRequired` remains the blocking `GW-SCHEMA-005` diagnostic until an authored
 provider-neutral semantic migration exists.
 
@@ -119,12 +145,12 @@ provider-neutral semantic migration exists.
 
 `--output json` emits one compact JSON object followed by a newline. Schema version `1` contains:
 
-- command and outcome;
+- command, outcome, and live/offline inspection mode when validating;
 - exact provider name/version and manifest target identity/version/fingerprint;
 - deterministic plan fingerprint and previously applied target fingerprint;
 - deterministically ordered resolved physical names;
 - pending and applied operation identities, fingerprints, kinds, storage units, and subjects;
-- required destructive/semantic authorization;
+- exact destructive operation and semantic migration identities requiring authorization;
 - blocking diagnostics; and
 - `targetMutated`, which is true only when this invocation applied target work.
 
@@ -140,7 +166,7 @@ The `Groundwork.SchemaTool` activity source emits only `groundwork.command`, `gr
 | `0` | success | Validation passed, no work is pending, or apply completed/reconciled successfully. |
 | `2` | pending changes | `plan` or `status` found applicable pending operations. |
 | `3` | validation failed | Blocking manifest, route, history, or physical-schema diagnostics exist. |
-| `4` | authorization required | Apply needs explicit destructive and/or semantic approval. |
+| `4` | authorization required | Safe apply found protected work, exact approval is incomplete, or the locked plan differs from `--expected-plan`. |
 | `5` | invalid invocation | Required source, provider, connection, database, or option input is missing/invalid. |
 | `10` | execution failed | Provider execution failed; details are deliberately suppressed from output. |
 | `130` | cancelled | Caller cancellation or Ctrl+C stopped the command before unapplied state was published. |
@@ -157,7 +183,7 @@ if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
   exit "$code"
 fi
 
-dotnet groundwork apply ... --output json > groundwork-apply.json
+dotnet groundwork apply ... --safe --output json > groundwork-apply.json
 ```
 
 Grant the deployment identity only the provider permissions required for the declared target plus

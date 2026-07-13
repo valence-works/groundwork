@@ -23,8 +23,11 @@ internal sealed record SchemaToolOptions(
     string? ConnectionEnvironmentVariable,
     string? Database,
     SchemaToolOutput Output,
-    bool AuthorizeDestructive,
-    IReadOnlySet<string> AuthorizedSemanticMigrations)
+    bool Offline,
+    bool ApplySafe,
+    string? ExpectedPlanFingerprint,
+    IReadOnlySet<string> AllowedDestructiveOperations,
+    IReadOnlySet<string> AllowedSemanticMigrations)
 {
     public static bool TryParse(
         IReadOnlyList<string> arguments,
@@ -40,19 +43,22 @@ internal sealed record SchemaToolOptions(
         }
 
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        var destructive = new HashSet<string>(StringComparer.Ordinal);
         var semantic = new HashSet<string>(StringComparer.Ordinal);
-        var destructive = false;
+        var offline = false;
+        var safe = false;
         for (var index = 1; index < arguments.Count; index++)
         {
             var option = arguments[index];
-            if (option == "--authorize-destructive")
+            if (option is "--offline" or "--safe")
             {
-                if (destructive)
+                if (option == "--offline" && offline || option == "--safe" && safe)
                 {
-                    diagnostic = "Option '--authorize-destructive' was supplied more than once.";
+                    diagnostic = $"Option '{option}' was supplied more than once.";
                     return false;
                 }
-                destructive = true;
+                offline |= option == "--offline";
+                safe |= option == "--safe";
                 continue;
             }
 
@@ -68,7 +74,12 @@ internal sealed record SchemaToolOptions(
                 diagnostic = $"Option '{option}' requires a non-empty value.";
                 return false;
             }
-            if (option == "--authorize-semantic")
+            if (option == "--allow-destructive")
+            {
+                destructive.Add(value);
+                continue;
+            }
+            if (option == "--allow-semantic")
             {
                 semantic.Add(value);
                 continue;
@@ -104,6 +115,42 @@ internal sealed record SchemaToolOptions(
 
         values.TryGetValue("--manifest-type", out var manifestType);
         values.TryGetValue("--database", out var database);
+        values.TryGetValue("--expected-plan", out var expectedPlanFingerprint);
+        if (expectedPlanFingerprint is not null &&
+            (expectedPlanFingerprint.Length != 64 || expectedPlanFingerprint.Any(character => !Uri.IsHexDigit(character))))
+        {
+            diagnostic = "Option '--expected-plan' must be a 64-character hexadecimal plan fingerprint.";
+            return false;
+        }
+        if (offline && command != SchemaToolCommand.Validate)
+        {
+            diagnostic = "Option '--offline' is valid only for the validate command.";
+            return false;
+        }
+        if (offline && (connection is not null || connectionEnvironmentVariable is not null || database is not null))
+        {
+            diagnostic = "Offline validation cannot accept connection input.";
+            return false;
+        }
+        var hasBoundAuthorization = expectedPlanFingerprint is not null || destructive.Count != 0 || semantic.Count != 0;
+        if (command == SchemaToolCommand.Apply)
+        {
+            if (safe == hasBoundAuthorization)
+            {
+                diagnostic = "Apply requires exactly one mode: '--safe' or '--expected-plan' with exact authorization.";
+                return false;
+            }
+            if (hasBoundAuthorization && expectedPlanFingerprint is null)
+            {
+                diagnostic = "Exact authorization requires '--expected-plan'.";
+                return false;
+            }
+        }
+        else if (safe || hasBoundAuthorization)
+        {
+            diagnostic = "Apply mode and authorization options are valid only for the apply command.";
+            return false;
+        }
         options = new SchemaToolOptions(
             command,
             assembly,
@@ -113,6 +160,9 @@ internal sealed record SchemaToolOptions(
             connectionEnvironmentVariable,
             database,
             output,
+            offline,
+            safe,
+            expectedPlanFingerprint,
             destructive,
             semantic);
         return true;
@@ -127,7 +177,9 @@ internal sealed record SchemaToolOptions(
         "--connection-env",
         "--database",
         "--output",
-        "--authorize-semantic"
+        "--expected-plan",
+        "--allow-destructive",
+        "--allow-semantic"
     };
 
     private static bool TryCommand(string value, out SchemaToolCommand command) =>

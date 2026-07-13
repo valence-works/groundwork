@@ -16,7 +16,7 @@ namespace Groundwork.Relational.PhysicalStorage;
 /// metadata inspection, advisory locks, and native value adaptation; operation ordering, durable
 /// acknowledgements, CAS state, backfill, and exact compatibility checks remain common.
 /// </summary>
-public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
+public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhysicalSchemaHistoryInspector
 {
     private const string BootstrapLockResource = "groundwork:physical:bootstrap";
     private readonly Func<DbConnection> createLockConnection;
@@ -135,6 +135,49 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 ? PhysicalSchemaHistoryState.Empty
                 : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
         }, cancellationToken);
+
+    public async ValueTask<PhysicalSchemaHistoryState> InspectHistoryAsync(
+        PhysicalSchemaTarget target,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        await using var connection = createLockConnection()
+            ?? throw new InvalidOperationException("The physical-schema inspection connection factory returned null.");
+        if (connection.State != ConnectionState.Open)
+            await connection.OpenAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        if (!await dialect.TableExistsAsync(
+                connection,
+                transaction,
+                "groundwork_physical_schema_state",
+                cancellationToken))
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return PhysicalSchemaHistoryState.Empty;
+        }
+
+        await using var command = Command(connection, transaction, """
+            SELECT applied_state_json
+            FROM groundwork_physical_schema_state
+            WHERE manifest_id = @manifestId AND provider_name = @providerName;
+            """);
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.Provider.Name);
+        var json = await command.ExecuteScalarAsync(cancellationToken) as string;
+        var history = json is null
+            ? PhysicalSchemaHistoryState.Empty
+            : PhysicalSchemaHistoryState.FromApplied(PhysicalSchemaAppliedStateSerializer.Deserialize(json));
+        if (history.AppliedState?.TargetFingerprint == target.Fingerprint)
+        {
+            await ValidateAsync(
+                connection,
+                transaction,
+                ValidatePhysicalSchemaOperation.ForTarget(target),
+                cancellationToken);
+        }
+        await transaction.CommitAsync(cancellationToken);
+        return history;
+    }
 
     public async ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
         PhysicalSchemaTargetIdentity target,

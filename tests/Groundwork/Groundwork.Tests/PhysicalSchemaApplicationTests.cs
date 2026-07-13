@@ -3,6 +3,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Validation;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -174,6 +175,53 @@ public sealed class PhysicalSchemaApplicationTests
         Assert.Equal(1, executor.RecordedStateCount);
     }
 
+    [Fact]
+    public async Task Plan_authorization_and_application_share_one_lock_and_one_exact_plan()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+        PhysicalSchemaDiffPlan? authorizedPlan = null;
+
+        var result = await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            executor,
+            planAuthorization: plan =>
+            {
+                Assert.True(executor.IsLockHeld);
+                authorizedPlan = plan;
+                return PhysicalSchemaPlanAuthorization.Allow;
+            });
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Outcome);
+        Assert.Equal(1, executor.LockAcquisitionCount);
+        Assert.NotNull(authorizedPlan);
+        Assert.Equal(
+            authorizedPlan.Operations
+                .Where(operation => operation is not RecordPhysicalSchemaAppliedStateOperation)
+                .Select(operation => operation.Identity)
+                .OrderBy(identity => identity, StringComparer.Ordinal),
+            executor.DurableOperations.Keys.OrderBy(identity => identity, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task Rejected_plan_authorization_runs_under_lock_and_applies_nothing()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+
+        var result = await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            executor,
+            planAuthorization: _ => PhysicalSchemaPlanAuthorization.Deny(
+                [GroundworkDiagnostic.Error("GW-TEST-001", "Authorization rejected.", "authorization")]));
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.AuthorizationRequired, result.Outcome);
+        Assert.Equal("GW-TEST-001", Assert.Single(result.AuthorizationDiagnostics).Code);
+        Assert.Equal(1, executor.LockAcquisitionCount);
+        Assert.Empty(executor.DurableOperations);
+        Assert.Null(executor.AppliedState);
+    }
+
     private static PhysicalSchemaTarget CreateTarget(bool includeSecondProjection)
     {
         var template = SampleManifests.MetadataManifest();
@@ -251,6 +299,7 @@ public sealed class PhysicalSchemaApplicationTests
         public int RecordedStateCount => recordedStateCount;
         public bool OperationObservedLeaseLoss { get; private set; }
         public int LiveValidationCount { get; private set; }
+        public bool IsLockHeld => Volatile.Read(ref currentLockHolders) == 1;
         private CancellationTokenSource? leaseLoss;
 
         public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(

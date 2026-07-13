@@ -102,7 +102,7 @@ Groundwork will provide a .NET CLI with deterministic human-readable and JSON ou
 - `groundwork validate`
 - `groundwork status`
 - `groundwork apply --safe`
-- `groundwork apply --allow-destructive <migration-id>`
+- `groundwork apply --expected-plan <plan-fingerprint> --allow-destructive <operation-id>`
 
 CI can plan and validate. Deployment pipelines or dedicated migrator jobs apply production changes. Development hosts may opt into safe automatic application.
 

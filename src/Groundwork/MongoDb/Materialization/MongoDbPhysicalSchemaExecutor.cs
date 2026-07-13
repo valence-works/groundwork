@@ -8,7 +8,7 @@ using MongoDB.Driver;
 namespace Groundwork.MongoDb.Materialization;
 
 /// <summary>Durable MongoDB implementation of the additive physical-schema execution boundary.</summary>
-public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
+public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhysicalSchemaHistoryInspector
 {
     private const string AppliedStateCollection = "groundwork_physical_schema_state";
     private const string OperationCollection = "groundwork_physical_schema_operations";
@@ -126,6 +126,40 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     {
         var lease = RequireLease(applicationLock, target);
         await lease.AssertOwnedAsync(session: null, cancellationToken);
+        return await ReadInspectedHistoryAsync(target, cancellationToken);
+    }
+
+    public ValueTask<PhysicalSchemaHistoryState> InspectHistoryAsync(
+        PhysicalSchemaTarget target,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        return new ValueTask<PhysicalSchemaHistoryState>(InspectTargetAsync(target, cancellationToken));
+    }
+
+    private async Task<PhysicalSchemaHistoryState> InspectTargetAsync(
+        PhysicalSchemaTarget target,
+        CancellationToken cancellationToken)
+    {
+        var history = await ReadInspectedHistoryAsync(target.Identity, cancellationToken);
+        if (history.AppliedState?.TargetFingerprint == target.Fingerprint)
+        {
+            await ValidateAsync(
+                ValidatePhysicalSchemaOperation.ForTarget(target),
+                cancellationToken);
+        }
+        return history;
+    }
+
+    private async Task<PhysicalSchemaHistoryState> ReadInspectedHistoryAsync(
+        PhysicalSchemaTargetIdentity target,
+        CancellationToken cancellationToken)
+    {
+        var collectionNames = await (await database.ListCollectionNamesAsync(cancellationToken: cancellationToken))
+            .ToListAsync(cancellationToken);
+        if (!collectionNames.Contains(AppliedStateCollection, StringComparer.Ordinal))
+            return await ReadLegacyHistoryAsync(target, collectionNames, cancellationToken);
+
         var state = await database.GetCollection<BsonDocument>(AppliedStateCollection)
             .Find(Builders<BsonDocument>.Filter.Eq("_id", TargetIdentityDocument(target)))
             .SingleOrDefaultAsync(cancellationToken);
@@ -135,16 +169,20 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
             await ValidateDurableEvidenceAsync(applied, cancellationToken);
             return PhysicalSchemaHistoryState.FromApplied(applied);
         }
+        return await ReadLegacyHistoryAsync(target, collectionNames, cancellationToken);
+    }
 
-        var legacyNames = await (await database.ListCollectionNamesAsync(cancellationToken: cancellationToken))
-            .ToListAsync(cancellationToken);
-        if (!legacyNames.Contains(MongoDbGroundworkNames.SchemaHistoryCollection, StringComparer.Ordinal))
+    private async Task<PhysicalSchemaHistoryState> ReadLegacyHistoryAsync(
+        PhysicalSchemaTargetIdentity target,
+        IReadOnlyCollection<string> collectionNames,
+        CancellationToken cancellationToken)
+    {
+        if (!collectionNames.Contains(MongoDbGroundworkNames.SchemaHistoryCollection, StringComparer.Ordinal))
             return PhysicalSchemaHistoryState.Empty;
-
-        var legacy = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.SchemaHistoryCollection);
-        var legacyFilter = Builders<BsonDocument>.Filter.Eq("manifest_id", target.ManifestIdentity.Value) &
-                           Builders<BsonDocument>.Filter.Eq("provider_name", target.ProviderName);
-        return await legacy.Find(legacyFilter).Limit(1).AnyAsync(cancellationToken)
+        var legacyHistory = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.SchemaHistoryCollection);
+        var legacyHistoryFilter = Builders<BsonDocument>.Filter.Eq("manifest_id", target.ManifestIdentity.Value) &
+                                  Builders<BsonDocument>.Filter.Eq("provider_name", target.ProviderName);
+        return await legacyHistory.Find(legacyHistoryFilter).Limit(1).AnyAsync(cancellationToken)
             ? PhysicalSchemaHistoryState.LegacyHistoryDetected
             : PhysicalSchemaHistoryState.Empty;
     }
