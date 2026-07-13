@@ -250,6 +250,82 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             CountAppliedStateAsync);
 
     [Fact]
+    public async Task Non_provider_failure_after_real_lock_loss_marks_ownership_lost_and_uses_stable_error()
+    {
+        const string injectedMessage = "simulated invalid transaction after SQL lock loss";
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: true,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        long sessionId = 0;
+        var executor = new SqlServerPhysicalSchemaExecutor(
+            container.GetConnectionString(),
+            new SqlServerPhysicalIdentityHash(),
+            null,
+            async (_, _) =>
+            {
+                await TerminateSessionAsync(sessionId);
+                throw new InvalidOperationException(injectedMessage);
+            });
+        await using var applicationLock = await executor.AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None);
+        sessionId = SqlServerPhysicalSchemaExecutor.LockSessionId(applicationLock);
+        var state = await PreparePendingStateAsync(model.Target, executor, applicationLock);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.RecordAppliedStateAsync(
+            state,
+            null,
+            applicationLock,
+            CancellationToken.None).AsTask());
+
+        Assert.Contains("lock session", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(injectedMessage, exception.ToString(), StringComparison.Ordinal);
+        Assert.True(applicationLock.OwnershipLost.IsCancellationRequested);
+        Assert.Equal(0, await CountAppliedStateAsync(model.Target.ManifestIdentity.Value, model.Target.Provider.Name));
+    }
+
+    [Fact]
+    public async Task Ordinary_invalid_operation_preserves_owned_lock_and_original_error()
+    {
+        const string injectedMessage = "ordinary schema validation failure";
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: true,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        var remainingFailures = 1;
+        using var callerCancellation = new CancellationTokenSource();
+        var executor = new SqlServerPhysicalSchemaExecutor(
+            container.GetConnectionString(),
+            new SqlServerPhysicalIdentityHash(),
+            null,
+            (_, _) =>
+            {
+                if (Interlocked.Exchange(ref remainingFailures, 0) != 1)
+                    return Task.CompletedTask;
+                callerCancellation.Cancel();
+                return Task.FromException(new InvalidOperationException(injectedMessage));
+            });
+        await using var applicationLock = await executor.AcquireApplicationLockAsync(
+            model.Target.Identity,
+            CancellationToken.None);
+        var state = await PreparePendingStateAsync(model.Target, executor, applicationLock);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.RecordAppliedStateAsync(
+            state,
+            null,
+            applicationLock,
+            callerCancellation.Token).AsTask());
+
+        Assert.Equal(injectedMessage, exception.Message);
+        Assert.False(applicationLock.OwnershipLost.IsCancellationRequested);
+        await executor.RecordAppliedStateAsync(state, null, applicationLock, CancellationToken.None);
+        Assert.False(applicationLock.OwnershipLost.IsCancellationRequested);
+    }
+
+    [Fact]
     public Task Terminated_lock_session_cannot_commit_backfill_or_operation_evidence() =>
         RelationalPhysicalServerAssertions.LostBackfillLockCannotCommitDataOrEvidenceAsync(
             SqlServerGroundworkCapabilities.Provider,
@@ -663,6 +739,25 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         await using var command = connection.CreateCommand();
         command.CommandText = $"KILL {sessionId};";
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<PhysicalSchemaAppliedState> PreparePendingStateAsync(
+        PhysicalSchemaTarget target,
+        IPhysicalSchemaExecutor executor,
+        IPhysicalSchemaApplicationLock applicationLock)
+    {
+        var history = await executor.ReadHistoryAsync(target.Identity, applicationLock, CancellationToken.None);
+        var plan = PhysicalSchemaDiffPlanner.Plan(target, history, DateTimeOffset.UtcNow);
+        var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>();
+        foreach (var operation in plan.Operations.Where(candidate => candidate is not RecordPhysicalSchemaAppliedStateOperation))
+        {
+            acknowledgements.Add(await executor.ApplyOperationAsync(
+                target.Identity,
+                operation,
+                applicationLock,
+                CancellationToken.None));
+        }
+        return plan.Complete(acknowledgements, DateTimeOffset.UtcNow);
     }
 
     private async Task<string> ReadPrimaryKeyNameAsync(string table)

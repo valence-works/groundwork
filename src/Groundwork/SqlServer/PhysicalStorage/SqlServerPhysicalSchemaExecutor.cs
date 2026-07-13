@@ -65,8 +65,6 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         identity.ExactPredicate(parts, Q, includeOriginal: false);
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is SqlException { Number: 2601 or 2627 };
-    public override bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
-        connection.State != System.Data.ConnectionState.Open || exception is SqlException { Class: >= 20 };
 
     public override string ProviderDisplayName => "SQL Server";
     public override string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";

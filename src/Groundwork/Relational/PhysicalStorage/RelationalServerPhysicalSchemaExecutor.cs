@@ -801,8 +801,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
     {
         ArgumentNullException.ThrowIfNull(applicationLock);
         if (applicationLock is not ApplicationLock relationalLock ||
-            relationalLock.Target != expectedTarget ||
-            !relationalLock.IsOwned)
+            relationalLock.Target != expectedTarget)
         {
             throw new InvalidOperationException(
                 $"Relational physical schema execution requires its active application lock for target '{expectedTarget}'.");
@@ -861,18 +860,41 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
                 if (Volatile.Read(ref disposed) != 0 || ownershipLost.IsCancellationRequested ||
                     connection.State != ConnectionState.Open)
                 {
-                    throw new InvalidOperationException(
-                        $"Relational physical schema execution requires its active application lock for target '{Target}'.");
+                    MarkOwnershipLost();
+                    throw OwnershipLostException();
                 }
 
-                return await action(connection, cancellationToken);
-            }
-            catch (DbException exception) when (dialect.IsSessionTerminationException(exception, connection))
-            {
-                MarkOwnershipLost();
-                throw new InvalidOperationException(
-                    $"The relational physical-schema lock session for target '{Target}' was lost during schema execution.",
-                    exception);
+                try
+                {
+                    return await action(connection, cancellationToken);
+                }
+                catch (Exception exception) when (exception is DbException or InvalidOperationException)
+                {
+                    var verificationFailure = default(Exception);
+                    var isOwned = false;
+                    if (Volatile.Read(ref disposed) == 0 && !ownershipLost.IsCancellationRequested &&
+                        connection.State == ConnectionState.Open)
+                    {
+                        using var verificationTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        try
+                        {
+                            isOwned = await dialect.VerifyApplicationLockAsync(
+                                connection,
+                                resource,
+                                verificationTimeout.Token);
+                        }
+                        catch (Exception ownershipException) when (
+                            ownershipException is DbException or InvalidOperationException or OperationCanceledException)
+                        {
+                            verificationFailure = ownershipException;
+                        }
+                    }
+
+                    if (isOwned)
+                        throw;
+                    MarkOwnershipLost();
+                    throw OwnershipLostException(exception, verificationFailure);
+                }
             }
             finally
             {
@@ -969,6 +991,18 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         {
             if (Volatile.Read(ref disposed) == 0 && !ownershipLost.IsCancellationRequested)
                 ownershipLost.Cancel();
+        }
+
+        private InvalidOperationException OwnershipLostException(
+            Exception? executionFailure = null,
+            Exception? verificationFailure = null)
+        {
+            Exception? inner = executionFailure;
+            if (verificationFailure is not null)
+                inner = new AggregateException(executionFailure!, verificationFailure);
+            return new InvalidOperationException(
+                $"The relational physical-schema lock session for target '{Target}' was lost during schema execution.",
+                inner);
         }
     }
 
@@ -1087,8 +1121,6 @@ public abstract class RelationalServerPhysicalSchemaDialect
     }
     public virtual string? HashOnlyIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) => null;
     public virtual bool IsUniqueConstraintException(DbException exception) => false;
-    public virtual bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
-        connection.State != ConnectionState.Open;
     public abstract string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind);
     public virtual RelationalPhysicalIdentityLayout IdentityLayout(
         IReadOnlyList<RelationalPhysicalIdentityColumn> identityColumns,

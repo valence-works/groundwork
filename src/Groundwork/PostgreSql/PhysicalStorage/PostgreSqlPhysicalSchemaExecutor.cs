@@ -39,9 +39,6 @@ public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalS
 
 internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysicalSchemaDialect
 {
-    public override bool IsSessionTerminationException(DbException exception, DbConnection connection) =>
-        connection.State != System.Data.ConnectionState.Open || exception is NpgsqlException and not PostgresException;
-
     public override string ProviderDisplayName => "PostgreSQL";
     public override string Q(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
