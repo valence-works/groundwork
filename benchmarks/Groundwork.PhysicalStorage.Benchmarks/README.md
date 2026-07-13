@@ -1,72 +1,74 @@
-# Groundwork physical-storage benchmarks
+# Groundwork physical-storage benchmark harness scaffolding
 
-This harness measures Groundwork's production document-store path across every supported provider
-and each of the three physical storage forms. It is a macrobenchmark and conformance harness: it
-materializes real manifests, creates real storage, uses production sessions and bounded-query
-translation, and records provider-native query plans. It does not contain an EF Core comparison or
-a benchmark-only persistence path.
+This project is an honest, mergeable harness-scaffolding slice for issue #50. It exercises
+Groundwork's production document-store path across SQLite, SQL Server, PostgreSQL, and MongoDB and
+the three physical storage forms. It materializes real manifests, creates real storage, uses
+production sessions and bounded-query translation, and records provider-native query plans.
 
-## Safety gates
+It does **not** complete issue #50. The current profiles are not a ratified performance matrix,
+contain no EF Core comparison, cannot be promoted as baselines, and cannot make an Elsa migration
+go/no-go decision. `reports/elsa-migration-evidence.json` records this as `readiness: insufficient`
+and lists the missing acceptance evidence.
 
-Timing starts only after the selected provider and storage form pass both gates:
+## Current correctness and plan gates
 
-1. The correctness gate proves storage-scope isolation, optimistic concurrency, unit-of-work
-   rollback, bounded query/count agreement, and mixed-direction ordering.
-2. The native-plan gate executes the production-rendered scale-bearing query through `EXPLAIN`,
-   `STATISTICS XML`, or MongoDB `explain`, and rejects a missing declared index, a full collection or
-   sequential scan, or a client-side fallback.
+Before timing, every selected provider and storage form must prove:
 
-A failed gate fails the run and leaves a failed `manifest.json`. Failed and incomplete runs cannot
-be promoted as baselines.
+1. storage-scope isolation, optimistic concurrency, unit-of-work rollback, bounded query/count
+   agreement, and mixed-direction ordering; and
+2. selection of the declared index through provider-native `EXPLAIN`, `STATISTICS XML`, or MongoDB
+   `explain`, with full scans rejected.
 
-## Fixed profiles
+The backfill workload has an additional post-measurement check. Outside the timed region, it uses
+the additive model to run the bounded query and directly queries the newly projected `category`
+field. Both counts must match the seeded migration row count.
 
-Profiles fix every reproducibility control. Provider, form, and workload options only filter a
-profile for diagnosis; they do not mutate its seed or measurement sizes.
+These are harness correctness gates only. Passing them does not make performance evidence complete.
 
-| Control | Smoke | Scheduled |
+## Diagnostic profiles
+
+The profiles provide repeatable harness controls, not the final issue #50 matrix:
+
+| Control | Smoke | Scheduled scaffold |
 |---|---:|---:|
 | Seed | 20260713 | 20260713 |
 | Primary dataset | 250 | 10,000 |
 | Migration dataset | 100 | 5,000 |
 | Warmup iterations | 2 | 5 |
 | Measured iterations | 7 | 30 |
-| Operations per iteration | 10 | 100 |
+| Operations per measured batch | 10 | 100 |
 | Concurrency | 4 | 16 |
 | Default providers | SQLite | All four |
 | Storage forms | All three | All three |
 
-Smoke runs are fast engineering signals. They are intentionally underpowered for release decisions
-and are never baseline-eligible. Scheduled runs are the comparison and baseline profile.
+Both profiles always emit `baselineEligibility.eligible: false`. Diagnostics explain that issue #50
+still requires the 1K/100K/1M matrix across payload sizes and query selectivity, exact-HEAD live
+evidence from all four providers, and the Elsa-owned EF Core oracle.
 
-The `Physical Storage Benchmarks` GitHub workflow runs the SQLite smoke matrix for relevant pull
-requests on GitHub-hosted Ubuntu. The complete four-provider matrix runs weekly or on manual
-dispatch on a controlled self-hosted runner labeled `self-hosted`, `linux`, `x64`, and
-`groundwork-benchmark`, with .NET 10 and Docker available. Scheduled runs upload candidate evidence
-even before a baseline exists.
-Once an approved immutable baseline archive is available, set the repository variable
-`GROUNDWORK_BENCHMARK_BASELINE_URL` to its HTTPS ZIP URL; CI then rejects incompatible evidence and
-automatically repeats candidate regressions as confirmation runs.
+The GitHub workflow is named `Physical Storage Benchmark Evidence (Scaffolding)`. Pull requests run
+SQLite smoke evidence. Weekly/manual jobs run the four-provider scheduled scaffold on a controlled
+self-hosted runner. Both jobs upload non-promotable evidence and do not perform baseline download,
+candidate promotion, confirmation, or migration-decision gating.
 
 ## Running the harness
 
-Run the default SQLite smoke matrix:
+Run SQLite smoke evidence:
 
 ```bash
 dotnet run --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run --profile smoke
 ```
 
-Run a narrow diagnostic case while retaining scheduled controls:
+Run a narrow scheduled-control diagnostic:
 
 ```bash
-dotnet run --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
+dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
   --profile scheduled \
   --providers postgresql \
   --forms entity \
   --workloads indexed-query,mixed-compound-ordering
 ```
 
-Run the complete scheduled matrix:
+Run all cases represented by the scheduled scaffold:
 
 ```bash
 dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
@@ -76,13 +78,13 @@ dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks
   --workloads all
 ```
 
-By default, server providers use pinned Testcontainers images:
+Server providers use pinned Testcontainers images by default:
 
 - SQL Server: `mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04`
 - PostgreSQL: `postgres:17.6-alpine3.22`
 - MongoDB: `mongo:7.0.24` with a replica set
 
-For controlled infrastructure, set the relevant variables and add `--no-containers`:
+For controlled infrastructure, set the relevant variable and pass `--no-containers`:
 
 ```text
 GROUNDWORK_BENCHMARK_SQLSERVER_CONNECTION_STRING
@@ -90,84 +92,53 @@ GROUNDWORK_BENCHMARK_POSTGRESQL_CONNECTION_STRING
 GROUNDWORK_BENCHMARK_MONGODB_CONNECTION_STRING
 ```
 
-Connection strings are not written to artifacts. Provider metadata records only the environment
-variable name or pinned image, database-reported version, isolation strategy, pooling behavior,
-and session lifecycle.
+Connection strings are not written to artifacts. Metadata records the source description,
+database-reported version, isolation strategy, pooling behavior, and session lifecycle.
 
-## Workloads
+## Workloads and precise semantics
 
-| Workload | Measured operation |
+| Workload | Measured batch |
 |---|---|
-| `cold-point-read` | Point load after client/provider state is cleared once per iteration |
-| `warm-point-read` | Repeated point loads without the client reset |
-| `indexed-query` | Bounded equality query using the declared physical index |
-| `mixed-compound-ordering` | Equality query with descending rank after ascending scope/status keys |
-| `insert`, `update`, `delete` | Single-document mutations through the production store |
-| `unit-of-work` | Batched writes and one commit |
+| `client-reset-point-read-batch` | Clear provider/client pools once, reopen stores, then perform the point-read batch |
+| `reused-client-point-read-batch` | Perform a point-read batch through already-open client state |
+| `indexed-query` | Repeat the bounded equality query using the declared physical index |
+| `mixed-compound-ordering` | Repeat equality queries with descending rank after ascending scope/status keys |
+| `insert`, `update`, `delete` | Repeat single-document mutations through the production store |
+| `unit-of-work` | Perform batched writes and one commit |
 | `concurrent-create` | Concurrent creates for one identity; exactly one must win |
 | `optimistic-concurrency` | Stale writes that must return concurrency conflicts |
 | `pagination-and-count` | Page and count operations with agreement asserted |
-| `backfill-migration` | Materialization/backfill of a fixed secondary dataset |
-| `restart-recovery` | Provider client/factory restart followed by verified reads |
-| `storage-growth` | Writes with a fixed 1 KiB payload padding |
+| `backfill-migration` | Time materialization/backfill, then validate projection/query correctness outside timing |
+| `client-restart-validation` | Dispose/clear client-side state, recreate it, and verify durable reads |
+| `storage-growth` | Writes with fixed 1 KiB payload padding |
 
-`cold-point-read` is client-cold and database-warm. It does not flush the database buffer pool,
-operating-system page cache, or disk cache. Results must not be described as cold-disk latency.
+`client-reset-point-read-batch` resets client/provider state once before the batch. It does not flush
+the database buffer pool, operating-system page cache, or disk cache, and it is not cold-disk or
+individual-cold-read latency.
 
-## Metrics
+`client-restart-validation` is limited to client/factory/pool restart. It is not process-crash,
+database-crash, power-loss, or disaster-recovery evidence.
 
-Each measured iteration is retained in `raw/measurements.jsonl`. Reports contain:
+## Metric semantics
 
-- nearest-rank p50, p95, and p99 latency per logical operation;
-- aggregate throughput and allocated bytes per operation;
-- observable round trips per operation;
-- storage and index bytes, primary/linked row counts, storage growth, write amplification, and
-  physical rows per logical mutation where the workload exposes those quantities;
-- provider-specific work counters, migration counts, and native plan evidence.
+Each raw sample is one measured batch. The harness records elapsed time and operation count, then
+normalizes that batch mean to nanoseconds per operation. Summary p50/p95/p99 values are percentiles
+across those normalized **batch means**:
 
-Round trips prefer provider diagnostic command-start events. If those are unavailable, database
-client activities are used as an explicitly marked proxy. A missing signal is `null`, never zero.
-Allocation uses process-wide `GC.GetTotalAllocatedBytes`; isolate the benchmark process and avoid
-unrelated background work. Storage snapshots and correctness/plan gates run outside timed regions.
+- `normalizedBatchLatencyNanosecondsPerOperation` on a raw sample;
+- `normalizedBatchLatencyP50NanosecondsPerOperation`, p95, and p99 on summaries/evidence.
 
-## Regression policy
+They are not percentiles of individual-operation latency because the harness does not record an
+individual latency distribution. Reports also contain aggregate throughput, allocation per
+operation, observable round trips, storage growth, write amplification, physical rows per logical
+mutation, provider work signals, and native-plan evidence where observable. A missing round-trip
+signal is `null`, never zero.
 
-Comparisons use deterministic bootstrap resampling of candidate-to-baseline ratios with a 95%
-confidence interval. Lower is better for latency, allocation, and storage amplification; higher is
-better for throughput.
-
-| Policy | Minimum samples | Resamples | Latency | Throughput | Allocation | Storage |
-|---|---:|---:|---:|---:|---:|---:|
-| Smoke | 5 | 1,000 | +100% | -50% | +50% | +50% |
-| Scheduled | 20 | 5,000 | +10% | -10% | +10% | +15% |
-
-A regression is reported only when the complete confidence interval lies beyond the budget. A
-scheduled regression is a candidate signal, not an immediate release failure. Repeat the same
-scheduled run on the same controlled machine and pass `--confirm-regression`; exit code `2` means
-the regression reproduced. Exit code `1` means the run or a safety gate failed, and `130` means it
-was cancelled.
-
-Scheduled comparisons accept only a complete baseline run directory whose schema, fixed controls,
-machine identity/runtime/GC/build-configuration metadata, provider versions, and provider
-configuration match the candidate.
-The baseline decision report must also be baseline-eligible. Passing a raw JSONL file is supported
-only for smoke diagnostics; its report explicitly records that reproducibility provenance is
-unavailable.
-
-```bash
-dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
-  --profile scheduled \
-  --baseline artifacts/physical-storage/v1/<approved-run>
-
-dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
-  --profile scheduled \
-  --baseline artifacts/physical-storage/v1/<approved-run> \
-  --confirm-regression
-```
+Regression comparisons remain available as diagnostic scaffolding. Current scheduled evidence is
+explicitly incompatible with gating because its evidence readiness is insufficient and its baseline
+eligibility is false. The committed baseline registry is empty and disabled.
 
 ## Artifact contract
-
-Every run uses this versioned layout:
 
 ```text
 manifest.json
@@ -180,46 +151,28 @@ raw/measurements.jsonl
 reports/summary.json
 reports/summary.md
 reports/regression.json
-reports/elsa-migration-decision.json
+reports/elsa-migration-evidence.json
 ```
 
-The v1 JSON Schemas live in [`schemas/v1`](schemas/v1). Elsa automation should consume
-`reports/elsa-migration-decision.json`; raw measurements remain available for independent analysis.
-Do not compare different schema versions without an explicit converter.
+The v1 JSON Schemas live in [`schemas/v1`](schemas/v1). The evidence report deliberately exposes:
 
-### Elsa decision consumption
+- `readiness: insufficient`;
+- `elsaEfOracleRequired: true`;
+- `baselineEligibility.eligible: false` with concrete diagnostics;
+- Groundwork case evidence and diagnostic regression signals; and
+- `remainingAcceptanceWork` for the later Elsa-owned evidence join.
 
-Consumers should first require a completed `manifest.json` and the exact supported
-`schemaVersion`. In `elsa-migration-decision.json`:
+No artifact in this slice is a migration decision or baseline-promotion authorization.
 
-- `baselineEligibility` answers only whether the run may be promoted; it is not a performance
-  recommendation by itself.
-- `cases` contains stable provider/form/workload metrics and the native-plan artifact reference.
-- `regressions[].isComparable` must be true before interpreting its metrics.
-- `regressionDetected` means at least one confidence interval exceeded policy.
-- `confirmationRequired` means a scheduled regression must reproduce in a confirmation run before
-  automation treats it as a blocking regression.
+## Remaining issue #50 acceptance work
 
-An automated Elsa migration gate should reject failed/incomplete runs and non-comparable cases,
-require human review of plan changes, and require the confirmation exit code for scheduled
-regressions. It should not infer a decision from raw latency alone.
+- Execute the ratified 1K/100K/1M dataset matrix across multiple payload sizes and selectivity
+  values, including the entity-form benefit classification.
+- Capture exact-HEAD live evidence from SQLite, SQL Server, PostgreSQL, and MongoDB.
+- Join the Groundwork results with an Elsa-owned EF Core oracle using matched workloads and controls.
+- Complete reliable provider database-work/round-trip signals and concurrent-load evidence.
+- Define, approve, integrity-protect, and exercise the immutable-baseline workflow.
+- Add actual crash/failure recovery workloads only if issue #50 requires those semantics.
 
-## Baseline promotion
-
-Baseline promotion is deliberately stricter than successful execution. The generated decision
-report is eligible only when it comes from:
-
-- the exact scheduled controls and the complete provider/form/workload matrix;
-- exactly 30 measured samples per case;
-- a known clean Git commit;
-- passing correctness gates and native plan evidence for every case.
-
-The committed [`baselines/v1/baseline-index.json`](baselines/v1/baseline-index.json) starts empty.
-No performance values are fabricated in source control. Promote a controlled scheduled run by
-archiving its immutable artifact directory, reviewing its machine/provider metadata and plan
-evidence, and adding a reference to that run to the index in a reviewed change. Never replace an
-existing baseline artifact in place.
-
-For defensible comparisons, keep CPU architecture, operating system, .NET runtime, GC mode,
-database versions/configuration, container or external-host topology, power policy, and competing
-machine load fixed. Record a new baseline when any of those intentionally changes.
+Until all applicable items are ratified and complete, the harness stays non-promotable and
+non-decisional.

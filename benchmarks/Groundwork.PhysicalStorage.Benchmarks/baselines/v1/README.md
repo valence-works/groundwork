@@ -1,13 +1,11 @@
-# Physical-storage baseline registry v1
+# Future physical-storage baseline registry v1
 
-This registry is intentionally empty until a complete scheduled run is executed on controlled
-infrastructure and approved. Do not add synthetic benchmark numbers or partial smoke results.
+This registry is deliberately disabled and empty. The current smoke and scheduled profiles are
+harness scaffolding: neither can be promoted, and neither can support an Elsa migration decision.
+Do not add synthetic numbers, smoke results, or scheduled-profile results to this index.
 
-An entry may be added only when `reports/elsa-migration-decision.json` reports
-`baselineEligibility.eligible: true`. Archive the complete immutable run directory, calculate a
-stable machine/configuration fingerprint outside the harness, and reference both the archive and
-decision report from `baseline-index.json`.
-
-Changing the machine, CPU architecture, operating system, .NET runtime, GC mode, provider version,
-provider topology, or material database configuration requires a new baseline entry. Never edit or
-replace an archived baseline in place.
+Issue #50 must first supply the ratified 1K/100K/1M matrix across payload sizes and query
+selectivity, exact-HEAD live evidence for SQLite, SQL Server, PostgreSQL, and MongoDB, the
+Elsa-owned EF Core oracle, provider database-work signals, concurrent-load evidence, and an
+approved immutable-baseline process. A later reviewed change may activate this registry only after
+those requirements are complete.

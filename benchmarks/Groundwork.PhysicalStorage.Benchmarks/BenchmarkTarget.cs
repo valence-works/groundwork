@@ -39,5 +39,6 @@ public interface IPhysicalStorageBenchmarkTarget : IAsyncDisposable
     Task PrepareWorkloadAsync(BenchmarkWorkload workload, int totalIterations, int operationsPerIteration, CancellationToken cancellationToken);
     Task PrepareIterationAsync(BenchmarkWorkload workload, int iteration, CancellationToken cancellationToken);
     Task<WorkloadExecution> ExecuteAsync(BenchmarkWorkload workload, int iteration, int operations, int concurrency, CancellationToken cancellationToken);
+    Task ValidateIterationAsync(BenchmarkWorkload workload, CancellationToken cancellationToken);
     Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken);
 }

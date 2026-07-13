@@ -14,7 +14,7 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
     {
         var layout = new ArtifactLayout(root);
         var record = new RawBenchmarkRecord(
-            new BenchmarkCase(BenchmarkProvider.Sqlite, PhysicalStorageForm.SharedDocuments, BenchmarkWorkload.WarmPointRead),
+            new BenchmarkCase(BenchmarkProvider.Sqlite, PhysicalStorageForm.SharedDocuments, BenchmarkWorkload.ReusedClientPointReadBatch),
             new BenchmarkSample(0, 1, 100, 50, null, 0, 0, null, null, new Dictionary<string, long>()));
         await using (var writer = new BenchmarkArtifactWriter(layout))
             await writer.AppendSampleAsync(record, CancellationToken.None);
@@ -31,7 +31,7 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task Report_includes_a_stable_Elsa_migration_decision_artifact()
+    public async Task Report_includes_insufficient_Elsa_migration_evidence_without_a_decision_claim()
     {
         var layout = new ArtifactLayout(root);
         var report = new BenchmarkRunReport(
@@ -45,13 +45,16 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
         await using (var writer = new BenchmarkArtifactWriter(layout))
             await writer.WriteReportAsync(report, CancellationToken.None);
 
-        Assert.True(File.Exists(layout.ElsaMigrationDecisionJson));
-        var decision = System.Text.Json.JsonSerializer.Deserialize<ElsaMigrationDecisionReport>(
-            await File.ReadAllTextAsync(layout.ElsaMigrationDecisionJson),
+        Assert.True(File.Exists(layout.ElsaMigrationEvidenceJson));
+        var evidence = System.Text.Json.JsonSerializer.Deserialize<ElsaMigrationEvidenceReport>(
+            await File.ReadAllTextAsync(layout.ElsaMigrationEvidenceJson),
             BenchmarkJson.Options);
-        Assert.NotNull(decision);
-        Assert.Equal(BenchmarkProfiles.SchemaVersion, decision.SchemaVersion);
-        Assert.False(decision.BaselineEligibility.Eligible);
+        Assert.NotNull(evidence);
+        Assert.Equal(BenchmarkProfiles.SchemaVersion, evidence.SchemaVersion);
+        Assert.Equal(BenchmarkEvidenceReadiness.Insufficient, evidence.Readiness);
+        Assert.True(evidence.ElsaEfOracleRequired);
+        Assert.False(evidence.BaselineEligibility.Eligible);
+        Assert.NotEmpty(evidence.RemainingAcceptanceWork);
     }
 
     [Fact]
@@ -83,7 +86,7 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
             false,
             layout.RelativePath(layout.RawMeasurements),
             layout.RelativePath(layout.SummaryJson),
-            layout.RelativePath(layout.ElsaMigrationDecisionJson),
+            layout.RelativePath(layout.ElsaMigrationEvidenceJson),
             layout.RelativePath(layout.MachineMetadata),
             layout.RelativePath(layout.ProviderMetadata),
             layout.RelativePath(layout.Configuration),
@@ -115,7 +118,7 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
         var layout = new ArtifactLayout(root);
         layout.CreateDirectories();
         var record = new RawBenchmarkRecord(
-            new BenchmarkCase(BenchmarkProvider.Sqlite, PhysicalStorageForm.SharedDocuments, BenchmarkWorkload.WarmPointRead),
+            new BenchmarkCase(BenchmarkProvider.Sqlite, PhysicalStorageForm.SharedDocuments, BenchmarkWorkload.ReusedClientPointReadBatch),
             new BenchmarkSample(0, 1, 100, 50, null, 0, 0, null, null, new Dictionary<string, long>()));
         var json = JsonNode.Parse(JsonSerializer.Serialize(record, BenchmarkJson.CompactOptions))!.AsObject();
         json["unexpected"] = true;

@@ -110,10 +110,12 @@ public sealed class MongoDbBenchmarkTarget(
         }
         migration = new MigrationState(
             initialHandle,
+            additiveManifest,
             MongoDbPhysicalStorageModel.Compile(
                 additiveManifest,
                 MongoDbGroundworkCapabilities.Provider,
                 BenchmarkModelFactory.NamePolicy(suffix)),
+            suffix,
             migrationDatasetSize);
     }
 
@@ -177,15 +179,47 @@ public sealed class MongoDbBenchmarkTarget(
             .MaterializeAsync(state.Additive, cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.Applied)
             throw new InvalidOperationException($"Backfill migration returned {result.Outcome}; expected Applied.");
-        await state.InitialHandle.DisposeAsync();
-        migration = null;
         return Execution(1, logicalMutations: state.Rows, providerWork: new Dictionary<string, long>
         {
             ["backfilled_documents"] = state.Rows
         });
     }
 
-    protected override async Task<WorkloadExecution> ExecuteRestartRecoveryAsync(
+    protected override async Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken)
+    {
+        var state = migration ?? throw new InvalidOperationException("Migration iteration was not executed.");
+        await using var additiveHandle = await MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+            connectionString,
+            databaseName,
+            state.AdditiveManifest,
+            MongoDbGroundworkCapabilities.Provider,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            BenchmarkModelFactory.NamePolicy(state.Suffix),
+            cancellationToken: cancellationToken);
+        var queryCount = await additiveHandle.Store.CountAsync(
+            Query().Select(BoundedQueryResultOperation.Count),
+            cancellationToken);
+
+        var route = state.Additive.Routes.Single();
+        var category = route.ProjectedColumns.Single(column => column.Definition.Path == "category");
+        var collectionName = category.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.PrimaryStorage.Name.Identifier
+            : route.LinkedIndexStorage!.Name.Identifier;
+        using var client = new MongoClient(connectionString);
+        var collection = client.GetDatabase(databaseName).GetCollection<BsonDocument>(collectionName);
+        var projectionCount = await collection.CountDocumentsAsync(
+            Builders<BsonDocument>.Filter.Eq(category.Column.Identifier, "migration"),
+            cancellationToken: cancellationToken);
+        if (queryCount != state.Rows || projectionCount != state.Rows)
+        {
+            throw new InvalidOperationException(
+                $"Backfill validation expected {state.Rows} queryable projected rows; query returned {queryCount} and category projection returned {projectionCount}.");
+        }
+        await state.InitialHandle.DisposeAsync();
+        migration = null;
+    }
+
+    protected override async Task<WorkloadExecution> ExecuteClientRestartValidationAsync(
         int operations,
         CancellationToken cancellationToken)
     {
@@ -198,7 +232,7 @@ public sealed class MongoDbBenchmarkTarget(
                     $"seed-{index:D8}",
                     cancellationToken) is null)
             {
-                throw new InvalidOperationException("Restart/recovery workload could not load durable seeded data.");
+                throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
         }
         return Execution(operations, providerWork: new Dictionary<string, long> { ["factory_restart_validations"] = 1 });
@@ -235,6 +269,8 @@ public sealed class MongoDbBenchmarkTarget(
 
     private sealed record MigrationState(
         MongoDbPhysicalDocumentStoreHandle InitialHandle,
+        StorageManifest AdditiveManifest,
         MongoDbPhysicalStorageModel Additive,
+        string Suffix,
         int Rows);
 }

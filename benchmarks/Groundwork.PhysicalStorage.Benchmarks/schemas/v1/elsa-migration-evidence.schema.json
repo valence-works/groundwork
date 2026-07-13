@@ -1,16 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/elsa-migration-decision.schema.json",
-  "title": "Elsa Groundwork migration decision report v1",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/elsa-migration-evidence.schema.json",
+  "title": "Elsa Groundwork migration evidence report v1 (insufficient evidence)",
+  "description": "Groundwork-only benchmark evidence that cannot make an Elsa migration or baseline-promotion decision.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schemaVersion",
     "runId",
     "mode",
+    "readiness",
+    "elsaEfOracleRequired",
     "baselineEligibility",
-    "regressionDetected",
-    "confirmationRequired",
+    "regressionSignalDetected",
+    "confirmationRunSuggested",
+    "remainingAcceptanceWork",
     "cases",
     "regressions"
   ],
@@ -18,17 +22,18 @@
     "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
     "runId": { "type": "string", "minLength": 1 },
     "mode": { "enum": ["smoke", "scheduled"] },
+    "readiness": { "const": "insufficient" },
+    "elsaEfOracleRequired": { "const": true },
     "baselineEligibility": { "$ref": "#/$defs/eligibility" },
-    "regressionDetected": { "type": "boolean" },
-    "confirmationRequired": { "type": "boolean" },
-    "cases": {
+    "regressionSignalDetected": { "type": "boolean" },
+    "confirmationRunSuggested": { "type": "boolean" },
+    "remainingAcceptanceWork": {
       "type": "array",
-      "items": { "$ref": "#/$defs/case" }
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
     },
-    "regressions": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/regression" }
-    }
+    "cases": { "type": "array", "items": { "$ref": "#/$defs/case" } },
+    "regressions": { "type": "array", "items": { "$ref": "#/$defs/regression" } }
   },
   "$defs": {
     "eligibility": {
@@ -36,8 +41,8 @@
       "additionalProperties": false,
       "required": ["eligible", "diagnostics"],
       "properties": {
-        "eligible": { "type": "boolean" },
-        "diagnostics": { "type": "array", "items": { "type": "string" } }
+        "eligible": { "const": false },
+        "diagnostics": { "type": "array", "minItems": 1, "items": { "type": "string" } }
       }
     },
     "case": {
@@ -48,9 +53,9 @@
         "provider",
         "storageForm",
         "workload",
-        "latencyP50Nanoseconds",
-        "latencyP95Nanoseconds",
-        "latencyP99Nanoseconds",
+        "normalizedBatchLatencyP50NanosecondsPerOperation",
+        "normalizedBatchLatencyP95NanosecondsPerOperation",
+        "normalizedBatchLatencyP99NanosecondsPerOperation",
         "throughputOperationsPerSecond",
         "allocatedBytesPerOperation",
         "planArtifact"
@@ -60,9 +65,9 @@
         "provider": { "enum": ["sqlite", "sqlServer", "postgreSql", "mongoDb"] },
         "storageForm": { "enum": ["sharedDocuments", "dedicatedDocumentTable", "physicalEntityTable"] },
         "workload": { "type": "string", "minLength": 1 },
-        "latencyP50Nanoseconds": { "type": "number", "exclusiveMinimum": 0 },
-        "latencyP95Nanoseconds": { "type": "number", "exclusiveMinimum": 0 },
-        "latencyP99Nanoseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyP50NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyP95NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyP99NanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
         "throughputOperationsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
         "allocatedBytesPerOperation": { "type": "number", "minimum": 0 },
         "roundTripsPerOperation": { "type": ["number", "null"], "minimum": 0 },

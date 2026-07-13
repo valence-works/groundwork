@@ -20,8 +20,8 @@
         "storageForm": { "enum": ["sharedDocuments", "dedicatedDocumentTable", "physicalEntityTable"] },
         "workload": {
           "enum": [
-            "coldPointRead",
-            "warmPointRead",
+            "clientResetPointReadBatch",
+            "reusedClientPointReadBatch",
             "indexedQuery",
             "mixedCompoundOrdering",
             "insert",
@@ -32,7 +32,7 @@
             "optimisticConcurrency",
             "paginationAndCount",
             "backfillMigration",
-            "restartRecovery",
+            "clientRestartValidation",
             "storageGrowth"
           ]
         },
@@ -50,7 +50,7 @@
         "logicalPayloadBytes",
         "logicalMutations",
         "providerWork",
-        "latencyNanosecondsPerOperation",
+        "normalizedBatchLatencyNanosecondsPerOperation",
         "throughputOperationsPerSecond",
         "allocatedBytesPerOperation"
       ],
@@ -65,7 +65,7 @@
         "storageBefore": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
         "storageAfter": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
         "providerWork": { "$ref": "#/$defs/integerMap" },
-        "latencyNanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "normalizedBatchLatencyNanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
         "throughputOperationsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
         "allocatedBytesPerOperation": { "type": "number", "minimum": 0 }
       }

@@ -12,8 +12,8 @@ public enum BenchmarkProvider
 
 public enum BenchmarkWorkload
 {
-    ColdPointRead,
-    WarmPointRead,
+    ClientResetPointReadBatch,
+    ReusedClientPointReadBatch,
     IndexedQuery,
     MixedCompoundOrdering,
     Insert,
@@ -24,7 +24,7 @@ public enum BenchmarkWorkload
     OptimisticConcurrency,
     PaginationAndCount,
     BackfillMigration,
-    RestartRecovery,
+    ClientRestartValidation,
     StorageGrowth
 }
 

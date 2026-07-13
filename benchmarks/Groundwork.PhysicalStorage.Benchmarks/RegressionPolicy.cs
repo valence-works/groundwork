@@ -90,16 +90,16 @@ public static class RegressionEvaluator
                 ["Baseline or candidate contains an invalid raw sample."]);
         }
 
-        var baselineLatency = baseline.Select(sample => sample.LatencyNanosecondsPerOperation).ToArray();
-        var candidateLatency = candidate.Select(sample => sample.LatencyNanosecondsPerOperation).ToArray();
+        var baselineLatency = baseline.Select(sample => sample.NormalizedBatchLatencyNanosecondsPerOperation).ToArray();
+        var candidateLatency = candidate.Select(sample => sample.NormalizedBatchLatencyNanosecondsPerOperation).ToArray();
         var diagnostics = new List<string>();
         var metrics = new List<RegressionMetric>
         {
             BootstrapMetric(
-                "latency_p50_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+                "normalized_batch_latency_p50_ns_per_operation", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
                 0.50, policy.LatencyBudget, policy, seed),
             BootstrapMetric(
-                "latency_p95_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+                "normalized_batch_latency_p95_ns_per_operation", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
                 0.95, policy.LatencyBudget, policy, seed + 1),
             BootstrapMetric(
                 "throughput_ops_per_second", MetricDirection.HigherIsBetter,

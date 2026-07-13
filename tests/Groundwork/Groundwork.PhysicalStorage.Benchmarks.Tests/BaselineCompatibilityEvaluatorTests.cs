@@ -18,7 +18,7 @@ public sealed class BaselineCompatibilityEvaluatorTests
         new Dictionary<string, string> { ["journal_mode"] = "wal" });
 
     [Fact]
-    public void Scheduled_comparison_accepts_matching_controlled_provenance()
+    public void Scheduled_comparison_rejects_scaffolding_evidence_even_when_provenance_matches()
     {
         var baseline = Baseline(machine, sqlite, withMeasurements: true);
 
@@ -28,8 +28,8 @@ public sealed class BaselineCompatibilityEvaluatorTests
             [sqlite],
             baseline);
 
-        Assert.True(result.IsCompatible);
-        Assert.Empty(result.Diagnostics);
+        Assert.False(result.IsCompatible);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("insufficient", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -142,7 +142,7 @@ public sealed class BaselineCompatibilityEvaluatorTests
             baselineMachine.GitDirty,
             "raw/measurements.jsonl",
             "reports/summary.json",
-            "reports/elsa-migration-decision.json",
+            "reports/elsa-migration-evidence.json",
             "metadata/machine.json",
             "metadata/providers.json",
             "metadata/configuration.json",
@@ -161,15 +161,18 @@ public sealed class BaselineCompatibilityEvaluatorTests
                             new Dictionary<string, long>()))))
                 .ToArray()
             : [];
-        var decision = new ElsaMigrationDecisionReport(
+        var evidence = new ElsaMigrationEvidenceReport(
             BenchmarkProfiles.SchemaVersion,
             "baseline",
             BenchmarkRunMode.Scheduled,
-            new BaselineEligibility(true, []),
+            BenchmarkEvidenceReadiness.Insufficient,
+            true,
+            new BaselineEligibility(false, Issue50EvidenceRequirements.Remaining),
             false,
             false,
+            Issue50EvidenceRequirements.Remaining,
             withMeasurements
-                ? benchmarkCases.Select(benchmarkCase => new ElsaMigrationDecisionCase(
+                ? benchmarkCases.Select(benchmarkCase => new ElsaMigrationEvidenceCase(
                         benchmarkCase.Identity,
                         benchmarkCase.Provider,
                         benchmarkCase.StorageForm,
@@ -193,6 +196,6 @@ public sealed class BaselineCompatibilityEvaluatorTests
                 : new BenchmarkProviderMetadata(candidate, "test-version", new Dictionary<string, string>()))
             .ToArray();
         return new BenchmarkBaseline(
-            records, manifest, BenchmarkProfiles.Scheduled, baselineMachine, providers, decision);
+            records, manifest, BenchmarkProfiles.Scheduled, baselineMachine, providers, evidence);
     }
 }

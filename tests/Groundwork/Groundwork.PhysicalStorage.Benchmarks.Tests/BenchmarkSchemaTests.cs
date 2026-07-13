@@ -12,7 +12,7 @@ public sealed class BenchmarkSchemaTests
     {
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-manifest.schema.json",
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/raw-measurement.schema.json",
-        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/elsa-migration-decision.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/elsa-migration-evidence.schema.json",
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/baselines/v1/baseline-index.schema.json"
     };
 
@@ -49,6 +49,7 @@ public sealed class BenchmarkSchemaTests
 
         Assert.Equal("baseline-index.schema.json", root.GetProperty("$schema").GetString());
         Assert.Equal(BenchmarkProfiles.SchemaVersion, root.GetProperty("schemaVersion").GetString());
+        Assert.Equal("scaffolding-no-approved-baselines", root.GetProperty("status").GetString());
         Assert.Empty(root.GetProperty("baselines").EnumerateArray());
     }
 

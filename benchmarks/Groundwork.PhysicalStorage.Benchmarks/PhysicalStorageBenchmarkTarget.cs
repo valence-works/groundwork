@@ -153,8 +153,8 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         int concurrency,
         CancellationToken cancellationToken) => workload switch
         {
-            BenchmarkWorkload.ColdPointRead => await PointReadsAsync(operations, cold: true, cancellationToken),
-            BenchmarkWorkload.WarmPointRead => await PointReadsAsync(operations, cold: false, cancellationToken),
+            BenchmarkWorkload.ClientResetPointReadBatch => await PointReadBatchAsync(operations, resetClient: true, cancellationToken),
+            BenchmarkWorkload.ReusedClientPointReadBatch => await PointReadBatchAsync(operations, resetClient: false, cancellationToken),
             BenchmarkWorkload.IndexedQuery => await IndexedQueriesAsync(operations, includeOrdering: false, cancellationToken),
             BenchmarkWorkload.MixedCompoundOrdering => await IndexedQueriesAsync(operations, includeOrdering: true, cancellationToken),
             BenchmarkWorkload.Insert => await InsertsAsync(operations, payloadPadding: 0, cancellationToken),
@@ -165,10 +165,16 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             BenchmarkWorkload.OptimisticConcurrency => await ConflictsAsync(operations, cancellationToken),
             BenchmarkWorkload.PaginationAndCount => await PaginationAndCountAsync(operations, iteration, cancellationToken),
             BenchmarkWorkload.BackfillMigration => await ExecuteBackfillMigrationAsync(cancellationToken),
-            BenchmarkWorkload.RestartRecovery => await ExecuteRestartRecoveryAsync(operations, cancellationToken),
+            BenchmarkWorkload.ClientRestartValidation => await ExecuteClientRestartValidationAsync(operations, cancellationToken),
             BenchmarkWorkload.StorageGrowth => await InsertsAsync(operations, payloadPadding: 1_024, cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(workload), workload, null)
         };
+
+    public virtual Task ValidateIterationAsync(
+        BenchmarkWorkload workload,
+        CancellationToken cancellationToken) => workload == BenchmarkWorkload.BackfillMigration
+        ? ValidateBackfillMigrationAsync(cancellationToken)
+        : Task.CompletedTask;
 
     public abstract Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken);
 
@@ -185,7 +191,9 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
 
     protected abstract Task<WorkloadExecution> ExecuteBackfillMigrationAsync(CancellationToken cancellationToken);
 
-    protected abstract Task<WorkloadExecution> ExecuteRestartRecoveryAsync(int operations, CancellationToken cancellationToken);
+    protected abstract Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken);
+
+    protected abstract Task<WorkloadExecution> ExecuteClientRestartValidationAsync(int operations, CancellationToken cancellationToken);
 
     protected static SaveDocumentRequest Save(string id, string content, long expectedVersion = 0) =>
         new(BenchmarkModelFactory.DocumentKind, id, "1", content, expectedVersion);
@@ -213,9 +221,9 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             throw new InvalidOperationException($"{operation} returned {result.Status}; expected {expected}.");
     }
 
-    private async Task<WorkloadExecution> PointReadsAsync(int operations, bool cold, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> PointReadBatchAsync(int operations, bool resetClient, CancellationToken cancellationToken)
     {
-        if (cold)
+        if (resetClient)
             await ResetClientStateAsync(cancellationToken);
         for (var index = 0; index < operations; index++)
         {

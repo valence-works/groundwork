@@ -6,7 +6,7 @@ namespace Groundwork.PhysicalStorage.Benchmarks.Tests;
 public sealed class BaselineEligibilityEvaluatorTests
 {
     [Fact]
-    public void Exact_scheduled_matrix_from_a_clean_commit_is_eligible()
+    public void Scheduled_scaffolding_matrix_is_non_promotable_until_issue_50_evidence_is_complete()
     {
         var cases = BenchmarkMatrix.Create(BenchmarkProfiles.Scheduled)
             .Select(CreateResult)
@@ -18,8 +18,13 @@ public sealed class BaselineEligibilityEvaluatorTests
             Machine(gitDirty: false),
             cases);
 
-        Assert.True(result.Eligible);
-        Assert.Empty(result.Diagnostics);
+        Assert.False(result.Eligible);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("1K/100K/1M", StringComparison.Ordinal));
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("payload", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("selectivity", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("exact-HEAD", StringComparison.Ordinal));
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("four providers", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("EF", StringComparison.Ordinal));
     }
 
     [Fact]

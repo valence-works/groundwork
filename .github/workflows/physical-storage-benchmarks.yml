@@ -1,4 +1,4 @@
-name: Physical Storage Benchmarks
+name: Physical Storage Benchmark Evidence (Scaffolding)
 
 on:
   pull_request:
@@ -30,7 +30,7 @@ env:
 
 jobs:
   smoke:
-    name: SQLite smoke matrix
+    name: SQLite smoke evidence (non-decision)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -61,7 +61,7 @@ jobs:
             --workloads all \
             --output "${RUNNER_TEMP}/physical-storage-smoke"
 
-      - name: Upload smoke evidence
+      - name: Upload non-promotable smoke evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -71,7 +71,7 @@ jobs:
           retention-days: 14
 
   scheduled:
-    name: Four-provider scheduled matrix
+    name: Four-provider scheduled evidence (non-gating scaffold)
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, linux, x64, groundwork-benchmark]
     timeout-minutes: 360
@@ -91,39 +91,8 @@ jobs:
       - name: Test harness contracts
         run: dotnet test tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/Groundwork.PhysicalStorage.Benchmarks.Tests.csproj --configuration Release --no-restore
 
-      - name: Download approved baseline
-        id: baseline
-        env:
-          BASELINE_URL: ${{ vars.GROUNDWORK_BENCHMARK_BASELINE_URL }}
+      - name: Run scheduled harness evidence
         run: |
-          if [[ -z "$BASELINE_URL" ]]; then
-            echo "No approved baseline URL is configured; this run will produce candidate evidence only."
-            echo "directory=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "$BASELINE_URL" != https://* ]]; then
-            echo "GROUNDWORK_BENCHMARK_BASELINE_URL must use HTTPS." >&2
-            exit 1
-          fi
-          mkdir -p "${RUNNER_TEMP}/physical-storage-baseline"
-          curl --fail --location --silent --show-error "$BASELINE_URL" --output "${RUNNER_TEMP}/baseline.zip"
-          unzip -q "${RUNNER_TEMP}/baseline.zip" -d "${RUNNER_TEMP}/physical-storage-baseline"
-          manifest="$(find "${RUNNER_TEMP}/physical-storage-baseline" -name manifest.json -type f -print -quit)"
-          if [[ -z "$manifest" ]]; then
-            echo "The approved baseline archive does not contain manifest.json." >&2
-            exit 1
-          fi
-          echo "directory=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
-
-      - name: Run scheduled candidate and confirmation
-        env:
-          BASELINE_DIRECTORY: ${{ steps.baseline.outputs.directory }}
-        run: |
-          baseline_args=()
-          if [[ -n "$BASELINE_DIRECTORY" ]]; then
-            baseline_args=(--baseline "$BASELINE_DIRECTORY")
-          fi
-
           dotnet run --configuration Release --no-build \
             --project benchmarks/Groundwork.PhysicalStorage.Benchmarks \
             -- run \
@@ -131,31 +100,11 @@ jobs:
             --providers all \
             --forms all \
             --workloads all \
-            --output "${RUNNER_TEMP}/physical-storage-scheduled/candidate" \
-            "${baseline_args[@]}"
+            --output "${RUNNER_TEMP}/physical-storage-scheduled/evidence"
 
-          if [[ -z "$BASELINE_DIRECTORY" ]]; then
-            exit 0
-          fi
-          decision="${RUNNER_TEMP}/physical-storage-scheduled/candidate/reports/elsa-migration-decision.json"
-          if jq -e '.regressions | any(.isComparable == false)' "$decision" >/dev/null; then
-            echo "Candidate is not comparable with the approved baseline." >&2
-            exit 1
-          fi
-          if jq -e '.regressionDetected == true' "$decision" >/dev/null; then
-            dotnet run --configuration Release --no-build \
-              --project benchmarks/Groundwork.PhysicalStorage.Benchmarks \
-              -- run \
-              --profile scheduled \
-              --providers all \
-              --forms all \
-              --workloads all \
-              --output "${RUNNER_TEMP}/physical-storage-scheduled/confirmation" \
-              --baseline "$BASELINE_DIRECTORY" \
-              --confirm-regression
-          fi
+          echo "This workflow validates harness execution only. Its artifacts are non-promotable and must not gate an Elsa migration decision."
 
-      - name: Upload scheduled evidence
+      - name: Upload non-promotable scheduled evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -42,7 +42,7 @@ public sealed class BenchmarkContractTests
 
         Assert.EndsWith("raw/measurements.jsonl", layout.RawMeasurements, StringComparison.Ordinal);
         Assert.EndsWith("reports/summary.json", layout.SummaryJson, StringComparison.Ordinal);
-        Assert.EndsWith("reports/elsa-migration-decision.json", layout.ElsaMigrationDecisionJson, StringComparison.Ordinal);
+        Assert.EndsWith("reports/elsa-migration-evidence.json", layout.ElsaMigrationEvidenceJson, StringComparison.Ordinal);
         Assert.EndsWith("metadata/machine.json", layout.MachineMetadata, StringComparison.Ordinal);
         Assert.Equal("reports/summary.json", layout.RelativePath(layout.SummaryJson));
         Assert.EndsWith(

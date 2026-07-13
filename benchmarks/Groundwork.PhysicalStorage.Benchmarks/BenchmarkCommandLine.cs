@@ -19,7 +19,7 @@ public static class BenchmarkCommandLine
           --workloads <list>              Kebab-case workload names or all
           --output <directory>            Artifact run directory
           --baseline <run-or-jsonl>       Compare with a v1 run; raw JSONL is smoke-only
-          --confirm-regression            Treat statistically confirmed regressions as exit code 2
+          --confirm-regression            Diagnostic scaffold; current insufficient evidence is non-gating
           --no-containers                 Require external provider connection strings
           --help                          Show this help
 

@@ -40,7 +40,7 @@ public sealed record BenchmarkRunManifest(
     bool GitDirty,
     string RawMeasurements,
     string Summary,
-    string ElsaMigrationDecision,
+    string ElsaMigrationEvidence,
     string MachineMetadata,
     string ProviderMetadata,
     string Configuration,
@@ -66,14 +66,14 @@ public sealed record BenchmarkRunReport(
     IReadOnlyList<RegressionEvaluation> Regressions,
     BaselineEligibility BaselineEligibility);
 
-public sealed record ElsaMigrationDecisionCase(
+public sealed record ElsaMigrationEvidenceCase(
     string CaseIdentity,
     BenchmarkProvider Provider,
     Groundwork.Core.PhysicalStorage.PhysicalStorageForm StorageForm,
     BenchmarkWorkload Workload,
-    double LatencyP50Nanoseconds,
-    double LatencyP95Nanoseconds,
-    double LatencyP99Nanoseconds,
+    double NormalizedBatchLatencyP50NanosecondsPerOperation,
+    double NormalizedBatchLatencyP95NanosecondsPerOperation,
+    double NormalizedBatchLatencyP99NanosecondsPerOperation,
     double ThroughputOperationsPerSecond,
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
@@ -82,31 +82,42 @@ public sealed record ElsaMigrationDecisionCase(
     double? PhysicalRowsPerLogicalMutation,
     string PlanArtifact);
 
-public sealed record ElsaMigrationDecisionReport(
+public enum BenchmarkEvidenceReadiness
+{
+    Insufficient
+}
+
+public sealed record ElsaMigrationEvidenceReport(
     string SchemaVersion,
     string RunId,
     BenchmarkRunMode Mode,
+    BenchmarkEvidenceReadiness Readiness,
+    bool ElsaEfOracleRequired,
     BaselineEligibility BaselineEligibility,
-    bool RegressionDetected,
-    bool ConfirmationRequired,
-    IReadOnlyList<ElsaMigrationDecisionCase> Cases,
+    bool RegressionSignalDetected,
+    bool ConfirmationRunSuggested,
+    IReadOnlyList<string> RemainingAcceptanceWork,
+    IReadOnlyList<ElsaMigrationEvidenceCase> Cases,
     IReadOnlyList<RegressionEvaluation> Regressions)
 {
-    public static ElsaMigrationDecisionReport From(BenchmarkRunReport report) => new(
+    public static ElsaMigrationEvidenceReport From(BenchmarkRunReport report) => new(
         report.SchemaVersion,
         report.RunId,
         report.Mode,
+        BenchmarkEvidenceReadiness.Insufficient,
+        true,
         report.BaselineEligibility,
         report.Regressions.Any(regression => regression.Regressed),
         report.Regressions.Any(regression => regression.Regressed && regression.RequiresConfirmation),
-        report.Cases.Select(result => new ElsaMigrationDecisionCase(
+        Issue50EvidenceRequirements.Remaining,
+        report.Cases.Select(result => new ElsaMigrationEvidenceCase(
                 result.Case.Identity,
                 result.Case.Provider,
                 result.Case.StorageForm,
                 result.Case.Workload,
-                result.Summary.LatencyP50Nanoseconds,
-                result.Summary.LatencyP95Nanoseconds,
-                result.Summary.LatencyP99Nanoseconds,
+                result.Summary.NormalizedBatchLatencyP50NanosecondsPerOperation,
+                result.Summary.NormalizedBatchLatencyP95NanosecondsPerOperation,
+                result.Summary.NormalizedBatchLatencyP99NanosecondsPerOperation,
                 result.Summary.ThroughputOperationsPerSecond,
                 result.Summary.AllocatedBytesPerOperation,
                 result.Summary.RoundTripsPerOperation,
@@ -196,8 +207,8 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         await WriteJsonAsync(Layout.SummaryJson, report, cancellationToken);
         await WriteJsonAsync(Layout.RegressionJson, report.Regressions, cancellationToken);
         await WriteJsonAsync(
-            Layout.ElsaMigrationDecisionJson,
-            ElsaMigrationDecisionReport.From(report),
+            Layout.ElsaMigrationEvidenceJson,
+            ElsaMigrationEvidenceReport.From(report),
             cancellationToken);
         await WriteTextAsync(Layout.SummaryMarkdown, Markdown(report), cancellationToken);
     }
@@ -239,7 +250,7 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
             await ReadJsonAsync<BenchmarkRunConfiguration>(Path.Combine(root, "metadata", "configuration.json"), cancellationToken),
             await ReadJsonAsync<BenchmarkMachineMetadata>(Path.Combine(root, "metadata", "machine.json"), cancellationToken),
             await ReadJsonAsync<IReadOnlyList<BenchmarkProviderMetadata>>(Path.Combine(root, "metadata", "providers.json"), cancellationToken),
-            await ReadJsonAsync<ElsaMigrationDecisionReport>(Path.Combine(root, "reports", "elsa-migration-decision.json"), cancellationToken));
+            await ReadJsonAsync<ElsaMigrationEvidenceReport>(Path.Combine(root, "reports", "elsa-migration-evidence.json"), cancellationToken));
     }
 
     private static async Task WriteJsonAsync<T>(string path, T value, CancellationToken cancellationToken)
@@ -294,15 +305,15 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         builder.AppendLine($"Mode: `{report.Mode}`");
         builder.AppendLine($"Baseline eligible: `{report.BaselineEligibility.Eligible}`");
         builder.AppendLine();
-        builder.AppendLine("| Provider | Form | Workload | p50 (ms) | p95 (ms) | p99 (ms) | ops/s | B/op | round trips/op | storage delta | write amp | plan |");
+        builder.AppendLine("| Provider | Form | Workload | normalized batch p50 (ms/op) | normalized batch p95 (ms/op) | normalized batch p99 (ms/op) | ops/s | B/op | round trips/op | storage delta | write amp | plan |");
         builder.AppendLine("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         foreach (var result in report.Cases.OrderBy(result => result.Case.Identity, StringComparer.Ordinal))
         {
             var summary = result.Summary;
             builder.AppendLine(
                 $"| {result.Case.Provider} | {result.Case.StorageForm} | {result.Case.Workload} | " +
-                $"{summary.LatencyP50Nanoseconds / 1_000_000:F3} | {summary.LatencyP95Nanoseconds / 1_000_000:F3} | " +
-                $"{summary.LatencyP99Nanoseconds / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
+                $"{summary.NormalizedBatchLatencyP50NanosecondsPerOperation / 1_000_000:F3} | {summary.NormalizedBatchLatencyP95NanosecondsPerOperation / 1_000_000:F3} | " +
+                $"{summary.NormalizedBatchLatencyP99NanosecondsPerOperation / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
                 $"{summary.AllocatedBytesPerOperation:F1} | {Format(summary.RoundTripsPerOperation)} | " +
                 $"{Format(summary.StorageGrowthBytes)} | {Format(summary.WriteAmplificationBytesPerLogicalByte)} | " +
                 $"[{Path.GetFileName(result.PlanArtifact)}](../{result.PlanArtifact}) |");
@@ -326,7 +337,7 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
             {
                 builder.AppendLine($"- `{evaluation.CaseIdentity}`: " +
                                    (evaluation.IsComparable
-                                       ? evaluation.Regressed ? "candidate regression" : "within budget"
+                                       ? evaluation.Regressed ? "diagnostic regression signal" : "within diagnostic budget"
                                        : string.Join(" ", evaluation.Diagnostics)));
             }
         }

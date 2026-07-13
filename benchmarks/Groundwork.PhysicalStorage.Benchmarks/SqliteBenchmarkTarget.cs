@@ -225,14 +225,50 @@ public sealed class SqliteBenchmarkTarget(
             cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.Applied)
             throw new InvalidOperationException($"Backfill migration returned {result.Outcome}; expected Applied.");
-        migration = null;
         return Execution(1, logicalMutations: state.Rows, providerWork: new Dictionary<string, long>
         {
             ["backfilled_documents"] = state.Rows
         });
     }
 
-    protected override async Task<WorkloadExecution> ExecuteRestartRecoveryAsync(
+    protected override async Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken)
+    {
+        var state = migration ?? throw new InvalidOperationException("Migration iteration was not executed.");
+        var route = state.Additive.Route;
+        var store = new SqlitePhysicalDocumentStore(
+            ConnectionString,
+            state.Additive.Manifest,
+            state.Additive.Target.Routes,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var queries = SqlitePhysicalQueryRuntime.Create(
+            store,
+            state.Additive.Manifest,
+            route,
+            state.Additive.Target.Provider);
+        var queryCount = await queries.CountAsync(
+            Query().Select(BoundedQueryResultOperation.Count),
+            cancellationToken);
+
+        var category = route.ProjectedColumns.Single(column => column.Definition.Path == "category");
+        var table = category.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.PrimaryStorage.Name.Identifier
+            : route.LinkedIndexStorage!.Name.Identifier;
+        await using var connection = new SqliteConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {Q(table)} WHERE {Q(category.Column.Identifier)} = @category;";
+        command.Parameters.AddWithValue("@category", "migration");
+        var projectionCount = Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken));
+
+        if (queryCount != state.Rows || projectionCount != state.Rows)
+        {
+            throw new InvalidOperationException(
+                $"Backfill validation expected {state.Rows} queryable projected rows; query returned {queryCount} and category projection returned {projectionCount}.");
+        }
+        migration = null;
+    }
+
+    protected override async Task<WorkloadExecution> ExecuteClientRestartValidationAsync(
         int operations,
         CancellationToken cancellationToken)
     {
@@ -255,7 +291,7 @@ public sealed class SqliteBenchmarkTarget(
                     $"seed-{index:D8}",
                     cancellationToken) is null)
             {
-                throw new InvalidOperationException("Restart/recovery gate could not load durable seeded data.");
+                throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
         }
         return Execution(operations, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
@@ -290,6 +326,8 @@ public sealed class SqliteBenchmarkTarget(
 
     private static Task<long> CountAsync(SqliteConnection connection, string table, CancellationToken cancellationToken) =>
         ScalarAsync(connection, $"SELECT COUNT(*) FROM \"{table.Replace("\"", "\"\"")}\";", cancellationToken);
+
+    private static string Q(string value) => $"\"{value.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
     private static void TryDelete(string path)
     {

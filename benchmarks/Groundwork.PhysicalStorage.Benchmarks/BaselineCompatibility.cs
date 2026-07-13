@@ -6,14 +6,14 @@ public sealed record BenchmarkBaseline(
     BenchmarkRunConfiguration? Configuration,
     BenchmarkMachineMetadata? Machine,
     IReadOnlyList<BenchmarkProviderMetadata>? Providers,
-    ElsaMigrationDecisionReport? DecisionReport)
+    ElsaMigrationEvidenceReport? EvidenceReport)
 {
     public bool HasProvenance =>
         Manifest is not null &&
         Configuration is not null &&
         Machine is not null &&
         Providers is not null &&
-        DecisionReport is not null;
+        EvidenceReport is not null;
 }
 
 public sealed record BaselineCompatibility(bool IsCompatible, IReadOnlyList<string> Diagnostics);
@@ -47,29 +47,30 @@ public static class BaselineCompatibilityEvaluator
         var baselineConfiguration = baseline.Configuration!;
         var baselineMachine = baseline.Machine!;
         var baselineProviders = baseline.Providers!;
-        var decision = baseline.DecisionReport!;
+        var evidence = baseline.EvidenceReport!;
 
         if (manifest.SchemaVersion != BenchmarkProfiles.SchemaVersion ||
             baselineConfiguration.SchemaVersion != BenchmarkProfiles.SchemaVersion ||
-            decision.SchemaVersion != BenchmarkProfiles.SchemaVersion)
+            evidence.SchemaVersion != BenchmarkProfiles.SchemaVersion)
             diagnostics.Add($"Baseline schema must be '{BenchmarkProfiles.SchemaVersion}'.");
         if (!manifest.Status.Equals("completed", StringComparison.Ordinal))
             diagnostics.Add("Baseline run manifest must have completed status.");
-        if (manifest.Mode != baselineConfiguration.Mode || decision.Mode != baselineConfiguration.Mode ||
-            !manifest.RunId.Equals(decision.RunId, StringComparison.Ordinal))
-            diagnostics.Add("Baseline manifest, configuration, and decision report are internally inconsistent.");
+        if (manifest.Mode != baselineConfiguration.Mode || evidence.Mode != baselineConfiguration.Mode ||
+            !manifest.RunId.Equals(evidence.RunId, StringComparison.Ordinal))
+            diagnostics.Add("Baseline manifest, configuration, and evidence report are internally inconsistent.");
         if (!manifest.GitCommit.Equals(baselineMachine.GitCommit, StringComparison.Ordinal) ||
             manifest.GitDirty != baselineMachine.GitDirty)
             diagnostics.Add("Baseline manifest and machine Git provenance are internally inconsistent.");
-        if (candidateConfiguration.Mode == BenchmarkRunMode.Scheduled && !decision.BaselineEligibility.Eligible)
-            diagnostics.Add("Scheduled comparison requires a baseline-eligible decision report.");
+        if (candidateConfiguration.Mode == BenchmarkRunMode.Scheduled &&
+            (evidence.Readiness == BenchmarkEvidenceReadiness.Insufficient || !evidence.BaselineEligibility.Eligible))
+            diagnostics.Add("Scheduled comparison cannot gate while the evidence report is insufficient and non-promotable.");
 
         CompareControls(candidateConfiguration, baselineConfiguration, diagnostics);
         CompareMachine(candidateMachine, baselineMachine, diagnostics);
         RequireProviderMetadata(candidateConfiguration.Providers, candidateProviders, "Candidate", diagnostics);
         RequireProviderMetadata(baselineConfiguration.Providers, baselineProviders, "Baseline", diagnostics);
         CompareProviders(candidateProviders, baselineProviders, diagnostics);
-        ValidateRawRecords(baseline, baselineConfiguration, decision, diagnostics);
+        ValidateRawRecords(baseline, baselineConfiguration, evidence, diagnostics);
 
         return new BaselineCompatibility(diagnostics.Count == 0, diagnostics);
     }
@@ -161,7 +162,7 @@ public static class BaselineCompatibilityEvaluator
     private static void ValidateRawRecords(
         BenchmarkBaseline baseline,
         BenchmarkRunConfiguration configuration,
-        ElsaMigrationDecisionReport decision,
+        ElsaMigrationEvidenceReport evidence,
         ICollection<string> diagnostics)
     {
         var groups = baseline.Records
@@ -175,11 +176,11 @@ public static class BaselineCompatibilityEvaluator
             diagnostics.Add("Baseline raw measurements contain a case outside the configured provider/form matrix.");
 
         var rawCases = groups.Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
-        var decisionCases = decision.Cases.Select(item => item.CaseIdentity).ToArray();
-        if (decisionCases.Length != decisionCases.Distinct(StringComparer.Ordinal).Count() ||
-            !rawCases.SetEquals(decisionCases))
-            diagnostics.Add("Baseline raw measurements and decision-report cases are internally inconsistent.");
-        if (decision.BaselineEligibility.Eligible)
+        var evidenceCases = evidence.Cases.Select(item => item.CaseIdentity).ToArray();
+        if (evidenceCases.Length != evidenceCases.Distinct(StringComparer.Ordinal).Count() ||
+            !rawCases.SetEquals(evidenceCases))
+            diagnostics.Add("Baseline raw measurements and evidence-report cases are internally inconsistent.");
+        if (evidence.BaselineEligibility.Eligible)
         {
             var expectedCases = BenchmarkMatrix.Create(configuration)
                 .Select(benchmarkCase => benchmarkCase.Identity)

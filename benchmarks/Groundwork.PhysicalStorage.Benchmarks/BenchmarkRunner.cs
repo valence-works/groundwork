@@ -59,7 +59,7 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
             machine.GitDirty,
             layout.RelativePath(layout.RawMeasurements),
             layout.RelativePath(layout.SummaryJson),
-            layout.RelativePath(layout.ElsaMigrationDecisionJson),
+            layout.RelativePath(layout.ElsaMigrationEvidenceJson),
             layout.RelativePath(layout.MachineMetadata),
             layout.RelativePath(layout.ProviderMetadata),
             layout.RelativePath(layout.Configuration),
@@ -128,6 +128,7 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                                 request.Configuration.OperationsPerIteration,
                                 request.Configuration.Concurrency,
                                 cancellationToken);
+                            await target.ValidateIterationAsync(workload, cancellationToken);
                         }
 
                         var samples = new List<BenchmarkSample>(request.Configuration.MeasurementIterations);
@@ -151,6 +152,7 @@ public sealed class BenchmarkRunner(Action<string>? progress = null)
                             var elapsedTicks = Stopwatch.GetTimestamp() - timestamp;
                             var signalSnapshot = measurement.Complete();
                             var allocatedBytes = Math.Max(0, GC.GetTotalAllocatedBytes(precise: false) - allocatedBefore);
+                            await target.ValidateIterationAsync(workload, cancellationToken);
                             var storageAfter = capturesStorage
                                 ? await target.CaptureStorageAsync(cancellationToken)
                                 : null;

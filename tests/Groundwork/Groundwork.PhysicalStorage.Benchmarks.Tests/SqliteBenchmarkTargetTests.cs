@@ -28,6 +28,28 @@ public sealed class SqliteBenchmarkTargetTests : IAsyncDisposable
         Assert.Contains(plan.IndexName, plan.NativePlan, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Backfill_measurement_is_followed_by_projected_query_validation(PhysicalStorageForm form)
+    {
+        await using IPhysicalStorageBenchmarkTarget target =
+            new SqliteBenchmarkTarget(form, Guid.NewGuid().ToString("N")[..8], scratch, 5);
+        await target.InitializeAsync(CancellationToken.None);
+        await target.PrepareIterationAsync(BenchmarkWorkload.BackfillMigration, 0, CancellationToken.None);
+
+        var execution = await target.ExecuteAsync(
+            BenchmarkWorkload.BackfillMigration,
+            0,
+            operations: 1,
+            concurrency: 1,
+            CancellationToken.None);
+        await target.ValidateIterationAsync(BenchmarkWorkload.BackfillMigration, CancellationToken.None);
+
+        Assert.Equal(5, execution.LogicalMutations);
+    }
+
     public ValueTask DisposeAsync()
     {
         if (Directory.Exists(scratch))

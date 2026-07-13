@@ -145,6 +145,23 @@ public sealed class PostgreSqlBenchmarkTarget(
         return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? "unknown";
     }
 
+    protected override async Task<long> CountProjectedRowsAsync(
+        ExecutableStorageRoute route,
+        ExecutableProjectedColumnRoute projection,
+        string value,
+        CancellationToken cancellationToken)
+    {
+        var table = projection.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.PrimaryStorage.Name.Identifier
+            : route.LinkedIndexStorage!.Name.Identifier;
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {Q(table)} WHERE {Q(projection.Column.Identifier)} = @value;";
+        command.Parameters.AddWithValue("value", value);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
     protected override void ClearPools() => NpgsqlConnection.ClearAllPools();
 
     private static string Q(string value) => $"\"{value.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
