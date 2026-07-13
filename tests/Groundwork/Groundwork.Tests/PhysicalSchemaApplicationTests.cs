@@ -46,6 +46,18 @@ public sealed class PhysicalSchemaApplicationTests
     }
 
     [Fact]
+    public async Task Same_target_restart_performs_fresh_live_schema_validation()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+
+        await PhysicalSchemaApplication.ApplyAsync(target, executor);
+        await PhysicalSchemaApplication.ApplyAsync(target, executor);
+
+        Assert.Equal(2, executor.LiveValidationCount);
+    }
+
+    [Fact]
     public async Task PartialFailureNeverRecordsTargetAndRetryResumesIdempotently()
     {
         var target = CreateTarget(includeSecondProjection: true);
@@ -238,6 +250,7 @@ public sealed class PhysicalSchemaApplicationTests
         public int LockAcquisitionCount => lockAcquisitionCount;
         public int RecordedStateCount => recordedStateCount;
         public bool OperationObservedLeaseLoss { get; private set; }
+        public int LiveValidationCount { get; private set; }
         private CancellationTokenSource? leaseLoss;
 
         public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
@@ -274,6 +287,8 @@ public sealed class PhysicalSchemaApplicationTests
             CancellationToken cancellationToken)
         {
             AssertLockHeld();
+            if (operation is ValidatePhysicalSchemaOperation)
+                LiveValidationCount++;
             var number = Interlocked.Increment(ref operationNumber);
             if (LoseLeaseDuringOperationNumber == number)
             {

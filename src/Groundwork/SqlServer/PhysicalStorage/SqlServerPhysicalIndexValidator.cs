@@ -18,15 +18,15 @@ internal static class SqlServerPhysicalIndexValidator
                     $"SQL Server physical index '{index.Identity}' declares {index.Columns.Count} key columns; the provider limit is {MaximumKeyColumns}.");
             }
 
-            var keyBytes = 0;
+            long keyBytes = 0;
             foreach (var indexColumn in index.Columns)
             {
                 var projection = route.ProjectedColumns.SingleOrDefault(column =>
                     column.Target == index.Target &&
                     column.Column.Identifier == indexColumn.Column.Identifier);
-                keyBytes += projection is null
+                keyBytes = checked(keyBytes + (projection is null
                     ? EnvelopeKeyBytes(route, index, indexColumn.Column.Identifier)
-                    : ProjectedKeyBytes(index, projection.Definition, indexColumn.Column.Identifier);
+                    : ProjectedKeyBytes(index, projection.Definition, indexColumn.Column.Identifier)));
             }
             if (keyBytes > MaximumKeyBytes)
             {

@@ -35,7 +35,10 @@ internal sealed class SqlServerPhysicalIdentity
                 hidden,
                 $"{quote(hidden)} AS {hash.Expression(quote(column.Name))} PERSISTED NOT NULL",
                 "binary(32)",
-                false);
+                false,
+                IsComputed: true,
+                IsPersisted: true,
+                ComputedDefinition: hash.Expression(quote(column.Name)));
         }).ToArray();
         return new RelationalPhysicalIdentityLayout(
             Array.AsReadOnly(columns),
@@ -67,25 +70,28 @@ internal sealed class SqlServerPhysicalIdentity
                 .Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage)
                 .Select(column => column.Column.Identifier)));
 
-        if (route.LinkedIndexStorage is null)
-            return;
-        var relationship = route.LinkedRelationship!;
-        ValidateTable(
-            route,
-            route.LinkedIndexStorage.Name.Identifier,
-            [
-                relationship.DocumentKind.Identifier,
-                relationship.StorageScope.Identifier,
-                relationship.DocumentId.Identifier
-            ],
-            new[]
-            {
-                relationship.DocumentKind.Identifier,
-                relationship.StorageScope.Identifier,
-                relationship.DocumentId.Identifier
-            }.Concat(route.ProjectedColumns
-                .Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage)
-                .Select(column => column.Column.Identifier)));
+        if (route.LinkedIndexStorage is not null)
+        {
+            var relationship = route.LinkedRelationship!;
+            ValidateTable(
+                route,
+                route.LinkedIndexStorage.Name.Identifier,
+                [
+                    relationship.DocumentKind.Identifier,
+                    relationship.StorageScope.Identifier,
+                    relationship.DocumentId.Identifier
+                ],
+                new[]
+                {
+                    relationship.DocumentKind.Identifier,
+                    relationship.StorageScope.Identifier,
+                    relationship.DocumentId.Identifier
+                }.Concat(route.ProjectedColumns
+                    .Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage)
+                    .Select(column => column.Column.Identifier)));
+        }
+
+        SqlServerPhysicalIndexValidator.Validate(route);
     }
 
     public string ExactPredicate(

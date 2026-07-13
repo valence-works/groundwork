@@ -66,6 +66,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         store.ExecutePhysicalQueryAsync((connection, ct) =>
             CountCoreAsync(connection, Build(query, plan, store.GetRoute(query.DocumentKind)), ct), cancellationToken);
 
+    internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
+        RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind)));
+
     public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
@@ -114,10 +117,14 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private async Task<long> CountCoreAsync(DbConnection connection, BuiltQuery built, CancellationToken ct)
     {
-        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, $"SELECT COUNT(*) {built.FromAndWhere};");
-        AddParameters(command, built.Parameters);
+        var rendered = RenderCount(built);
+        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
+        AddParameters(command, rendered.Parameters);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct));
     }
+
+    private static RelationalPhysicalQueryCommand RenderCount(BuiltQuery built) =>
+        new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters);
 
     private BuiltQuery Build(DocumentQuery query, PhysicalQueryPlan plan, ExecutableStorageRoute route)
     {
@@ -276,3 +283,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private sealed record BuiltQuery(string FromAndWhere, IReadOnlyList<(string Name, object? Value)> Parameters);
 }
+
+internal sealed record RelationalPhysicalQueryCommand(
+    string CommandText,
+    IReadOnlyList<(string Name, object? Value)> Parameters);

@@ -110,10 +110,20 @@ public static class PhysicalSchemaApplication
         if (!plan.IsApplicable)
             return new PhysicalSchemaApplicationResult(PhysicalSchemaApplicationOutcome.Rejected, plan, null);
         if (plan.Operations.Count == 0)
+        {
+            var validation = new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+            var acknowledgement = await executor.ApplyOperationAsync(
+                target.Identity,
+                validation,
+                applicationLock,
+                applicationToken);
+            applicationToken.ThrowIfCancellationRequested();
+            EnsureAcknowledges(validation, acknowledgement);
             return new PhysicalSchemaApplicationResult(
                 PhysicalSchemaApplicationOutcome.NoChanges,
                 plan,
                 history.AppliedState);
+        }
 
         var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>();
         foreach (var operation in plan.Operations)
@@ -128,18 +138,7 @@ public static class PhysicalSchemaApplication
                 applicationLock,
                 applicationToken);
             applicationToken.ThrowIfCancellationRequested();
-            if (acknowledgement.Identity != operation.Identity)
-            {
-                throw new InvalidOperationException(
-                    $"Executor acknowledged operation '{acknowledgement.Identity}' while '{operation.Identity}' was expected.");
-            }
-            if (acknowledgement.Fingerprint != operation.Fingerprint)
-            {
-                throw new PhysicalSchemaFingerprintConflictException(
-                    operation.Identity,
-                    operation.Fingerprint,
-                    acknowledgement.Fingerprint);
-            }
+            EnsureAcknowledges(operation, acknowledgement);
             acknowledgements.Add(acknowledgement);
         }
 
@@ -155,5 +154,23 @@ public static class PhysicalSchemaApplication
             PhysicalSchemaApplicationOutcome.Applied,
             plan,
             appliedState);
+    }
+
+    private static void EnsureAcknowledges(
+        PhysicalSchemaOperation operation,
+        PhysicalSchemaOperationAcknowledgement acknowledgement)
+    {
+        if (acknowledgement.Identity != operation.Identity)
+        {
+            throw new InvalidOperationException(
+                $"Executor acknowledged operation '{acknowledgement.Identity}' while '{operation.Identity}' was expected.");
+        }
+        if (acknowledgement.Fingerprint != operation.Fingerprint)
+        {
+            throw new PhysicalSchemaFingerprintConflictException(
+                operation.Identity,
+                operation.Fingerprint,
+                acknowledgement.Fingerprint);
+        }
     }
 }

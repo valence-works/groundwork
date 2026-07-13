@@ -87,6 +87,12 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor
             {
                 if (!string.Equals(prior.Value.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
                     throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, prior.Value.Fingerprint);
+                if (operation is ValidatePhysicalSchemaOperation)
+                {
+                    await using var validationTransaction = await connection.BeginTransactionAsync(ct);
+                    await ApplyOperationCoreAsync(operation, validationTransaction, ct);
+                    await validationTransaction.CommitAsync(ct);
+                }
                 return new PhysicalSchemaOperationAcknowledgement(operation.Identity, prior.Value.Fingerprint, prior.Value.AppliedAt);
             }
 

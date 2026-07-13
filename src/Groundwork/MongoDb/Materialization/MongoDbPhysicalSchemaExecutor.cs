@@ -166,6 +166,11 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor
         if (existing is not null)
         {
             var acknowledgement = AcknowledgeExisting(operation, existing);
+            if (operation is ValidatePhysicalSchemaOperation)
+            {
+                await ExecuteAsync(operation, cancellationToken);
+                return acknowledgement;
+            }
             if (await IsOperationPublishedAsync(operation, lease.Target, cancellationToken))
                 return acknowledgement;
             // Execution evidence from an attempt that never published its target is not a skip

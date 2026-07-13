@@ -150,5 +150,7 @@ silently collide, while the executor quotes every final provider identifier.
 `RelationalPhysicalQueryRuntime` derives every advertised source capability from an executable
 handler identity. SQL Server and PostgreSQL wrappers certify the exact route/object/index/field
 mapping and execute predicates, compound ordering, paging, count, any, and first server-side. Their
-container conformance uses SQL Server `SHOWPLAN` and PostgreSQL `EXPLAIN` to prove the declared
-physical index is a valid selected access path.
+container conformance captures the exact count command and parameters emitted by that runtime,
+without optimizer hints. SQL Server executes it with `SET STATISTICS XML ON` and inspects only the
+resulting actual-plan XML result set; PostgreSQL prefixes the same command with `EXPLAIN (FORMAT
+JSON)`. Both assert that the optimizer selected the declared physical index.

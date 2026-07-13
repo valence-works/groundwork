@@ -1,6 +1,7 @@
 using System.Data.Common;
 using System.Globalization;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.PhysicalStorage;
@@ -20,10 +21,21 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
     internal SqlServerPhysicalSchemaExecutor(
         string connectionString,
         SqlServerPhysicalIdentityHash hash)
+        : this(connectionString, hash, null, null)
+    {
+    }
+
+    internal SqlServerPhysicalSchemaExecutor(
+        string connectionString,
+        SqlServerPhysicalIdentityHash hash,
+        Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence,
+        Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence)
         : base(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             () => new SqlConnection(LockConnectionString(connectionString)),
-            new SqlServerPhysicalSchemaDialect(hash))
+            new SqlServerPhysicalSchemaDialect(hash),
+            beforeOperationEvidence,
+            beforeAppliedStateFence)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
@@ -34,6 +46,9 @@ public sealed class SqlServerPhysicalSchemaExecutor : RelationalServerPhysicalSc
         : this(sessions, createLockConnection, new SqlServerPhysicalIdentityHash())
     {
     }
+
+    internal static long LockSessionId(IPhysicalSchemaApplicationLock applicationLock) =>
+        ReadLockSessionId(applicationLock);
 
     internal SqlServerPhysicalSchemaExecutor(
         RelationalSessionFactory sessions,
@@ -62,6 +77,10 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
     public override void ValidateRoute(ExecutableStorageRoute route) => identity.ValidateRoute(route);
     public override string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         identity.ExactPredicate(parts, Q, includeOriginal: true);
+    public override string? HashOnlyIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        identity.ExactPredicate(parts, Q, includeOriginal: false);
+    public override bool IsUniqueConstraintException(DbException exception) =>
+        exception is SqlException { Number: 2601 or 2627 };
 
     public override string ProviderDisplayName => "SQL Server";
     public override string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
@@ -109,6 +128,20 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
     public override string? NormalizeDefault(ProjectedColumnDefinition definition) =>
         definition.DefaultValue is null ? null : DefaultSql(definition);
 
+    public override string? NormalizeComputedDefinition(string? definition)
+    {
+        if (definition is null)
+            return null;
+        var normalized = string.Concat(definition.Where(character => !char.IsWhiteSpace(character)))
+            .Replace("[binary]", "binary", StringComparison.OrdinalIgnoreCase)
+            .Replace("[varbinary]", "varbinary", StringComparison.OrdinalIgnoreCase)
+            .Replace("[nvarchar]", "nvarchar", StringComparison.OrdinalIgnoreCase)
+            .ToLowerInvariant();
+        while (HasRedundantOuterParentheses(normalized))
+            normalized = normalized[1..^1];
+        return normalized;
+    }
+
     public override string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind) =>
         $"{Q(name)} {EnvelopeType(kind)}" +
         (EnvelopeCollation(kind) is { } collation ? $" COLLATE {CollationToken(collation)}" : string.Empty) +
@@ -121,7 +154,7 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
 
     public override string CreateTableSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> primaryKey)
     {
-        var constraint = Q(TrimIdentifier($"PK_{table}"));
+        var constraint = Q(SqlServerPhysicalName.Normalize($"PK_{table}"));
         return $"CREATE TABLE {Q(table)} ({string.Join(", ", columns)}, CONSTRAINT {constraint} PRIMARY KEY NONCLUSTERED ({string.Join(", ", primaryKey.Select(Q))}));";
     }
 
@@ -224,10 +257,120 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    public override async Task<bool> VerifyApplicationLockAsync(
+        DbConnection connection,
+        string resource,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT APPLOCK_MODE(N'public', @resource, N'Session');";
+        Add(command, "resource", resource);
+        return string.Equals(
+            Convert.ToString(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture),
+            "Exclusive",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    public override async Task<long> ReadServerSessionIdAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT @@SPID;";
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    public override async Task<long> AcquireFenceAsync(
+        DbConnection connection,
+        PhysicalSchemaTargetIdentity target,
+        string owner,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SET XACT_ABORT ON;
+            BEGIN TRANSACTION;
+            DECLARE @next bigint;
+            SELECT @next = fence
+            FROM groundwork_physical_schema_locks WITH (UPDLOCK, HOLDLOCK)
+            WHERE manifest_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @manifestId)))
+              AND provider_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @providerName)))
+              AND manifest_id = @manifestId AND provider_name = @providerName;
+            IF @next IS NULL
+            BEGIN
+                SET @next = 1;
+                INSERT INTO groundwork_physical_schema_locks
+                    (manifest_id, provider_name, owner_id, fence)
+                VALUES (@manifestId, @providerName, @owner, @next);
+            END
+            ELSE
+            BEGIN
+                IF @next = 9223372036854775807
+                BEGIN
+                    ROLLBACK TRANSACTION;
+                    SELECT CAST(NULL AS bigint);
+                    RETURN;
+                END;
+                SET @next = @next + 1;
+                UPDATE groundwork_physical_schema_locks
+                SET owner_id = @owner, fence = @next
+                WHERE manifest_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @manifestId)))
+                  AND provider_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @providerName)))
+                  AND manifest_id = @manifestId AND provider_name = @providerName;
+            END;
+            COMMIT TRANSACTION;
+            SELECT @next;
+            """;
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        Add(command, "owner", owner);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        if (result is null or DBNull)
+            throw new InvalidOperationException($"SQL Server physical-schema fence is exhausted for target '{target}'.");
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    public override async Task AssertFenceAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        PhysicalSchemaTargetIdentity target,
+        string owner,
+        long fence,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT 1
+            FROM groundwork_physical_schema_locks WITH (UPDLOCK, HOLDLOCK)
+            WHERE manifest_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @manifestId)))
+              AND provider_key = CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @providerName)))
+              AND manifest_id = @manifestId AND provider_name = @providerName
+              AND owner_id = @owner AND fence = @fence;
+            """);
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        Add(command, "owner", owner);
+        Add(command, "fence", fence);
+        if (await command.ExecuteScalarAsync(cancellationToken) is null)
+            throw new InvalidOperationException($"SQL Server physical-schema fence {fence} is no longer owned for target '{target}'.");
+    }
+
     public override async Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = """
+            IF OBJECT_ID(N'groundwork_physical_schema_locks', N'U') IS NULL
+            BEGIN
+                CREATE TABLE groundwork_physical_schema_locks (
+                    manifest_id nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    provider_name nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    owner_id nvarchar(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    fence bigint NOT NULL,
+                    manifest_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), manifest_id))) PERSISTED NOT NULL,
+                    provider_key AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), provider_name))) PERSISTED NOT NULL,
+                    CONSTRAINT PK_groundwork_physical_schema_locks PRIMARY KEY NONCLUSTERED
+                        (manifest_key, provider_key)
+                );
+            END;
             IF OBJECT_ID(N'groundwork_physical_schema_operations', N'U') IS NULL
             BEGIN
                 CREATE TABLE groundwork_physical_schema_operations (
@@ -276,10 +419,11 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
             SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable,
                    dc.definition,
                    CASE WHEN c.collation_name = CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')) THEN NULL ELSE c.collation_name END,
-                   COALESCE(ic.key_ordinal, 0)
+                   COALESCE(ic.key_ordinal, 0), c.is_computed, COALESCE(cc.is_persisted, 0), cc.definition
             FROM sys.columns c
             JOIN sys.types t ON t.user_type_id = c.user_type_id
             LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+            LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id
             LEFT JOIN sys.indexes i ON i.object_id = c.object_id AND i.is_primary_key = 1
             LEFT JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.index_id = i.index_id AND ic.column_id = c.column_id
             WHERE c.object_id = OBJECT_ID(@table)
@@ -298,7 +442,10 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
                 reader.GetBoolean(5),
                 reader.IsDBNull(6) ? null : NormalizeDatabaseDefault(reader.GetString(6)),
                 reader.IsDBNull(7) ? null : reader.GetString(7),
-                reader.GetInt32(8)));
+                reader.GetInt32(8),
+                reader.GetBoolean(9),
+                Convert.ToBoolean(reader.GetValue(10), CultureInfo.InvariantCulture),
+                reader.IsDBNull(11) ? null : reader.GetString(11)));
         }
         return result;
     }
@@ -380,7 +527,24 @@ internal sealed class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalS
         return result;
     }
 
-    private static string TrimIdentifier(string value) => value.Length <= 128 ? value : value[..128];
+    private static bool HasRedundantOuterParentheses(string value)
+    {
+        if (value.Length < 2 || value[0] != '(' || value[^1] != ')')
+            return false;
+        var depth = 0;
+        for (var index = 0; index < value.Length; index++)
+        {
+            depth += value[index] switch
+            {
+                '(' => 1,
+                ')' => -1,
+                _ => 0
+            };
+            if (depth == 0 && index < value.Length - 1)
+                return false;
+        }
+        return depth == 0;
+    }
 
     private static DbCommand Command(DbConnection connection, DbTransaction transaction, string sql)
     {

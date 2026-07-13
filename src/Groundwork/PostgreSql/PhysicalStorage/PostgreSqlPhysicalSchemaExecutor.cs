@@ -1,6 +1,7 @@
 using System.Data.Common;
 using System.Globalization;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.PhysicalStorage;
 using Groundwork.Relational.Physicalization;
@@ -12,10 +13,20 @@ namespace Groundwork.PostgreSql.PhysicalStorage;
 public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalSchemaExecutor
 {
     public PostgreSqlPhysicalSchemaExecutor(string connectionString)
+        : this(connectionString, null, null)
+    {
+    }
+
+    internal PostgreSqlPhysicalSchemaExecutor(
+        string connectionString,
+        Func<PhysicalSchemaOperation, CancellationToken, Task>? beforeOperationEvidence,
+        Func<PhysicalSchemaAppliedState, CancellationToken, Task>? beforeAppliedStateFence)
         : base(
             RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
             () => new NpgsqlConnection(LockConnectionString(connectionString)),
-            new PostgreSqlPhysicalSchemaDialect())
+            new PostgreSqlPhysicalSchemaDialect(),
+            beforeOperationEvidence,
+            beforeAppliedStateFence)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
@@ -26,6 +37,9 @@ public sealed class PostgreSqlPhysicalSchemaExecutor : RelationalServerPhysicalS
         : base(sessions, createLockConnection, new PostgreSqlPhysicalSchemaDialect())
     {
     }
+
+    internal static long LockSessionId(IPhysicalSchemaApplicationLock applicationLock) =>
+        ReadLockSessionId(applicationLock);
 
     private static string LockConnectionString(string connectionString) =>
         new NpgsqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString;
@@ -45,7 +59,13 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
     };
 
-    public override string? EnvelopeCollation(RelationalEnvelopeColumnKind kind) => null;
+    public override string? EnvelopeCollation(RelationalEnvelopeColumnKind kind) => kind switch
+    {
+        RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.StorageScope or
+            RelationalEnvelopeColumnKind.Id or RelationalEnvelopeColumnKind.SchemaVersion or
+            RelationalEnvelopeColumnKind.Timestamp => "C",
+        _ => null
+    };
 
     public override string ProjectedType(ProjectedColumnDefinition definition) => definition.Type switch
     {
@@ -64,17 +84,33 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
 
     public override string? Collation(string? portableCollation) => portableCollation?.Trim() switch
     {
-        null or "" => null,
+        null or "" => "C",
         var value when value.Equals("ordinal", StringComparison.OrdinalIgnoreCase) ||
                        value.Equals("binary", StringComparison.OrdinalIgnoreCase) => "C",
         var value => value
     };
 
+    public override string? NormalizeCollationIdentity(string? collation)
+    {
+        if (collation is null || string.Equals(collation, "C", StringComparison.Ordinal))
+            return collation;
+        var separator = collation.IndexOf(':');
+        if (separator < 0)
+            return collation;
+        var schema = collation[..separator];
+        var name = collation[(separator + 1)..];
+        return string.Equals(name, "C", StringComparison.Ordinal)
+            ? string.Equals(schema, "pg_catalog", StringComparison.Ordinal) ? "C" : collation
+            : name;
+    }
+
     public override string? NormalizeDefault(ProjectedColumnDefinition definition) =>
         definition.DefaultValue is null ? null : DefaultSql(definition);
 
     public override string EnvelopeColumn(string name, RelationalEnvelopeColumnKind kind) =>
-        $"{Q(name)} {EnvelopeType(kind)} NOT NULL";
+        $"{Q(name)} {EnvelopeType(kind)}" +
+        (EnvelopeCollation(kind) is { } collation ? $" COLLATE {CollationToken(collation)}" : string.Empty) +
+        " NOT NULL";
 
     public override string CreateTableSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> primaryKey) =>
         $"CREATE TABLE {Q(table)} ({string.Join(", ", columns)}, PRIMARY KEY ({string.Join(", ", primaryKey.Select(Q))}));";
@@ -150,22 +186,109 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    public override async Task<bool> VerifyApplicationLockAsync(
+        DbConnection connection,
+        string resource,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_locks
+                WHERE locktype = 'advisory'
+                  AND pid = pg_catalog.pg_backend_pid()
+                  AND granted
+                  AND objsubid = 1
+                  AND classid::bigint = ((pg_catalog.hashtextextended(@resource, 0) >> 32) & 4294967295)
+                  AND objid::bigint = (pg_catalog.hashtextextended(@resource, 0) & 4294967295)
+            );
+            """;
+        Add(command, "resource", resource);
+        return Convert.ToBoolean(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    public override async Task<long> ReadServerSessionIdAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT pg_catalog.pg_backend_pid();";
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    public override async Task<long> AcquireFenceAsync(
+        DbConnection connection,
+        PhysicalSchemaTargetIdentity target,
+        string owner,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO groundwork_physical_schema_locks
+                (manifest_id, provider_name, owner_id, fence)
+            VALUES (@manifestId, @providerName, @owner, 1)
+            ON CONFLICT (manifest_id, provider_name) DO UPDATE
+            SET owner_id = EXCLUDED.owner_id,
+                fence = groundwork_physical_schema_locks.fence + 1
+            WHERE groundwork_physical_schema_locks.fence < 9223372036854775807
+            RETURNING fence;
+            """;
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        Add(command, "owner", owner);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        if (result is null or DBNull)
+            throw new InvalidOperationException($"PostgreSQL physical-schema fence is exhausted for target '{target}'.");
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    public override async Task AssertFenceAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        PhysicalSchemaTargetIdentity target,
+        string owner,
+        long fence,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT 1
+            FROM groundwork_physical_schema_locks
+            WHERE manifest_id = @manifestId AND provider_name = @providerName
+              AND owner_id = @owner AND fence = @fence
+            FOR UPDATE;
+            """);
+        Add(command, "manifestId", target.ManifestIdentity.Value);
+        Add(command, "providerName", target.ProviderName);
+        Add(command, "owner", owner);
+        Add(command, "fence", fence);
+        if (await command.ExecuteScalarAsync(cancellationToken) is null)
+            throw new InvalidOperationException($"PostgreSQL physical-schema fence {fence} is no longer owned for target '{target}'.");
+    }
+
     public override async Task EnsureInfrastructureAsync(DbConnection connection, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = """
+            CREATE TABLE IF NOT EXISTS groundwork_physical_schema_locks (
+                manifest_id text COLLATE pg_catalog."C" NOT NULL,
+                provider_name text COLLATE pg_catalog."C" NOT NULL,
+                owner_id text COLLATE pg_catalog."C" NOT NULL,
+                fence bigint NOT NULL,
+                PRIMARY KEY (manifest_id, provider_name)
+            );
             CREATE TABLE IF NOT EXISTS groundwork_physical_schema_operations (
-                manifest_id text NOT NULL,
-                provider_name text NOT NULL,
-                operation_id text NOT NULL,
-                operation_fingerprint text NOT NULL,
+                manifest_id text COLLATE pg_catalog."C" NOT NULL,
+                provider_name text COLLATE pg_catalog."C" NOT NULL,
+                operation_id text COLLATE pg_catalog."C" NOT NULL,
+                operation_fingerprint text COLLATE pg_catalog."C" NOT NULL,
                 applied_utc timestamp with time zone NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name, operation_id)
             );
             CREATE TABLE IF NOT EXISTS groundwork_physical_schema_state (
-                manifest_id text NOT NULL,
-                provider_name text NOT NULL,
-                target_fingerprint text NOT NULL,
+                manifest_id text COLLATE pg_catalog."C" NOT NULL,
+                provider_name text COLLATE pg_catalog."C" NOT NULL,
+                target_fingerprint text COLLATE pg_catalog."C" NOT NULL,
                 applied_state_json text NOT NULL,
                 PRIMARY KEY (manifest_id, provider_name)
             );
@@ -190,7 +313,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
                    pg_catalog.format_type(a.atttypid, a.atttypmod),
                    NOT a.attnotnull,
                    pg_get_expr(ad.adbin, ad.adrelid),
-                   CASE WHEN a.attcollation = typ.typcollation THEN NULL ELSE coll.collname END,
+                   CASE WHEN a.attcollation = typ.typcollation THEN NULL ELSE coll_ns.nspname || ':' || coll.collname END,
                    COALESCE(pk.ordinality, 0)::integer
             FROM pg_catalog.pg_class c
             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -198,6 +321,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
             JOIN pg_catalog.pg_type typ ON typ.oid = a.atttypid
             LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
             LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = a.attcollation AND a.attcollation <> 0
+            LEFT JOIN pg_catalog.pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
             LEFT JOIN pg_catalog.pg_constraint con ON con.conrelid = c.oid AND con.contype = 'p'
             LEFT JOIN LATERAL unnest(con.conkey) WITH ORDINALITY pk(attnum, ordinality) ON pk.attnum = a.attnum
             WHERE n.nspname = current_schema() AND c.relname = @table
@@ -258,7 +382,12 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         (DefaultSql(definition) is { } value ? $" DEFAULT {value}" : string.Empty);
 
     private string CollationSql(ProjectedColumnDefinition definition) =>
-        ProjectedCollation(definition) is { } value ? $" COLLATE {Q(value)}" : string.Empty;
+        ProjectedCollation(definition) is { } value ? $" COLLATE {CollationToken(value)}" : string.Empty;
+
+    private string CollationToken(string value) =>
+        string.Equals(value, "C", StringComparison.Ordinal)
+            ? $"{Q("pg_catalog")}.{Q("C")}"
+            : Q(value);
 
     private static string? DefaultSql(ProjectedColumnDefinition definition)
     {

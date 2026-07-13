@@ -21,32 +21,8 @@ public static class RelationalPhysicalQueryRuntime
         string handlerPrefix,
         IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
     {
-        ArgumentNullException.ThrowIfNull(store);
-        ArgumentNullException.ThrowIfNull(manifest);
-        ArgumentNullException.ThrowIfNull(route);
-        ArgumentNullException.ThrowIfNull(provider);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerPrefix);
-        var unit = manifest.StorageUnits.Single(candidate => candidate.Identity == route.StorageUnit);
-        var storage = unit.PhysicalStorage ?? throw new InvalidOperationException(
-            $"Storage unit '{route.StorageUnit.Value}' has no physical query declarations.");
-        var capabilities = Capabilities(provider, handlerPrefix, canonicalJsonValueKinds);
-        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
-        if (!compilation.IsValid)
-            throw new InvalidOperationException(string.Join(Environment.NewLine, compilation.Diagnostics.Select(x => $"{x.Code}: {x.Message}")));
-
-        var handlers = capabilities.HandlerIdentities.Select(registration =>
-        {
-            var certifications = compilation.Plans
-                .Where(plan => plan.HandlerIdentity == registration.Value)
-                .Select(RelationalPhysicalDocumentQueryHandler.Certify)
-                .ToArray();
-            return (IPhysicalDocumentQueryHandler)new RelationalPhysicalDocumentQueryHandler(
-                registration.Value,
-                registration.Key,
-                store,
-                certifications);
-        }).ToArray();
-        return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
+        var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds);
+        return new PhysicalQueryDocumentStore(route, runtime.Storage, runtime.Capabilities, runtime.Handlers);
     }
 
     public static PhysicalQueryPlannerCapabilities Capabilities(
@@ -85,4 +61,64 @@ public static class RelationalPhysicalQueryRuntime
                 [PhysicalQuerySourceKind.PrimaryCanonicalJson] = valueKinds
             });
     }
+
+    internal static RelationalPhysicalQueryCommand BuildCountCommand(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        DocumentQuery query,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds);
+        var plan = runtime.Compilation.Plans.Single(candidate => candidate.QueryIdentity == query.QueryIdentity);
+        var handler = runtime.Handlers
+            .OfType<RelationalPhysicalDocumentQueryHandler>()
+            .Single(candidate => candidate.Identity == plan.HandlerIdentity);
+        return handler.BuildCountCommand(query, plan);
+    }
+
+    private static RuntimeComponents BuildRuntime(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(route);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerPrefix);
+        var unit = manifest.StorageUnits.Single(candidate => candidate.Identity == route.StorageUnit);
+        var storage = unit.PhysicalStorage ?? throw new InvalidOperationException(
+            $"Storage unit '{route.StorageUnit.Value}' has no physical query declarations.");
+        var capabilities = Capabilities(provider, handlerPrefix, canonicalJsonValueKinds);
+        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
+        if (!compilation.IsValid)
+            throw new InvalidOperationException(string.Join(Environment.NewLine, compilation.Diagnostics.Select(x => $"{x.Code}: {x.Message}")));
+
+        var handlers = capabilities.HandlerIdentities.Select(registration =>
+        {
+            var certifications = compilation.Plans
+                .Where(plan => plan.HandlerIdentity == registration.Value)
+                .Select(RelationalPhysicalDocumentQueryHandler.Certify)
+                .ToArray();
+            return (IPhysicalDocumentQueryHandler)new RelationalPhysicalDocumentQueryHandler(
+                registration.Value,
+                registration.Key,
+                store,
+                certifications);
+        }).ToArray();
+        return new RuntimeComponents(storage, capabilities, compilation, handlers);
+    }
+
+    private sealed record RuntimeComponents(
+        StorageUnitPhysicalStorage Storage,
+        PhysicalQueryPlannerCapabilities Capabilities,
+        PhysicalQueryPlanCompilationResult Compilation,
+        IReadOnlyList<IPhysicalDocumentQueryHandler> Handlers);
 }
