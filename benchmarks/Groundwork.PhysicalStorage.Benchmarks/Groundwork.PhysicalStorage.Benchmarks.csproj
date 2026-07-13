@@ -28,4 +28,8 @@
     <ProjectReference Include="..\..\src\Groundwork\SqlServer\Groundwork.SqlServer.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Groundwork.PhysicalStorage.Benchmarks.Tests" />
+  </ItemGroup>
+
 </Project>

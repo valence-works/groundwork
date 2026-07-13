@@ -23,6 +23,11 @@ The backfill workload has an additional post-measurement check. Outside the time
 the additive model to run the bounded query and directly queries the newly projected `category`
 field. Both counts must match the seeded migration row count.
 
+The SQL Server plan gate temporarily adds internally consistent plan-only documents outside the
+timed workload, refreshes statistics, captures the native plan, then removes those documents and
+refreshes statistics again. This keeps smoke-profile optimizer decisions representative without
+changing measured workload data.
+
 These are harness correctness gates only. Passing them does not make performance evidence complete.
 
 ## Diagnostic profiles
