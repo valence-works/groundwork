@@ -239,6 +239,7 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
         var deleted = await store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", id, ExpectedVersion: 2));
 
         Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal(id, deleted.AuthoritativeId);
         Assert.Null(await store.LoadAsync("configurationDocument", id));
         Assert.Empty(await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", secondKey)));
     }

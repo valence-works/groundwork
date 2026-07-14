@@ -188,7 +188,7 @@ public class RelationalDocumentStore : IDocumentStore
         await DeleteIndexesAsync(request.DocumentKind, request.Id, scope, transaction, ct);
         await DeletePhysicalizedAsync(unit, request.Id, scope, transaction, ct);
 
-        return DocumentStoreWriteResult.Deleted;
+        return DocumentStoreWriteResult.Deleted(existing.Id);
     }
 
     public TransactionBoundary TransactionBoundary => TransactionBoundary.CrossUnitAtomic;

@@ -651,7 +651,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         if (request.ExpectedVersion is not null)
             AddPhysicalParameter(command, "expectedVersion", request.ExpectedVersion.Value);
         return await command.ExecuteNonQueryAsync(ct) == 1
-            ? DocumentStoreWriteResult.Deleted
+            ? DocumentStoreWriteResult.Deleted(existing.Id)
             : DocumentStoreWriteResult.ConcurrencyConflict;
     }
 

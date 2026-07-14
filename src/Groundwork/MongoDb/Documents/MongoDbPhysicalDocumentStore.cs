@@ -620,9 +620,9 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
         if (request.ExpectedVersion is not null)
             filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
-        var result = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .DeleteOneAsync(session, filter, cancellationToken: cancellationToken);
-        if (result.DeletedCount == 0)
+        var deleted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .FindOneAndDeleteAsync(session, filter, cancellationToken: cancellationToken);
+        if (deleted is null)
         {
             var exists = await LoadDocumentAsync(route, request.Id, scope.StorageKey!, session, cancellationToken);
             return exists is null ? DocumentStoreWriteResult.NotFound : DocumentStoreWriteResult.ConcurrencyConflict;
@@ -635,7 +635,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             await database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
                 .DeleteOneAsync(session, linkedFilter, cancellationToken: cancellationToken);
         }
-        return DocumentStoreWriteResult.Deleted;
+        return DocumentStoreWriteResult.Deleted(deleted[route.Envelope.Id.Identifier].AsString);
     }
 
     private async Task<DocumentEnvelope?> LoadCoreAsync(

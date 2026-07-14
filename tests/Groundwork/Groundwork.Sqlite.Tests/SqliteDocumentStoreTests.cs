@@ -83,6 +83,7 @@ public sealed class SqliteDocumentStoreTests
         var deleted = await store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "doc-1", ExpectedVersion: 2));
 
         Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("doc-1", deleted.AuthoritativeId);
         Assert.Null(await store.LoadAsync("configurationDocument", "doc-1"));
         Assert.Empty(await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "beta")));
     }

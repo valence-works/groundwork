@@ -101,6 +101,7 @@ public sealed class SqlitePhysicalDocumentStoreTests
 
         var deleted = await store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "one", 2));
         Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("one", deleted.AuthoritativeId);
         Assert.Null(await store.LoadAsync("configurationDocument", "one"));
         if (route.LinkedIndexStorage is not null)
             Assert.Equal(0L, Convert.ToInt64(await ScalarAsync(connection, $"SELECT COUNT(*) FROM \"{route.LinkedIndexStorage.Name.Identifier}\";")));

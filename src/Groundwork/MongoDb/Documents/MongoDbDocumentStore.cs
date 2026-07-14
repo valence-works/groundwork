@@ -148,9 +148,9 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             ? DocumentIdentityFilter(scope.StorageKey!, request.Id)
             : DocumentIdentityFilter(scope.StorageKey!, request.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
 
-        var result = await DeleteOneAsync(collection, session, filter, cancellationToken);
-        if (result.DeletedCount == 1)
-            return DocumentStoreWriteResult.Deleted;
+        var deleted = await FindOneAndDeleteAsync(collection, session, filter, cancellationToken);
+        if (deleted is not null)
+            return DocumentStoreWriteResult.Deleted(deleted["_id"].AsBsonDocument["id"].AsString);
 
         return await LoadCoreAsync(unit, request.Id, scope, session, cancellationToken) is null
             ? DocumentStoreWriteResult.NotFound
@@ -208,10 +208,10 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             ? collection.ReplaceOneAsync(filter, document, cancellationToken: cancellationToken)
             : collection.ReplaceOneAsync(session, filter, document, cancellationToken: cancellationToken);
 
-    private static Task<DeleteResult> DeleteOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, CancellationToken cancellationToken) =>
+    private static async Task<BsonDocument?> FindOneAndDeleteAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, CancellationToken cancellationToken) =>
         session is null
-            ? collection.DeleteOneAsync(filter, cancellationToken)
-            : collection.DeleteOneAsync(session, filter, cancellationToken: cancellationToken);
+            ? await collection.FindOneAndDeleteAsync(filter, cancellationToken: cancellationToken)
+            : await collection.FindOneAndDeleteAsync(session, filter, cancellationToken: cancellationToken);
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {

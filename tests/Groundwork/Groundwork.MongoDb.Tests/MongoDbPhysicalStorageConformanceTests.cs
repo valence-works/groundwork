@@ -216,8 +216,10 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             "list-by-status",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]));
         await pageRead.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await writer.DeleteAsync(new DeleteDocumentRequest(
-            "workItem", "snapshot-delete", ExpectedVersion: 1))).Status);
+        var deleted = await writer.DeleteAsync(new DeleteDocumentRequest(
+            "workItem", "snapshot-delete", ExpectedVersion: 1));
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("snapshot-delete", deleted.AuthoritativeId);
         continueHydration.TrySetResult();
 
         var result = await query;
