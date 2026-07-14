@@ -370,9 +370,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             plan.LookupObject,
             plan.PrimaryObject,
             plan.IndexName,
-            new[] { plan.Scope.Field, plan.Discriminator }
-                .Concat(plan.Predicates.Select(predicate => predicate.Field))
-                .Concat(plan.Order.Select(order => order.Field))
+            plan.RequiredFields
                 .GroupBy(field => field.Path, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.First().Identifier, StringComparer.Ordinal),
             plan.RouteFingerprint);

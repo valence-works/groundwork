@@ -70,24 +70,52 @@ public sealed record ExecutableDocumentIdentityRoute(
 {
     public PortableStringIdentityProjection Project(string originalId)
     {
-        EnsureSupportedAlgorithms();
-        var projection = PortableStringComparison.ProjectIdentity(
-            originalId,
-            PortableStringComparison.ForIdentityPolicy(StringCasePolicy));
-        return projection;
+        return Project(
+            StringCasePolicy,
+            ComparisonAlgorithmId,
+            LookupAlgorithmId,
+            originalId);
     }
 
     internal void EnsureSupportedAlgorithms()
     {
-        var portablePolicy = PortableStringComparison.ForIdentityPolicy(StringCasePolicy);
+        EnsureSupportedAlgorithms(StringCasePolicy, ComparisonAlgorithmId, LookupAlgorithmId);
+    }
+
+    internal static PortableStringIdentityProjection Project(
+        StringIdentityCasePolicy stringCasePolicy,
+        string comparisonAlgorithmId,
+        string lookupAlgorithmId,
+        string originalId)
+    {
+        EnsureSupportedAlgorithms(stringCasePolicy, comparisonAlgorithmId, lookupAlgorithmId);
+        return PortableStringComparison.ProjectIdentity(
+            originalId,
+            ToPortableComparisonPolicy(stringCasePolicy));
+    }
+
+    private static void EnsureSupportedAlgorithms(
+        StringIdentityCasePolicy stringCasePolicy,
+        string comparisonAlgorithmId,
+        string lookupAlgorithmId)
+    {
+        var portablePolicy = ToPortableComparisonPolicy(stringCasePolicy);
         var expectedComparison = PortableStringComparison.GetAlgorithmId(portablePolicy);
-        if (!string.Equals(ComparisonAlgorithmId, expectedComparison, StringComparison.Ordinal) ||
-            !string.Equals(LookupAlgorithmId, PortableStringComparison.LookupHashAlgorithmId, StringComparison.Ordinal))
+        if (!string.Equals(comparisonAlgorithmId, expectedComparison, StringComparison.Ordinal) ||
+            !string.Equals(lookupAlgorithmId, PortableStringComparison.LookupHashAlgorithmId, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 "The executable identity route contains an unsupported comparison or lookup algorithm.");
         }
     }
+
+    internal static PortableStringComparisonPolicy ToPortableComparisonPolicy(
+        StringIdentityCasePolicy policy) => policy switch
+        {
+            StringIdentityCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
+            _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+        };
 }
 
 public sealed record ExecutableDocumentEnvelopeRoute(

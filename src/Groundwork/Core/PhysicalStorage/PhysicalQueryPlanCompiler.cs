@@ -68,6 +68,7 @@ public static class PhysicalQueryPlanCompiler
                 target));
         }
         ValidateOperations(predicateDeclarations, query, capabilities, target, diagnostics);
+        ValidateIdentityOperations(predicateDeclarations, target, diagnostics);
         ValidateShape(query, predicateDeclarations.Count, capabilities, target, diagnostics);
         ValidateEnvelopeKinds(logicalIndex, target, diagnostics);
 
@@ -100,10 +101,21 @@ public static class PhysicalQueryPlanCompiler
             return null;
         }
 
+        var documentIdentity = ResolveDocumentIdentity(
+            route,
+            selectedSource.Value,
+            capabilities);
         var predicates = predicateDeclarations
             .Select(predicate => new PhysicalQueryPredicate(
                 predicate.Path,
-                ResolveField(route, selectedSource.Value, predicate.Path, logicalIndex.GetValueKind(predicate.Path), capabilities),
+                predicate.Path == PhysicalDocumentFieldPaths.Id
+                    ? documentIdentity.Comparison
+                    : ResolveField(
+                        route,
+                        selectedSource.Value,
+                        predicate.Path,
+                        logicalIndex.GetValueKind(predicate.Path),
+                        capabilities),
                 predicate.Operations.ToFrozenSet()))
             .ToArray();
         ValidateExecutableCompatibility(route, predicates, target, diagnostics);
@@ -172,7 +184,14 @@ public static class PhysicalQueryPlanCompiler
             lookupTarget,
             lookupObject,
             IndexValueKind.Keyword);
-        var order = ResolveOrder(route, physicalIndex, selectedSource.Value, logicalIndex, query, capabilities);
+        var order = ResolveOrder(
+            route,
+            physicalIndex,
+            selectedSource.Value,
+            logicalIndex,
+            query,
+            capabilities,
+            documentIdentity);
 
         var draft = new PhysicalQueryPlan(
             route.StorageUnit,
@@ -188,6 +207,7 @@ public static class PhysicalQueryPlanCompiler
             HasIndexedAccess(selectedSource.Value, physicalIndex) ? physicalIndex?.Name : null,
             scope,
             discriminator,
+            documentIdentity,
             predicates,
             order,
             requiredEqualityPrefixPaths,
@@ -283,6 +303,22 @@ public static class PhysicalQueryPlanCompiler
             diagnostics.Add(Error("GW-QUERY-003", "Provider cannot execute declared any results.", target));
         if (query.ResultOperations.Contains(BoundedQueryResultOperation.First) && !capabilities.SupportsFirst)
             diagnostics.Add(Error("GW-QUERY-003", "Provider cannot execute declared first results.", target));
+    }
+
+    private static void ValidateIdentityOperations(
+        IReadOnlyList<BoundedQueryPredicateField> predicates,
+        string target,
+        List<GroundworkDiagnostic> diagnostics)
+    {
+        if (predicates.Any(predicate =>
+                predicate.Path == PhysicalDocumentFieldPaths.Id &&
+                predicate.Operations.Contains(PortableQueryOperation.Contains)))
+        {
+            diagnostics.Add(Error(
+                "GW-QUERY-011",
+                "Document identity does not support Contains because no bounded identity projection preserves substring semantics.",
+                target));
+        }
     }
 
     private static void ValidateExecutableCompatibility(
@@ -458,7 +494,8 @@ public static class PhysicalQueryPlanCompiler
         PhysicalQuerySourceKind source,
         LogicalIndexDeclaration logicalIndex,
         BoundedQueryDeclaration query,
-        PhysicalQueryPlannerCapabilities capabilities)
+        PhysicalQueryPlannerCapabilities capabilities,
+        PhysicalQueryDocumentIdentityBinding documentIdentity)
     {
         var declared = query.SortFields.Count != 0
             ? query.SortFields
@@ -471,7 +508,9 @@ public static class PhysicalQueryPlanCompiler
                         : PhysicalSortDirection.Ascending)).ToArray();
         var order = declared.Select(field => new PhysicalQueryOrder(
             field.Path,
-            ResolveField(route, source, field.Path, logicalIndex.GetValueKind(field.Path), capabilities),
+            field.Path == PhysicalDocumentFieldPaths.Id
+                ? documentIdentity.Comparison
+                : ResolveField(route, source, field.Path, logicalIndex.GetValueKind(field.Path), capabilities),
             field.Direction,
             IsIdentityTieBreak: false)).ToList();
         if (route.ScopePolicy == StorageScopePolicy.Scoped &&
@@ -492,11 +531,59 @@ public static class PhysicalQueryPlanCompiler
         {
             order.Add(new PhysicalQueryOrder(
                 PhysicalDocumentFieldPaths.Id,
-                ResolveField(route, source, PhysicalDocumentFieldPaths.Id, IndexValueKind.Keyword, capabilities),
+                documentIdentity.Comparison,
                 PhysicalSortDirection.Ascending,
                 IsIdentityTieBreak: true));
         }
         return order;
+    }
+
+    private static PhysicalQueryDocumentIdentityBinding ResolveDocumentIdentity(
+        ExecutableStorageRoute route,
+        PhysicalQuerySourceKind source,
+        PhysicalQueryPlannerCapabilities capabilities)
+    {
+        var linked = source == PhysicalQuerySourceKind.LinkedIndex;
+        var identity = linked
+            ? route.LinkedRelationship!.Identity
+            : route.Envelope.Identity;
+        var target = linked
+            ? ExecutableStorageObjectRole.LinkedIndexStorage
+            : ExecutableStorageObjectRole.PrimaryStorage;
+        var objectName = linked
+            ? route.LinkedIndexStorage!.Name
+            : route.PrimaryStorage.Name;
+        var fieldSource = source switch
+        {
+            PhysicalQuerySourceKind.LinkedIndex => PhysicalQueryFieldSource.LinkedRelationship,
+            PhysicalQuerySourceKind.NativeDocumentFields => PhysicalQueryFieldSource.NativeDocumentField,
+            _ => PhysicalQueryFieldSource.Envelope
+        };
+
+        PhysicalQueryField Field(
+            string path,
+            ExecutableColumnRoute column,
+            string? identifier = null) =>
+            new(
+                path,
+                identifier ?? column.Identifier,
+                fieldSource,
+                target,
+                objectName,
+                IndexValueKind.Keyword);
+
+        return new PhysicalQueryDocumentIdentityBinding(
+            identity.StringCasePolicy,
+            identity.ComparisonAlgorithmId,
+            identity.LookupAlgorithmId,
+            Field(
+                PhysicalDocumentIdentityFieldPaths.Original,
+                identity.OriginalId,
+                source == PhysicalQuerySourceKind.NativeDocumentFields
+                    ? capabilities.NativeFieldIdentifiers[PhysicalDocumentFieldPaths.Id]
+                    : null),
+            Field(PhysicalDocumentIdentityFieldPaths.Comparison, identity.ComparisonKey),
+            Field(PhysicalDocumentIdentityFieldPaths.Lookup, identity.LookupKey));
     }
 
     private static PhysicalQueryField ResolveField(

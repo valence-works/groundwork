@@ -121,7 +121,7 @@ public static class BoundedMutationRequestFingerprint
         };
         var clauses = mutation.Clauses
             .Select(clause => clause.Comparisons
-                .Select(CanonicalComparison)
+                .Select(comparison => CanonicalComparison(comparison, plan.Predicate))
                 .Order(StringComparer.Ordinal)
                 .ToArray())
             .Select(comparisons => string.Join("\u001d", comparisons))
@@ -159,23 +159,55 @@ public static class BoundedMutationRequestFingerprint
             ((int)predicate.Scope.Policy).ToString(System.Globalization.CultureInfo.InvariantCulture),
             predicate.Scope.IsMandatory ? "1" : "0",
             predicate.Scope.UsesGlobalSentinel ? "1" : "0",
+            CanonicalIdentityPlan(predicate.DocumentIdentity),
             string.Join("\u0014", predicates),
             string.Join("\u0013", predicate.RequiredEqualityPrefixPaths.Select(Encode)),
             predicate.SupportsDisjunction ? "1" : "0",
             predicate.IsScaleBearing ? "1" : "0");
     }
 
-    private static string CanonicalComparison(DocumentQueryComparison comparison)
+    private static string CanonicalIdentityPlan(PhysicalQueryDocumentIdentityBinding identity) =>
+        string.Join(
+            "\u0011",
+            ((int)identity.StringCasePolicy).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Encode(identity.ComparisonAlgorithmId),
+            Encode(identity.LookupAlgorithmId),
+            CanonicalIdentityField(identity.Original),
+            CanonicalIdentityField(identity.Comparison),
+            CanonicalIdentityField(identity.Lookup));
+
+    private static string CanonicalIdentityField(PhysicalQueryField field) =>
+        string.Join(
+            "\u0010",
+            Encode(field.Path),
+            Encode(field.Identifier),
+            ((int)field.Source).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ((int)field.Target).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Encode(field.ObjectName.Identifier));
+
+    private static string CanonicalComparison(
+        DocumentQueryComparison comparison,
+        PhysicalQueryPlan plan)
     {
-        IEnumerable<string?> values = comparison.Operator == QueryComparisonOperator.In
-            ? comparison.Values.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)
+        IEnumerable<string?> values = comparison.Path == PhysicalDocumentFieldPaths.Id
+            ? PhysicalDocumentIdentityQuery.Bind(plan, comparison).Values
+                .Select(value => (string?)CanonicalIdentityValue(value))
             : comparison.Values;
+        if (comparison.Operator == QueryComparisonOperator.In)
+            values = values.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal);
         return string.Join(
             "\u001a",
             Encode(comparison.Path),
             ((int)comparison.Operator).ToString(System.Globalization.CultureInfo.InvariantCulture),
             string.Join("\u0019", values.Select(Encode)));
     }
+
+    private static string CanonicalIdentityValue(PhysicalQueryIdentityValue value) =>
+        string.Join(
+            "\u0012",
+            ((int)value.Kind).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Encode(value.ComparisonKey),
+            Encode(value.LookupKey));
 
     private static string Encode(string? value) => value is null ? "-" : $"{value.Length}:{value}";
 }
@@ -288,9 +320,7 @@ public sealed class PhysicalMutationHandlerCertification
         transitionPath = transition?.Path;
         transitionTarget = transition?.TargetValue;
         allowedSourceValues = Array.AsReadOnly(transition?.AllowedSourceValues.ToArray() ?? []);
-        var fields = new[] { plan.Predicate.Scope.Field, plan.Predicate.Discriminator }
-            .Concat(plan.Predicate.Predicates.Select(item => item.Field))
-            .Concat(plan.Predicate.Order.Select(item => item.Field))
+        var fields = plan.Predicate.RequiredFields
             .GroupBy(field => field.Path, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.First().Identifier, StringComparer.Ordinal);
         predicate = new PhysicalQueryHandlerCertification(

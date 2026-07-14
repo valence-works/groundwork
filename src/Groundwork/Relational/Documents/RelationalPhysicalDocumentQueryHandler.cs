@@ -126,9 +126,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public static PhysicalQueryHandlerCertification Certify(PhysicalQueryPlan plan)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        var fields = new[] { plan.Scope.Field, plan.Discriminator }
-            .Concat(plan.Predicates.Select(predicate => predicate.Field))
-            .Concat(plan.Order.Select(order => order.Field))
+        var fields = plan.RequiredFields
             .GroupBy(field => field.Path, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.First().Identifier, StringComparer.Ordinal);
         return new PhysicalQueryHandlerCertification(

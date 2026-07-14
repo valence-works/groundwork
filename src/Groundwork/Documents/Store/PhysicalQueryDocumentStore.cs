@@ -138,9 +138,7 @@ public sealed class PhysicalQueryHandlerCertification : IEquatable<PhysicalQuery
     }
 
     private static IEnumerable<PhysicalQueryField> PlanFields(PhysicalQueryPlan plan) =>
-        new[] { plan.Scope.Field, plan.Discriminator }
-            .Concat(plan.Predicates.Select(predicate => predicate.Field))
-            .Concat(plan.Order.Select(order => order.Field));
+        plan.RequiredFields;
 }
 
 /// <summary>The runtime document-query seam whose requests are always resolved to compiled plans.</summary>
