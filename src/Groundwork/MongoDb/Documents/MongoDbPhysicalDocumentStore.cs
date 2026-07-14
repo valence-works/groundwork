@@ -290,7 +290,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     {
         foreach (var index in storage.LogicalIndexes)
         {
-            foreach (var field in index.Fields.Where(field => !IsEnvelopePath(field.Path)))
+            foreach (var field in index.Fields.Where(field => !PhysicalDocumentFieldPaths.IsEnvelope(field.Path)))
             {
                 var valueKind = index.GetValueKind(field);
                 var projection = route.ProjectedColumns.SingleOrDefault(candidate =>
@@ -334,9 +334,6 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             }
         }
     }
-
-    private static bool IsEnvelopePath(string path) => path is
-        "id" or "documentKind" or "storageScope" or "version" or "schemaVersion";
 
     private static void ValidateScaleBearingOperations(StorageUnitPhysicalStorage storage)
     {
@@ -1110,7 +1107,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             var physicalIndex = route.Indexes.SingleOrDefault(index => index.Identity == plan.LogicalIndexIdentity);
             var membershipFields = physicalIndex is null
                 ? logicalIndex.Fields
-                    .Where(field => !IsEnvelopePath(field.Path))
+                    .Where(field => !PhysicalDocumentFieldPaths.IsEnvelope(field.Path))
                     .Select(field => $"{MongoDbPhysicalStorageFields.NativeContent}.{field.Path}")
                     .ToArray()
                 : MongoDbPhysicalIndexSemantics.ValueFields(route, physicalIndex);
@@ -1128,9 +1125,6 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         }
         return Builders<BsonDocument>.Filter.And(filters);
     }
-
-    private static bool IsEnvelopePath(string path) => path is
-        "id" or "documentKind" or "storageScope" or "version" or "schemaVersion";
 
     internal static SortDefinition<BsonDocument> BuildSort(DocumentQuery query, PhysicalQueryPlan plan)
     {

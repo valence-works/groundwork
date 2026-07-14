@@ -32,6 +32,148 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     private readonly MsSqlContainer container = fixture.Container;
 
     [Fact]
+    public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_distinct_transitions_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Direct_connection_mutations_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_distinct_deletes_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Ordinary_save_and_delete_serialize_with_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Linked_ordinary_crud_interleavings_serialize_in_pooled_and_direct_sessions() =>
+        RelationalBoundedMutationServerAssertions.LinkedOrdinaryCrudInterleavingsSerializeAsync(MutationHarness());
+
+    [Fact]
+    public Task Large_selection_uses_constant_set_based_lock_commands() =>
+        RelationalBoundedMutationServerAssertions.LargeSelectionUsesConstantSetBasedLockCommandsAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
+
+    [Fact]
+    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            SqlServerGroundworkCapabilities.Provider.Name,
+            "sqlserver");
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            mutationContext,
+            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
+
+        var plan = await ExplainAsync(selection, route);
+
+        var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
+        Assert.Contains(expectedIndex, plan, StringComparison.Ordinal);
+        Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Bounded_mutation_ledger_lookup_seeks_the_hash_primary_key_at_scale()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "ledger-plan", "1", "{\"category\":\"pending\"}"))).Status);
+        var request = new DocumentMutation(
+            "configurationDocument",
+            "revoke-pending",
+            "sqlserver-ledger-plan-target");
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await SqlServerPhysicalMutationRuntime.Create(store, model.Manifest, route, model.Target.Provider)
+                .ExecuteAsync(request));
+        await SeedMutationLedgerPlanNoiseAsync(request.OperationId);
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            SqlServerGroundworkCapabilities.Provider.Name,
+            "sqlserver");
+        var lookup = RelationalPhysicalMutationRuntime.BuildOperationReadCommand(mutationContext, request);
+        Assert.All(
+            new[] { "manifest_key", "provider_key", "storage_unit_key", "storage_scope_key", "operation_key" },
+            key => Assert.Contains(key, lookup.CommandText, StringComparison.Ordinal));
+        Assert.Equal(5, lookup.CommandText.Split("varbinary(max)", StringSplitOptions.None).Length - 1);
+        Assert.DoesNotContain("varbinary(900)", lookup.CommandText, StringComparison.Ordinal);
+
+        await ExecuteAdminAsync($"UPDATE STATISTICS {Q(RelationalPhysicalStorageColumns.MutationOperationsTable)};");
+        var plan = await ExplainAsync(lookup, route);
+
+        Assert.Contains("PK_groundwork_document_mutation_operations", plan, StringComparison.Ordinal);
+        Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+        Assert.DoesNotContain("Table Scan", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public Task ConcurrentMaterializationAndAcknowledgementLossAreRestartSafe()
     {
         var connectionString = new SqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 1 }.ConnectionString;
@@ -628,6 +770,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
             store, manifest, route, provider, "sqlserver", query);
         await SeedPlanNoiseAsync(route);
+        return await ExplainAsync(rendered, route);
+    }
+
+    private async Task<string> ExplainAsync(
+        RelationalPhysicalQueryCommand rendered,
+        ExecutableStorageRoute route)
+    {
         await using var connection = new SqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         await using (var statistics = connection.CreateCommand())
@@ -637,8 +786,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                 : $"UPDATE STATISTICS {Q(route.PrimaryStorage.Name.Identifier)}; UPDATE STATISTICS {Q(route.LinkedIndexStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync();
         }
+        await using (var enable = connection.CreateCommand())
+        {
+            enable.CommandText = "SET STATISTICS XML ON;";
+            await enable.ExecuteNonQueryAsync();
+        }
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SET STATISTICS XML ON; {rendered.CommandText} SET STATISTICS XML OFF;";
+        command.CommandText = rendered.CommandText;
         foreach (var (name, value) in rendered.Parameters)
             command.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
         var plans = new List<string>();
@@ -653,6 +807,10 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                         plans.Add(reader.GetValue(ordinal).ToString() ?? string.Empty);
                     }
         } while (await reader.NextResultAsync());
+        await reader.DisposeAsync();
+        await using var disable = connection.CreateCommand();
+        disable.CommandText = "SET STATISTICS XML OFF;";
+        await disable.ExecuteNonQueryAsync();
         return Assert.Single(plans);
     }
 
@@ -692,6 +850,31 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             """;
         seed.Parameters.AddWithValue("@category", "tools");
         await seed.ExecuteNonQueryAsync();
+    }
+
+    private async Task SeedMutationLedgerPlanNoiseAsync(string operationId)
+    {
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var seed = connection.CreateCommand();
+        seed.CommandText = """
+            WITH source AS (
+                SELECT TOP (1) *
+                FROM groundwork_document_mutation_operations
+                WHERE operation_id = @operationId
+            ), numbers AS (
+                SELECT TOP (10000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+                FROM sys.all_objects a CROSS JOIN sys.all_objects b
+            )
+            INSERT INTO groundwork_document_mutation_operations (
+                manifest_id, provider_name, completed_provider_version, storage_unit, storage_scope,
+                operation_id, request_fingerprint, affected_count, completed_utc)
+            SELECT s.manifest_id, s.provider_name, s.completed_provider_version, s.storage_unit, s.storage_scope,
+                CONCAT(N'ledger-plan-noise-', n.n), s.request_fingerprint, s.affected_count, s.completed_utc
+            FROM source s CROSS JOIN numbers n;
+            """;
+        seed.Parameters.AddWithValue("@operationId", operationId);
+        Assert.Equal(10000, await seed.ExecuteNonQueryAsync());
     }
 
     private async Task TerminateSessionAsync(long sessionId)
@@ -897,6 +1080,63 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private RelationalLockContentionProbe LockContention() => new(
+        ReadSessionIdAsync,
+        WaitUntilBlockedAsync);
+
+    private RelationalMutationServerHarness<SqlServerPhysicalDocumentStore> MutationHarness() => new(
+        SqlServerGroundworkCapabilities.Provider,
+        "sqlserver",
+        SqlServerGroundworkCapabilities.PhysicalNames,
+        () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+        (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), manifest, routes, access),
+        SqlServerPhysicalMutationRuntime.Create,
+        SqlServerPhysicalQueryRuntime.Create,
+        () => new SqlConnection(container.GetConnectionString()),
+        () => new SqlServerPhysicalDocumentDialect(),
+        LockContention());
+
+    private static async ValueTask<int> ReadSessionIdAsync(
+        System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT @@SPID;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private async Task WaitUntilBlockedAsync(
+        int blockedSessionId,
+        int blockerSessionId,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT CASE WHEN EXISTS (
+                SELECT 1
+                FROM sys.dm_exec_requests
+                WHERE session_id = @blocked AND blocking_session_id = @blocker
+            ) THEN 1 ELSE 0 END;
+            """;
+        command.Parameters.AddWithValue("@blocked", blockedSessionId);
+        command.Parameters.AddWithValue("@blocker", blockerSessionId);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Convert.ToBoolean(await command.ExecuteScalarAsync(cancellationToken)))
+                return;
+            await Task.Delay(20, cancellationToken);
+        }
+        throw new TimeoutException(
+            $"SQL Server session {blockedSessionId} was not observed waiting on session {blockerSessionId}.");
     }
 
     private static string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";

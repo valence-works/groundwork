@@ -4,6 +4,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
 using Groundwork.Provider.Relational;
+using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Npgsql;
 
@@ -46,6 +47,9 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
     public override string QuoteIdentifier(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation };
+    public override string MutationOperationIdentityPredicate(
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
+        PostgreSqlMutationOperationIdentity.ExactPredicate(parts, QuoteIdentifier);
 
     public override object? ConvertProjectionValue(object? value, ProjectedColumnDefinition definition) => value switch
     {
@@ -66,6 +70,15 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
         return $"jsonb_extract_path_text(({canonicalJsonExpression})::jsonb, {segments})";
     }
 
+    public override string SetJsonValue(
+        string canonicalJsonExpression,
+        string jsonPathParameter,
+        string jsonValueParameter) =>
+        $"jsonb_set(({canonicalJsonExpression})::jsonb, {jsonPathParameter}, " +
+        $"({jsonValueParameter})::jsonb, true)::text";
+
+    public override object ConvertMutationJsonPath(string stablePath) => stablePath.Split('.');
+
     public override string Contains(string fieldExpression, string parameterExpression) =>
         $"{fieldExpression} ILIKE {parameterExpression} ESCAPE '\\'";
 
@@ -76,4 +89,39 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
         $"{selectSql} LIMIT {takeParameter} OFFSET {skipParameter};";
 
     public override string ApplyFirst(string selectSql) => $"{selectSql} LIMIT 1;";
+
+    public override string CompleteMutationSelection(string selectSql, bool includesLinkedStorage) =>
+        $"{selectSql} FOR UPDATE OF p{(includesLinkedStorage ? ", l" : string.Empty)}";
+
+    public override string CreateMutationSelectionTable(
+        string tableExpression,
+        string documentKindColumn,
+        string storageScopeColumn,
+        string documentIdColumn,
+        string documentVersionColumn,
+        string documentIncarnationColumn) =>
+        $"CREATE TEMP TABLE {tableExpression} (" +
+        $"{QuoteIdentifier(documentKindColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(storageScopeColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(documentIdColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
+        $"{QuoteIdentifier(documentIncarnationColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) " +
+        "ON COMMIT DROP;";
+
+    public override async Task AcquireMutationOperationLockAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string operationLock,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(@operationLock, 0));";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "@operationLock";
+        parameter.Value = operationLock;
+        command.Parameters.Add(parameter);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
 }

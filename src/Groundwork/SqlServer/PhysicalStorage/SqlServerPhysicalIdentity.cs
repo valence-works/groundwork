@@ -157,3 +157,20 @@ internal sealed class SqlServerPhysicalIdentityHash
 
     public string Expression(string valueExpression) => expression(valueExpression);
 }
+
+internal static class SqlServerUnboundedIdentityHash
+{
+    public static string Expression(string valueExpression) =>
+        $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {valueExpression})))";
+}
+
+internal static class SqlServerMutationOperationIdentity
+{
+    public static string ExactPredicate(
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts,
+        Func<string, string> quote) =>
+        RelationalMutationOperationIdentity.ExactPredicate(
+            parts,
+            quote,
+            SqlServerUnboundedIdentityHash.Expression);
+}

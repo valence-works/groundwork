@@ -10,6 +10,8 @@ using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Groundwork.TestInfrastructure;
 using Npgsql;
+using System.Security.Cryptography;
+using System.Text;
 using Testcontainers.PostgreSql;
 using Xunit;
 
@@ -32,6 +34,141 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     : RelationalPhysicalStorageConformance, IClassFixture<PostgreSqlPhysicalStorageContainer>
 {
     private readonly PostgreSqlContainer container = fixture.Container;
+
+    [Fact]
+    public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_distinct_transitions_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Direct_connection_mutations_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Concurrent_distinct_deletes_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Ordinary_save_and_delete_serialize_with_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(MutationHarness());
+
+    [Fact]
+    public Task Linked_ordinary_crud_interleavings_serialize_in_pooled_and_direct_sessions() =>
+        RelationalBoundedMutationServerAssertions.LinkedOrdinaryCrudInterleavingsSerializeAsync(MutationHarness());
+
+    [Fact]
+    public Task Large_selection_uses_constant_set_based_lock_commands() =>
+        RelationalBoundedMutationServerAssertions.LargeSelectionUsesConstantSetBasedLockCommandsAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(MutationHarness());
+
+    [Fact]
+    public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
+
+    [Fact]
+    public async Task Bounded_mutation_ledger_supports_unbounded_operation_identity()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: true,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true, IncludeRangeDelete: true));
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "long-operation", "1", "{\"category\":\"pending\",\"priority\":1}"))).Status);
+        var operationId = string.Concat(Enumerable.Range(0, 100).Select(index =>
+            Convert.ToHexString(SHA256.HashData(BitConverter.GetBytes(index)))));
+        Assert.Equal(6400, Encoding.UTF8.GetByteCount(operationId));
+        var request = new DocumentMutation("configurationDocument", "revoke-pending", operationId);
+        var mutations = PostgreSqlPhysicalMutationRuntime.Create(store, model.Manifest, route, model.Target.Provider);
+
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(request));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Replayed, 1),
+            await mutations.ExecuteAsync(request));
+        await Assert.ThrowsAsync<BoundedMutationOperationConflictException>(() => mutations.ExecuteAsync(
+            new DocumentMutation(
+                "configurationDocument",
+                "prune-by-category-cutoff",
+                operationId,
+                [
+                    DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending")),
+                    DocumentQueryClause.Of(DocumentQueryComparison.LessThan("priority", "10"))
+                ])));
+    }
+
+    [Fact]
+    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        await AnalyzeRouteAsync(route);
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
+            store,
+            model.Manifest,
+            route,
+            model.Target.Provider,
+            PostgreSqlGroundworkCapabilities.Provider.Name,
+            "postgresql");
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            mutationContext,
+            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
+
+        var plan = await ExplainAsync(selection);
+
+        var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
+        Assert.True(plan.Contains(expectedIndex, StringComparison.Ordinal), plan);
+        Assert.DoesNotContain("Seq Scan", plan, StringComparison.Ordinal);
+    }
 
     [Fact]
     public Task ConcurrentMaterializationAndAcknowledgementLossAreRestartSafe()
@@ -102,6 +239,9 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     [InlineData(InfrastructureTamper.SameNameCShadowCollation)]
     [InlineData(InfrastructureTamper.MissingStatePrimaryKey)]
     [InlineData(InfrastructureTamper.ReorderedOperationsPrimaryKey)]
+    [InlineData(InfrastructureTamper.LegacyMutationLedgerPrimaryKey)]
+    [InlineData(InfrastructureTamper.WrongMutationLedgerHashExpression)]
+    [InlineData(InfrastructureTamper.WrongMutationHashFunction)]
     public async Task Restart_rejects_malformed_infrastructure_before_target_fence_mutation(InfrastructureTamper tamper)
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -466,6 +606,12 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
             store, manifest, route, provider, "postgresql", query);
         await SeedPlanNoiseAsync(route);
+        await AnalyzeRouteAsync(route);
+        return await ExplainAsync(rendered);
+    }
+
+    private async Task AnalyzeRouteAsync(ExecutableStorageRoute route)
+    {
         await using var connection = new NpgsqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         await using (var statistics = connection.CreateCommand())
@@ -475,6 +621,12 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 : $"ANALYZE {Q(route.PrimaryStorage.Name.Identifier)}; ANALYZE {Q(route.LinkedIndexStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync();
         }
+    }
+
+    private async Task<string> ExplainAsync(RelationalPhysicalQueryCommand rendered)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";
         foreach (var (name, value) in rendered.Parameters)
@@ -681,6 +833,35 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 ALTER TABLE groundwork_physical_schema_operations
                     ADD PRIMARY KEY (provider_name, manifest_id, operation_id);
                 """,
+            InfrastructureTamper.LegacyMutationLedgerPrimaryKey => """
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP CONSTRAINT groundwork_document_mutation_operations_pkey;
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP COLUMN manifest_key,
+                    DROP COLUMN provider_key,
+                    DROP COLUMN storage_unit_key,
+                    DROP COLUMN storage_scope_key,
+                    DROP COLUMN operation_key;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD PRIMARY KEY (manifest_id, provider_name, storage_unit, storage_scope, operation_id);
+                """,
+            InfrastructureTamper.WrongMutationLedgerHashExpression => """
+                ALTER TABLE groundwork_document_mutation_operations
+                    DROP CONSTRAINT groundwork_document_mutation_operations_pkey;
+                ALTER TABLE groundwork_document_mutation_operations DROP COLUMN operation_key;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD COLUMN operation_key bytea
+                    GENERATED ALWAYS AS (groundwork_utf8_sha256('wrong-operation')) STORED NOT NULL;
+                ALTER TABLE groundwork_document_mutation_operations
+                    ADD PRIMARY KEY (manifest_key, provider_key, storage_unit_key, storage_scope_key, operation_key);
+                """,
+            InfrastructureTamper.WrongMutationHashFunction => """
+                CREATE OR REPLACE FUNCTION groundwork_utf8_sha256(value text) RETURNS bytea
+                LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+                AS $function$
+                    SELECT pg_catalog.sha256(pg_catalog.convert_to('wrong-value', 'UTF8'))
+                $function$;
+                """,
             _ => throw new ArgumentOutOfRangeException(nameof(tamper), tamper, null)
         };
         await using var command = connection.CreateCommand();
@@ -699,6 +880,57 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         return Convert.ToInt64(await command.ExecuteScalarAsync());
     }
 
+    private RelationalLockContentionProbe LockContention() => new(
+        ReadSessionIdAsync,
+        WaitUntilBlockedAsync);
+
+    private RelationalMutationServerHarness<PostgreSqlPhysicalDocumentStore> MutationHarness() => new(
+        PostgreSqlGroundworkCapabilities.Provider,
+        "postgresql",
+        PostgreSqlGroundworkCapabilities.PhysicalNames,
+        () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+        (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), manifest, routes, access),
+        PostgreSqlPhysicalMutationRuntime.Create,
+        PostgreSqlPhysicalQueryRuntime.Create,
+        () => new NpgsqlConnection(container.GetConnectionString()),
+        () => new PostgreSqlPhysicalDocumentDialect(),
+        LockContention());
+
+    private static async ValueTask<int> ReadSessionIdAsync(
+        System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT pg_catalog.pg_backend_pid();";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private async Task WaitUntilBlockedAsync(
+        int blockedSessionId,
+        int blockerSessionId,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT @blocker = ANY(pg_catalog.pg_blocking_pids(@blocked));";
+        command.Parameters.AddWithValue("blocker", blockerSessionId);
+        command.Parameters.AddWithValue("blocked", blockedSessionId);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Convert.ToBoolean(await command.ExecuteScalarAsync(cancellationToken)))
+                return;
+            await Task.Delay(20, cancellationToken);
+        }
+        throw new TimeoutException(
+            $"PostgreSQL session {blockedSessionId} was not observed waiting on session {blockerSessionId}.");
+    }
+
     private static string Q(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
     public enum InfrastructureTamper
@@ -711,6 +943,9 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         WrongStateCollation,
         SameNameCShadowCollation,
         MissingStatePrimaryKey,
-        ReorderedOperationsPrimaryKey
+        ReorderedOperationsPrimaryKey,
+        LegacyMutationLedgerPrimaryKey,
+        WrongMutationLedgerHashExpression,
+        WrongMutationHashFunction
     }
 }

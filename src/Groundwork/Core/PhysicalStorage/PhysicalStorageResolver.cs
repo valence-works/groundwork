@@ -536,7 +536,7 @@ public static class PhysicalStorageResolver
     private static IReadOnlyList<ProjectedColumnDefinition> SynthesizeProjectedColumns(
         IReadOnlyList<ScaleBearingPathDemand> demand) =>
         demand
-            .Where(x => !IsEnvelopePath(x.Path))
+            .Where(x => !PhysicalDocumentFieldPaths.IsEnvelope(x.Path))
             .GroupBy(x => x.Path, StringComparer.Ordinal)
             .Select(group => new ProjectedColumnDefinition(
                 FeatureDefaultColumnName(group.Key),
@@ -576,7 +576,7 @@ public static class PhysicalStorageResolver
 
             var firstFieldOrder = columns.Count;
             columns.AddRange(logicalIndex.Fields.Select((field, order) => new PhysicalIndexColumnDefinition(
-                IsEnvelopePath(field.Path)
+                PhysicalDocumentFieldPaths.IsEnvelope(field.Path)
                     ? EnvelopeColumnName(envelope, field.Path)
                     : projectedNames[field.Path],
                 firstFieldOrder + order,
@@ -903,7 +903,7 @@ public static class PhysicalStorageResolver
 
         var projectedPaths = definition.ProjectedColumns.Select(x => x.Path).ToHashSet(StringComparer.Ordinal);
         var unmetDemand = demand
-            .Where(x => !IsEnvelopePath(x.Path) && !projectedPaths.Contains(x.Path))
+            .Where(x => !PhysicalDocumentFieldPaths.IsEnvelope(x.Path) && !projectedPaths.Contains(x.Path))
             .Select(x => x.Path)
             .Distinct(StringComparer.Ordinal)
             .OrderBy(x => x, StringComparer.Ordinal)
@@ -1245,12 +1245,9 @@ public static class PhysicalStorageResolver
         return true;
     }
 
-    private static bool IsEnvelopePath(string path) => path is
-        "id" or "documentKind" or "storageScope" or "version" or "schemaVersion";
-
     private static bool RequiresStorageScope(StorageUnit unit, LogicalIndexDeclaration index) =>
         unit.Tenancy.Kind == TenancyKind.Scoped &&
-        index.Fields.All(field => field.Path != "storageScope");
+        index.Fields.All(field => field.Path != PhysicalDocumentFieldPaths.StorageScope);
 
     private static IReadOnlyList<PhysicalSortDirection> ResolveSortDirections(
         BoundedQueryDeclaration query,
@@ -1374,7 +1371,7 @@ public static class PhysicalStorageResolver
         foreach (var (field, fieldOrder) in logicalIndex.Fields.Select((field, order) => (field, order)))
         {
             string logicalName;
-            if (IsEnvelopePath(field.Path))
+            if (PhysicalDocumentFieldPaths.IsEnvelope(field.Path))
             {
                 logicalName = EnvelopeColumnName(envelope, field.Path);
             }
@@ -1394,11 +1391,11 @@ public static class PhysicalStorageResolver
 
     private static string EnvelopeColumnName(DocumentEnvelopeDefinition envelope, string path) => path switch
     {
-        "id" => envelope.IdColumn,
-        "documentKind" => envelope.DocumentKindColumn,
-        "storageScope" => envelope.StorageScopeColumn,
-        "version" => envelope.VersionColumn,
-        "schemaVersion" => envelope.SchemaVersionColumn,
+        PhysicalDocumentFieldPaths.Id => envelope.IdColumn,
+        PhysicalDocumentFieldPaths.DocumentKind => envelope.DocumentKindColumn,
+        PhysicalDocumentFieldPaths.StorageScope => envelope.StorageScopeColumn,
+        PhysicalDocumentFieldPaths.Version => envelope.VersionColumn,
+        PhysicalDocumentFieldPaths.SchemaVersion => envelope.SchemaVersionColumn,
         _ => throw new ArgumentOutOfRangeException(nameof(path), path, null)
     };
 

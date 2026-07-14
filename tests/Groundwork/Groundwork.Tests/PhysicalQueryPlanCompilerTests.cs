@@ -507,6 +507,47 @@ public sealed class PhysicalQueryPlanCompilerTests
         Assert.Equal(Assert.Single(fixture.Route.ProjectedColumns).Column.Identifier, transition.Field.Identifier);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NamedTransitionRejectsEnvelopeAndLinkedRelationshipFields(bool linked)
+    {
+        var fixture = CreateIntrinsicMutationFixture(
+            linked,
+            BoundedMutationAction.Transition(linked ? "id" : "schemaVersion", ["1"], "2"));
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(linked ? PhysicalQuerySourceKind.LinkedIndex : PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-MUTATION-005" &&
+            diagnostic.Message.Contains("content", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData(false, PhysicalQueryFieldSource.Envelope)]
+    [InlineData(true, PhysicalQueryFieldSource.LinkedRelationship)]
+    public void NamedDeleteRetainsEnvelopeAndLinkedRelationshipPredicates(
+        bool linked,
+        PhysicalQueryFieldSource expectedSource)
+    {
+        var fixture = CreateIntrinsicMutationFixture(linked, BoundedMutationAction.Delete());
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(linked ? PhysicalQuerySourceKind.LinkedIndex : PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        var plan = Assert.Single(result.Plans);
+        Assert.IsType<PhysicalDeleteMutationAction>(plan.Action);
+        Assert.Equal(expectedSource, Assert.Single(plan.Predicate.Predicates).Field.Source);
+    }
+
     [Fact]
     public void MutationCompilationRejectsAnOrdinaryPredicateThatCouldScanWithoutAnIndex()
     {
@@ -1377,6 +1418,47 @@ public sealed class PhysicalQueryPlanCompilerTests
             [logicalIndex],
             [query]);
         return Resolve(storage, form == PhysicalStorageForm.SharedDocuments ? binding : null);
+    }
+
+    private static PlanningFixture CreateIntrinsicMutationFixture(bool linked, BoundedMutationAction action)
+    {
+        var path = linked ? "id" : "schemaVersion";
+        var index = new LogicalIndexDeclaration(
+            $"by-{path}",
+            [new IndexField(path)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            $"list-by-{path}",
+            index.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var physicalIndex = new PhysicalIndexDefinition(
+            index.Identity,
+            [
+                new PhysicalIndexColumnDefinition("storage_scope", 0),
+                new PhysicalIndexColumnDefinition(linked ? "id" : "schema_version", 1)
+            ],
+            target: linked
+                ? PhysicalIndexStorageTarget.LinkedIndexStorage
+                : PhysicalIndexStorageTarget.PrimaryStorage);
+        var definition = PhysicalTableDefinition.DedicatedDocumentTable(
+            "intrinsic_documents",
+            indexes: [physicalIndex],
+            linkedProjectedColumns: linked
+                ? [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)]
+                : null,
+            linkedProjectionLogicalName: linked ? "intrinsic_index" : null);
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Explicit(definition),
+            [index],
+            [query],
+            boundedMutations: [new BoundedMutationDeclaration("mutate-intrinsic", query.Identity, action)]);
+        return Resolve(storage, null);
     }
 
     private static PlanningFixture CreateEntityFixture(

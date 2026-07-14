@@ -64,6 +64,33 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments, 2)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable, 2)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable, 1)]
+    public async Task Large_selection_uses_a_constant_number_of_set_based_lock_commands(
+        PhysicalStorageForm form,
+        int expectedLockCommands)
+    {
+        var lockCommands = 0;
+        await using var fixture = await CreateAsync(
+            point =>
+            {
+                if (point == RelationalPhysicalMutationExecutionPoint.BeforeRowLockCommand)
+                    Interlocked.Increment(ref lockCommands);
+                return ValueTask.CompletedTask;
+            },
+            form: form);
+        for (var index = 0; index < 128; index++)
+            await fixture.SaveAsync($"pending-{index}", "pending");
+
+        var result = await fixture.Mutations.ExecuteAsync(Transition($"{form}-large-selection"));
+
+        Assert.Equal(128, result.AffectedCount);
+        Assert.Equal(expectedLockCommands, lockCommands);
+        Assert.Equal(128, await fixture.CountAsync("revoked"));
+    }
+
+    [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
     public async Task Physical_storage_forms_execute_exact_transition_and_delete_mutations(
@@ -210,6 +237,57 @@ public sealed class SqliteBoundedMutationTests
 
         Assert.NotNull(await fixture.Documents.LoadAsync(DocumentKind, "stale"));
         Assert.Equal(1, await fixture.CountAsync("stale"));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(request));
+    }
+
+    [Fact]
+    public async Task Primary_affected_count_mismatch_rolls_back_without_ledger_evidence()
+    {
+        await using var fixture = await CreateAsync(form: PhysicalStorageForm.PhysicalEntityTable);
+        await fixture.SaveAsync("primary-count-mismatch", "pending");
+        var mutations = fixture.CreateMutationRuntime(async (point, connection, transaction, cancellationToken) =>
+        {
+            if (point != RelationalPhysicalMutationExecutionPoint.AfterSelection)
+                return;
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText =
+                $"UPDATE {Q(fixture.Route.PrimaryStorage.Name.Identifier)} SET " +
+                $"{Q(fixture.Route.Envelope.Version.Identifier)} = {Q(fixture.Route.Envelope.Version.Identifier)} + 1;";
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        });
+        var request = Transition("primary-count-mismatch");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(request));
+
+        Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "primary-count-mismatch"))!.ContentJson));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(request));
+    }
+
+    [Fact]
+    public async Task Required_linked_affected_count_mismatch_rolls_back_without_ledger_evidence()
+    {
+        await using var fixture = await CreateAsync();
+        await fixture.SaveAsync("linked-count-mismatch", "pending");
+        var mutations = fixture.CreateMutationRuntime(async (point, connection, transaction, cancellationToken) =>
+        {
+            if (point != RelationalPhysicalMutationExecutionPoint.AfterSelection)
+                return;
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"DELETE FROM {Q(fixture.Route.LinkedIndexStorage!.Name.Identifier)};";
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        });
+        var request = Transition("linked-count-mismatch");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(request));
+
+        Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "linked-count-mismatch"))!.ContentJson));
+        Assert.Equal(1, await fixture.CountAsync("pending"));
         Assert.Equal(
             new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
             await fixture.CreateMutationRuntime().ExecuteAsync(request));
@@ -562,6 +640,9 @@ public sealed class SqliteBoundedMutationTests
     private static string Category(string json) =>
         JsonDocument.Parse(json).RootElement.GetProperty("category").GetString()!;
 
+    private static string Q(string identifier) =>
+        $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+
     private static ValueTask CancelMutation(CancellationTokenSource cancellation)
     {
         cancellation.Cancel();
@@ -696,6 +777,17 @@ public sealed class SqliteBoundedMutationTests
 
         public IBoundedDocumentMutationStore CreateMutationRuntime() =>
             SqlitePhysicalMutationRuntime.Create(Documents, manifest, Route, target.Provider);
+
+        public IBoundedDocumentMutationStore CreateMutationRuntime(RelationalPhysicalMutationInterceptor intercept) =>
+            RelationalPhysicalMutationRuntime.CreateWithInterceptor(
+                new RelationalPhysicalMutationRuntimeContext(
+                    Documents,
+                    manifest,
+                    Route,
+                    target.Provider,
+                    target.Provider.Name,
+                    "sqlite"),
+                intercept);
 
         public async Task<long> CountAsync(string category)
         {

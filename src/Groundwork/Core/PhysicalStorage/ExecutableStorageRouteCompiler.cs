@@ -470,13 +470,10 @@ public static class ExecutableStorageRouteCompiler
         List<GroundworkDiagnostic> diagnostics)
     {
         var projectedPaths = projections.Select(projection => projection.Definition.Path).ToHashSet(StringComparer.Ordinal);
-        var envelopePaths = new HashSet<string>(StringComparer.Ordinal)
-        {
-            "id", "documentKind", "storageScope", "version", "schemaVersion"
-        };
         foreach (var demand in definition.Resolved.ScaleBearingDemand)
         {
-            if (envelope is null || (!envelopePaths.Contains(demand.Path) && !projectedPaths.Contains(demand.Path)))
+            if (envelope is null ||
+                (!PhysicalDocumentFieldPaths.IsEnvelope(demand.Path) && !projectedPaths.Contains(demand.Path)))
             {
                 diagnostics.Add(Error(
                     "GW-ROUTE-003",
@@ -572,11 +569,11 @@ public static class ExecutableStorageRouteCompiler
     private static ExecutableStorageObjectRole ResolveIndexTarget(
         PhysicalTableDefinition definition,
         PhysicalIndexDefinition index) => PhysicalIndexStorageTargetResolver.Resolve(definition, index) switch
-    {
-        PhysicalIndexStorageTarget.PrimaryStorage => ExecutableStorageObjectRole.PrimaryStorage,
-        PhysicalIndexStorageTarget.LinkedIndexStorage => ExecutableStorageObjectRole.LinkedIndexStorage,
-        _ => throw new ArgumentOutOfRangeException(nameof(index), index.Target, null)
-    };
+        {
+            PhysicalIndexStorageTarget.PrimaryStorage => ExecutableStorageObjectRole.PrimaryStorage,
+            PhysicalIndexStorageTarget.LinkedIndexStorage => ExecutableStorageObjectRole.LinkedIndexStorage,
+            _ => throw new ArgumentOutOfRangeException(nameof(index), index.Target, null)
+        };
 
     private static IEnumerable<ExecutableColumnRoute> EnvelopeColumns(ExecutableDocumentEnvelopeRoute envelope)
     {

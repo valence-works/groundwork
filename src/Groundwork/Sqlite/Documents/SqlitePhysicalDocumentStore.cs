@@ -134,11 +134,15 @@ internal sealed class SqlitePhysicalDocumentDialect : RelationalPhysicalDocument
         string tableExpression,
         string documentKindColumn,
         string storageScopeColumn,
-        string documentIdColumn) =>
+        string documentIdColumn,
+        string documentVersionColumn,
+        string documentIncarnationColumn) =>
         $"CREATE TEMP TABLE {tableExpression} (" +
         $"{QuoteIdentifier(documentKindColumn)} TEXT NOT NULL, " +
         $"{QuoteIdentifier(storageScopeColumn)} TEXT NOT NULL, " +
         $"{QuoteIdentifier(documentIdColumn)} TEXT NOT NULL, " +
+        $"{QuoteIdentifier(documentVersionColumn)} INTEGER NOT NULL, " +
+        $"{QuoteIdentifier(documentIncarnationColumn)} TEXT NOT NULL, " +
         $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) WITHOUT ROWID;";
 
     public override ValueTask<DbTransaction> BeginMutationTransactionAsync(
