@@ -1,5 +1,6 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
 using Groundwork.Relational.Documents;
@@ -13,6 +14,8 @@ public abstract class RelationalServerPhysicalIdentityConformance : RelationalPh
     protected abstract Task<RelationalServerIdentityFixture> CreateIdentityAsync(
         PhysicalStorageForm form,
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal);
+
+    protected abstract Task<RelationalServerLinkedBackfillCollisionFixture> CreateLinkedBackfillCollisionAsync();
 
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
@@ -208,6 +211,39 @@ public abstract class RelationalServerPhysicalIdentityConformance : RelationalPh
         Assert.Null(await fixture.Documents.LoadAsync("configurationDocument", "staged-before-collision"));
     }
 
+    [Fact]
+    public async Task LinkedBackfillLookupCollisionRollsBackProjectedRowsAndCanRetry()
+    {
+        await using var fixture = await CreateLinkedBackfillCollisionAsync();
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await fixture.InitialDocuments.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "a-valid", "1", "{\"category\":\"tools\",\"priority\":1}", 0))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await fixture.InitialDocuments.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "z-collision", "1", "{\"category\":\"tools\",\"priority\":2}", 0))).Status);
+
+        var requestedIdentity = fixture.Route.LinkedRelationship!.Identity.Project("z-collision");
+        await fixture.SetLinkedIdentityAsync(
+            requestedIdentity.LookupKey,
+            "Retained-Collision-Id",
+            "different-comparison");
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(
+            fixture.ApplyAdditiveAsync);
+
+        AssertCollision(
+            exception,
+            "z-collision",
+            requestedIdentity.LookupKey,
+            "Retained-Collision-Id");
+        Assert.Equal([null, null], await fixture.ReadPriorityValuesAsync());
+
+        await fixture.SetLinkedIdentityAsync(
+            requestedIdentity.LookupKey,
+            requestedIdentity.OriginalValue,
+            requestedIdentity.ComparisonKey);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, await fixture.ApplyAdditiveAsync());
+        Assert.Equal([1, 2], await fixture.ReadPriorityValuesAsync());
+    }
+
     private static SaveDocumentRequest Save(string id, string category, long expectedVersion) =>
         new("configurationDocument", id, "1", $"{{\"category\":\"{category}\",\"priority\":1}}", expectedVersion);
 
@@ -269,3 +305,19 @@ public sealed class RelationalServerIdentityFixture(
 public sealed record RelationalIdentitySchemaEvidence(
     IReadOnlySet<string> Columns,
     IReadOnlyList<string> PrimaryKeyColumns);
+
+public sealed class RelationalServerLinkedBackfillCollisionFixture(
+    IDocumentStore initialDocuments,
+    ExecutableStorageRoute route,
+    Func<string, string, string, Task> setLinkedIdentityAsync,
+    Func<Task<PhysicalSchemaApplicationOutcome>> applyAdditiveAsync,
+    Func<Task<IReadOnlyList<int?>>> readPriorityValuesAsync,
+    Func<ValueTask> disposeAsync) : IAsyncDisposable
+{
+    public IDocumentStore InitialDocuments { get; } = initialDocuments;
+    public ExecutableStorageRoute Route { get; } = route;
+    public Func<string, string, string, Task> SetLinkedIdentityAsync { get; } = setLinkedIdentityAsync;
+    public Func<Task<PhysicalSchemaApplicationOutcome>> ApplyAdditiveAsync { get; } = applyAdditiveAsync;
+    public Func<Task<IReadOnlyList<int?>>> ReadPriorityValuesAsync { get; } = readPriorityValuesAsync;
+    public ValueTask DisposeAsync() => disposeAsync();
+}

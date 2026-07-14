@@ -5,6 +5,8 @@ using System.Security.Cryptography;
 using System.Text;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Text;
+using Groundwork.Documents.Store;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.Physicalization;
@@ -494,6 +496,13 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         {
             var values = RelationalPhysicalProjectionValues.Read(document.CanonicalJson, linked);
             var identity = relationship.Identity.Project(document.Id);
+            await ThrowIfLinkedIdentityCollisionAsync(
+                connection,
+                transaction,
+                route,
+                document.Scope,
+                identity,
+                ct);
             var relationColumns = new[]
             {
                 relationship.DocumentKind.Identifier,
@@ -534,6 +543,44 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 throw;
             }
         });
+    }
+
+    private async Task ThrowIfLinkedIdentityCollisionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        ExecutableStorageRoute route,
+        string scope,
+        PortableStringIdentityProjection identity,
+        CancellationToken ct)
+    {
+        var relationship = route.LinkedRelationship!;
+        await using var command = Command(
+            connection,
+            transaction,
+            $"SELECT {dialect.Q(relationship.DocumentId.Identifier)}, " +
+            $"{dialect.Q(relationship.Identity.ComparisonKey.Identifier)} " +
+            $"FROM {dialect.Q(route.LinkedIndexStorage!.Name.Identifier)} WHERE " +
+            dialect.ExactIdentityPredicate(
+            [
+                new(relationship.DocumentKind.Identifier, null, "@collisionKind"),
+                new(relationship.StorageScope.Identifier, null, "@collisionScope"),
+                new(relationship.Identity.LookupKey.Identifier, null, "@collisionLookup")
+            ]) + ";");
+        Add(command, "collisionKind", route.Discriminator.Value);
+        Add(command, "collisionScope", scope);
+        Add(command, "collisionLookup", identity.LookupKey);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return;
+        var retainedId = reader.GetString(0);
+        if (!string.Equals(reader.GetString(1), identity.ComparisonKey, StringComparison.Ordinal))
+        {
+            throw new DocumentIdentityLookupCollisionException(
+                route.Discriminator.Value,
+                identity.OriginalValue,
+                retainedId,
+                identity.LookupKey);
+        }
     }
 
     private async Task ThrowIfIdentityHashCollisionAsync(

@@ -48,45 +48,45 @@ internal sealed class SqlServerPhysicalIdentity
     public void ValidateRoute(ExecutableStorageRoute route)
     {
         ArgumentNullException.ThrowIfNull(route);
+        var primaryIdentityColumns = new[]
+        {
+            route.Envelope.DocumentKind.Identifier,
+            route.Envelope.StorageScope.Identifier,
+            route.Envelope.Id.Identifier,
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            route.Envelope.Identity.LookupKey.Identifier
+        };
         ValidateTable(
             route,
             route.PrimaryStorage.Name.Identifier,
+            primaryIdentityColumns,
+            primaryIdentityColumns.Concat(
             [
-                route.Envelope.DocumentKind.Identifier,
-                route.Envelope.StorageScope.Identifier,
-                route.Envelope.Id.Identifier
-            ],
-            new[]
-            {
-                route.Envelope.DocumentKind.Identifier,
-                route.Envelope.StorageScope.Identifier,
-                route.Envelope.Id.Identifier,
                 route.Envelope.SchemaVersion.Identifier,
                 route.Envelope.Version.Identifier,
                 route.Envelope.CanonicalJson.Identifier,
                 RelationalPhysicalStorageColumns.CreatedUtc,
                 RelationalPhysicalStorageColumns.UpdatedUtc
-            }.Concat(route.ProjectedColumns
+            ]).Concat(route.ProjectedColumns
                 .Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage)
                 .Select(column => column.Column.Identifier)));
 
         if (route.LinkedIndexStorage is not null)
         {
             var relationship = route.LinkedRelationship!;
+            var linkedIdentityColumns = new[]
+            {
+                relationship.DocumentKind.Identifier,
+                relationship.StorageScope.Identifier,
+                relationship.DocumentId.Identifier,
+                relationship.Identity.ComparisonKey.Identifier,
+                relationship.Identity.LookupKey.Identifier
+            };
             ValidateTable(
                 route,
                 route.LinkedIndexStorage.Name.Identifier,
-                [
-                    relationship.DocumentKind.Identifier,
-                    relationship.StorageScope.Identifier,
-                    relationship.DocumentId.Identifier
-                ],
-                new[]
-                {
-                    relationship.DocumentKind.Identifier,
-                    relationship.StorageScope.Identifier,
-                    relationship.DocumentId.Identifier
-                }.Concat(route.ProjectedColumns
+                linkedIdentityColumns,
+                linkedIdentityColumns.Concat(route.ProjectedColumns
                     .Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage)
                     .Select(column => column.Column.Identifier)));
         }

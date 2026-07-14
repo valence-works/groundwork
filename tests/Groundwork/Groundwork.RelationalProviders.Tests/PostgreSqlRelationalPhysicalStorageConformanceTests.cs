@@ -581,6 +581,49 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             () => ValueTask.CompletedTask);
     }
 
+    protected override async Task<RelationalServerLinkedBackfillCollisionFixture> CreateLinkedBackfillCollisionAsync()
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var initial = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        var additive = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: true,
+            instance: instance,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        var connectionString = container.GetConnectionString();
+        await PhysicalSchemaApplication.ApplyAsync(
+            initial.Target,
+            new PostgreSqlPhysicalSchemaExecutor(connectionString));
+        var route = additive.Target.Routes.Single();
+        var priority = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "priority");
+        return new RelationalServerLinkedBackfillCollisionFixture(
+            new PostgreSqlPhysicalDocumentStore(
+                connectionString,
+                initial.Manifest,
+                initial.Target.Routes,
+                DocumentStoreAccess.Global),
+            route,
+            (lookupKey, retainedId, comparisonKey) => SetLinkedIdentityAsync(
+                route,
+                lookupKey,
+                retainedId,
+                comparisonKey),
+            async () => (await PhysicalSchemaApplication.ApplyAsync(
+                additive.Target,
+                new PostgreSqlPhysicalSchemaExecutor(connectionString))).Outcome,
+            () => ReadNullableInt32Async(
+                route.LinkedIndexStorage!.Name.Identifier,
+                priority.Column.Identifier,
+                route.LinkedRelationship!.DocumentId.Identifier),
+            () => ValueTask.CompletedTask);
+    }
+
     protected override async Task<RelationalScopedPhysicalStorageFixture> CreateScopedAsync(PhysicalStorageForm form)
     {
         var model = RelationalPhysicalStorageTestModels.Create(
@@ -766,6 +809,42 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         command.Parameters.AddWithValue("retainedId", retainedId);
         command.Parameters.AddWithValue("comparisonKey", comparisonKey);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task SetLinkedIdentityAsync(
+        ExecutableStorageRoute route,
+        string lookupKey,
+        string retainedId,
+        string comparisonKey)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {Q(route.LinkedIndexStorage!.Name.Identifier)} SET " +
+            $"{Q(route.LinkedRelationship!.DocumentId.Identifier)} = @retainedId, " +
+            $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey " +
+            $"WHERE {Q(route.LinkedRelationship.Identity.LookupKey.Identifier)} = @lookupKey;";
+        command.Parameters.AddWithValue("retainedId", retainedId);
+        command.Parameters.AddWithValue("comparisonKey", comparisonKey);
+        command.Parameters.AddWithValue("lookupKey", lookupKey);
+        Assert.Equal(1, await command.ExecuteNonQueryAsync());
+    }
+
+    private async Task<IReadOnlyList<int?>> ReadNullableInt32Async(
+        string table,
+        string column,
+        string orderBy)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT {Q(column)} FROM {Q(table)} ORDER BY {Q(orderBy)};";
+        var values = new List<int?>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            values.Add(reader.IsDBNull(0) ? null : reader.GetInt32(0));
+        return values;
     }
 
     private async Task<RelationalIdentitySchemaEvidence> ReadIdentitySchemaAsync(
