@@ -11,16 +11,20 @@ namespace Groundwork.MongoDb.Documents;
 internal static class MongoDbPhysicalMutationStorage
 {
     public const string Root = "_groundwork_mutation";
+    public const string BindingRoot = "_groundwork_mutation_bindings";
 
     public static string Field(StorageUnitIdentity storageUnit, string path) =>
         $"{Root}.{Segment(storageUnit, path)}";
+
+    public static string BindingFenceField(StorageUnitIdentity storageUnit, string mutationIdentity) =>
+        $"{BindingRoot}.{Segment(storageUnit, mutationIdentity)}";
 
     public static string IndexName(
         ExecutableStorageRoute route,
         BoundedQueryDeclaration query,
         ExecutableStorageObjectRole target) =>
         $"groundwork_mutation_{(target == ExecutableStorageObjectRole.PrimaryStorage ? "p" : "l")}_" +
-        Encoded($"{route.StorageUnit.Value}\u001f{query.Identity}\u001f{target}");
+        Encoded($"{route.StorageUnit.Value}\u001f{query.IndexIdentity}\u001f{target}");
 
     public static IReadOnlyList<string> IndexPaths(
         StorageUnitPhysicalStorage storage,
@@ -80,32 +84,63 @@ internal static class MongoDbPhysicalMutationStorage
         BsonDocument primary,
         BsonDocument content,
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> bindings,
+        ExecutableStorageObjectRole targetRole,
         IReadOnlyDictionary<ExecutableProjectedColumnRoute, MongoDbPhysicalProjectionValue> projectedValues)
     {
         var mirrors = new BsonDocument();
-        foreach (var path in MutationQueries(storage)
-            .SelectMany(query => IndexPaths(storage, query))
-            .Distinct(StringComparer.Ordinal))
+        foreach (var mirror in bindings
+                     .Select(binding => targetRole == ExecutableStorageObjectRole.PrimaryStorage
+                         ? binding.Schema.Primary
+                         : binding.Schema.Linked)
+                     .Where(selector => selector is not null)
+                     .SelectMany(selector => selector!.Fields)
+                     .Where(field => field.Identifier.StartsWith($"{Root}.", StringComparison.Ordinal))
+                     .DistinctBy(field => field.Identifier, StringComparer.Ordinal))
         {
-            if (TryReadEnvelope(primary, route, path, out var envelope))
-            {
-                mirrors[Segment(route.StorageUnit, path)] = envelope;
-                continue;
-            }
-            var projection = route.ProjectedColumns.FirstOrDefault(candidate =>
-                candidate.Definition.Path == path);
-            if (projection is not null)
-            {
-                var value = projectedValues[projection];
-                if (value.IsPresent)
-                    mirrors[Segment(route.StorageUnit, path)] = value.Value;
-                continue;
-            }
-            if (TryRead(content, path, out var native))
-                mirrors[Segment(route.StorageUnit, path)] = native;
+            var value = ResolveMirror(primary, content, route, mirror, projectedValues);
+            if (value.IsPresent)
+                SetDotted(mirrors, mirror.Identifier[(Root.Length + 1)..], value.Value);
         }
         target[Root] = mirrors;
+        target[BindingRoot] = new BsonDocument(bindings.Select(binding =>
+            new BsonElement(
+                binding.Schema.FenceField[(BindingRoot.Length + 1)..],
+                binding.Schema.Fingerprint)));
+    }
+
+    private static void SetDotted(BsonDocument document, string path, BsonValue value)
+    {
+        var segments = path.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var current = document;
+        for (var index = 0; index < segments.Length - 1; index++)
+        {
+            if (!current.TryGetValue(segments[index], out var child) || !child.IsBsonDocument)
+            {
+                child = new BsonDocument();
+                current[segments[index]] = child;
+            }
+            current = child.AsBsonDocument;
+        }
+        current[segments[^1]] = value;
+    }
+
+    public static MongoDbPhysicalProjectionValue ResolveMirror(
+        BsonDocument primary,
+        BsonDocument content,
+        ExecutableStorageRoute route,
+        MongoDbPhysicalMutationMirrorField mirror,
+        IReadOnlyDictionary<ExecutableProjectedColumnRoute, MongoDbPhysicalProjectionValue> projectedValues)
+    {
+        if (TryReadEnvelope(primary, route, mirror.Path, out var envelope))
+            return new MongoDbPhysicalProjectionValue(true, envelope);
+        var projection = route.ProjectedColumns.FirstOrDefault(candidate =>
+            candidate.Definition.Path == mirror.Path);
+        if (projection is not null)
+            return projectedValues[projection];
+        return TryRead(content, mirror.Path, out var native)
+            ? new MongoDbPhysicalProjectionValue(true, native)
+            : MongoDbPhysicalProjectionValue.Omitted;
     }
 
     private static bool TryReadEnvelope(

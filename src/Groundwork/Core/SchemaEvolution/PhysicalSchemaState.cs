@@ -12,7 +12,8 @@ public sealed class PhysicalSchemaTarget
         StorageManifestIdentity manifestIdentity,
         StorageManifestVersion manifestVersion,
         ProviderIdentity provider,
-        IReadOnlyList<ExecutableStorageRoute> routes)
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        IReadOnlyList<ProviderPhysicalSchemaDefinition>? providerDefinitions = null)
     {
         ManifestIdentity = manifestIdentity;
         ManifestVersion = manifestVersion;
@@ -27,9 +28,42 @@ public sealed class PhysicalSchemaTarget
         if (duplicate is not null)
             throw new ArgumentException($"Storage unit '{duplicate.Key}' has more than one executable route.", nameof(routes));
 
+        ProviderDefinitions = Array.AsReadOnly(
+            ProviderPhysicalSchemaDefinition.Canonicalize(providerDefinitions));
+        if (ProviderDefinitions.Any(definition =>
+                !string.Equals(definition.ProviderName, provider.Name, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException(
+                $"Every provider physical-schema definition must belong to provider '{provider.Name}'.",
+                nameof(providerDefinitions));
+        }
+        if (ProviderDefinitions.Any(definition =>
+                Routes.All(route => route.StorageUnit != definition.StorageUnit)))
+        {
+            throw new ArgumentException(
+                "Every provider physical-schema definition must belong to an executable storage route.",
+                nameof(providerDefinitions));
+        }
+        var duplicateProviderDefinition = ProviderDefinitions
+            .GroupBy(definition => definition.Identity)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateProviderDefinition is not null)
+        {
+            throw new ArgumentException(
+                $"Provider physical-schema definition '{duplicateProviderDefinition.Key}' is declared more than once.",
+                nameof(providerDefinitions));
+        }
+
         Identity = new PhysicalSchemaTargetIdentity(manifestIdentity, provider.Name);
         Fingerprint = PhysicalSchemaFingerprint.Create(
-            [manifestIdentity.Value, manifestVersion.Value, provider.Name, provider.Version, .. Routes.Select(route => route.Fingerprint)]);
+            [
+                manifestIdentity.Value,
+                manifestVersion.Value,
+                provider.Name,
+                provider.Version,
+                .. Routes.Select(route => route.Fingerprint),
+                .. ProviderDefinitions.Select(definition => definition.Fingerprint)
+            ]);
     }
 
     public PhysicalSchemaTargetIdentity Identity { get; }
@@ -41,6 +75,8 @@ public sealed class PhysicalSchemaTarget
     public ProviderIdentity Provider { get; }
 
     public IReadOnlyList<ExecutableStorageRoute> Routes { get; }
+
+    public IReadOnlyList<ProviderPhysicalSchemaDefinition> ProviderDefinitions { get; }
 
     public string Fingerprint { get; }
 }
@@ -99,10 +135,13 @@ public sealed class PhysicalSchemaAppliedSnapshot
 {
     internal PhysicalSchemaAppliedSnapshot(
         IReadOnlyList<AppliedStorageRouteSnapshot> routes,
-        IReadOnlyList<AppliedSemanticOperationSnapshot> semanticOperations)
+        IReadOnlyList<AppliedSemanticOperationSnapshot> semanticOperations,
+        IReadOnlyList<ProviderPhysicalSchemaDefinition>? providerDefinitions = null)
     {
         Routes = Array.AsReadOnly(routes.OrderBy(route => route.StorageUnit.Value, StringComparer.Ordinal).ToArray());
         SemanticOperations = Array.AsReadOnly(semanticOperations.OrderBy(operation => operation.Identity, StringComparer.Ordinal).ToArray());
+        ProviderDefinitions = Array.AsReadOnly(
+            ProviderPhysicalSchemaDefinition.Canonicalize(providerDefinitions));
         foreach (var route in Routes)
         {
             ExecutableStorageRouteSerializer.ValidateCanonicalSnapshot(
@@ -112,6 +151,7 @@ public sealed class PhysicalSchemaAppliedSnapshot
         }
         foreach (var operation in SemanticOperations)
             PhysicalSchemaOperationIntegrity.Validate(operation);
+        ValidateProviderDefinitions();
         CanonicalJson = Serialize(this);
         Fingerprint = PhysicalSchemaFingerprint.CreateCanonical(CanonicalJson);
     }
@@ -120,11 +160,45 @@ public sealed class PhysicalSchemaAppliedSnapshot
 
     public IReadOnlyList<AppliedSemanticOperationSnapshot> SemanticOperations { get; }
 
+    public IReadOnlyList<ProviderPhysicalSchemaDefinition> ProviderDefinitions { get; }
+
     /// <summary>Canonical provider-neutral snapshot persisted for restart comparison and inspection.</summary>
     public string CanonicalJson { get; }
 
     /// <summary>Integrity fingerprint of the complete canonical applied snapshot.</summary>
     public string Fingerprint { get; }
+
+    private void ValidateProviderDefinitions()
+    {
+        if (ProviderDefinitions.Any(definition =>
+                Routes.All(route => route.StorageUnit != definition.StorageUnit)))
+        {
+            throw new InvalidOperationException(
+                "Applied provider physical-schema definitions must belong to an executable storage route.");
+        }
+
+        var expected = ProviderDefinitions
+            .Select(definition => new ApplyProviderPhysicalSchemaDefinitionOperation(definition))
+            .Select(operation => new AppliedSemanticOperationSnapshot(
+                operation.Identity,
+                operation.Fingerprint,
+                operation.Kind,
+                operation.StorageUnit,
+                operation.SubjectIdentity,
+                operation.SlotIdentity,
+                operation.CanonicalPayload))
+            .OrderBy(operation => operation.Identity, StringComparer.Ordinal)
+            .ToArray();
+        var actual = SemanticOperations
+            .Where(operation => operation.Kind == PhysicalSchemaOperationKind.ApplyProviderDefinition)
+            .OrderBy(operation => operation.Identity, StringComparer.Ordinal)
+            .ToArray();
+        if (!expected.SequenceEqual(actual))
+        {
+            throw new InvalidOperationException(
+                "Applied provider physical-schema definitions do not match their semantic operation evidence.");
+        }
+    }
 
     internal static PhysicalSchemaAppliedSnapshot Deserialize(string canonicalJson)
     {
@@ -158,7 +232,15 @@ public sealed class PhysicalSchemaAppliedSnapshot
                 operation.GetProperty("slotIdentity").GetString()!,
                 operation.GetProperty("canonicalPayload").GetString()!);
         }).ToArray();
-        var snapshot = new PhysicalSchemaAppliedSnapshot(routes, operations);
+        var providerDefinitions = root.GetProperty("providerDefinitions").EnumerateArray().Select(definition =>
+            new ProviderPhysicalSchemaDefinition(
+                definition.GetProperty("providerName").GetString()!,
+                new StorageUnitIdentity(definition.GetProperty("storageUnit").GetString()!),
+                definition.GetProperty("kind").GetString()!,
+                definition.GetProperty("subjectIdentity").GetString()!,
+                definition.GetProperty("canonicalDefinition").GetString()!))
+            .ToArray();
+        var snapshot = new PhysicalSchemaAppliedSnapshot(routes, operations, providerDefinitions);
         if (!string.Equals(snapshot.CanonicalJson, canonicalJson, StringComparison.Ordinal))
             throw new InvalidOperationException("Applied physical schema snapshot is not in canonical form.");
         return snapshot;
@@ -194,6 +276,20 @@ public sealed class PhysicalSchemaAppliedSnapshot
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WritePropertyName("providerDefinitions");
+            writer.WriteStartArray();
+            foreach (var definition in snapshot.ProviderDefinitions)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("providerName", definition.ProviderName);
+                writer.WriteString("storageUnit", definition.StorageUnit.Value);
+                writer.WriteString("kind", definition.Kind);
+                writer.WriteString("subjectIdentity", definition.SubjectIdentity);
+                writer.WriteString("canonicalDefinition", definition.CanonicalDefinition);
+                writer.WriteString("fingerprint", definition.Fingerprint);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -280,7 +376,8 @@ public sealed class PhysicalSchemaAppliedState
                 manifestVersion.Value,
                 provider.Name,
                 provider.Version,
-                .. Snapshot.Routes.Select(route => route.RouteFingerprint)
+                .. Snapshot.Routes.Select(route => route.RouteFingerprint),
+                .. Snapshot.ProviderDefinitions.Select(definition => definition.Fingerprint)
             ]);
         if (expectedTargetFingerprint != targetFingerprint)
             throw new InvalidOperationException("Applied physical schema target fingerprint does not match its snapshot.");

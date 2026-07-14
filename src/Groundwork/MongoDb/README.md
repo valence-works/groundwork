@@ -43,8 +43,16 @@ transactional diagnostic-record provider.
 - Exposes native `explain` evidence for the resolved collection and selected physical index.
 - Executes named bounded transitions and deletes through set-based `UpdateMany`/`DeleteMany`
   operations. Provider-owned, route-scoped typed mutation mirrors and deterministic indexes exist
-  on both primary and linked collections, so linked forms require no client identity materialization
-  or per-document writes. Canonical BSON, native BSON, projections, linked rows, exact result ledger, and physical
+  on both primary and linked collections. Additive per-mutation fence definitions and deduplicated
+  per-logical-index selector definitions flow through the leased physical-schema desired-state plan,
+  durable operation ledger, applied snapshot, validation, and CLI. Selector backfill is restart-safe,
+  incarnation-fenced, and runs once for each physical selector rather than once per mutation. Runtime
+  writes carry immutable-binding fence values enforced by strict collection validators, so stale
+  hosts cannot create selector-invisible documents during publication or rolling coexistence.
+  Validator rules compose additively on shared collections and are part of live schema validation.
+  Runtime writes use the exact bound indexes as explicit hints, and explain proves both exact primary
+  and linked winning plans. Linked forms therefore require no client identity materialization or
+  per-document writes. Canonical BSON, native BSON, projections, linked rows, exact result ledger, and physical
   affected-count checks share one snapshot/majority transaction. The ledger identity excludes the
   provider version so acknowledgement-loss retries survive process restarts and provider upgrades.
 - Saves, loads, updates, deletes, and queries JSON document envelopes.

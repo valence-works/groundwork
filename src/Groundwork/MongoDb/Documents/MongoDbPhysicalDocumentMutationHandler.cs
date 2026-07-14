@@ -1,5 +1,4 @@
 using System.Collections.Frozen;
-using System.Text.RegularExpressions;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
@@ -24,7 +23,7 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
 {
     private readonly MongoDbPhysicalDocumentStore store;
     private readonly ExecutableStorageRoute route;
-    private readonly StorageUnitPhysicalStorage storage;
+    private readonly IReadOnlyDictionary<string, MongoDbPhysicalMutationBinding> bindings;
     private readonly Func<MongoDbPhysicalMutationExecutionPoint, ValueTask>? intercept;
 
     internal MongoDbPhysicalDocumentMutationHandler(
@@ -32,8 +31,7 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         PhysicalQuerySourceKind source,
         MongoDbPhysicalDocumentStore store,
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage,
-        IReadOnlyList<PhysicalMutationHandlerCertification> certifications,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> bindings,
         IReadOnlyDictionary<string, string> nativeFieldIdentifiers,
         Func<MongoDbPhysicalMutationExecutionPoint, ValueTask>? intercept)
     {
@@ -43,9 +41,18 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         Source = source;
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.route = route ?? throw new ArgumentNullException(nameof(route));
-        this.storage = storage ?? throw new ArgumentNullException(nameof(storage));
-        Certifications = Array.AsReadOnly(
-            (certifications ?? throw new ArgumentNullException(nameof(certifications))).ToArray());
+        var exactBindings = (bindings ?? throw new ArgumentNullException(nameof(bindings))).ToArray();
+        if (exactBindings.Any(binding => binding.Schema.Route.Fingerprint != route.Fingerprint))
+            throw new ArgumentException("One mutation handler cannot mix executable routes.", nameof(bindings));
+        this.bindings = exactBindings.ToFrozenDictionary(
+            binding => binding.Plan.MutationIdentity,
+            StringComparer.Ordinal);
+        Certifications = Array.AsReadOnly(exactBindings
+            .Select(binding => new PhysicalMutationHandlerCertification(binding.Plan, binding.Certification))
+            .ToArray());
+        SupportedActions = exactBindings
+            .Select(binding => binding.Plan.Action.Kind)
+            .ToFrozenSet();
         NativeFieldIdentifiers = source == PhysicalQuerySourceKind.NativeDocumentFields
             ? (nativeFieldIdentifiers ?? throw new ArgumentNullException(nameof(nativeFieldIdentifiers)))
                 .ToFrozenDictionary(StringComparer.Ordinal)
@@ -57,11 +64,10 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
 
     public PhysicalQuerySourceKind Source { get; }
 
-    public IReadOnlySet<PortableQueryOperation> SupportedOperations { get; } =
-        Enum.GetValues<PortableQueryOperation>().ToFrozenSet();
+    public IReadOnlySet<PortableQueryOperation> SupportedOperations =>
+        MongoDbPhysicalMutationCapabilities.Operations;
 
-    public IReadOnlySet<BoundedMutationActionKind> SupportedActions { get; } =
-        Enum.GetValues<BoundedMutationActionKind>().ToFrozenSet();
+    public IReadOnlySet<BoundedMutationActionKind> SupportedActions { get; }
 
     public IReadOnlyDictionary<string, string> NativeFieldIdentifiers { get; }
 
@@ -76,44 +82,35 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         PhysicalMutationPlan plan,
         CancellationToken cancellationToken)
     {
-        var scope = store.ResolveMutationScope(mutation.DocumentKind);
-        if (scope.AcrossScopes || scope.StorageKey is null)
-            throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
-        var fingerprint = BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey);
+        var invocation = BindInvocation(mutation, plan);
         var completed = false;
         return await store.ExecutePhysicalMutationAsync(
             mutation.DocumentKind,
             async (session, ct) =>
             {
                 completed = false;
-                var durable = await ReadOperationAsync(session, mutation, plan, scope, ct);
+                var durable = await ReadOperationAsync(session, mutation, plan, invocation.Scope, ct);
                 if (durable is not null)
                 {
-                    if (!string.Equals(durable.Value.Fingerprint, fingerprint, StringComparison.Ordinal))
+                    if (!string.Equals(durable.Value.Fingerprint, invocation.Fingerprint, StringComparison.Ordinal))
                     {
                         throw new BoundedMutationOperationConflictException(
                             mutation.OperationId,
-                            fingerprint,
+                            invocation.Fingerprint,
                             durable.Value.Fingerprint);
                     }
                     return BoundedMutationResult.Replayed(durable.Value.AffectedCount);
                 }
 
                 var affected = plan.Action is PhysicalDeleteMutationAction
-                    ? await DeleteAsync(session, mutation, plan, scope, ct)
-                    : await TransitionAsync(
-                        session,
-                        mutation,
-                        plan,
-                        scope,
-                        (PhysicalTransitionMutationAction)plan.Action,
-                        ct);
+                    ? await DeleteAsync(session, invocation, ct)
+                    : await TransitionAsync(session, invocation, ct);
                 await RecordOperationAsync(
                     session,
                     mutation,
                     plan,
-                    scope,
-                    fingerprint,
+                    invocation.Scope,
+                    invocation.Fingerprint,
                     affected,
                     ct);
                 completed = true;
@@ -132,41 +129,57 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
             cancellationToken);
     }
 
-    internal FilterDefinition<BsonDocument> BuildPrimaryFilter(
+    internal MongoDbPhysicalMutationInvocation BindInvocation(
         DocumentMutation mutation,
-        PhysicalMutationPlan plan,
-        DocumentScopeSelection scope) =>
-        BuildMutationFilter(mutation, plan, scope, linked: false);
-
-    internal FilterDefinition<BsonDocument> BuildLinkedFilter(
-        DocumentMutation mutation,
-        PhysicalMutationPlan plan,
-        DocumentScopeSelection scope) =>
-        BuildMutationFilter(mutation, plan, scope, linked: true);
+        PhysicalMutationPlan plan)
+    {
+        var binding = Binding(plan);
+        var scope = store.ResolveMutationScope(mutation.DocumentKind);
+        if (scope.AcrossScopes || scope.StorageKey is null)
+            throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
+        var primaryFilter = BuildMutationFilter(mutation, plan, binding.Schema.Primary, scope);
+        var linkedFilter = binding.Schema.Linked is null
+            ? null
+            : BuildMutationFilter(mutation, plan, binding.Schema.Linked, scope);
+        UpdateDefinition<BsonDocument>? primaryUpdate = null;
+        UpdateDefinition<BsonDocument>? linkedUpdate = null;
+        if (plan.Action is PhysicalTransitionMutationAction transition)
+        {
+            primaryUpdate = BuildPrimaryTransitionUpdate(binding, transition);
+            if (binding.Schema.Linked is not null)
+                linkedUpdate = BuildLinkedTransitionUpdate(binding, transition);
+        }
+        return new MongoDbPhysicalMutationInvocation(
+            binding,
+            scope,
+            BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey),
+            primaryFilter,
+            linkedFilter,
+            primaryUpdate,
+            linkedUpdate);
+    }
 
     private async Task<long> DeleteAsync(
         IClientSessionHandle session,
-        DocumentMutation mutation,
-        PhysicalMutationPlan plan,
-        DocumentScopeSelection scope,
+        MongoDbPhysicalMutationInvocation invocation,
         CancellationToken cancellationToken)
     {
         long? linkedCount = null;
-        if (route.LinkedIndexStorage is not null)
+        if (invocation.Binding.Schema.Linked is not null)
         {
-            var linked = await store.Database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
+            var linked = await store.Database.GetCollection<BsonDocument>(invocation.Binding.Schema.Linked.StorageObject.Identifier)
                 .DeleteManyAsync(
                     session,
-                    BuildLinkedFilter(mutation, plan, scope),
-                    options: null,
+                    invocation.LinkedFilter!,
+                    new DeleteOptions { Hint = invocation.Binding.Schema.Linked.Index.Identifier },
                     cancellationToken);
             linkedCount = linked.DeletedCount;
         }
-        var primary = await store.Database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+        var primary = await store.Database.GetCollection<BsonDocument>(invocation.Binding.Schema.Primary.StorageObject.Identifier)
             .DeleteManyAsync(
                 session,
-                BuildPrimaryFilter(mutation, plan, scope),
-                options: null,
+                invocation.PrimaryFilter,
+                new DeleteOptions { Hint = invocation.Binding.Schema.Primary.Index.Identifier },
                 cancellationToken);
         if (linkedCount is { } actual)
             EnsureExactPhysicalCount("linked delete", primary.DeletedCount, actual);
@@ -175,14 +188,38 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
 
     private async Task<long> TransitionAsync(
         IClientSessionHandle session,
-        DocumentMutation mutation,
-        PhysicalMutationPlan plan,
-        DocumentScopeSelection scope,
-        PhysicalTransitionMutationAction transition,
+        MongoDbPhysicalMutationInvocation invocation,
         CancellationToken cancellationToken)
     {
+        var primary = await store.Database.GetCollection<BsonDocument>(invocation.Binding.Schema.Primary.StorageObject.Identifier)
+            .UpdateManyAsync(
+                session,
+                invocation.PrimaryFilter,
+                invocation.PrimaryUpdate!,
+                new UpdateOptions { Hint = invocation.Binding.Schema.Primary.Index.Identifier },
+                cancellationToken: cancellationToken);
+        EnsureExactPhysicalCount("primary transition modification", primary.MatchedCount, primary.ModifiedCount);
+
+        if (invocation.Binding.Schema.Linked is null)
+            return primary.MatchedCount;
+        var linked = await store.Database.GetCollection<BsonDocument>(invocation.Binding.Schema.Linked.StorageObject.Identifier)
+            .UpdateManyAsync(
+                session,
+                invocation.LinkedFilter!,
+                invocation.LinkedUpdate!,
+                new UpdateOptions { Hint = invocation.Binding.Schema.Linked.Index.Identifier },
+                cancellationToken: cancellationToken);
+        EnsureExactPhysicalCount("linked transition", primary.MatchedCount, linked.MatchedCount);
+        EnsureExactPhysicalCount("linked transition modification", linked.MatchedCount, linked.ModifiedCount);
+        return primary.MatchedCount;
+    }
+
+    private UpdateDefinition<BsonDocument> BuildPrimaryTransitionUpdate(
+        MongoDbPhysicalMutationBinding binding,
+        PhysicalTransitionMutationAction transition)
+    {
         var nativeValue = NativeValue(transition);
-        var primaryUpdates = new List<UpdateDefinition<BsonDocument>>
+        var updates = new List<UpdateDefinition<BsonDocument>>
         {
             Builders<BsonDocument>.Update.Set(
                 $"{route.Envelope.CanonicalJson.Identifier}.{transition.Path}",
@@ -191,7 +228,7 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
                 $"{MongoDbPhysicalStorageFields.NativeContent}.{transition.Path}",
                 nativeValue),
             Builders<BsonDocument>.Update.Set(
-                MongoDbPhysicalMutationStorage.Field(route.StorageUnit, transition.Path),
+                binding.Schema.Primary.FieldByPath[transition.Path].Identifier,
                 MongoDbPhysicalMutationStorage.QueryValue(
                     route,
                     transition.Path,
@@ -202,26 +239,23 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
                 MongoDbPhysicalStorageFields.UpdatedAt,
                 DateTime.UtcNow)
         };
-        primaryUpdates.AddRange(route.ProjectedColumns
+        updates.AddRange(route.ProjectedColumns
             .Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage &&
                              column.Definition.Path == transition.Path)
             .Select(projection => Builders<BsonDocument>.Update.Set(
                 projection.Column.Identifier,
                 MongoDbPhysicalProjectionValues.ParseQueryValue(projection, transition.TargetValue))));
-        var primary = await store.Database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .UpdateManyAsync(
-                session,
-                BuildPrimaryFilter(mutation, plan, scope),
-                Builders<BsonDocument>.Update.Combine(primaryUpdates),
-                cancellationToken: cancellationToken);
-        EnsureExactPhysicalCount("primary transition modification", primary.MatchedCount, primary.ModifiedCount);
+        return Builders<BsonDocument>.Update.Combine(updates);
+    }
 
-        if (route.LinkedIndexStorage is null)
-            return primary.MatchedCount;
-        var linkedUpdates = new List<UpdateDefinition<BsonDocument>>
+    private UpdateDefinition<BsonDocument> BuildLinkedTransitionUpdate(
+        MongoDbPhysicalMutationBinding binding,
+        PhysicalTransitionMutationAction transition)
+    {
+        var updates = new List<UpdateDefinition<BsonDocument>>
         {
             Builders<BsonDocument>.Update.Set(
-                MongoDbPhysicalMutationStorage.Field(route.StorageUnit, transition.Path),
+                binding.Schema.Linked!.FieldByPath[transition.Path].Identifier,
                 MongoDbPhysicalMutationStorage.QueryValue(
                     route,
                     transition.Path,
@@ -229,63 +263,51 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
                     transition.TargetValue)),
             Builders<BsonDocument>.Update.Inc(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, 1L)
         };
-        linkedUpdates.AddRange(route.ProjectedColumns
+        updates.AddRange(route.ProjectedColumns
             .Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
                              column.Definition.Path == transition.Path)
             .Select(projection => Builders<BsonDocument>.Update.Set(
                 projection.Column.Identifier,
                 MongoDbPhysicalProjectionValues.ParseQueryValue(projection, transition.TargetValue))));
-        var linked = await store.Database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
-            .UpdateManyAsync(
-                session,
-                BuildLinkedFilter(mutation, plan, scope),
-                Builders<BsonDocument>.Update.Combine(linkedUpdates),
-                cancellationToken: cancellationToken);
-        EnsureExactPhysicalCount("linked transition", primary.MatchedCount, linked.MatchedCount);
-        EnsureExactPhysicalCount("linked transition modification", linked.MatchedCount, linked.ModifiedCount);
-        return primary.MatchedCount;
+        return Builders<BsonDocument>.Update.Combine(updates);
     }
 
     private FilterDefinition<BsonDocument> BuildMutationFilter(
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
-        DocumentScopeSelection scope,
-        bool linked)
+        MongoDbPhysicalMutationSelector selector,
+        DocumentScopeSelection scope)
     {
         var query = PredicateQuery(mutation, plan);
-        var discriminator = linked
-            ? route.LinkedRelationship!.DocumentKind.Identifier
-            : route.Envelope.DocumentKind.Identifier;
-        var scopeField = linked
-            ? route.LinkedRelationship!.StorageScope.Identifier
-            : route.Envelope.StorageScope.Identifier;
-        string Field(string path) => linked
-            ? MongoDbPhysicalMutationStorage.LinkedField(route, path)
-            : MongoDbPhysicalMutationStorage.PrimaryField(route, path);
         var filters = new List<FilterDefinition<BsonDocument>>
         {
-            Builders<BsonDocument>.Filter.Eq(discriminator, route.Discriminator.Value),
-            Builders<BsonDocument>.Filter.Eq(scopeField, scope.StorageKey)
+            Builders<BsonDocument>.Filter.Eq(selector.DiscriminatorField, selector.DiscriminatorValue),
+            Builders<BsonDocument>.Filter.Eq(selector.ScopeField, scope.StorageKey)
         };
-        var logicalIndex = storage.LogicalIndexes.Single(index =>
-            index.Identity == plan.Predicate.LogicalIndexIdentity);
-        if (logicalIndex.MissingValueBehavior == MissingValueBehavior.Excluded)
+        if (selector.MissingValueBehavior == MissingValueBehavior.Excluded)
         {
-            filters.AddRange(MongoDbPhysicalMutationStorage.IndexPaths(
-                    storage,
-                    storage.BoundedQueries.Single(candidate => candidate.Identity == plan.Predicate.QueryIdentity))
-                .Select(path => Builders<BsonDocument>.Filter.Exists(Field(path), true)));
+            filters.AddRange(selector.Fields.Select(mirror =>
+                Builders<BsonDocument>.Filter.Exists(mirror.Identifier, true)));
         }
         foreach (var clause in query.Clauses)
         {
             filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
             {
-                var predicate = plan.Predicate.Predicates.Single(candidate =>
-                    candidate.Path == comparison.Path);
-                return Comparison(comparison, Field(comparison.Path), predicate.Field.ValueKind);
+                var mirror = selector.FieldByPath[comparison.Path];
+                return Comparison(comparison, mirror.Identifier, mirror.ValueKind);
             })));
         }
         return Builders<BsonDocument>.Filter.And(filters);
+    }
+
+    private MongoDbPhysicalMutationBinding Binding(PhysicalMutationPlan plan)
+    {
+        if (!bindings.TryGetValue(plan.MutationIdentity, out var binding) || !binding.Certifies(plan))
+        {
+            throw new InvalidOperationException(
+                $"MongoDB bounded mutation '{plan.MutationIdentity}' does not match its executable binding.");
+        }
+        return binding;
     }
 
     private FilterDefinition<BsonDocument> Comparison(
@@ -306,12 +328,6 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
             QueryComparisonOperator.In => comparison.Values.Count == 0
                 ? Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true)
                 : Builders<BsonDocument>.Filter.In(field, comparison.Values.Select(ToValue)),
-            QueryComparisonOperator.Contains => Builders<BsonDocument>.Filter.Regex(
-                field,
-                new BsonRegularExpression(Regex.Escape(comparison.Values[0]!), "i")),
-            QueryComparisonOperator.StartsWith => Builders<BsonDocument>.Filter.Regex(
-                field,
-                new BsonRegularExpression("^" + Regex.Escape(comparison.Values[0]!), "i")),
             QueryComparisonOperator.GreaterThan => Builders<BsonDocument>.Filter.Gt(field, value),
             QueryComparisonOperator.GreaterThanOrEqual => Builders<BsonDocument>.Filter.Gte(field, value),
             QueryComparisonOperator.LessThan => Builders<BsonDocument>.Filter.Lt(field, value),
@@ -407,3 +423,12 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         }
     }
 }
+
+internal sealed record MongoDbPhysicalMutationInvocation(
+    MongoDbPhysicalMutationBinding Binding,
+    DocumentScopeSelection Scope,
+    string Fingerprint,
+    FilterDefinition<BsonDocument> PrimaryFilter,
+    FilterDefinition<BsonDocument>? LinkedFilter,
+    UpdateDefinition<BsonDocument>? PrimaryUpdate,
+    UpdateDefinition<BsonDocument>? LinkedUpdate);

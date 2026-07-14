@@ -4,6 +4,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
@@ -185,6 +186,371 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Runtime_rejects_unrelated_unit_changes_under_the_same_manifest_identity_and_version()
+    {
+        var fixture = await CreateAsync();
+        var unit = Assert.Single(fixture.Model.Manifest.StorageUnits);
+        var hostile = fixture.Model.Manifest with
+        {
+            StorageUnits =
+            [
+                unit,
+                unit with
+                {
+                    Identity = new StorageUnitIdentity("unrelated"),
+                    Tenancy = TenancyPolicy.Global,
+                    Serialization = new SerializationPolicy(SerializationKind.ProviderNative)
+                }
+            ]
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbPhysicalMutationRuntime.Create(
+                fixture.Documents,
+                hostile,
+                Assert.Single(fixture.Model.Routes),
+                fixture.Model.Provider));
+
+        Assert.Contains("canonical manifest", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Mutation_schema_work_is_published_in_the_durable_physical_schema_plan()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var model = Model();
+
+        var result = await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+
+        Assert.NotNull(result.AppliedState);
+        Assert.Contains(result.AppliedState.AppliedOperations, operation =>
+            operation.SubjectIdentity == "prune-by-status");
+        Assert.Contains(result.AppliedState.AppliedOperations, operation =>
+            operation.SubjectIdentity == "revoke-pending");
+        Assert.Single(model.Target.ProviderDefinitions.Where(definition =>
+            definition.Kind == MongoDbPhysicalMutationSelectorSchemaDefinition.DefinitionKind));
+        Assert.Single(result.Plan.Operations
+            .OfType<ApplyProviderPhysicalSchemaDefinitionOperation>()
+            .Where(operation =>
+                operation.Definition.Kind == MongoDbPhysicalMutationSelectorSchemaDefinition.DefinitionKind));
+        Assert.Equal(
+            new[]
+            {
+                MongoDbPhysicalMutationSchemaBinding.DefinitionKind,
+                MongoDbPhysicalMutationSchemaBinding.DefinitionKind,
+                MongoDbPhysicalMutationSelectorSchemaDefinition.DefinitionKind
+            },
+            result.Plan.Operations
+                .OfType<ApplyProviderPhysicalSchemaDefinitionOperation>()
+                .Select(operation => operation.Definition.Kind)
+                .ToArray());
+
+        var route = Assert.Single(model.Routes);
+        var query = model.StorageByStorageUnit[DocumentKind].BoundedQueries.Single(candidate =>
+            candidate.Identity == "list-by-status");
+        var expectedIndex = MongoDbPhysicalMutationStorage.IndexName(
+            route,
+            query,
+            ExecutableStorageObjectRole.PrimaryStorage);
+        var indexes = await (await database
+            .GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Indexes.ListAsync()).ToListAsync();
+        Assert.Single(indexes.Where(index => index["name"].AsString == expectedIndex));
+    }
+
+    [Fact]
+    public async Task Conflicting_mutation_index_fails_without_publishing_applied_state()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var model = Model();
+        var route = Assert.Single(model.Routes);
+        var storage = model.StorageByStorageUnit[DocumentKind];
+        var query = storage.BoundedQueries.Single(candidate => candidate.Identity == "list-by-status");
+        var indexName = MongoDbPhysicalMutationStorage.IndexName(
+            route,
+            query,
+            ExecutableStorageObjectRole.PrimaryStorage);
+        await database.CreateCollectionAsync(route.PrimaryStorage.Name.Identifier);
+        await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+                Builders<BsonDocument>.IndexKeys.Ascending(route.Envelope.Id.Identifier),
+                new CreateIndexOptions { Name = indexName }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(model));
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(model.Target, CancellationToken.None);
+
+        Assert.Contains("bounded-mutation index", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(inspection.History.AppliedState);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Failure_before_publication_replays_schema_work_and_backfill_on_restart(
+        PhysicalStorageForm form)
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model(form);
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var originalDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(originalDocuments, "stale-before-failure", "stale");
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            beforeBackfillWrite: null,
+            beforeAppliedStateWrite: _ => ValueTask.FromException(new SimulatedSchemaFailureException()));
+
+        await Assert.ThrowsAsync<SimulatedSchemaFailureException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(mutationModel.Target, executor));
+        var failedInspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(originalModel.Target, CancellationToken.None);
+        Assert.Equal(originalModel.Target.Fingerprint, failedInspection.History.AppliedState?.TargetFingerprint);
+
+        var restarted = await PhysicalSchemaApplication.ApplyAsync(
+            mutationModel.Target,
+            new MongoDbPhysicalSchemaExecutor(database));
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var mutations = MongoDbPhysicalMutationRuntime.Create(
+            documents,
+            mutationModel.Manifest,
+            Assert.Single(mutationModel.Routes),
+            mutationModel.Provider);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, restarted.Outcome);
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(Delete($"{form}-restart-after-publication-failure", "stale")));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Interrupted_backfill_is_restart_safe_across_document_reincarnation(
+        PhysicalStorageForm form)
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model(form);
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var originalDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(originalDocuments, "reincarnated", "stale");
+        var evolvedDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var changedIncarnation = false;
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            beforeBackfillWrite: async _ =>
+            {
+                if (changedIncarnation)
+                    return;
+                changedIncarnation = true;
+                Assert.Equal(
+                    DocumentStoreWriteStatus.Deleted,
+                    (await evolvedDocuments.DeleteAsync(new DeleteDocumentRequest(
+                        DocumentKind,
+                        "reincarnated"))).Status);
+                await SaveAsync(evolvedDocuments, "reincarnated", "current");
+            });
+
+        var application = await PhysicalSchemaApplication.ApplyAsync(mutationModel.Target, executor);
+        var mutations = MongoDbPhysicalMutationRuntime.Create(
+            evolvedDocuments,
+            mutationModel.Manifest,
+            Assert.Single(mutationModel.Routes),
+            mutationModel.Provider);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, application.Outcome);
+        Assert.Equal("current", Status((await evolvedDocuments.LoadAsync(DocumentKind, "reincarnated"))!.ContentJson));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(Delete($"{form}-reincarnation-visible", "current")));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Adding_mutations_backfills_preexisting_primary_and_linked_documents(
+        PhysicalStorageForm form)
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model(form);
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var originalDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(originalDocuments, "stale-before-declaration", "stale");
+
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel);
+        var evolvedDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var mutations = MongoDbPhysicalMutationRuntime.Create(
+            evolvedDocuments,
+            mutationModel.Manifest,
+            Assert.Single(mutationModel.Routes),
+            mutationModel.Provider);
+
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(Delete($"{form}-backfilled", "stale")));
+        Assert.Null(await evolvedDocuments.LoadAsync(DocumentKind, "stale-before-declaration"));
+    }
+
+    [Fact]
+    public async Task Orphan_linked_mutation_rows_prevent_schema_publication()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model();
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var originalDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(originalDocuments, "canonical", "stale");
+        var route = Assert.Single(originalModel.Routes);
+        var relationship = route.LinkedRelationship!;
+        var linkedCollection = database.GetCollection<BsonDocument>(
+            route.LinkedIndexStorage!.Name.Identifier);
+        var orphan = (await linkedCollection.Find(FilterDefinition<BsonDocument>.Empty)
+            .SingleAsync()).DeepClone().AsBsonDocument;
+        orphan[MongoDbPhysicalStorageFields.Id] = ObjectId.GenerateNewId();
+        orphan[relationship.DocumentId.Identifier] = "orphan";
+        await linkedCollection.InsertOneAsync(orphan);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel));
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(originalModel.Target, CancellationToken.None);
+
+        Assert.Contains("orphan or duplicate linked mirror state", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(originalModel.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Stale_writer_is_fenced_between_final_validation_and_publication(
+        PhysicalStorageForm form)
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model(form);
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var staleDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var staleWriteWasRejected = false;
+        var executor = new MongoDbPhysicalSchemaExecutor(
+            database,
+            timeProvider: null,
+            leaseDuration: null,
+            beforeBackfillWrite: null,
+            beforeAppliedStateWrite: async _ =>
+            {
+                await Assert.ThrowsAnyAsync<MongoException>(() =>
+                    SaveAsync(staleDocuments, $"{form}-publication-race", "stale"));
+                staleWriteWasRejected = true;
+            });
+
+        var result = await PhysicalSchemaApplication.ApplyAsync(mutationModel.Target, executor);
+        var currentDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(currentDocuments, $"{form}-current-writer", "current");
+
+        Assert.True(staleWriteWasRejected);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Outcome);
+        Assert.Null(await currentDocuments.LoadAsync(DocumentKind, $"{form}-publication-race"));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Published_mutation_schema_rejects_rolling_stale_writers(
+        PhysicalStorageForm form)
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model(form);
+        var originalModel = WithoutMutations(mutationModel);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(originalModel);
+        var staleDocuments = new MongoDbPhysicalDocumentStore(
+            database,
+            originalModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel);
+
+        await Assert.ThrowsAnyAsync<MongoException>(() =>
+            SaveAsync(staleDocuments, $"{form}-rolling-stale", "stale"));
+    }
+
+    [Fact]
+    public async Task Mutation_write_fences_compose_and_live_validation_proves_their_presence()
+    {
+        var fixture = await CreateAsync();
+        var route = Assert.Single(fixture.Model.Routes);
+        var bindings = fixture.Model.MutationBindingsByStorageUnit[DocumentKind];
+        var metadata = await CollectionMetadataAsync(
+            fixture.Database,
+            route.PrimaryStorage.Name.Identifier);
+        var validatorJson = metadata["options"]["validator"].ToJson();
+
+        Assert.All(bindings, binding =>
+        {
+            Assert.Contains(binding.Schema.FenceField, validatorJson, StringComparison.Ordinal);
+            Assert.Contains(binding.Schema.Fingerprint, validatorJson, StringComparison.Ordinal);
+        });
+        var restart = await new MongoDbGroundworkMaterializer(fixture.Database)
+            .MaterializeAsync(fixture.Model);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, restart.Outcome);
+
+        await fixture.Database.RunCommandAsync<BsonDocument>(new BsonDocument
+        {
+            ["collMod"] = route.PrimaryStorage.Name.Identifier,
+            ["validator"] = new BsonDocument()
+        });
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new MongoDbGroundworkMaterializer(fixture.Database).MaterializeAsync(fixture.Model));
+        Assert.Contains("write fence", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Runtime_rejects_a_route_that_does_not_match_the_compiled_store()
     {
         var fixture = await CreateAsync();
@@ -284,6 +650,27 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
         Assert.Equal(
             "revoked",
             Status((await restartedDocuments.LoadAsync(DocumentKind, "pending"))!.ContentJson));
+    }
+
+    [Fact]
+    public async Task Provider_upgrade_revalidates_without_replacing_identical_mutation_schema_definitions()
+    {
+        var fixture = await CreateAsync();
+        var upgradedProvider = new Groundwork.Core.Capabilities.ProviderIdentity(
+            fixture.Model.Provider.Name,
+            "2.0.0");
+        var upgradedModel = MongoDbPhysicalStorageModel.Compile(
+            fixture.Model.Manifest,
+            upgradedProvider);
+
+        var result = await new MongoDbGroundworkMaterializer(fixture.Database)
+            .MaterializeAsync(upgradedModel);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Outcome);
+        Assert.Equal(upgradedProvider, result.AppliedState?.Provider);
+        Assert.DoesNotContain(
+            result.Plan.Operations,
+            operation => operation is ApplyProviderPhysicalSchemaDefinitionOperation);
     }
 
     [Theory]
@@ -456,10 +843,14 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
         Assert.Null(await documents.LoadAsync(DocumentKind, "schema-1"));
     }
 
-    [Fact]
-    public async Task Mutation_explain_uses_the_provider_owned_primary_index()
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Mutation_explain_proves_the_exact_primary_and_linked_executable_selectors(
+        PhysicalStorageForm form)
     {
-        var fixture = await CreateAsync();
+        var fixture = await CreateAsync(form: form);
         await SaveAsync(fixture.Documents, "stale", "stale");
         var route = Assert.Single(fixture.Model.Routes);
         var storage = fixture.Model.StorageByStorageUnit[DocumentKind];
@@ -468,26 +859,34 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             route,
             query,
             ExecutableStorageObjectRole.PrimaryStorage);
-        var expectedLinked = MongoDbPhysicalMutationStorage.IndexName(
-            route,
-            query,
-            ExecutableStorageObjectRole.LinkedIndexStorage);
 
         var explanation = await MongoDbPhysicalMutationRuntime.ExplainAsync(
             fixture.Documents,
             fixture.Model.Manifest,
             route,
             fixture.Model.Provider,
-            Delete("explain-1", "stale"));
+            Delete($"{form}-explain-1", "stale"));
 
-        Assert.Contains(expected, explanation.ToJson(), StringComparison.Ordinal);
-        Assert.DoesNotContain("COLLSCAN", explanation.ToJson(), StringComparison.Ordinal);
+        Assert.Equal(expected, explanation["primary"]["indexName"].AsString);
+        Assert.Equal(expected, explanation["primary"]["winningPlanIndex"].AsString);
         var primaryIndexes = await (await fixture.Database
             .GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .Indexes.ListAsync()).ToListAsync();
         Assert.Contains(primaryIndexes, index => index["name"].AsString == expected);
+        if (route.LinkedIndexStorage is null)
+        {
+            Assert.True(explanation["linked"].IsBsonNull);
+            return;
+        }
+
+        var expectedLinked = MongoDbPhysicalMutationStorage.IndexName(
+            route,
+            query,
+            ExecutableStorageObjectRole.LinkedIndexStorage);
+        Assert.Equal(expectedLinked, explanation["linked"]["indexName"].AsString);
+        Assert.Equal(expectedLinked, explanation["linked"]["winningPlanIndex"].AsString);
         var linkedIndexes = await (await fixture.Database
-            .GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+            .GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
             .Indexes.ListAsync()).ToListAsync();
         Assert.Contains(linkedIndexes, index => index["name"].AsString == expectedLinked);
     }
@@ -639,6 +1038,63 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             Query("stale").Select(BoundedQueryResultOperation.Count)));
     }
 
+    [Fact]
+    public async Task Concurrent_save_and_mutation_retry_without_splitting_primary_and_linked_state()
+    {
+        var mutationReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseMutation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fixture = await CreateAsync(async point =>
+        {
+            if (point != MongoDbPhysicalMutationExecutionPoint.BeforeCommit)
+                return;
+            mutationReady.TrySetResult(true);
+            await releaseMutation.Task;
+        });
+        await SaveAsync(fixture.Documents, "contended", "pending");
+
+        var saveStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writer = new MongoDbPhysicalDocumentStore(
+            fixture.Database,
+            fixture.Model,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            scopeObserver: null,
+            options: null,
+            timeProvider: TimeProvider.System,
+            hooks: MongoDbPhysicalDocumentStoreExecutionHooks.None with
+            {
+                TransactionBodyStarting = (_, _, _) =>
+                {
+                    saveStarted.TrySetResult(true);
+                    return ValueTask.CompletedTask;
+                }
+            });
+        var mutation = fixture.Mutations.ExecuteAsync(new DocumentMutation(
+            DocumentKind,
+            "revoke-pending",
+            "save-mutation-interleaving"));
+        await mutationReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var save = writer.SaveAsync(new SaveDocumentRequest(
+            DocumentKind,
+            "contended",
+            "1",
+            """{"status":"archived","rank":1}""",
+            ExpectedVersion: 1));
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        releaseMutation.TrySetResult(true);
+
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutation);
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, (await save).Status);
+        Assert.Equal(
+            "revoked",
+            Status((await fixture.Documents.LoadAsync(DocumentKind, "contended"))!.ContentJson));
+        Assert.Equal(1, await fixture.Documents.CountAsync(
+            Query("revoked").Select(BoundedQueryResultOperation.Count)));
+        Assert.Equal(0, await fixture.Documents.CountAsync(
+            Query("pending").Select(BoundedQueryResultOperation.Count)));
+    }
+
     internal static MongoDbPhysicalStorageModel Model(
         PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable,
         string path = "status",
@@ -676,6 +1132,27 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             ]
         };
         return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel WithoutMutations(MongoDbPhysicalStorageModel mutationModel)
+    {
+        var unit = Assert.Single(mutationModel.Manifest.StorageUnits);
+        var storage = unit.PhysicalStorage!;
+        return MongoDbPhysicalStorageModel.Compile(mutationModel.Manifest with
+        {
+            StorageUnits =
+            [
+                unit with
+                {
+                    PhysicalStorage = new StorageUnitPhysicalStorage(
+                        storage.ProvisioningMode,
+                        storage.Policy,
+                        storage.LogicalIndexes,
+                        storage.BoundedQueries,
+                        storage.NameOverrides)
+                }
+            ]
+        });
     }
 
     private static MongoDbPhysicalStorageModel RelationshipExpiryModel()
@@ -863,6 +1340,17 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     private static string Status(string json) =>
         JsonDocument.Parse(json).RootElement.GetProperty("status").GetString()!;
 
+    private static async Task<BsonDocument> CollectionMetadataAsync(
+        IMongoDatabase database,
+        string collection)
+    {
+        using var cursor = await database.ListCollectionsAsync(new ListCollectionsOptions
+        {
+            Filter = Builders<BsonDocument>.Filter.Eq("name", collection)
+        });
+        return (await cursor.ToListAsync()).Single();
+    }
+
     private static async Task SaveAsync(
         MongoDbPhysicalDocumentStore documents,
         string id,
@@ -911,4 +1399,6 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     private sealed class SimulatedMutationFailureException : Exception;
 
     private sealed class SimulatedMutationAcknowledgementLossException : Exception;
+
+    private sealed class SimulatedSchemaFailureException : Exception;
 }

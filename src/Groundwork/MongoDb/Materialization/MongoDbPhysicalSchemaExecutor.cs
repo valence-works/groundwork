@@ -2,6 +2,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using System.Globalization;
 using System.Text.Json;
+using Groundwork.MongoDb.Documents;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -30,6 +31,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
     private readonly Func<CancellationToken, ValueTask>? beforeOperationEvidenceWrite;
     private readonly Func<CancellationToken, ValueTask>? beforeAppliedStateWrite;
     private readonly Action<DateTimeOffset>? afterLeaseRenewal;
+    private readonly MongoDbPhysicalMutationSchemaDefinitionHandler mutationDefinitions;
 
     public MongoDbPhysicalSchemaExecutor(
         IMongoDatabase database,
@@ -64,6 +66,9 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         this.beforeOperationEvidenceWrite = beforeOperationEvidenceWrite;
         this.beforeAppliedStateWrite = beforeAppliedStateWrite;
         this.afterLeaseRenewal = afterLeaseRenewal;
+        mutationDefinitions = new MongoDbPhysicalMutationSchemaDefinitionHandler(
+            this.database,
+            beforeBackfillWrite);
     }
 
     public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
@@ -402,6 +407,9 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
             case BackfillCanonicalJsonOperation backfill:
                 await BackfillAsync(backfill, cancellationToken);
                 break;
+            case ApplyProviderPhysicalSchemaDefinitionOperation providerDefinition:
+                await mutationDefinitions.ApplyAsync(providerDefinition.Definition, cancellationToken);
+                break;
             case ValidatePhysicalSchemaOperation validation:
                 await ValidateAsync(validation, cancellationToken);
                 break;
@@ -609,7 +617,7 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         Groundwork.Core.Indexing.MissingValueBehavior MissingValueBehavior,
         BsonDocument? PartialFilter);
 
-    private static bool IndexMatches(
+    internal static bool IndexMatches(
         BsonDocument actual,
         BsonDocument keys,
         bool unique,
@@ -693,122 +701,18 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
         string canonicalJson,
         CancellationToken cancellationToken)
     {
-        var relationship = route.LinkedRelationship!;
-        var linked = new BsonDocument
-        {
-            [relationship.DocumentId.Identifier] = primary[route.Envelope.Id.Identifier],
-            [relationship.DocumentKind.Identifier] = route.Discriminator.Value,
-            [relationship.StorageScope.Identifier] = primary[route.Envelope.StorageScope.Identifier]
-        };
-        var primaryVersion = primary[route.Envelope.Version.Identifier];
-        linked[MongoDbPhysicalStorageFields.LinkedPrimaryVersion] = primaryVersion;
-        linked[MongoDbPhysicalStorageFields.Incarnation] = primary[MongoDbPhysicalStorageFields.Incarnation];
         var projections = route.ProjectedColumns
             .Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage)
             .ToArray();
         var projectedValues = MongoDbPhysicalProjectionValues.ResolveAll(canonicalJson, projections);
-        foreach (var projection in projections)
-        {
-            var value = projectedValues[projection];
-            if (value.IsPresent)
-                linked[projection.Column.Identifier] = value.Value;
-        }
-        linked[MongoDbPhysicalStorageFields.Id] = KeyDocument(route.AuxiliaryKey!, linked);
-        var linkedCollection = database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier);
-        using var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
-        session.StartTransaction(new TransactionOptions(ReadConcern.Snapshot, writeConcern: WriteConcern.WMajority));
-        try
-        {
-            var currentPrimary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-                .Find(
-                    session,
-                    Builders<BsonDocument>.Filter.Eq(
-                        MongoDbPhysicalStorageFields.Id,
-                        primary[MongoDbPhysicalStorageFields.Id]) &
-                    Builders<BsonDocument>.Filter.Eq(
-                        MongoDbPhysicalStorageFields.Incarnation,
-                        primary[MongoDbPhysicalStorageFields.Incarnation]) &
-                    Builders<BsonDocument>.Filter.Eq(
-                        route.Envelope.Version.Identifier,
-                        primaryVersion))
-                .Limit(1)
-                .AnyAsync(cancellationToken);
-            if (!currentPrimary)
-            {
-                await session.AbortTransactionAsync(cancellationToken);
-                return;
-            }
-
-            var filter = Builders<BsonDocument>.Filter.Eq(
-                             MongoDbPhysicalStorageFields.Id,
-                             linked[MongoDbPhysicalStorageFields.Id]) &
-                         (Builders<BsonDocument>.Filter.Lte(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, primaryVersion) |
-                          Builders<BsonDocument>.Filter.Exists(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, false));
-            await linkedCollection.ReplaceOneAsync(
-                session,
-                filter,
-                linked,
-                new ReplaceOptions { IsUpsert = true },
-                cancellationToken);
-            await session.CommitTransactionAsync(cancellationToken);
-        }
-        catch (MongoWriteException exception) when (exception.WriteError?.Code == 11000)
-        {
-            if (session.IsInTransaction)
-                await session.AbortTransactionAsync(CancellationToken.None);
-            if (!await HasStrictlyNewerLinkedIncarnationAsync(
-                    route,
-                    linkedCollection,
-                    primary,
-                    linked,
-                    primaryVersion,
-                    cancellationToken))
-            {
-                throw;
-            }
-        }
-        catch
-        {
-            if (session.IsInTransaction)
-                await session.AbortTransactionAsync(CancellationToken.None);
-            throw;
-        }
-    }
-
-    private async Task<bool> HasStrictlyNewerLinkedIncarnationAsync(
-        ExecutableStorageRoute route,
-        IMongoCollection<BsonDocument> linkedCollection,
-        BsonDocument backfillPrimary,
-        BsonDocument attemptedLinked,
-        BsonValue backfillVersion,
-        CancellationToken cancellationToken)
-    {
-        var identity = attemptedLinked[MongoDbPhysicalStorageFields.Id];
-        var existing = await linkedCollection.Find(
-                Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Id, identity))
-            .SingleOrDefaultAsync(cancellationToken);
-        if (existing is null)
-            return false;
-
-        var existingVersion = existing.GetValue(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, BsonNull.Value);
-        var existingIncarnation = existing.GetValue(MongoDbPhysicalStorageFields.Incarnation, BsonNull.Value);
-        var attemptedIncarnation = attemptedLinked[MongoDbPhysicalStorageFields.Incarnation];
-        if (existingIncarnation.Equals(attemptedIncarnation))
-            return existingVersion.IsNumeric && existingVersion.ToInt64() > backfillVersion.ToInt64();
-
-        return await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .Find(
-                Builders<BsonDocument>.Filter.Eq(
-                    MongoDbPhysicalStorageFields.Id,
-                    backfillPrimary[MongoDbPhysicalStorageFields.Id]) &
-                Builders<BsonDocument>.Filter.Eq(
-                    MongoDbPhysicalStorageFields.Incarnation,
-                    existingIncarnation) &
-                Builders<BsonDocument>.Filter.Eq(
-                    route.Envelope.Version.Identifier,
-                    existingVersion))
-            .Limit(1)
-            .AnyAsync(cancellationToken);
+        var linked = MongoDbLinkedDocumentStorage.Create(route, primary, projectedValues);
+        await MongoDbLinkedDocumentStorage.ReconcileAsync(
+            database,
+            route,
+            primary,
+            linked,
+            linked.Updates(),
+            cancellationToken);
     }
 
     private static List<UpdateDefinition<BsonDocument>> ProjectionUpdates(
@@ -868,6 +772,8 @@ public sealed class MongoDbPhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPh
                 }
             }
         }
+
+        await mutationDefinitions.ValidateAsync(operation.ProviderDefinitions, cancellationToken);
     }
 
     private static void ValidateWritableCollection(

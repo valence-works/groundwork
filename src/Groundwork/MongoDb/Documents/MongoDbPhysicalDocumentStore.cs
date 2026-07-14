@@ -377,41 +377,12 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private PhysicalQueryPlannerCapabilities Capabilities(
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage)
-    {
-        var fields = new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["id"] = route.Envelope.Id.Identifier,
-            ["documentKind"] = route.Envelope.DocumentKind.Identifier,
-            ["storageScope"] = route.Envelope.StorageScope.Identifier,
-            ["version"] = route.Envelope.Version.Identifier,
-            ["schemaVersion"] = route.Envelope.SchemaVersion.Identifier
-        };
-        foreach (var path in storage.LogicalIndexes.SelectMany(index => index.Fields).Select(field => field.Path).Distinct(StringComparer.Ordinal))
-        {
-            fields[path] = route.ProjectedColumns.SingleOrDefault(column =>
-                    column.Target == ExecutableStorageObjectRole.PrimaryStorage && column.Definition.Path == path)?.Column.Identifier
-                ?? $"{ContentField}.{path}";
-        }
-        return new PhysicalQueryPlannerCapabilities(
+        StorageUnitPhysicalStorage storage) =>
+        MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
             model.Provider,
-            [PhysicalQuerySourceKind.LinkedIndex, PhysicalQuerySourceKind.NativeDocumentFields],
-            MongoDbPhysicalQueryHandler.Operations,
-            new Dictionary<PhysicalQuerySourceKind, string>
-            {
-                [PhysicalQuerySourceKind.LinkedIndex] = MongoDbPhysicalQueryHandler.LinkedIdentity,
-                [PhysicalQuerySourceKind.NativeDocumentFields] = MongoDbPhysicalQueryHandler.NativeIdentity
-            },
-            fields,
-            supportsCompoundPredicates: true,
-            supportsDisjunction: true,
-            supportsOffsetPaging: true,
-            supportsKeysetPaging: false,
-            supportsCount: true,
-            supportsAny: true,
-            supportsFirst: true,
-            supportsLatestPerKey: false);
-    }
+            MongoDbPhysicalQueryHandler.Operations);
 
     private async Task<DocumentStoreWriteResult> ExecuteAtomicAsync(
         IReadOnlyList<string> documentKinds,
@@ -606,7 +577,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         var projectedValues = MongoDbPhysicalProjectionValues.ResolveAll(request.ContentJson, route.ProjectedColumns);
         var document = CreatePrimary(
             route,
-            model.StorageByStorageUnit[route.StorageUnit.Value],
+            GetMutationBindings(route.StorageUnit.Value),
             request,
             scope.StorageKey!,
             version,
@@ -631,7 +602,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         }
         await MaintainLinkedAsync(
             route,
-            model.StorageByStorageUnit[route.StorageUnit.Value],
+            GetMutationBindings(route.StorageUnit.Value),
             document,
             projectedValues,
             session,
@@ -694,7 +665,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private static BsonDocument CreatePrimary(
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> mutationBindings,
         SaveDocumentRequest request,
         string scope,
         long version,
@@ -728,7 +699,8 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             document,
             content,
             route,
-            storage,
+            mutationBindings,
+            ExecutableStorageObjectRole.PrimaryStorage,
             projectedValues);
         document[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.PrimaryKey, document);
         return document;
@@ -736,7 +708,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private async Task MaintainLinkedAsync(
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> mutationBindings,
         BsonDocument primary,
         IReadOnlyDictionary<ExecutableProjectedColumnRoute, MongoDbPhysicalProjectionValue> projectedValues,
         IClientSessionHandle session,
@@ -744,33 +716,19 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     {
         if (route.LinkedIndexStorage is null)
             return;
-        var rel = route.LinkedRelationship!;
-        var linked = new BsonDocument
-        {
-            [rel.DocumentId.Identifier] = primary[route.Envelope.Id.Identifier],
-            [rel.DocumentKind.Identifier] = route.Discriminator.Value,
-            [rel.StorageScope.Identifier] = primary[route.Envelope.StorageScope.Identifier],
-            [MongoDbPhysicalStorageFields.LinkedPrimaryVersion] = primary[route.Envelope.Version.Identifier],
-            [MongoDbPhysicalStorageFields.Incarnation] = primary[MongoDbPhysicalStorageFields.Incarnation]
-        };
-        foreach (var projection in route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage))
-        {
-            var value = projectedValues[projection];
-            if (value.IsPresent)
-                linked[projection.Column.Identifier] = value.Value;
-        }
+        var linked = MongoDbLinkedDocumentStorage.Create(route, primary, projectedValues);
         MongoDbPhysicalMutationStorage.ApplyMirrors(
-            linked,
+            linked.Document,
             primary,
             primary[ContentField].AsBsonDocument,
             route,
-            storage,
+            mutationBindings,
+            ExecutableStorageObjectRole.LinkedIndexStorage,
             projectedValues);
-        linked[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.AuxiliaryKey!, linked);
         await database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier).ReplaceOneAsync(
             session,
-            Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Id, linked[MongoDbPhysicalStorageFields.Id]),
-            linked,
+            Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Id, linked.Identity),
+            linked.Document,
             new ReplaceOptions { IsUpsert = true },
             cancellationToken);
     }
@@ -828,7 +786,12 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     internal PhysicalQueryPlannerCapabilities GetMutationCapabilities(
         ExecutableStorageRoute route,
         StorageUnitPhysicalStorage storage) =>
-        Capabilities(route, storage);
+        MongoDbPhysicalMutationCapabilities.Create(route, storage, model.Provider);
+
+    internal IReadOnlyList<MongoDbPhysicalMutationBinding> GetMutationBindings(string documentKind) =>
+        model.MutationBindingsByStorageUnit.TryGetValue(documentKind, out var bindings)
+            ? bindings
+            : [];
 
     internal Task EnsureMutationSupportedAsync(string documentKind, CancellationToken cancellationToken) =>
         transactionCapability.EnsureSupportedAsync(

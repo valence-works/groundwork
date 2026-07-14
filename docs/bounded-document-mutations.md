@@ -105,14 +105,28 @@ serialization and cleanup-failure preservation.
 
 MongoDB stores the physical canonical document as addressable BSON and serializes standard JSON on
 read. Provider-owned, route-scoped typed mutation mirrors are written to primary and linked
-documents during every save. Materialization creates deterministic compound mutation indexes over discriminator, scope,
-and the declared logical-index paths on both collections. A bounded mutation can therefore execute
-one `UpdateMany` or `DeleteMany` against each physical object without loading document identities or
-issuing per-document writes. Transitions update canonical BSON, native BSON, typed mirrors, ordinary
-projections, and versions in the same transaction as the durable operation outcome.
+documents during every save. Each compiled mutation contributes an additive binding-fence definition,
+while mutations sharing a logical index contribute one deduplicated selector definition. Both flow
+through the ordinary physical-schema plan under the same lease, operation ledger, applied snapshot,
+validation, and CLI lifecycle as portable schema work. Binding definitions install strict collection
+validators; selector definitions create exact compound indexes over discriminator, scope, and declared
+logical-index paths on both collections and backfill pre-existing documents once per selector. Backfill
+writes are document-incarnation and version fenced, are
+safe to replay after an unpublished attempt, and validate the final primary and linked mirror state
+before the target is published. The validators require an exact immutable-binding fence on every
+relevant primary and linked write. A host still running the pre-mutation model is therefore rejected by
+MongoDB during the validation/publication gap and throughout rolling coexistence instead of creating
+selector-invisible documents. Additive mutation declarations compose their validator rules on shared
+collections, and live schema validation proves each rule is still active. A bounded mutation can
+therefore execute one hinted `UpdateMany` or
+`DeleteMany` against each physical object without loading document identities or issuing per-document
+writes. Transitions update canonical BSON, native BSON, typed mirrors, ordinary projections, and
+versions in the same transaction as the durable operation outcome.
 
 MongoDB's canonical boundary retains JSON number lexemes that exceed BSON's native numeric envelope
 through a provider-owned raw-number tag and emits them as standard JSON numbers on read. Original
 JSON whitespace is not retained. Replica-set or sharded-cluster transaction support is required and
 is checked before ledger or document I/O. Native `explain` evidence must select the provider-owned
-primary mutation index rather than a collection scan.
+exact primary and linked mutation indexes rather than a collection scan. Explain evidence is derived
+from the same immutable binding used by schema materialization, capability certification, and runtime
+execution.

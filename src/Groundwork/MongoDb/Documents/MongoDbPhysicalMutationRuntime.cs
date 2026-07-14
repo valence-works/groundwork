@@ -32,17 +32,15 @@ public static class MongoDbPhysicalMutationRuntime
         var compilation = binding.Compilation;
         var handlers = capabilities.HandlerIdentities.Select(registration =>
         {
-            var certifications = compilation.Plans
-                .Where(plan => plan.HandlerIdentity == registration.Value)
-                .Select(plan => new PhysicalMutationHandlerCertification(plan))
+            var executableBindings = binding.Bindings
+                .Where(candidate => candidate.Plan.HandlerIdentity == registration.Value)
                 .ToArray();
             return (IPhysicalDocumentMutationHandler)new MongoDbPhysicalDocumentMutationHandler(
                 registration.Value,
                 registration.Key,
                 store,
                 route,
-                storage,
-                certifications,
+                executableBindings,
                 capabilities.NativeFieldIdentifiers,
                 intercept);
         }).ToArray();
@@ -60,8 +58,9 @@ public static class MongoDbPhysicalMutationRuntime
     {
         ArgumentNullException.ThrowIfNull(mutation);
         var binding = Resolve(store, manifest, route, provider);
-        var plan = binding.Compilation.Plans.Single(candidate =>
-            candidate.MutationIdentity == mutation.MutationIdentity);
+        var executable = binding.Bindings.Single(candidate =>
+            candidate.Plan.MutationIdentity == mutation.MutationIdentity);
+        var plan = executable.Plan;
         var registration = binding.Capabilities.HandlerIdentities.Single(candidate =>
             candidate.Value == plan.HandlerIdentity);
         var handler = new MongoDbPhysicalDocumentMutationHandler(
@@ -69,31 +68,35 @@ public static class MongoDbPhysicalMutationRuntime
             registration.Key,
             store,
             binding.Route,
-            binding.Storage,
-            [new PhysicalMutationHandlerCertification(plan)],
+            [executable],
             binding.Capabilities.NativeFieldIdentifiers,
             null);
-        var collection = store.Database.GetCollection<BsonDocument>(
-            binding.Route.PrimaryStorage.Name.Identifier);
-        var filter = handler.BuildPrimaryFilter(
-            mutation,
-            plan,
-            store.ResolveMutationScope(mutation.DocumentKind));
-        var command = new BsonDocument
-        {
-            ["explain"] = new BsonDocument
-            {
-                ["find"] = binding.Route.PrimaryStorage.Name.Identifier,
-                ["filter"] = filter.Render(new RenderArgs<BsonDocument>(
-                    collection.DocumentSerializer,
-                    BsonSerializer.SerializerRegistry))
-            },
-            ["verbosity"] = "queryPlanner"
-        };
+        var invocation = handler.BindInvocation(mutation, plan);
         await store.EnsureMutationSupportedAsync(mutation.DocumentKind, cancellationToken);
-        return await store.Database.RunCommandAsync<BsonDocument>(
-            command,
-            cancellationToken: cancellationToken);
+        var evidence = new BsonDocument
+        {
+            ["bindingFingerprint"] = executable.Schema.Fingerprint,
+            ["mutationIdentity"] = executable.Plan.MutationIdentity,
+            ["action"] = executable.Plan.Action.Kind.ToString(),
+            ["primary"] = await ExplainSelectorAsync(
+                store,
+                executable.Schema.Primary,
+                invocation.PrimaryFilter,
+                cancellationToken)
+        };
+        if (executable.Schema.Linked is not null)
+        {
+            evidence["linked"] = await ExplainSelectorAsync(
+                store,
+                executable.Schema.Linked,
+                invocation.LinkedFilter!,
+                cancellationToken);
+        }
+        else
+        {
+            evidence["linked"] = BsonNull.Value;
+        }
+        return evidence;
     }
 
     private static RuntimeBinding Resolve(
@@ -106,12 +109,12 @@ public static class MongoDbPhysicalMutationRuntime
         ArgumentNullException.ThrowIfNull(manifest);
         ArgumentNullException.ThrowIfNull(route);
         ArgumentNullException.ThrowIfNull(provider);
-        if (!string.Equals(manifest.Identity.Value, store.Manifest.Identity.Value, StringComparison.Ordinal) ||
-            !string.Equals(manifest.Version.Value, store.Manifest.Version.Value, StringComparison.Ordinal))
+        if (!manifest.HasSameDefinitionAs(store.Manifest))
         {
             throw new InvalidOperationException(
                 $"MongoDB mutation manifest '{manifest.Identity.Value}/{manifest.Version.Value}' does not match " +
-                $"the compiled store manifest '{store.Manifest.Identity.Value}/{store.Manifest.Version.Value}'.");
+                $"the whole canonical manifest compiled into the store " +
+                $"'{store.Manifest.Identity.Value}/{store.Manifest.Version.Value}'.");
         }
         if (!string.Equals(provider.Name, store.Provider.Name, StringComparison.Ordinal) ||
             !string.Equals(provider.Version, store.Provider.Version, StringComparison.Ordinal))
@@ -153,12 +156,102 @@ public static class MongoDbPhysicalMutationRuntime
                 compilation.Diagnostics.Select(item => $"{item.Code}: {item.Message}")));
         }
 
-        return new RuntimeBinding(route, storage, capabilities, compilation);
+        var bindings = store.GetMutationBindings(route.StorageUnit.Value);
+        if (bindings.Count != compilation.Plans.Count ||
+            compilation.Plans.Any(plan => !bindings.Any(binding => binding.Plan.Equals(plan))))
+        {
+            throw new InvalidOperationException(
+                $"MongoDB mutation bindings for storage unit '{route.StorageUnit.Value}' do not match the compiled mutation plans.");
+        }
+
+        return new RuntimeBinding(route, storage, capabilities, compilation, bindings);
+    }
+
+    private static async Task<BsonDocument> ExplainSelectorAsync(
+        MongoDbPhysicalDocumentStore store,
+        MongoDbPhysicalMutationSelector selector,
+        FilterDefinition<BsonDocument> filter,
+        CancellationToken cancellationToken)
+    {
+        var collection = store.Database.GetCollection<BsonDocument>(selector.StorageObject.Identifier);
+        var rendered = filter.Render(new RenderArgs<BsonDocument>(
+            collection.DocumentSerializer,
+            BsonSerializer.SerializerRegistry));
+        var explanation = await store.Database.RunCommandAsync<BsonDocument>(
+            new BsonDocument
+            {
+                ["explain"] = new BsonDocument
+                {
+                    ["find"] = selector.StorageObject.Identifier,
+                    ["filter"] = rendered,
+                    ["hint"] = selector.Index.Identifier
+                },
+                ["verbosity"] = "queryPlanner"
+            },
+            cancellationToken: cancellationToken);
+        var winningPlan = ExactWinningPlan(explanation);
+        var stages = Descendants(winningPlan)
+            .Where(document => document.TryGetValue("stage", out _))
+            .Select(document => document["stage"].AsString)
+            .ToArray();
+        var indexes = Descendants(winningPlan)
+            .Where(document => document.TryGetValue("indexName", out _))
+            .Select(document => document["indexName"].AsString)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (stages.Contains("COLLSCAN", StringComparer.Ordinal) ||
+            indexes.Length != 1 ||
+            indexes[0] != selector.Index.Identifier)
+        {
+            throw new InvalidOperationException(
+                $"MongoDB bounded-mutation selector for '{selector.StorageObject.Identifier}' did not use exact index '{selector.Index.Identifier}'.");
+        }
+        return new BsonDocument
+        {
+            ["collection"] = selector.StorageObject.Identifier,
+            ["indexName"] = selector.Index.Identifier,
+            ["filter"] = rendered,
+            ["winningPlanIndex"] = indexes[0],
+            ["winningPlan"] = winningPlan
+        };
+    }
+
+    private static BsonDocument ExactWinningPlan(BsonDocument explanation)
+    {
+        var planners = Descendants(explanation)
+            .Where(document => document.TryGetValue("queryPlanner", out var value) && value.IsBsonDocument)
+            .Select(document => document["queryPlanner"].AsBsonDocument)
+            .ToArray();
+        if (planners.Length != 1 ||
+            !planners[0].TryGetValue("winningPlan", out var winningPlan) ||
+            !winningPlan.IsBsonDocument)
+        {
+            throw new InvalidOperationException(
+                "MongoDB bounded-mutation explain must contain exactly one queryPlanner.winningPlan.");
+        }
+        return winningPlan.AsBsonDocument;
+    }
+
+    private static IEnumerable<BsonDocument> Descendants(BsonValue value)
+    {
+        if (value.IsBsonDocument)
+        {
+            var document = value.AsBsonDocument;
+            yield return document;
+            foreach (var child in document.Elements.SelectMany(element => Descendants(element.Value)))
+                yield return child;
+            yield break;
+        }
+        if (!value.IsBsonArray)
+            yield break;
+        foreach (var child in value.AsBsonArray.SelectMany(Descendants))
+            yield return child;
     }
 
     private sealed record RuntimeBinding(
         ExecutableStorageRoute Route,
         StorageUnitPhysicalStorage Storage,
         PhysicalQueryPlannerCapabilities Capabilities,
-        PhysicalMutationPlanCompilationResult Compilation);
+        PhysicalMutationPlanCompilationResult Compilation,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> Bindings);
 }

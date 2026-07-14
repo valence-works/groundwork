@@ -2,7 +2,7 @@ using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.Core.Manifests;
 
-public sealed record StorageManifest(
+public sealed partial record StorageManifest(
     StorageManifestIdentity Identity,
     StorageManifestOwner Owner,
     StorageManifestVersion Version,

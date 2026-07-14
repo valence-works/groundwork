@@ -78,7 +78,8 @@ public static class PhysicalSchemaDiffPlanner
         // structural semantic set is unchanged (for example, a manifest version-only change).
         pending.Add(new ValidatePhysicalSchemaOperation(
             target.Fingerprint,
-            target.Routes));
+            target.Routes,
+            target.ProviderDefinitions));
         pending.Add(new RecordPhysicalSchemaAppliedStateOperation(target.Fingerprint));
 
         return PhysicalSchemaDiffPlan.Valid(
@@ -146,11 +147,17 @@ public static class PhysicalSchemaDiffPlanner
             }
         }
 
+        operations.AddRange(target.ProviderDefinitions.Select(definition =>
+            new ApplyProviderPhysicalSchemaDefinitionOperation(definition)));
+
         return operations
             .GroupBy(operation => operation.Identity, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(OperationOrder)
             .ThenBy(operation => operation.StorageUnit?.Value, StringComparer.Ordinal)
+            .ThenBy(operation => operation is ApplyProviderPhysicalSchemaDefinitionOperation providerDefinition
+                ? providerDefinition.Definition.Kind
+                : string.Empty, StringComparer.Ordinal)
             .ThenBy(operation => operation.SubjectIdentity, StringComparer.Ordinal)
             .ToArray();
     }
@@ -207,7 +214,7 @@ public static class PhysicalSchemaDiffPlanner
             operation.SubjectIdentity,
             operation.SlotIdentity,
             operation.CanonicalPayload)).ToArray();
-        return new PhysicalSchemaAppliedSnapshot(routes, operations);
+        return new PhysicalSchemaAppliedSnapshot(routes, operations, target.ProviderDefinitions);
     }
 
     private static IReadOnlyList<PhysicalSchemaResolvedName> ResolvedNames(ExecutableStorageRoute route)
@@ -270,6 +277,7 @@ public static class PhysicalSchemaDiffPlanner
         } ? 3 : 6,
         PhysicalSchemaOperationKind.FinalizeProjectedColumn => 4,
         PhysicalSchemaOperationKind.CreatePhysicalIndex => 5,
+        PhysicalSchemaOperationKind.ApplyProviderDefinition => 7,
         _ => 7
     };
 
