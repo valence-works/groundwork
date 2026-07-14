@@ -17,6 +17,90 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         VALUES (@manifestId, @manifestVersion, @providerName, @providerVersion, @appliedUtc);
         """;
 
+    protected override ValueTask<DbTransaction> BeginMaterializationTransactionAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromResult<DbTransaction>(connection.BeginTransaction(deferred: false));
+
+    protected override Task AcquireIdentitySchemaLockAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+
+    protected override async Task<IReadOnlySet<string>> ReadDocumentColumnsAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand("PRAGMA table_info(groundwork_documents);", transaction);
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            columns.Add(reader.GetString(1));
+        return columns;
+    }
+
+    protected override async Task<IdentityLookupIndexShape> ReadIdentityLookupIndexShapeAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var unique = false;
+        await using (var command = CreateCommand("PRAGMA index_list(groundwork_documents);", transaction))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (reader.GetString(1) == "ux_groundwork_documents_identity_lookup")
+                {
+                    unique = reader.GetInt64(2) == 1;
+                    break;
+                }
+            }
+        }
+
+        var columns = new List<string>();
+        if (unique)
+        {
+            await using var command = CreateCommand(
+                "PRAGMA index_info(ux_groundwork_documents_identity_lookup);",
+                transaction);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                columns.Add(reader.GetString(2));
+        }
+
+        return new(unique, columns);
+    }
+
+    protected override async Task AddIdentityColumnsAsync(
+        IReadOnlySet<string> existingColumns,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        if (!existingColumns.Contains("id_comparison_key"))
+        {
+            await ExecuteAsync(
+                "ALTER TABLE groundwork_documents ADD COLUMN id_comparison_key TEXT NULL;",
+                transaction,
+                cancellationToken);
+        }
+
+        if (!existingColumns.Contains("id_lookup_key"))
+        {
+            await ExecuteAsync(
+                "ALTER TABLE groundwork_documents ADD COLUMN id_lookup_key TEXT NULL;",
+                transaction,
+                cancellationToken);
+        }
+    }
+
+    protected override Task EnsureIdentityLookupIndexAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        ExecuteAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_documents_identity_lookup
+            ON groundwork_documents(document_kind, storage_scope, id_lookup_key);
+            """,
+            transaction,
+            cancellationToken);
+
+    protected override IReadOnlyList<string> RequiredIdentityLookupIndexColumns { get; } =
+        ["document_kind", "storage_scope", "id_lookup_key"];
+
     protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
         var table = RelationalPhysicalizationNames.TableName(projection.UnitIdentity);
@@ -221,8 +305,7 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
             content_json TEXT NOT NULL,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            PRIMARY KEY (document_kind, storage_scope, id_lookup_key),
-            UNIQUE (document_kind, storage_scope, id)
+            PRIMARY KEY (document_kind, storage_scope, id)
         );
         """;
 
@@ -247,10 +330,8 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
 
     private const string IdentitySchemaSql = """
         CREATE TABLE IF NOT EXISTS groundwork_document_identity_schema (
-            document_kind TEXT NOT NULL PRIMARY KEY,
-            string_case_policy TEXT NOT NULL,
-            comparison_algorithm TEXT NOT NULL,
-            lookup_algorithm TEXT NOT NULL
+            storage_unit TEXT NOT NULL PRIMARY KEY,
+            state_json TEXT NOT NULL
         );
         """;
 

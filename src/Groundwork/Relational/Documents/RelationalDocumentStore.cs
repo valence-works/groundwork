@@ -111,7 +111,21 @@ public class RelationalDocumentStore : IDocumentStore
         {
             try
             {
-                await InsertDocumentAsync(request, requestedIdentity, scope, version, createdAt, now, transaction, ct);
+                var inserted = await InsertDocumentAsync(request, requestedIdentity, scope, version, createdAt, now, transaction, ct);
+                if (!inserted)
+                {
+                    var retained = await LoadCoreAsync(
+                        transaction.Connection!,
+                        request.DocumentKind,
+                        requestedIdentity,
+                        identity,
+                        scope,
+                        transaction,
+                        ct);
+                    return retained is not null && !string.Equals(retained.Envelope.Id, request.Id, StringComparison.Ordinal)
+                        ? DocumentStoreWriteResult.IdentityConflict(retained.Envelope.Id)
+                        : DocumentStoreWriteResult.ConcurrencyConflict;
+                }
             }
             catch (DbException exception) when (dialect.IsDuplicateDocumentKeyException(exception))
             {
@@ -358,7 +372,7 @@ public class RelationalDocumentStore : IDocumentStore
             AddParameter(command, name, value);
     }
 
-    private async Task InsertDocumentAsync(
+    private async Task<bool> InsertDocumentAsync(
         SaveDocumentRequest request,
         Groundwork.Core.Text.PortableStringIdentityProjection identity,
         DocumentScopeSelection scope,
@@ -370,7 +384,7 @@ public class RelationalDocumentStore : IDocumentStore
     {
         await using var command = CreateCommand(dialect.InsertDocumentSql, transaction);
         AddDocumentParameters(command, request, identity, request.Id, scope, version, createdAt, updatedAt);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 
     private async Task<bool> UpdateDocumentAsync(

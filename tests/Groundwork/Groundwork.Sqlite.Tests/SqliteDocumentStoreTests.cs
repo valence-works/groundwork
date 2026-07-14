@@ -16,7 +16,7 @@ namespace Groundwork.Sqlite.Tests;
 public sealed class SqliteDocumentStoreTests
 {
     [Fact]
-    public void Conventional_store_construction_requires_factory_admission()
+    public void Document_store_construction_requires_factory_admission()
     {
         Assert.Empty(typeof(SqliteDocumentStore).GetConstructors());
         Assert.Empty(typeof(RelationalDocumentStore).GetConstructors());
@@ -117,7 +117,126 @@ public sealed class SqliteDocumentStoreTests
                 SqliteTestManifests.Provider));
 
         Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("identity policy", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("identity schema", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Restart_validation_does_not_repair_rows_behind_recorded_identity_schema_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        var materializer = new SqliteGroundworkMaterializer(connection);
+        await materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        var store = new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+        await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "retained", "1", """{"key":"retained"}"""));
+        await using (var corrupt = connection.CreateCommand())
+        {
+            corrupt.CommandText = "UPDATE groundwork_documents SET id_comparison_key = 'tampered' WHERE id = 'retained';";
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider));
+
+        Assert.Contains("recorded original identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+        await using var read = connection.CreateCommand();
+        read.CommandText = "SELECT id_comparison_key FROM groundwork_documents WHERE id = 'retained';";
+        Assert.Equal("tampered", (string)(await read.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task Materialization_evolves_pre_policy_rows_before_recording_identity_schema_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await CreateLegacyDocumentTableAsync(connection);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                INSERT INTO groundwork_documents
+                    (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                VALUES
+                    ('configurationDocument', '__groundwork_global__', '𐐀', '1', 1, '{"key":"legacy"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        var store = new SqliteDocumentStore(
+            connection,
+            manifest,
+            Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+
+        var loaded = await store.LoadAsync("configurationDocument", "𐐨");
+
+        Assert.Equal("𐐀", loaded!.Id);
+    }
+
+    [Fact]
+    public async Task Materialization_rolls_back_pre_policy_identity_collisions_without_recording_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await CreateLegacyDocumentTableAsync(connection);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                INSERT INTO groundwork_documents
+                    (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                VALUES
+                    ('configurationDocument', '__groundwork_global__', 'A', '1', 1, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('configurationDocument', '__groundwork_global__', 'a', '1', 1, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+                WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("collide", exception.Message, StringComparison.OrdinalIgnoreCase);
+        await using var shape = connection.CreateCommand();
+        shape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key');
+            """;
+        Assert.Equal(0L, (long)(await shape.ExecuteScalarAsync())!);
+        await using var state = connection.CreateCommand();
+        state.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groundwork_document_identity_schema';";
+        Assert.Equal(0L, (long)(await state.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task Materialization_fails_closed_when_pre_policy_storage_has_no_original_identity()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                CREATE TABLE groundwork_documents (
+                    document_kind TEXT NOT NULL,
+                    storage_scope TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    content_json TEXT NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL
+                );
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+                WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("original identity", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -766,6 +885,25 @@ public sealed class SqliteDocumentStoreTests
                 }
             ]
         };
+    }
+
+    private static async Task CreateLegacyDocumentTableAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE groundwork_documents (
+                document_kind TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
+                id TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content_json TEXT NOT NULL,
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL,
+                PRIMARY KEY (document_kind, storage_scope, id)
+            );
+            """;
+        await command.ExecuteNonQueryAsync();
     }
 
     private static StorageManifest WithCompoundIndex(StorageManifest manifest)

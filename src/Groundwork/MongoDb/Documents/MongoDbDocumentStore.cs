@@ -93,7 +93,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             {
                 await InsertOneAsync(collection, session, document, cancellationToken);
             }
-            catch (MongoWriteException exception) when (IsDuplicateKey(exception))
+            catch (MongoWriteException exception) when (session is null && IsDuplicateKey(exception))
             {
                 var retained = await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken);
                 return retained is not null && !string.Equals(retained.Id, request.Id, StringComparison.Ordinal)
@@ -111,7 +111,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             {
                 result = await ReplaceOneAsync(collection, session, filter, document, cancellationToken);
             }
-            catch (MongoWriteException exception) when (IsDuplicateKey(exception))
+            catch (MongoWriteException exception) when (session is null && IsDuplicateKey(exception))
             {
                 return DocumentStoreWriteResult.ConcurrencyConflict;
             }
@@ -529,6 +529,57 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private static bool IsDuplicateKey(MongoWriteException exception) =>
         exception.WriteError?.Code == 11000;
 
+    private static bool IsTerminalTransactionWriteConflict(MongoException exception) =>
+        MongoDbPhysicalDocumentStore.IsTransientTransactionConflict(exception) ||
+        exception switch
+        {
+            MongoCommandException command => command.Code == 11000,
+            MongoWriteException write =>
+                write.WriteError?.Code == 11000 || write.WriteConcernError?.Code == 11000,
+            MongoBulkWriteException bulk =>
+                bulk.WriteErrors.Any(error => error.Code == 11000) || bulk.WriteConcernError?.Code == 11000,
+            _ => false
+        };
+
+    private async Task<DocumentStoreWriteResult> ClassifySaveConflictOutsideSessionAsync(
+        StorageUnit unit,
+        SaveDocumentRequest request,
+        DocumentScopeSelection scope,
+        CancellationToken cancellationToken)
+    {
+        var identity = identityBindings[request.DocumentKind];
+        var requestedIdentity = identity.Project(request.Id);
+        var retained = await LoadCoreAsync(
+            unit,
+            requestedIdentity,
+            identity,
+            scope,
+            session: null,
+            cancellationToken);
+        return retained is not null && !string.Equals(retained.Id, request.Id, StringComparison.Ordinal)
+            ? DocumentStoreWriteResult.IdentityConflict(retained.Id)
+            : DocumentStoreWriteResult.ConcurrencyConflict;
+    }
+
+    private async Task<DocumentStoreWriteResult> ClassifyDeleteConflictOutsideSessionAsync(
+        StorageUnit unit,
+        DeleteDocumentRequest request,
+        DocumentScopeSelection scope,
+        CancellationToken cancellationToken)
+    {
+        var identity = identityBindings[request.DocumentKind];
+        var retained = await LoadCoreAsync(
+            unit,
+            identity.Project(request.Id),
+            identity,
+            scope,
+            session: null,
+            cancellationToken);
+        return retained is null
+            ? DocumentStoreWriteResult.NotFound
+            : DocumentStoreWriteResult.ConcurrencyConflict;
+    }
+
     private sealed class MongoDocumentUnitOfWork(
         MongoDbDocumentStore store,
         IClientSessionHandle session,
@@ -549,6 +600,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
                     await AbortAsync(CancellationToken.None);
                 return result;
             }
+            catch (MongoException exception) when (IsTerminalTransactionWriteConflict(exception))
+            {
+                await AbortAsync(CancellationToken.None);
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
+                return await store.ClassifySaveConflictOutsideSessionAsync(unit, request, scope, cancellationToken);
+            }
             catch
             {
                 await AbortAsync(CancellationToken.None);
@@ -568,6 +626,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
                 if (result.Status != DocumentStoreWriteStatus.Deleted)
                     await AbortAsync(CancellationToken.None);
                 return result;
+            }
+            catch (MongoException exception) when (IsTerminalTransactionWriteConflict(exception))
+            {
+                await AbortAsync(CancellationToken.None);
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
+                return await store.ClassifyDeleteConflictOutsideSessionAsync(unit, request, scope, cancellationToken);
             }
             catch
             {

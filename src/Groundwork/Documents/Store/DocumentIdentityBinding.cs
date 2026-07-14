@@ -5,7 +5,7 @@ namespace Groundwork.Documents.Store;
 
 /// <summary>
 /// Binds one declared string-identity policy to the portable comparison and lookup algorithms used
-/// by conventional document stores. Providers persist the returned projection without re-deriving it.
+/// by Document Store implementations. Providers persist the returned projection without re-deriving it.
 /// </summary>
 public sealed class DocumentIdentityBinding
 {
@@ -13,17 +13,8 @@ public sealed class DocumentIdentityBinding
 
     private DocumentIdentityBinding(StringIdentityCasePolicy stringCasePolicy)
     {
-        StringCasePolicy = stringCasePolicy;
         comparisonPolicy = PortableStringComparison.ForIdentityPolicy(stringCasePolicy);
-        ComparisonAlgorithmId = PortableStringComparison.GetAlgorithmId(comparisonPolicy);
-        LookupAlgorithmId = PortableStringComparison.LookupHashAlgorithmId;
     }
-
-    public StringIdentityCasePolicy StringCasePolicy { get; }
-
-    public string ComparisonAlgorithmId { get; }
-
-    public string LookupAlgorithmId { get; }
 
     public static DocumentIdentityBinding From(StorageUnit unit)
     {
@@ -31,7 +22,7 @@ public sealed class DocumentIdentityBinding
         if (unit.IdentityPolicy.Kind != StorageIdentityKind.String)
         {
             throw new InvalidOperationException(
-                $"Conventional document store '{unit.Identity.Value}' requires a string identity policy.");
+                $"Document Store Storage Unit '{unit.Identity.Value}' requires a string identity policy.");
         }
 
         return new DocumentIdentityBinding(unit.IdentityPolicy.StringCasePolicy);

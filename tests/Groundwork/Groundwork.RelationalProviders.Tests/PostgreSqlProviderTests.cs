@@ -20,7 +20,7 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
-    public void ConventionalStoreConstructionRequiresFactoryAdmission() =>
+    public void DocumentStoreConstructionRequiresFactoryAdmission() =>
         Assert.Empty(typeof(PostgreSqlDocumentStore).GetConstructors());
 
     [Fact]
@@ -142,11 +142,62 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
             return Convert.ToInt64(await command.ExecuteScalarAsync());
         }
 
+        public async Task<long> CountIdentitySchemaRowsAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM groundwork_document_identity_schema;";
+            return Convert.ToInt64(await command.ExecuteScalarAsync());
+        }
+
+        public async Task ReAdmitIdentitySchemaConcurrentlyAsync()
+        {
+            await EnsureOpenAsync();
+            await using (var reset = connection.CreateCommand())
+            {
+                reset.CommandText = """
+                    DELETE FROM groundwork_document_identity_schema;
+                    DROP INDEX IF EXISTS ux_groundwork_documents_identity_lookup;
+                    """;
+                await reset.ExecuteNonQueryAsync();
+            }
+
+            await Task.WhenAll(Enumerable.Range(0, 8).Select(async _ =>
+            {
+                await using var concurrent = new NpgsqlConnection(connectionString);
+                await new PostgreSqlGroundworkMaterializer(concurrent).MaterializeAsync(
+                    manifest,
+                    RelationalTestManifests.PostgreSqlProvider);
+            }));
+        }
+
+        public async Task ForceLookupCollisionAsync(string retainedId, string requestedId)
+        {
+            await EnsureOpenAsync();
+            string lookup;
+            await using (var read = connection.CreateCommand())
+            {
+                read.CommandText = "SELECT id_lookup_key FROM groundwork_documents WHERE id = @id;";
+                read.Parameters.AddWithValue("id", requestedId);
+                lookup = (string)(await read.ExecuteScalarAsync())!;
+            }
+
+            await using var corrupt = connection.CreateCommand();
+            corrupt.CommandText = """
+                DELETE FROM groundwork_documents WHERE id = @requestedId;
+                UPDATE groundwork_documents SET id_lookup_key = @lookup WHERE id = @retainedId;
+                """;
+            corrupt.Parameters.AddWithValue("requestedId", requestedId);
+            corrupt.Parameters.AddWithValue("retainedId", retainedId);
+            corrupt.Parameters.AddWithValue("lookup", lookup);
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
         public async Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync()
             => await ReadConstraintColumnsAsync("groundwork_documents", "PRIMARY KEY");
 
         public async Task<IReadOnlyList<string>> ReadIdentityLookupUniqueIndexColumnsAsync()
-            => await ReadIndexColumnsAsync("groundwork_documents", "groundwork_documents_pkey");
+            => await ReadIndexColumnsAsync("groundwork_documents", "ux_groundwork_documents_identity_lookup");
 
         public async Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_document_indexes", "ux_groundwork_document_indexes_unique");

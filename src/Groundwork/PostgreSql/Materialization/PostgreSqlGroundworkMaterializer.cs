@@ -1,3 +1,4 @@
+using System.Data.Common;
 using Groundwork.Core.Physicalization;
 using Groundwork.Materialization;
 using Groundwork.Relational.Materialization;
@@ -16,6 +17,87 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
         VALUES (@manifestId, @manifestVersion, @providerName, @providerVersion, @appliedUtc)
         ON CONFLICT (manifest_id, manifest_version, provider_name, provider_version) DO NOTHING;
         """;
+
+    protected override Task AcquireIdentitySchemaLockAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        ExecuteAsync(
+            "SELECT pg_advisory_xact_lock(hashtextextended('groundwork.document-store.identity-schema', 0));",
+            transaction,
+            cancellationToken);
+
+    protected override async Task<IReadOnlySet<string>> ReadDocumentColumnsAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'groundwork_documents';
+            """,
+            transaction);
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            columns.Add(reader.GetString(0));
+        return columns;
+    }
+
+    protected override async Task<IdentityLookupIndexShape> ReadIdentityLookupIndexShapeAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(
+            """
+            SELECT i.indisunique, attribute.attname
+            FROM pg_class table_class
+            JOIN pg_index i ON i.indrelid = table_class.oid
+            JOIN pg_class index_class ON index_class.oid = i.indexrelid
+            JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinal) ON TRUE
+            JOIN pg_attribute attribute ON attribute.attrelid = table_class.oid AND attribute.attnum = key.attnum
+            WHERE table_class.relname = 'groundwork_documents'
+              AND index_class.relname = 'ux_groundwork_documents_identity_lookup'
+            ORDER BY key.ordinal;
+            """,
+            transaction);
+        var columns = new List<string>();
+        var unique = false;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            unique = reader.GetBoolean(0);
+            columns.Add(reader.GetString(1));
+        }
+        return new(unique, columns);
+    }
+
+    protected override async Task AddIdentityColumnsAsync(
+        IReadOnlySet<string> existingColumns,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        if (!existingColumns.Contains("id_comparison_key"))
+            await ExecuteAsync("ALTER TABLE groundwork_documents ADD COLUMN id_comparison_key TEXT NULL;", transaction, cancellationToken);
+        if (!existingColumns.Contains("id_lookup_key"))
+            await ExecuteAsync("ALTER TABLE groundwork_documents ADD COLUMN id_lookup_key TEXT NULL;", transaction, cancellationToken);
+    }
+
+    protected override async Task FinalizeIdentityColumnsAsync(DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync("ALTER TABLE groundwork_documents ALTER COLUMN id_comparison_key SET NOT NULL;", transaction, cancellationToken);
+        await ExecuteAsync("ALTER TABLE groundwork_documents ALTER COLUMN id_lookup_key SET NOT NULL;", transaction, cancellationToken);
+    }
+
+    protected override Task EnsureIdentityLookupIndexAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        ExecuteAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_documents_identity_lookup
+            ON groundwork_documents(document_kind, storage_scope, id_lookup_key);
+            """,
+            transaction,
+            cancellationToken);
+
+    protected override IReadOnlyList<string> RequiredIdentityLookupIndexColumns { get; } =
+        ["document_kind", "storage_scope", "id_lookup_key"];
 
     protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
@@ -65,17 +147,14 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
             content_json TEXT NOT NULL,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            PRIMARY KEY (document_kind, storage_scope, id_lookup_key),
-            UNIQUE (document_kind, storage_scope, id)
+            PRIMARY KEY (document_kind, storage_scope, id)
         );
         """;
 
     private const string IdentitySchemaSql = """
         CREATE TABLE IF NOT EXISTS groundwork_document_identity_schema (
-            document_kind TEXT NOT NULL PRIMARY KEY,
-            string_case_policy TEXT NOT NULL,
-            comparison_algorithm TEXT NOT NULL,
-            lookup_algorithm TEXT NOT NULL
+            storage_unit TEXT NOT NULL PRIMARY KEY,
+            state_json TEXT NOT NULL
         );
         """;
 

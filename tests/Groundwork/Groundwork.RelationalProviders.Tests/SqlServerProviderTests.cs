@@ -17,7 +17,7 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
-    public void ConventionalStoreConstructionRequiresFactoryAdmission() =>
+    public void DocumentStoreConstructionRequiresFactoryAdmission() =>
         Assert.Empty(typeof(SqlServerDocumentStore).GetConstructors());
 
     [Fact]
@@ -201,6 +201,58 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
             command.Parameters.AddWithValue("@manifestId", manifest.Identity.Value);
             command.Parameters.AddWithValue("@providerName", RelationalTestManifests.SqlServerProvider.Name);
             return Convert.ToInt64(await command.ExecuteScalarAsync());
+        }
+
+        public async Task<long> CountIdentitySchemaRowsAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM groundwork_document_identity_schema;";
+            return Convert.ToInt64(await command.ExecuteScalarAsync());
+        }
+
+        public async Task ReAdmitIdentitySchemaConcurrentlyAsync()
+        {
+            await EnsureOpenAsync();
+            await using (var reset = connection.CreateCommand())
+            {
+                reset.CommandText = """
+                    DELETE FROM groundwork_document_identity_schema;
+                    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ux_groundwork_documents_identity_lookup' AND object_id = OBJECT_ID(N'groundwork_documents'))
+                        DROP INDEX ux_groundwork_documents_identity_lookup ON groundwork_documents;
+                    """;
+                await reset.ExecuteNonQueryAsync();
+            }
+
+            await Task.WhenAll(Enumerable.Range(0, 8).Select(async _ =>
+            {
+                await using var concurrent = new SqlConnection(connectionString);
+                await new SqlServerGroundworkMaterializer(concurrent).MaterializeAsync(
+                    manifest,
+                    RelationalTestManifests.SqlServerProvider);
+            }));
+        }
+
+        public async Task ForceLookupCollisionAsync(string retainedId, string requestedId)
+        {
+            await EnsureOpenAsync();
+            string lookup;
+            await using (var read = connection.CreateCommand())
+            {
+                read.CommandText = "SELECT id_lookup_key FROM groundwork_documents WHERE id = @id;";
+                read.Parameters.AddWithValue("id", requestedId);
+                lookup = (string)(await read.ExecuteScalarAsync())!;
+            }
+
+            await using var corrupt = connection.CreateCommand();
+            corrupt.CommandText = """
+                DELETE FROM groundwork_documents WHERE id = @requestedId;
+                UPDATE groundwork_documents SET id_lookup_key = @lookup WHERE id = @retainedId;
+                """;
+            corrupt.Parameters.AddWithValue("requestedId", requestedId);
+            corrupt.Parameters.AddWithValue("retainedId", retainedId);
+            corrupt.Parameters.AddWithValue("lookup", lookup);
+            await corrupt.ExecuteNonQueryAsync();
         }
 
         public async Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync()

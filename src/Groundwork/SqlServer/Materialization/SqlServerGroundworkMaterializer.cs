@@ -1,3 +1,4 @@
+using System.Data.Common;
 using Groundwork.Core.Physicalization;
 using Groundwork.Materialization;
 using Groundwork.Relational.Materialization;
@@ -25,6 +26,96 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
             VALUES (@manifestId, @manifestVersion, @providerName, @providerVersion, @appliedUtc);
         END;
         """;
+
+    protected override async Task AcquireIdentitySchemaLockAsync(DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(
+            """
+            DECLARE @result INT;
+            EXEC @result = sys.sp_getapplock
+                @Resource = N'groundwork.document-store.identity-schema',
+                @LockMode = N'Exclusive',
+                @LockOwner = N'Transaction',
+                @LockTimeout = 30000;
+            SELECT @result;
+            """,
+            transaction);
+        if (Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken)) < 0)
+            throw new InvalidOperationException("Could not acquire the Document Store identity schema evolution lock.");
+    }
+
+    protected override async Task<IReadOnlySet<string>> ReadDocumentColumnsAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(
+            "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'groundwork_documents');",
+            transaction);
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            columns.Add(reader.GetString(0));
+        return columns;
+    }
+
+    protected override async Task<IdentityLookupIndexShape> ReadIdentityLookupIndexShapeAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand(
+            """
+            SELECT i.is_unique, c.name
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.object_id = OBJECT_ID(N'groundwork_documents')
+              AND i.name = N'ux_groundwork_documents_identity_lookup'
+              AND ic.key_ordinal > 0
+            ORDER BY ic.key_ordinal;
+            """,
+            transaction);
+        var columns = new List<string>();
+        var unique = false;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            unique = reader.GetBoolean(0);
+            columns.Add(reader.GetString(1));
+        }
+        return new(unique, columns);
+    }
+
+    protected override async Task AddIdentityColumnsAsync(
+        IReadOnlySet<string> existingColumns,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        if (!existingColumns.Contains("id_comparison_key"))
+            await ExecuteAsync("ALTER TABLE groundwork_documents ADD id_comparison_key VARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL;", transaction, cancellationToken);
+        if (!existingColumns.Contains("id_lookup_key"))
+            await ExecuteAsync("ALTER TABLE groundwork_documents ADD id_lookup_key VARCHAR(64) COLLATE Latin1_General_100_BIN2 NULL;", transaction, cancellationToken);
+    }
+
+    protected override async Task FinalizeIdentityColumnsAsync(DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync("ALTER TABLE groundwork_documents ALTER COLUMN id_comparison_key VARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL;", transaction, cancellationToken);
+        await ExecuteAsync("ALTER TABLE groundwork_documents ALTER COLUMN id_lookup_key VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL;", transaction, cancellationToken);
+    }
+
+    protected override Task EnsureIdentityLookupIndexAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        ExecuteAsync(
+            """
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ux_groundwork_documents_identity_lookup' AND object_id = OBJECT_ID(N'groundwork_documents'))
+            BEGIN
+                CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+                ON groundwork_documents(document_kind_key, storage_scope_key, id_lookup_key);
+            END;
+            """,
+            transaction,
+            cancellationToken);
+
+    protected override IReadOnlyList<string> RequiredIdentityLookupIndexColumns { get; } =
+        ["document_kind_key", "storage_scope_key", "id_lookup_key"];
 
     protected override string ExactEqualityPredicate(string columnExpression, string parameterReference) =>
         $"{columnExpression}_key = {HashParameter(parameterReference)} AND {columnExpression} = {parameterReference}";
@@ -137,12 +228,10 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
         IF OBJECT_ID(N'groundwork_document_identity_schema', N'U') IS NULL
         BEGIN
             CREATE TABLE groundwork_document_identity_schema (
-                document_kind NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                {RequiredHashKey("document_kind")},
-                string_case_policy NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                comparison_algorithm NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                lookup_algorithm NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
-                CONSTRAINT pk_groundwork_document_identity_schema PRIMARY KEY (document_kind_key)
+                storage_unit NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                {RequiredHashKey("storage_unit")},
+                state_json NVARCHAR(MAX) NOT NULL,
+                CONSTRAINT pk_groundwork_document_identity_schema PRIMARY KEY (storage_unit_key)
             );
         END;
         """;

@@ -2,7 +2,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Materialization;
 using Groundwork.Core.Physicalization;
-using Groundwork.Core.Text;
+using Groundwork.Core.SchemaEvolution;
 
 namespace Groundwork.Materialization;
 
@@ -44,12 +44,8 @@ public sealed record MaterializedStorageUnit(
     string? SchemaField,
     IdentityPolicy IdentityPolicy)
 {
-    public StringIdentityCasePolicy StringIdentityCasePolicy => IdentityPolicy.StringCasePolicy;
-
-    public string ComparisonAlgorithmId => PortableStringComparison.GetAlgorithmId(
-        PortableStringComparison.ForIdentityPolicy(StringIdentityCasePolicy));
-
-    public string LookupAlgorithmId => PortableStringComparison.LookupHashAlgorithmId;
+    public DocumentStoreIdentitySchemaState IdentitySchemaState =>
+        DocumentStoreIdentitySchemaState.Capture(IdentityPolicy);
 }
 
 public sealed record MaterializedIndex(
