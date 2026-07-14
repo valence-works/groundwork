@@ -149,6 +149,14 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
             ? $"{QuoteIdentifier(tableIdentifier)} AS {alias}"
             : $"{QuoteIdentifier(tableIdentifier)} AS {alias} WITH (INDEX({QuoteIdentifier(indexIdentifier)}))";
 
+    public override string MutationQuerySource(string tableIdentifier, string alias, string? indexIdentifier)
+    {
+        var hints = indexIdentifier is null
+            ? "UPDLOCK, HOLDLOCK"
+            : $"INDEX({QuoteIdentifier(indexIdentifier)}), UPDLOCK, HOLDLOCK";
+        return $"{QuoteIdentifier(tableIdentifier)} AS {alias} WITH ({hints})";
+    }
+
     public override string MutationSelectionTable(string logicalName) =>
         QuoteIdentifier($"#{logicalName}");
 
@@ -156,7 +164,9 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         string tableExpression,
         string documentKindColumn,
         string storageScopeColumn,
-        string documentIdColumn)
+        string documentIdColumn,
+        string documentVersionColumn,
+        string documentIncarnationColumn)
     {
         var kindKey = SqlServerPhysicalIdentity.HiddenColumn(documentKindColumn);
         var scopeKey = SqlServerPhysicalIdentity.HiddenColumn(storageScopeColumn);
@@ -165,11 +175,27 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
                $"{QuoteIdentifier(documentKindColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(storageScopeColumn)} nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentIdColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
+               $"{QuoteIdentifier(documentIncarnationColumn)} nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(kindKey)} AS {hash.Expression(QuoteIdentifier(documentKindColumn))} PERSISTED NOT NULL, " +
                $"{QuoteIdentifier(scopeKey)} AS {hash.Expression(QuoteIdentifier(storageScopeColumn))} PERSISTED NOT NULL, " +
                $"{QuoteIdentifier(idKey)} AS {hash.Expression(QuoteIdentifier(documentIdColumn))} PERSISTED NOT NULL, " +
                $"PRIMARY KEY NONCLUSTERED ({QuoteIdentifier(kindKey)}, {QuoteIdentifier(scopeKey)}, {QuoteIdentifier(idKey)}));";
     }
+
+    public override string LockByMutationSelection(
+        string tableIdentifier,
+        string selectionTableExpression,
+        string exactIdentityJoin,
+        string selectionKindColumn,
+        string selectionScopeColumn,
+        string selectionIdColumn) =>
+        $"DECLARE @groundwork_lock_marker int; " +
+        $"SELECT @groundwork_lock_marker = 1 FROM (" +
+        $"SELECT TOP (9223372036854775807) * FROM {selectionTableExpression} " +
+        $"ORDER BY {QuoteIdentifier(selectionKindColumn)}, {QuoteIdentifier(selectionScopeColumn)}, {QuoteIdentifier(selectionIdColumn)}" +
+        $") AS s INNER LOOP JOIN {MutationQuerySource(tableIdentifier, "p", null)} ON {exactIdentityJoin} " +
+        "OPTION (FORCE ORDER, LOOP JOIN, MAXDOP 1);";
 
     public override string DeleteByMutationSelection(
         string tableExpression,

@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Text.Json;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
@@ -11,6 +12,21 @@ using Groundwork.Relational.Documents;
 using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
+
+internal sealed record RelationalLockContentionProbe(
+    Func<DbConnection, DbTransaction, CancellationToken, ValueTask<int>> ReadSessionId,
+    Func<int, int, CancellationToken, Task> WaitUntilBlockedAsync);
+
+internal sealed record RelationalMutationServerHarness<TStore>(
+    ProviderIdentity Provider,
+    string HandlerPrefix,
+    IProviderPhysicalNameNormalizer Normalizer,
+    Func<IPhysicalSchemaExecutor> CreateExecutor,
+    Func<StorageManifest, IReadOnlyList<ExecutableStorageRoute>, TStore> CreateStore,
+    Func<DbConnection> CreateConnection,
+    Func<RelationalPhysicalDocumentDialect> CreateDialect,
+    RelationalLockContentionProbe Contention)
+    where TStore : RelationalPhysicalDocumentStore;
 
 internal static class RelationalBoundedMutationServerAssertions
 {
@@ -86,6 +102,559 @@ internal static class RelationalBoundedMutationServerAssertions
         Assert.All(results, result => Assert.Equal(5, result.AffectedCount));
         for (var index = 0; index < 5; index++)
             Assert.Equal("revoked", await ReadCategoryAsync(firstStore, $"pending-{index}"));
+    }
+
+    public static async Task ConcurrentDistinctTransitionsSerializeSelectedSetAsync<TStore>(
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<StorageManifest, IReadOnlyList<ExecutableStorageRoute>, TStore> createStore,
+        RelationalLockContentionProbe contention)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var route = model.Target.Routes.Single();
+        var firstStore = createStore(model.Manifest, model.Target.Routes);
+        var secondStore = createStore(model.Manifest, model.Target.Routes);
+        await AssertDistinctTransitionRaceAsync(
+            provider,
+            handlerPrefix,
+            model,
+            route,
+            firstStore,
+            secondStore,
+            contention);
+    }
+
+    public static async Task DirectConnectionDistinctTransitionSerializesSelectedSetAsync(
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<DbConnection> createConnection,
+        Func<RelationalPhysicalDocumentDialect> createDialect,
+        RelationalLockContentionProbe contention)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var route = model.Target.Routes.Single();
+        await using var firstConnection = createConnection();
+        await using var secondConnection = createConnection();
+        var firstStore = new RelationalPhysicalDocumentStore(
+            firstConnection,
+            model.Manifest,
+            model.Target.Routes,
+            createDialect(),
+            DocumentStoreAccess.Global);
+        var secondStore = new RelationalPhysicalDocumentStore(
+            secondConnection,
+            model.Manifest,
+            model.Target.Routes,
+            createDialect(),
+            DocumentStoreAccess.Global);
+        await AssertDistinctTransitionRaceAsync(
+            provider,
+            handlerPrefix,
+            model,
+            route,
+            firstStore,
+            secondStore,
+            contention);
+    }
+
+    private static async Task AssertDistinctTransitionRaceAsync<TStore>(
+        ProviderIdentity provider,
+        string handlerPrefix,
+        (StorageManifest Manifest, PhysicalSchemaTarget Target) model,
+        ExecutableStorageRoute route,
+        TStore firstStore,
+        TStore secondStore,
+        RelationalLockContentionProbe contention)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        await SaveAsync(firstStore, "distinct-transition-race", "pending");
+        var firstSelected = NewSignal<int>();
+        var releaseFirst = NewSignal();
+        var secondAttempt = NewSignal<int>();
+        var firstRuntime = CreateRuntime(firstStore, model, route, provider, handlerPrefix, async (point, connection, transaction, ct) =>
+        {
+            if (point != RelationalPhysicalMutationExecutionPoint.AfterSelection)
+                return;
+            firstSelected.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+            await releaseFirst.Task;
+        });
+        var secondRuntime = CreateRuntime(secondStore, model, route, provider, handlerPrefix, async (point, connection, transaction, ct) =>
+        {
+            if (point == RelationalPhysicalMutationExecutionPoint.BeforeSelection)
+                secondAttempt.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+        });
+
+        var first = firstRuntime.ExecuteAsync(Transition($"{provider.Name}-distinct-transition-first"));
+        var blocker = await firstSelected.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var second = secondRuntime.ExecuteAsync(Transition($"{provider.Name}-distinct-transition-second"));
+        var blocked = await secondAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await contention.WaitUntilBlockedAsync(blocked, blocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+        var results = await Task.WhenAll(first, second);
+
+        Assert.Equal(new long[] { 0, 1 }, results.Select(result => result.AffectedCount).Order().ToArray());
+        Assert.Equal("revoked", await ReadCategoryAsync(firstStore, "distinct-transition-race"));
+    }
+
+    public static async Task ConcurrentDistinctDeletesSerializeSelectedSetAsync<TStore>(
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<StorageManifest, IReadOnlyList<ExecutableStorageRoute>, TStore> createStore,
+        RelationalLockContentionProbe contention)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: true,
+            includeRangeDelete: true,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var route = model.Target.Routes.Single();
+        var firstStore = createStore(model.Manifest, model.Target.Routes);
+        var secondStore = createStore(model.Manifest, model.Target.Routes);
+        await SaveAsync(firstStore, "distinct-delete-race", "authorization-a", 1);
+        var firstSelected = NewSignal<int>();
+        var releaseFirst = NewSignal();
+        var secondAttempt = NewSignal<int>();
+        var firstRuntime = CreateRuntime(firstStore, model, route, provider, handlerPrefix, async (point, connection, transaction, ct) =>
+        {
+            if (point != RelationalPhysicalMutationExecutionPoint.AfterSelection)
+                return;
+            firstSelected.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+            await releaseFirst.Task;
+        });
+        var secondRuntime = CreateRuntime(secondStore, model, route, provider, handlerPrefix, async (point, connection, transaction, ct) =>
+        {
+            if (point == RelationalPhysicalMutationExecutionPoint.BeforeSelection)
+                secondAttempt.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+        });
+
+        var first = firstRuntime.ExecuteAsync(Delete($"{provider.Name}-distinct-delete-first"));
+        var blocker = await firstSelected.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var second = secondRuntime.ExecuteAsync(Delete($"{provider.Name}-distinct-delete-second"));
+        var blocked = await secondAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await contention.WaitUntilBlockedAsync(blocked, blocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+        var results = await Task.WhenAll(first, second);
+
+        Assert.Equal(new long[] { 0, 1 }, results.Select(result => result.AffectedCount).Order().ToArray());
+        Assert.Null(await firstStore.LoadAsync("configurationDocument", "distinct-delete-race"));
+    }
+
+    public static async Task OrdinaryCrudSerializesWithSelectedSetAsync<TStore>(
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<StorageManifest, IReadOnlyList<ExecutableStorageRoute>, TStore> createStore,
+        RelationalLockContentionProbe contention)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var route = model.Target.Routes.Single();
+        var mutationStore = createStore(model.Manifest, model.Target.Routes);
+        var ordinaryStore = createStore(model.Manifest, model.Target.Routes);
+
+        await SaveAsync(mutationStore, "ordinary-save-race", "pending");
+        var saveMutation = HoldAfterSelection(
+            mutationStore,
+            model,
+            route,
+            provider,
+            handlerPrefix,
+            contention,
+            out var saveSelected,
+            out var releaseSave);
+        var saveAttempt = NewSignal<int>();
+        ordinaryStore.WriteInterceptor = async (point, operation, connection, transaction, ct) =>
+        {
+            if (point == RelationalPhysicalWriteExecutionPoint.BeforePrimaryLock &&
+                operation == RelationalPhysicalWriteOperation.Save)
+                saveAttempt.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+        };
+        var mutationBeforeSave = saveMutation.ExecuteAsync(Transition($"{provider.Name}-ordinary-save-race"));
+        var saveBlocker = await saveSelected.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var save = ordinaryStore.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "ordinary-save-race",
+            "1",
+            "{\"category\":\"active\",\"priority\":1}"));
+        var blockedSave = await saveAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await contention.WaitUntilBlockedAsync(blockedSave, saveBlocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseSave.TrySetResult();
+        }
+        var saved = await save;
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(3, saved.Document!.Version);
+        Assert.Equal(1, (await mutationBeforeSave).AffectedCount);
+        var persistedAfterSave = await mutationStore.LoadAsync("configurationDocument", "ordinary-save-race");
+        Assert.Equal(3, persistedAfterSave!.Version);
+        Assert.Equal("active", Category(persistedAfterSave));
+
+        await SaveAsync(mutationStore, "ordinary-delete-race", "pending");
+        var deleteMutation = HoldAfterSelection(
+            mutationStore,
+            model,
+            route,
+            provider,
+            handlerPrefix,
+            contention,
+            out var deleteSelected,
+            out var releaseDelete);
+        var deleteAttempt = NewSignal<int>();
+        ordinaryStore.WriteInterceptor = async (point, operation, connection, transaction, ct) =>
+        {
+            if (point == RelationalPhysicalWriteExecutionPoint.BeforePrimaryLock &&
+                operation == RelationalPhysicalWriteOperation.Delete)
+                deleteAttempt.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+        };
+        var mutationBeforeDelete = deleteMutation.ExecuteAsync(Transition($"{provider.Name}-ordinary-delete-race"));
+        var deleteBlocker = await deleteSelected.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var delete = ordinaryStore.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "ordinary-delete-race"));
+        var blockedDelete = await deleteAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await contention.WaitUntilBlockedAsync(blockedDelete, deleteBlocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseDelete.TrySetResult();
+        }
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await delete).Status);
+        Assert.Equal(1, (await mutationBeforeDelete).AffectedCount);
+        Assert.Null(await mutationStore.LoadAsync("configurationDocument", "ordinary-delete-race"));
+    }
+
+    public static async Task LinkedOrdinaryCrudInterleavingsSerializeAsync<TStore>(
+        RelationalMutationServerHarness<TStore> harness)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        foreach (var form in new[]
+                 {
+                     PhysicalStorageForm.SharedDocuments,
+                     PhysicalStorageForm.DedicatedDocumentTable
+                 })
+        {
+            var model = RelationalPhysicalStorageTestModels.Create(
+                form,
+                harness.Provider,
+                includePriority: true,
+                includeCategoryTransition: true,
+                includeRangeDelete: true,
+                normalizer: harness.Normalizer);
+            await PhysicalSchemaApplication.ApplyAsync(model.Target, harness.CreateExecutor());
+            var route = model.Target.Routes.Single();
+            await AssertLinkedOrdinaryCrudInterleavingsAsync(
+                new LinkedCrudInterleavingContext<TStore>(
+                    harness.Provider,
+                    harness.HandlerPrefix,
+                    model,
+                    route,
+                    harness.CreateStore(model.Manifest, model.Target.Routes),
+                    harness.CreateStore(model.Manifest, model.Target.Routes),
+                    $"{form}-pooled",
+                    harness.Contention));
+
+            await using var mutationConnection = harness.CreateConnection();
+            await using var ordinaryConnection = harness.CreateConnection();
+            var mutationStore = new RelationalPhysicalDocumentStore(
+                mutationConnection,
+                model.Manifest,
+                model.Target.Routes,
+                harness.CreateDialect(),
+                DocumentStoreAccess.Global);
+            var ordinaryStore = new RelationalPhysicalDocumentStore(
+                ordinaryConnection,
+                model.Manifest,
+                model.Target.Routes,
+                harness.CreateDialect(),
+                DocumentStoreAccess.Global);
+            await AssertLinkedOrdinaryCrudInterleavingsAsync(
+                new LinkedCrudInterleavingContext<RelationalPhysicalDocumentStore>(
+                    harness.Provider,
+                    harness.HandlerPrefix,
+                    model,
+                    route,
+                    mutationStore,
+                    ordinaryStore,
+                    $"{form}-direct",
+                    harness.Contention));
+        }
+    }
+
+    public static async Task LargeSelectionUsesConstantSetBasedLockCommandsAsync<TStore>(
+        RelationalMutationServerHarness<TStore> harness)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            harness.Provider,
+            includePriority: false,
+            includeCategoryTransition: true,
+            normalizer: harness.Normalizer);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, harness.CreateExecutor());
+        var route = model.Target.Routes.Single();
+        var store = harness.CreateStore(model.Manifest, model.Target.Routes);
+        for (var index = 0; index < 128; index++)
+            await SaveAsync(store, $"large-selection-{index}", "pending");
+        var lockCommands = 0;
+        var runtime = CreateRuntime(
+            store,
+            model,
+            route,
+            harness.Provider,
+            harness.HandlerPrefix,
+            (point, _, _, _) =>
+            {
+                if (point == RelationalPhysicalMutationExecutionPoint.BeforeRowLockCommand)
+                    Interlocked.Increment(ref lockCommands);
+                return ValueTask.CompletedTask;
+            });
+
+        var result = await runtime.ExecuteAsync(
+            Transition($"{harness.Provider.Name}-large-set-based-lock-selection"));
+
+        Assert.Equal(128, result.AffectedCount);
+        Assert.Equal(2, lockCommands);
+        Assert.Equal(128, await CountAsync(
+            RelationalPhysicalQueryRuntime.Create(
+                store,
+                model.Manifest,
+                route,
+                model.Target.Provider,
+                harness.HandlerPrefix),
+            "revoked"));
+    }
+
+    private static async Task AssertLinkedOrdinaryCrudInterleavingsAsync<TStore>(
+        LinkedCrudInterleavingContext<TStore> context)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        var mutationFirstId = $"mutation-first-save-{context.Scenario}";
+        await SaveAsync(context.MutationStore, mutationFirstId, "pending");
+        var mutationFirst = HoldAfterSelection(
+            context.MutationStore,
+            context.Model,
+            context.Route,
+            context.Provider,
+            context.HandlerPrefix,
+            context.Contention,
+            out var selected,
+            out var releaseMutation);
+        var saveAttempt = NewSignal<int>();
+        context.OrdinaryStore.WriteInterceptor = async (point, operation, connection, transaction, ct) =>
+        {
+            if (point == RelationalPhysicalWriteExecutionPoint.BeforePrimaryLock &&
+                operation == RelationalPhysicalWriteOperation.Save)
+                saveAttempt.TrySetResult(await context.Contention.ReadSessionId(connection, transaction, ct));
+        };
+        var transition = mutationFirst.ExecuteAsync(
+            Transition($"{context.Provider.Name}-{context.Scenario}-mutation-first-save"));
+        var blocker = await selected.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var save = context.OrdinaryStore.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            mutationFirstId,
+            "1",
+            "{\"category\":\"active\",\"priority\":1}"));
+        var blocked = await saveAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await context.Contention.WaitUntilBlockedAsync(blocked, blocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseMutation.TrySetResult();
+        }
+        var saved = await save.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(3, saved.Document!.Version);
+        Assert.Equal(1, (await transition.WaitAsync(TimeSpan.FromSeconds(30))).AffectedCount);
+        await AssertDocumentAndProjectionAsync(
+            context.MutationStore,
+            context.Model,
+            context.Route,
+            context.Provider,
+            context.HandlerPrefix,
+            mutationFirstId,
+            "active",
+            3);
+
+        await AssertCrudFirstMutationAsync(
+            context,
+            $"save-transition-{context.Scenario}",
+            "pending",
+            RelationalPhysicalWriteOperation.Save,
+            Transition($"{context.Provider.Name}-{context.Scenario}-save-transition"));
+        await AssertCrudFirstMutationAsync(
+            context,
+            $"delete-transition-{context.Scenario}",
+            "pending",
+            RelationalPhysicalWriteOperation.Delete,
+            Transition($"{context.Provider.Name}-{context.Scenario}-delete-transition"));
+        await AssertCrudFirstMutationAsync(
+            context,
+            $"save-delete-{context.Scenario}",
+            "authorization-a",
+            RelationalPhysicalWriteOperation.Save,
+            Delete($"{context.Provider.Name}-{context.Scenario}-save-delete"));
+        await AssertCrudFirstMutationAsync(
+            context,
+            $"delete-delete-{context.Scenario}",
+            "authorization-a",
+            RelationalPhysicalWriteOperation.Delete,
+            Delete($"{context.Provider.Name}-{context.Scenario}-delete-delete"));
+    }
+
+    private static async Task AssertCrudFirstMutationAsync<TStore>(
+        LinkedCrudInterleavingContext<TStore> context,
+        string id,
+        string initialCategory,
+        RelationalPhysicalWriteOperation ordinaryOperation,
+        DocumentMutation mutation)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        await SaveAsync(context.MutationStore, id, initialCategory);
+        var ordinaryLocked = NewSignal<int>();
+        var releaseOrdinary = NewSignal();
+        context.OrdinaryStore.WriteInterceptor = async (point, operation, connection, transaction, ct) =>
+        {
+            if (point != RelationalPhysicalWriteExecutionPoint.AfterPrimaryLock || operation != ordinaryOperation)
+                return;
+            ordinaryLocked.TrySetResult(await context.Contention.ReadSessionId(connection, transaction, ct));
+            await releaseOrdinary.Task;
+        };
+        var mutationAttempt = NewSignal<int>();
+        var runtime = CreateRuntime(
+            context.MutationStore,
+            context.Model,
+            context.Route,
+            context.Provider,
+            context.HandlerPrefix,
+            async (point, connection, transaction, ct) =>
+            {
+                if (point == RelationalPhysicalMutationExecutionPoint.AfterCandidateDiscovery)
+                    mutationAttempt.TrySetResult(await context.Contention.ReadSessionId(connection, transaction, ct));
+            });
+        var ordinary = ordinaryOperation == RelationalPhysicalWriteOperation.Save
+            ? context.OrdinaryStore.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument",
+                id,
+                "1",
+                "{\"category\":\"active\",\"priority\":1}"))
+            : context.OrdinaryStore.DeleteAsync(new DeleteDocumentRequest("configurationDocument", id));
+        var blocker = await ordinaryLocked.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var bounded = runtime.ExecuteAsync(mutation);
+        var blocked = await mutationAttempt.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            await context.Contention.WaitUntilBlockedAsync(blocked, blocker, CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseOrdinary.TrySetResult();
+        }
+        var ordinaryResult = await ordinary.WaitAsync(TimeSpan.FromSeconds(30));
+        var boundedResult = await bounded.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(0, boundedResult.AffectedCount);
+        if (ordinaryOperation == RelationalPhysicalWriteOperation.Delete)
+        {
+            Assert.Equal(DocumentStoreWriteStatus.Deleted, ordinaryResult.Status);
+            Assert.Null(await context.MutationStore.LoadAsync("configurationDocument", id));
+            return;
+        }
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, ordinaryResult.Status);
+        Assert.Equal(2, ordinaryResult.Document!.Version);
+        await AssertDocumentAndProjectionAsync(
+            context.MutationStore,
+            context.Model,
+            context.Route,
+            context.Provider,
+            context.HandlerPrefix,
+            id,
+            "active",
+            2);
+    }
+
+    private static async Task AssertDocumentAndProjectionAsync(
+        RelationalPhysicalDocumentStore store,
+        (StorageManifest Manifest, PhysicalSchemaTarget Target) model,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        string id,
+        string expectedCategory,
+        long expectedVersion)
+    {
+        var persisted = await store.LoadAsync("configurationDocument", id);
+        Assert.NotNull(persisted);
+        Assert.Equal(expectedVersion, persisted.Version);
+        Assert.Equal(expectedCategory, Category(persisted));
+        var query = RelationalPhysicalQueryRuntime.Create(
+            store,
+            model.Manifest,
+            route,
+            provider,
+            handlerPrefix);
+        var projected = await QueryCategoryAsync(query, expectedCategory);
+        Assert.Contains(projected.Documents, document => document.Id == id);
+        foreach (var staleCategory in new[] { "pending", "revoked", "authorization-a" }
+                     .Where(category => category != expectedCategory))
+        {
+            var stale = await QueryCategoryAsync(query, staleCategory);
+            Assert.DoesNotContain(stale.Documents, document => document.Id == id);
+        }
     }
 
     public static async Task PhysicalFormsExecuteTransitionAndRangeDeleteAsync<TStore>(
@@ -304,13 +873,13 @@ internal static class RelationalBoundedMutationServerAssertions
         await SaveAsync(store, "pending", "pending");
         var request = Transition($"{provider.Name}-rollback");
         var mutations = RelationalPhysicalMutationRuntime.Create(
-            store,
-            model.Manifest,
-            route,
-            model.Target.Provider,
-            provider.Name,
-            handlerPrefix,
-            canonicalJsonValueKinds: null,
+            new RelationalPhysicalMutationRuntimeContext(
+                store,
+                model.Manifest,
+                route,
+                model.Target.Provider,
+                provider.Name,
+                handlerPrefix),
             point => point == RelationalPhysicalMutationExecutionPoint.BeforeCommit
                 ? ValueTask.FromException(new SimulatedMutationFailureException())
                 : ValueTask.CompletedTask);
@@ -347,13 +916,13 @@ internal static class RelationalBoundedMutationServerAssertions
         var request = Transition($"{provider.Name}-cancellation");
         using var cancellation = new CancellationTokenSource();
         var mutations = RelationalPhysicalMutationRuntime.Create(
-            store,
-            model.Manifest,
-            route,
-            model.Target.Provider,
-            provider.Name,
-            handlerPrefix,
-            canonicalJsonValueKinds: null,
+            new RelationalPhysicalMutationRuntimeContext(
+                store,
+                model.Manifest,
+                route,
+                model.Target.Provider,
+                provider.Name,
+                handlerPrefix),
             point =>
             {
                 if (point != RelationalPhysicalMutationExecutionPoint.BeforeCommit)
@@ -396,13 +965,13 @@ internal static class RelationalBoundedMutationServerAssertions
         var request = Transition(operationId);
         var loseAcknowledgement = true;
         var mutations = RelationalPhysicalMutationRuntime.Create(
-            firstStore,
-            model.Manifest,
-            route,
-            model.Target.Provider,
-            provider.Name,
-            handlerPrefix,
-            canonicalJsonValueKinds: null,
+            new RelationalPhysicalMutationRuntimeContext(
+                firstStore,
+                model.Manifest,
+                route,
+                model.Target.Provider,
+                provider.Name,
+                handlerPrefix),
             point =>
             {
                 if (point != RelationalPhysicalMutationExecutionPoint.AfterCommitBeforeAcknowledgement ||
@@ -449,8 +1018,11 @@ internal static class RelationalBoundedMutationServerAssertions
     {
         var document = await store.LoadAsync("configurationDocument", id);
         Assert.NotNull(document);
-        return JsonDocument.Parse(document.ContentJson).RootElement.GetProperty("category").GetString()!;
+        return Category(document);
     }
+
+    private static string Category(DocumentEnvelope document) =>
+        JsonDocument.Parse(document.ContentJson).RootElement.GetProperty("category").GetString()!;
 
     private static Task<long> CountAsync(IBoundedDocumentStore store, string category) =>
         store.CountAsync(new DocumentQuery(
@@ -458,6 +1030,12 @@ internal static class RelationalBoundedMutationServerAssertions
             "list-by-category",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", category))],
             resultOperation: BoundedQueryResultOperation.Count));
+
+    private static Task<DocumentQueryResult> QueryCategoryAsync(IBoundedDocumentStore store, string category) =>
+        store.QueryAsync(new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", category))]));
 
     private static Task<long> CountFieldAsync(IBoundedDocumentStore store, string field, string value) =>
         store.CountAsync(new DocumentQuery(
@@ -485,6 +1063,75 @@ internal static class RelationalBoundedMutationServerAssertions
 
     private static DocumentMutation Transition(string operationId) =>
         new("configurationDocument", "revoke-pending", operationId);
+
+    private static DocumentMutation Delete(string operationId) =>
+        new(
+            "configurationDocument",
+            "prune-by-category-cutoff",
+            operationId,
+            [
+                DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "authorization-a")),
+                DocumentQueryClause.Of(DocumentQueryComparison.LessThan("priority", "10"))
+            ]);
+
+    private static IBoundedDocumentMutationStore HoldAfterSelection<TStore>(
+        TStore store,
+        (StorageManifest Manifest, PhysicalSchemaTarget Target) model,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        RelationalLockContentionProbe contention,
+        out TaskCompletionSource<int> selected,
+        out TaskCompletionSource release)
+        where TStore : RelationalPhysicalDocumentStore
+    {
+        selected = NewSignal<int>();
+        release = NewSignal();
+        var selectedSignal = selected;
+        var releaseSignal = release;
+        return CreateRuntime(store, model, route, provider, handlerPrefix, async (point, connection, transaction, ct) =>
+        {
+            if (point != RelationalPhysicalMutationExecutionPoint.AfterSelection)
+                return;
+            selectedSignal.TrySetResult(await contention.ReadSessionId(connection, transaction, ct));
+            await releaseSignal.Task;
+        });
+    }
+
+    private static IBoundedDocumentMutationStore CreateRuntime<TStore>(
+        TStore store,
+        (StorageManifest Manifest, PhysicalSchemaTarget Target) model,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        RelationalPhysicalMutationInterceptor intercept)
+        where TStore : RelationalPhysicalDocumentStore =>
+        RelationalPhysicalMutationRuntime.CreateWithInterceptor(
+            new RelationalPhysicalMutationRuntimeContext(
+                store,
+                model.Manifest,
+                route,
+                model.Target.Provider,
+                provider.Name,
+                handlerPrefix),
+            intercept);
+
+    private static TaskCompletionSource NewSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private static TaskCompletionSource<T> NewSignal<T>() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private sealed record LinkedCrudInterleavingContext<TStore>(
+        ProviderIdentity Provider,
+        string HandlerPrefix,
+        (StorageManifest Manifest, PhysicalSchemaTarget Target) Model,
+        ExecutableStorageRoute Route,
+        TStore MutationStore,
+        TStore OrdinaryStore,
+        string Scenario,
+        RelationalLockContentionProbe Contention)
+        where TStore : RelationalPhysicalDocumentStore;
 
     private sealed class SimulatedMutationFailureException : Exception;
 

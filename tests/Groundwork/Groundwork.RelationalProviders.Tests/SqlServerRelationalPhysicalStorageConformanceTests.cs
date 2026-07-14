@@ -58,6 +58,58 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             SqlServerPhysicalMutationRuntime.Create);
 
     [Fact]
+    public Task Concurrent_distinct_transitions_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            LockContention());
+
+    [Fact]
+    public Task Direct_connection_mutations_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            () => new SqlConnection(container.GetConnectionString()),
+            () => new SqlServerPhysicalDocumentDialect(),
+            LockContention());
+
+    [Fact]
+    public Task Concurrent_distinct_deletes_serialize_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            LockContention());
+
+    [Fact]
+    public Task Ordinary_save_and_delete_serialize_with_the_selected_set() =>
+        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            "sqlserver",
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+            LockContention());
+
+    [Fact]
+    public Task Linked_ordinary_crud_interleavings_serialize_in_pooled_and_direct_sessions() =>
+        RelationalBoundedMutationServerAssertions.LinkedOrdinaryCrudInterleavingsSerializeAsync(MutationHarness());
+
+    [Fact]
+    public Task Large_selection_uses_constant_set_based_lock_commands() =>
+        RelationalBoundedMutationServerAssertions.LargeSelectionUsesConstantSetBasedLockCommandsAsync(MutationHarness());
+
+    [Fact]
     public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
         RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(
             SqlServerGroundworkCapabilities.Provider,
@@ -1117,6 +1169,61 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private RelationalLockContentionProbe LockContention() => new(
+        ReadSessionIdAsync,
+        WaitUntilBlockedAsync);
+
+    private RelationalMutationServerHarness<SqlServerPhysicalDocumentStore> MutationHarness() => new(
+        SqlServerGroundworkCapabilities.Provider,
+        "sqlserver",
+        SqlServerGroundworkCapabilities.PhysicalNames,
+        () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+        (manifest, routes) => new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+        () => new SqlConnection(container.GetConnectionString()),
+        () => new SqlServerPhysicalDocumentDialect(),
+        LockContention());
+
+    private static async ValueTask<int> ReadSessionIdAsync(
+        System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT @@SPID;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private async Task WaitUntilBlockedAsync(
+        int blockedSessionId,
+        int blockerSessionId,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT CASE WHEN EXISTS (
+                SELECT 1
+                FROM sys.dm_exec_requests
+                WHERE session_id = @blocked AND blocking_session_id = @blocker
+            ) THEN 1 ELSE 0 END;
+            """;
+        command.Parameters.AddWithValue("@blocked", blockedSessionId);
+        command.Parameters.AddWithValue("@blocker", blockerSessionId);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Convert.ToBoolean(await command.ExecuteScalarAsync(cancellationToken)))
+                return;
+            await Task.Delay(20, cancellationToken);
+        }
+        throw new TimeoutException(
+            $"SQL Server session {blockedSessionId} was not observed waiting on session {blockerSessionId}.");
     }
 
     private static string Q(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";

@@ -90,15 +90,22 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
 
     public override string ApplyFirst(string selectSql) => $"{selectSql} LIMIT 1;";
 
+    public override string CompleteMutationSelection(string selectSql, bool includesLinkedStorage) =>
+        $"{selectSql} FOR UPDATE OF p{(includesLinkedStorage ? ", l" : string.Empty)}";
+
     public override string CreateMutationSelectionTable(
         string tableExpression,
         string documentKindColumn,
         string storageScopeColumn,
-        string documentIdColumn) =>
+        string documentIdColumn,
+        string documentVersionColumn,
+        string documentIncarnationColumn) =>
         $"CREATE TEMP TABLE {tableExpression} (" +
         $"{QuoteIdentifier(documentKindColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"{QuoteIdentifier(storageScopeColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"{QuoteIdentifier(documentIdColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
+        $"{QuoteIdentifier(documentIncarnationColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) " +
         "ON COMMIT DROP;";
 

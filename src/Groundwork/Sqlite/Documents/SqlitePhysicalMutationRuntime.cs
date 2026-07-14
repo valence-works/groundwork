@@ -26,13 +26,14 @@ public static class SqlitePhysicalMutationRuntime
         ProviderIdentity provider,
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept) =>
         RelationalPhysicalMutationRuntime.Create(
-            store,
-            manifest,
-            route,
-            provider,
-            SqliteGroundworkCapabilities.Provider.Name,
-            "sqlite",
-            CanonicalJsonValueKinds(provider),
+            new RelationalPhysicalMutationRuntimeContext(
+                store,
+                manifest,
+                route,
+                provider,
+                SqliteGroundworkCapabilities.Provider.Name,
+                "sqlite",
+                CanonicalJsonValueKinds(provider)),
             intercept);
 
     internal static async Task<string> ExplainAsync(

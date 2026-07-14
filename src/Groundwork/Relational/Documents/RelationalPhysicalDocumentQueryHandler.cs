@@ -141,8 +141,14 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     internal RelationalPhysicalQueryPredicate BuildPredicate(
         DocumentQuery query,
         PhysicalQueryPlan plan,
-        DocumentScopeSelection scope) =>
-        Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: true, fixedScope: scope);
+        DocumentScopeSelection scope,
+        bool linkedIdentityOnly = false) =>
+        Build(
+            query,
+            plan,
+            store.GetRoute(query.DocumentKind),
+            requiresPrimaryLookup: !linkedIdentityOnly,
+            fixedScope: scope);
 
     private async Task<long> CountCoreAsync(DbConnection connection, RelationalPhysicalQueryPredicate built, CancellationToken ct)
     {
@@ -212,7 +218,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             throw new InvalidOperationException(
                 $"Document query '{query.QueryIdentity}' requires {parameters.Count + 2} parameters, exceeding the provider limit of {store.MaxPhysicalParameters}.");
         }
-        return new RelationalPhysicalQueryPredicate($"{from} WHERE {string.Join(" AND ", predicates)}", parameters);
+        var fromAndWhere = $"{from} WHERE {string.Join(" AND ", predicates)}";
+        return new RelationalPhysicalQueryPredicate(
+            fromAndWhere,
+            parameters);
     }
 
     private static IEnumerable<PhysicalQueryField> PredicateFields(PhysicalQueryPlan plan) =>

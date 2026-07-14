@@ -136,11 +136,11 @@ public static class PhysicalQueryPlanCompiler
             ? route.LinkedRelationship!.StorageScope
             : route.ScopeKey.Column;
         var scopeIdentifier = access == PhysicalQueryAccessKind.NativeDocumentFields
-            ? capabilities.NativeFieldIdentifiers["storageScope"]
+            ? capabilities.NativeFieldIdentifiers[PhysicalDocumentFieldPaths.StorageScope]
             : scopeColumn.Identifier;
         var scope = new PhysicalQueryScope(
             new PhysicalQueryField(
-                "storageScope",
+                PhysicalDocumentFieldPaths.StorageScope,
                 scopeIdentifier,
                 access switch
                 {
@@ -158,10 +158,10 @@ public static class PhysicalQueryPlanCompiler
             ? route.LinkedRelationship!.DocumentKind
             : route.Discriminator.Column;
         var discriminatorIdentifier = access == PhysicalQueryAccessKind.NativeDocumentFields
-            ? capabilities.NativeFieldIdentifiers["documentKind"]
+            ? capabilities.NativeFieldIdentifiers[PhysicalDocumentFieldPaths.DocumentKind]
             : discriminatorColumn.Identifier;
         var discriminator = new PhysicalQueryField(
-            "documentKind",
+            PhysicalDocumentFieldPaths.DocumentKind,
             discriminatorIdentifier,
             access switch
             {
@@ -223,7 +223,7 @@ public static class PhysicalQueryPlanCompiler
         }
         if (predicates.Select(predicate => predicate.Path).Distinct(StringComparer.Ordinal).Count() != predicates.Length)
             diagnostics.Add(Error("GW-QUERY-002", "Predicate paths must be unique.", target));
-        if (predicates.Any(predicate => predicate.Path == "storageScope"))
+        if (predicates.Any(predicate => predicate.Path == PhysicalDocumentFieldPaths.StorageScope))
             diagnostics.Add(Error("GW-QUERY-002", "Storage scope is injected by the session and cannot be a caller predicate.", target));
         if (predicates.Any(predicate => predicate.Operations.Count == 0))
             diagnostics.Add(Error("GW-QUERY-002", "Every predicate path must declare at least one operation.", target));
@@ -342,11 +342,11 @@ public static class PhysicalQueryPlanCompiler
             available.Add(PhysicalQuerySourceKind.LinkedIndex);
         if (physicalIndex?.Target == ExecutableStorageObjectRole.PrimaryStorage)
         {
-            if (logicalIndex.Fields.All(field => IsEnvelopePath(field.Path)) &&
+            if (logicalIndex.Fields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
                 capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryEnvelope))
                 available.Add(PhysicalQuerySourceKind.PrimaryEnvelope);
-            if (logicalIndex.Fields.Any(field => !IsEnvelopePath(field.Path)) &&
-                logicalIndex.Fields.All(field => IsEnvelopePath(field.Path) ||
+            if (logicalIndex.Fields.Any(field => !PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
+                logicalIndex.Fields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path) ||
                     route.ProjectedColumns.Any(column => column.Definition.Path == field.Path)) &&
                 capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryProjectedColumns))
                 available.Add(PhysicalQuerySourceKind.PrimaryProjectedColumns);
@@ -354,7 +354,11 @@ public static class PhysicalQueryPlanCompiler
         if (capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryCanonicalJson))
             available.Add(PhysicalQuerySourceKind.PrimaryCanonicalJson);
         var requiredNativePaths = logicalIndex.Fields.Select(field => field.Path)
-            .Concat(["id", "storageScope", "documentKind"])
+            .Concat([
+                PhysicalDocumentFieldPaths.Id,
+                PhysicalDocumentFieldPaths.StorageScope,
+                PhysicalDocumentFieldPaths.DocumentKind
+            ])
             .Distinct(StringComparer.Ordinal);
         if (requiredNativePaths.All(capabilities.NativeFieldIdentifiers.ContainsKey) &&
             capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.NativeDocumentFields))
@@ -388,7 +392,7 @@ public static class PhysicalQueryPlanCompiler
         requiredEqualityPrefixPaths = [];
         var paths = physicalIndex.Columns
             .Select(column => ResolveIndexPath(route, physicalIndex.Target, column.Column))
-            .Where(path => path != "storageScope")
+            .Where(path => path != PhysicalDocumentFieldPaths.StorageScope)
             .ToArray();
         var predicatePaths = predicates.Select(predicate => predicate.Path).ToArray();
         if (!paths.Take(predicatePaths.Length).SequenceEqual(predicatePaths))
@@ -470,19 +474,25 @@ public static class PhysicalQueryPlanCompiler
             ResolveField(route, source, field.Path, logicalIndex.GetValueKind(field.Path), capabilities),
             field.Direction,
             IsIdentityTieBreak: false)).ToList();
-        if (route.ScopePolicy == StorageScopePolicy.Scoped && order.All(item => item.Path != "storageScope"))
+        if (route.ScopePolicy == StorageScopePolicy.Scoped &&
+            order.All(item => item.Path != PhysicalDocumentFieldPaths.StorageScope))
         {
             order.Add(new PhysicalQueryOrder(
-                "storageScope",
-                ResolveField(route, source, "storageScope", IndexValueKind.Keyword, capabilities),
+                PhysicalDocumentFieldPaths.StorageScope,
+                ResolveField(
+                    route,
+                    source,
+                    PhysicalDocumentFieldPaths.StorageScope,
+                    IndexValueKind.Keyword,
+                    capabilities),
                 PhysicalSortDirection.Ascending,
                 IsIdentityTieBreak: true));
         }
-        if (order.All(item => item.Path != "id"))
+        if (order.All(item => item.Path != PhysicalDocumentFieldPaths.Id))
         {
             order.Add(new PhysicalQueryOrder(
-                "id",
-                ResolveField(route, source, "id", IndexValueKind.Keyword, capabilities),
+                PhysicalDocumentFieldPaths.Id,
+                ResolveField(route, source, PhysicalDocumentFieldPaths.Id, IndexValueKind.Keyword, capabilities),
                 PhysicalSortDirection.Ascending,
                 IsIdentityTieBreak: true));
         }
@@ -510,7 +520,7 @@ public static class PhysicalQueryPlanCompiler
                 logicalValueKind);
         }
 
-        if (IsEnvelopePath(path))
+        if (PhysicalDocumentFieldPaths.IsEnvelope(path))
         {
             var column = linked
                 ? LinkedColumn(route, path)
@@ -545,7 +555,7 @@ public static class PhysicalQueryPlanCompiler
             logicalValueKind);
     }
 
-    private static IndexValueKind EnvelopeValueKind(string path) => path == "version"
+    private static IndexValueKind EnvelopeValueKind(string path) => path == PhysicalDocumentFieldPaths.Version
         ? IndexValueKind.Number
         : IndexValueKind.Keyword;
 
@@ -554,7 +564,7 @@ public static class PhysicalQueryPlanCompiler
         string target,
         List<GroundworkDiagnostic> diagnostics)
     {
-        foreach (var field in logicalIndex.Fields.Where(field => IsEnvelopePath(field.Path)))
+        foreach (var field in logicalIndex.Fields.Where(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path)))
         {
             var declared = logicalIndex.GetValueKind(field);
             var intrinsic = EnvelopeValueKind(field.Path);
@@ -578,40 +588,37 @@ public static class PhysicalQueryPlanCompiler
             return projection.Definition.Path;
         if (column.LogicalName == route.Envelope.Id.LogicalName ||
             column.LogicalName == route.LinkedRelationship?.DocumentId.LogicalName)
-            return "id";
+            return PhysicalDocumentFieldPaths.Id;
         if (column.LogicalName == route.Envelope.DocumentKind.LogicalName ||
             column.LogicalName == route.LinkedRelationship?.DocumentKind.LogicalName)
-            return "documentKind";
+            return PhysicalDocumentFieldPaths.DocumentKind;
         if (column.LogicalName == route.Envelope.StorageScope.LogicalName ||
             column.LogicalName == route.LinkedRelationship?.StorageScope.LogicalName)
-            return "storageScope";
+            return PhysicalDocumentFieldPaths.StorageScope;
         if (column.LogicalName == route.Envelope.Version.LogicalName)
-            return "version";
+            return PhysicalDocumentFieldPaths.Version;
         if (column.LogicalName == route.Envelope.SchemaVersion.LogicalName)
-            return "schemaVersion";
+            return PhysicalDocumentFieldPaths.SchemaVersion;
         return column.LogicalName;
     }
 
     private static ExecutableColumnRoute EnvelopeColumn(ExecutableStorageRoute route, string path) => path switch
     {
-        "id" => route.Envelope.Id,
-        "documentKind" => route.Envelope.DocumentKind,
-        "storageScope" => route.Envelope.StorageScope,
-        "version" => route.Envelope.Version,
-        "schemaVersion" => route.Envelope.SchemaVersion,
+        PhysicalDocumentFieldPaths.Id => route.Envelope.Id,
+        PhysicalDocumentFieldPaths.DocumentKind => route.Envelope.DocumentKind,
+        PhysicalDocumentFieldPaths.StorageScope => route.Envelope.StorageScope,
+        PhysicalDocumentFieldPaths.Version => route.Envelope.Version,
+        PhysicalDocumentFieldPaths.SchemaVersion => route.Envelope.SchemaVersion,
         _ => throw new ArgumentOutOfRangeException(nameof(path), path, null)
     };
 
     private static ExecutableColumnRoute LinkedColumn(ExecutableStorageRoute route, string path) => path switch
     {
-        "id" => route.LinkedRelationship!.DocumentId,
-        "documentKind" => route.LinkedRelationship!.DocumentKind,
-        "storageScope" => route.LinkedRelationship!.StorageScope,
+        PhysicalDocumentFieldPaths.Id => route.LinkedRelationship!.DocumentId,
+        PhysicalDocumentFieldPaths.DocumentKind => route.LinkedRelationship!.DocumentKind,
+        PhysicalDocumentFieldPaths.StorageScope => route.LinkedRelationship!.StorageScope,
         _ => throw new ArgumentOutOfRangeException(nameof(path), path, null)
     };
-
-    private static bool IsEnvelopePath(string path) => path is
-        "id" or "documentKind" or "storageScope" or "version" or "schemaVersion";
 
     private static bool HasIndexedAccess(
         PhysicalQuerySourceKind source,

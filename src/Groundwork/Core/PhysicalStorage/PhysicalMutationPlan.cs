@@ -131,7 +131,7 @@ public static class PhysicalMutationPlanCompiler
                 $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}.action"));
             return null;
         }
-        if (!IsContentTransitionField(field.Field))
+        if (!PhysicalDocumentFieldPaths.IsMutableContent(field.Field))
         {
             diagnostics.Add(GroundworkDiagnostic.Error(
                 "GW-MUTATION-005",
@@ -175,12 +175,4 @@ public static class PhysicalMutationPlanCompiler
             transition.TargetValue,
             field.Field);
     }
-
-    private static bool IsContentTransitionField(PhysicalQueryField field) => field.Source switch
-    {
-        PhysicalQueryFieldSource.CanonicalJsonPath or PhysicalQueryFieldSource.ProjectedColumn => true,
-        PhysicalQueryFieldSource.NativeDocumentField => field.Path is not
-            ("id" or "documentKind" or "storageScope" or "version" or "schemaVersion"),
-        _ => false
-    };
 }

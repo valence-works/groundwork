@@ -7,6 +7,11 @@ using Groundwork.Core.SchemaEvolution;
 
 namespace Groundwork.RelationalProviders.Tests;
 
+internal sealed record RelationalTypedTransitionTestOptions(
+    string PrioritySource = "1",
+    string PriorityTarget = "2",
+    IReadOnlyDictionary<string, (string Source, string Target)>? FieldValues = null);
+
 internal static class RelationalPhysicalStorageTestModels
 {
     public static (StorageManifest Manifest, PhysicalSchemaTarget Target) Create(
@@ -26,8 +31,10 @@ internal static class RelationalPhysicalStorageTestModels
         bool includeRangeDelete = false,
         string documentKind = "configurationDocument",
         Func<PhysicalNameContext, string>? namePolicy = null,
-        bool includeTypedTransitions = false)
+        bool includeTypedTransitions = false,
+        RelationalTypedTransitionTestOptions? typedTransitions = null)
     {
+        typedTransitions ??= new RelationalTypedTransitionTestOptions();
         var template = RelationalTestManifests.MetadataManifest();
         instance ??= Guid.NewGuid().ToString("N")[..8];
         var columns = new List<ProjectedColumnDefinition>
@@ -202,13 +209,20 @@ internal static class RelationalPhysicalStorageTestModels
             boundedMutations.Add(new BoundedMutationDeclaration(
                 "raise-priority",
                 "list-by-priority",
-                BoundedMutationAction.Transition("priority", ["1"], "2")));
+                BoundedMutationAction.Transition(
+                    "priority",
+                    [typedTransitions.PrioritySource],
+                    typedTransitions.PriorityTarget)));
             foreach (var field in TypedTransitionFields())
             {
+                var values = typedTransitions.FieldValues is not null &&
+                             typedTransitions.FieldValues.TryGetValue(field.Name, out var configured)
+                    ? configured
+                    : (field.Source, field.Target);
                 boundedMutations.Add(new BoundedMutationDeclaration(
                     $"transition-{field.Name}",
                     $"list-by-{field.Name}",
-                    BoundedMutationAction.Transition(field.Name, [field.Source], field.Target)));
+                    BoundedMutationAction.Transition(field.Name, [values.Source], values.Target)));
             }
         }
 
