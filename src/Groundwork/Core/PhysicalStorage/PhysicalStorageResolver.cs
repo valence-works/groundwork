@@ -122,6 +122,14 @@ public static class PhysicalStorageResolver
 
         foreach (var unit in manifest.StorageUnits)
         {
+            if (IdentityPolicyAdmission.Validate(
+                    unit.IdentityPolicy,
+                    $"storageUnits.{unit.Identity.Value}.identityPolicy") is { } identityPolicyDiagnostic)
+            {
+                diagnostics.Add(identityPolicyDiagnostic);
+                continue;
+            }
+
             if (unit.PhysicalStorage is null)
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(

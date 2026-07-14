@@ -21,6 +21,18 @@ public sealed class PhysicalSchemaTarget
         Routes = Array.AsReadOnly(routes?
             .OrderBy(route => route.StorageUnit.Value, StringComparer.Ordinal)
             .ToArray() ?? throw new ArgumentNullException(nameof(routes)));
+        try
+        {
+            foreach (var route in Routes)
+                route.EnsureSupportedIdentityAlgorithms();
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new ArgumentException(
+                "Physical schema targets require supported executable identity policies and algorithms.",
+                nameof(routes),
+                exception);
+        }
 
         var duplicate = Routes
             .GroupBy(route => route.StorageUnit.Value, StringComparer.Ordinal)

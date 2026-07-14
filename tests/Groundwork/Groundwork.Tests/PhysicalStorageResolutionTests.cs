@@ -11,6 +11,65 @@ namespace Groundwork.Tests;
 public sealed class PhysicalStorageResolutionTests
 {
     [Fact]
+    public void Resolver_rejects_non_string_identity_with_a_non_ordinal_string_case_policy()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var manifest = WithPhysicalStorage(
+            template with
+            {
+                StorageUnits =
+                [
+                    template.StorageUnits.Single() with
+                    {
+                        IdentityPolicy = new IdentityPolicy(
+                            StorageIdentityKind.Guid,
+                            "id",
+                            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+                    }
+                ]
+            },
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default()));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-UNIT-013" &&
+            diagnostic.Target == "storageUnits.configurationDocument.identityPolicy.stringCasePolicy");
+    }
+
+    [Fact]
+    public void Resolver_reports_a_missing_identity_policy_structurally()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var manifest = WithPhysicalStorage(
+            template with
+            {
+                StorageUnits = [template.StorageUnits.Single() with { IdentityPolicy = null! }]
+            },
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default()));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-UNIT-007" &&
+            diagnostic.Target == "storageUnits.configurationDocument.identityPolicy");
+    }
+
+    [Fact]
     public void BoundedMutationMustReferenceOneScaleBearingPredicateDeclaration()
     {
         var index = new LogicalIndexDeclaration(

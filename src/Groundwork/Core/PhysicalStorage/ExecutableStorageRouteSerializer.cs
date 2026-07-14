@@ -21,6 +21,13 @@ public static class ExecutableStorageRouteSerializer
 
     public static ExecutableStorageRoute Deserialize(string canonicalJson)
     {
+        var route = DeserializeRaw(canonicalJson);
+        route.EnsureSupportedIdentityAlgorithms();
+        return route;
+    }
+
+    internal static ExecutableStorageRoute DeserializeRaw(string canonicalJson)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(canonicalJson);
         using var document = JsonDocument.Parse(canonicalJson);
         var root = document.RootElement;
@@ -84,11 +91,12 @@ public static class ExecutableStorageRouteSerializer
         string expectedDefinitionFingerprint,
         string expectedRouteFingerprint)
     {
+        var route = DeserializeRaw(canonicalJson);
         using var document = JsonDocument.Parse(canonicalJson);
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object ||
-            root.GetProperty("definitionFingerprint").GetString() != expectedDefinitionFingerprint ||
-            root.GetProperty("fingerprint").GetString() != expectedRouteFingerprint)
+            route.DefinitionFingerprint != expectedDefinitionFingerprint ||
+            route.Fingerprint != expectedRouteFingerprint)
         {
             throw new InvalidOperationException("Applied route snapshot fingerprints do not match its canonical route.");
         }

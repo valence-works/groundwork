@@ -129,19 +129,7 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteNumber("schemaVersion", definition.SchemaVersion);
         WriteEvolution(writer, definition.Evolution);
         if (definition.Envelope is not null)
-        {
-            writer.WritePropertyName("envelope");
-            writer.WriteStartObject();
-            writer.WriteString("id", definition.Envelope.IdColumn);
-            writer.WriteString("idComparisonKey", definition.Envelope.IdComparisonKeyColumn);
-            writer.WriteString("idLookupKey", definition.Envelope.IdLookupKeyColumn);
-            writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-            writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
-            writer.WriteString("version", definition.Envelope.VersionColumn);
-            writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
-            writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
-            writer.WriteEndObject();
-        }
+            WriteEnvelopeDefinition(writer, definition.Envelope);
 
         writer.WritePropertyName("projectedColumns");
         writer.WriteStartArray();
@@ -199,18 +187,25 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteString("binding", definition.Binding.Value);
         writer.WriteString("featureDefaultLogicalName", definition.FeatureDefaultLogicalName);
         writer.WriteNumber("schemaVersion", definition.SchemaVersion);
+        WriteEnvelopeDefinition(writer, definition.Envelope);
+        WriteEvolution(writer, definition.Evolution);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteEnvelopeDefinition(
+        Utf8JsonWriter writer,
+        DocumentEnvelopeDefinition envelope)
+    {
         writer.WritePropertyName("envelope");
         writer.WriteStartObject();
-        writer.WriteString("id", definition.Envelope.IdColumn);
-        writer.WriteString("idComparisonKey", definition.Envelope.IdComparisonKeyColumn);
-        writer.WriteString("idLookupKey", definition.Envelope.IdLookupKeyColumn);
-        writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-        writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
-        writer.WriteString("version", definition.Envelope.VersionColumn);
-        writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
-        writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
-        writer.WriteEndObject();
-        WriteEvolution(writer, definition.Evolution);
+        writer.WriteString("id", envelope.IdColumn);
+        writer.WriteString("idComparisonKey", envelope.IdComparisonKeyColumn);
+        writer.WriteString("idLookupKey", envelope.IdLookupKeyColumn);
+        writer.WriteString("documentKind", envelope.DocumentKindColumn);
+        writer.WriteString("storageScope", envelope.StorageScopeColumn);
+        writer.WriteString("version", envelope.VersionColumn);
+        writer.WriteString("schemaVersion", envelope.SchemaVersionColumn);
+        writer.WriteString("canonicalJson", envelope.CanonicalJsonColumn);
         writer.WriteEndObject();
     }
 

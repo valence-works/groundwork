@@ -460,6 +460,32 @@ public sealed class PhysicalSchemaDiffPlannerTests
     }
 
     [Theory]
+    [InlineData("comparisonAlgorithm")]
+    [InlineData("lookupAlgorithm")]
+    public void Public_schema_target_rejects_unsupported_route_algorithms(string algorithmProperty)
+    {
+        var current = CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false);
+        var root = JsonNode.Parse(ExecutableStorageRouteSerializer.Serialize(current.Routes.Single()))!.AsObject();
+        root["envelope"]!["identity"]![algorithmProperty] = "unsupported-v2";
+        root.Remove("fingerprint");
+        root["fingerprint"] = Fingerprint(root.ToJsonString());
+        var rawDeserializer = typeof(ExecutableStorageRouteSerializer).GetMethod(
+            "DeserializeRaw",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(rawDeserializer);
+        var unsupported = Assert.IsType<ExecutableStorageRoute>(rawDeserializer.Invoke(null, [root.ToJsonString()]));
+
+        var exception = Assert.Throws<ArgumentException>(() => new PhysicalSchemaTarget(
+            current.ManifestIdentity,
+            current.ManifestVersion,
+            current.Provider,
+            [unsupported]));
+
+        Assert.Contains("identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("algorithm", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]

@@ -4,7 +4,10 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.Scoping;
 using Groundwork.Core.Text;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -137,6 +140,25 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.Equal(
             PortableStringComparison.ProjectIdentity("Straße-Σς", PortableStringComparisonPolicy.Ordinal),
             projection);
+    }
+
+    [Theory]
+    [InlineData("comparisonAlgorithm")]
+    [InlineData("lookupAlgorithm")]
+    public void Public_route_deserialization_rejects_unsupported_identity_algorithms(string algorithmProperty)
+    {
+        var route = AssertRoute(ExecutableStorageRouteCompiler.Compile(Resolve(SharedScaleBearingManifest())));
+        var root = JsonNode.Parse(ExecutableStorageRouteSerializer.Serialize(route))!.AsObject();
+        root["envelope"]!["identity"]![algorithmProperty] = "unsupported-v2";
+        root["linkedRelationship"]!["identity"]![algorithmProperty] = "unsupported-v2";
+        root.Remove("fingerprint");
+        root["fingerprint"] = Fingerprint(root.ToJsonString());
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            ExecutableStorageRouteSerializer.Deserialize(root.ToJsonString()));
+
+        Assert.Contains("identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("algorithm", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -639,6 +661,9 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(diagnostic => diagnostic.Message)));
         return Assert.Single(result.Routes);
     }
+
+    private static string Fingerprint(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
     private static ProviderPhysicalTableDefinition Resolve(StorageManifest manifest)
     {
