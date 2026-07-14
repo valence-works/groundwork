@@ -7,6 +7,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Text;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
@@ -80,6 +81,272 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         else
             Assert.Equal("open", (await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
                 .Find(Builders<BsonDocument>.Filter.Empty).FirstAsync())[route.ProjectedColumns.Single().Column.Identifier].AsString);
+    }
+
+    [Fact]
+    public async Task Unicode_equivalent_identity_loads_the_retained_original_spelling()
+    {
+        var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
+        const string retainedId = "metric-\U00010428-\u00e9";
+
+        var saved = await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            retainedId,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+        var loaded = await store.LoadAsync("workItem", "METRIC-\U00010400-\u00c9");
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(retainedId, loaded!.Id);
+    }
+
+    [Fact]
+    public async Task Equivalent_identity_save_returns_the_authoritative_original_without_overwriting()
+    {
+        var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
+        const string retainedId = "metric-\U00010428-\u00e9";
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            retainedId,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+
+        var conflict = await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            "METRIC-\U00010400-\u00c9",
+            "1",
+            """{"status":"closed"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal(retainedId, conflict.AuthoritativeId);
+        var retained = await store.LoadAsync("workItem", retainedId);
+        Assert.Equal(retainedId, retained!.Id);
+        Assert.Equal("""{"status":"open"}""", retained.ContentJson);
+        Assert.Equal(1, retained.Version);
+    }
+
+    [Fact]
+    public async Task Equivalent_identity_delete_removes_primary_and_linked_records()
+    {
+        var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.SharedDocuments);
+        const string retainedId = "metric-\U00010428-\u00e9";
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            retainedId,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+
+        var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
+            "workItem",
+            "METRIC-\U00010400-\u00c9",
+            ExpectedVersion: 1));
+
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal(retainedId, deleted.AuthoritativeId);
+        Assert.Null(await store.LoadAsync("workItem", retainedId));
+        Assert.Equal(0, await store.CountAsync(new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))],
+            resultOperation: BoundedQueryResultOperation.Count)));
+    }
+
+    [Fact]
+    public async Task Distinct_comparison_keys_with_one_lookup_key_raise_an_identity_collision()
+    {
+        var (database, model, store) = await CreateIdentityStoreAsync(
+            PhysicalStorageForm.PhysicalEntityTable,
+            StringIdentityCasePolicy.Ordinal);
+        const string retainedId = "retained-id";
+        const string requestedId = "requested-id";
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            retainedId,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+        var route = Assert.Single(model.Routes);
+        var collection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
+        var retained = await collection.Find(Builders<BsonDocument>.Filter.Empty).SingleAsync();
+        await collection.DeleteOneAsync(Builders<BsonDocument>.Filter.Eq(
+            MongoDbPhysicalStorageFields.Id,
+            retained[MongoDbPhysicalStorageFields.Id]));
+        var requestedProjection = route.Envelope.Identity.Project(requestedId);
+        retained[route.Envelope.Identity.LookupKey.Identifier] = requestedProjection.LookupKey;
+        retained[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(
+            route.PrimaryKey,
+            retained);
+        await collection.InsertOneAsync(retained);
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            store.SaveAsync(new SaveDocumentRequest(
+                "workItem",
+                requestedId,
+                "1",
+                """{"status":"closed"}""",
+                ExpectedVersion: 0)));
+
+        Assert.Equal("workItem", exception.DocumentKind);
+        Assert.Equal(requestedId, exception.RequestedId);
+        Assert.Equal(retainedId, exception.RetainedId);
+        Assert.Equal(requestedProjection.LookupKey, exception.LookupKey);
+        await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            store.LoadAsync("workItem", requestedId));
+        await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            store.DeleteAsync(new DeleteDocumentRequest("workItem", requestedId)));
+    }
+
+    [Fact]
+    public async Task Concurrent_equivalent_identity_creates_report_the_retained_original()
+    {
+        var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
+        const string firstSpelling = "metric-\U00010428-\u00e9";
+        const string secondSpelling = "METRIC-\U00010400-\u00c9";
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var saves = Enumerable.Range(0, 16).Select(async index =>
+        {
+            await start.Task;
+            return await store.SaveAsync(new SaveDocumentRequest(
+                "workItem",
+                index % 2 == 0 ? firstSpelling : secondSpelling,
+                "1",
+                """{"status":"open"}""",
+                ExpectedVersion: 0));
+        }).ToArray();
+
+        start.SetResult();
+        var results = await Task.WhenAll(saves);
+
+        var saved = Assert.Single(results, result => result.Status == DocumentStoreWriteStatus.Saved);
+        var authoritativeId = saved.Document!.Id;
+        Assert.Equal(8, results.Count(result => result.Status == DocumentStoreWriteStatus.IdentityConflict));
+        Assert.All(
+            results.Where(result => result.Status == DocumentStoreWriteStatus.IdentityConflict),
+            result => Assert.Equal(authoritativeId, result.AuthoritativeId));
+        Assert.Equal(7, results.Count(result => result.Status == DocumentStoreWriteStatus.ConcurrencyConflict));
+    }
+
+    [Fact]
+    public async Task Unit_of_work_identity_conflict_is_terminal_and_rolls_back_prior_writes()
+    {
+        var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
+        const string retainedId = "metric-\U00010428-\u00e9";
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            retainedId,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+        await using var transaction = await store.BeginAsync(DocumentCommitScope.Of("workItem"));
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            "staged",
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0))).Status);
+
+        var conflict = await transaction.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            "METRIC-\U00010400-\u00c9",
+            "1",
+            """{"status":"closed"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal(retainedId, conflict.AuthoritativeId);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transaction.CommitAsync());
+        Assert.Null(await store.LoadAsync("workItem", "staged"));
+        Assert.Equal("""{"status":"open"}""", (await store.LoadAsync("workItem", retainedId))!.ContentJson);
+    }
+
+    [Fact]
+    public async Task Public_factory_rejects_identity_policy_drift_in_applied_database_state()
+    {
+        var databaseName = $"groundwork_{Guid.NewGuid():N}";
+        var database = new MongoClient(container.GetConnectionString()).GetDatabase(databaseName);
+        var ordinal = Model(PhysicalStorageForm.PhysicalEntityTable);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(ordinal);
+        var unicode = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            identityCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+                container.GetConnectionString(),
+                databaseName,
+                unicode.Manifest,
+                unicode.Provider,
+                DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Contains("Rejected", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("GW-SCHEMA-006", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Public_factory_accepts_an_existing_database_through_the_admitted_seam()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            identityCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        await using var handle = await MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+            database,
+            model.Manifest,
+            model.Provider,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var saved = await handle.Store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            "metric-\u00e9",
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal("metric-\u00e9", (await handle.Store.LoadAsync("workItem", "METRIC-\u00c9"))!.Id);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Physical_forms_persist_original_comparison_and_lookup_identity_evidence(
+        PhysicalStorageForm form)
+    {
+        var (database, model, store) = await CreateIdentityStoreAsync(form);
+        const string id = "metric-\U00010428-\u00e9";
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem",
+            id,
+            "1",
+            """{"status":"open"}""",
+            ExpectedVersion: 0));
+
+        var route = Assert.Single(model.Routes);
+        var projection = route.Envelope.Identity.Project(id);
+        var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .SingleAsync();
+        AssertIdentity(primary, route.Envelope.Identity, projection);
+        Assert.Equal(
+            projection.LookupKey,
+            primary[MongoDbPhysicalStorageFields.Id]
+                .AsBsonDocument[route.Envelope.Identity.LookupKey.Identifier]
+                .AsString);
+
+        if (route.LinkedIndexStorage is null)
+            return;
+        var linked = await database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
+            .Find(Builders<BsonDocument>.Filter.Empty)
+            .SingleAsync();
+        AssertIdentity(linked, route.LinkedRelationship!.Identity, projection);
+        Assert.Equal(
+            projection.LookupKey,
+            linked[MongoDbPhysicalStorageFields.Id]
+                .AsBsonDocument[route.LinkedRelationship.Identity.LookupKey.Identifier]
+                .AsString);
     }
 
     [Theory]
@@ -1057,7 +1324,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         var collision = (await primaryCollection.Find(Builders<BsonDocument>.Filter.Eq(
                 route.Envelope.Id.Identifier,
                 "existing")).SingleAsync()).DeepClone().AsBsonDocument;
-        collision[route.Envelope.Id.Identifier] = "collision";
+        MongoDbPhysicalDocumentIdentity.WritePrimary(collision, route, "collision");
         collision[MongoDbPhysicalStorageFields.Incarnation] = Guid.NewGuid().ToString("N");
         collision[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.PrimaryKey, collision);
         await primaryCollection.InsertOneAsync(collision);
@@ -1412,6 +1679,35 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     private IMongoDatabase Database() =>
         new MongoClient(container.GetConnectionString()).GetDatabase($"groundwork_{Guid.NewGuid():N}");
 
+    private async Task<(
+        IMongoDatabase Database,
+        MongoDbPhysicalStorageModel Model,
+        MongoDbPhysicalDocumentStore Store)> CreateIdentityStoreAsync(
+        PhysicalStorageForm form,
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+    {
+        var database = Database();
+        var model = Model(form, identityCasePolicy: identityCasePolicy);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        return (
+            database,
+            model,
+            new MongoDbPhysicalDocumentStore(
+                database,
+                model,
+                DocumentStoreAccess.Scoped(new("tenant-a"))));
+    }
+
+    private static void AssertIdentity(
+        BsonDocument document,
+        ExecutableDocumentIdentityRoute route,
+        PortableStringIdentityProjection expected)
+    {
+        Assert.Equal(expected.OriginalValue, document[route.OriginalId.Identifier].AsString);
+        Assert.Equal(expected.ComparisonKey, document[route.ComparisonKey.Identifier].AsString);
+        Assert.Equal(expected.LookupKey, document[route.LookupKey.Identifier].AsString);
+    }
+
     private static Task StealLeaseAsync(IMongoDatabase database, PhysicalSchemaTargetIdentity target) =>
         database.GetCollection<BsonDocument>("groundwork_physical_schema_locks").UpdateOneAsync(
             Builders<BsonDocument>.Filter.Eq("_id", MongoDbPhysicalSchemaExecutor.TargetIdentityDocument(target)),
@@ -1429,7 +1725,8 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         bool isNullable = false,
         string? defaultValue = null,
         bool isUnique = false,
-        MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded)
+        MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded,
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal)
     {
         var binding = new SharedStorageBinding("runtime");
         var projected = new ProjectedColumnDefinition(
@@ -1474,7 +1771,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             "Work item",
             StorageIntent.PortableDocument(),
             LifecyclePolicy.Mutable,
-            IdentityPolicy.StringId(),
+            IdentityPolicy.StringId(stringCasePolicy: identityCasePolicy),
             TenancyPolicy.Scoped,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
