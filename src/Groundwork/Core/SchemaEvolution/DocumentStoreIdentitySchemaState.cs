@@ -30,12 +30,12 @@ public sealed record DocumentStoreIdentitySchemaState
     public static DocumentStoreIdentitySchemaState Capture(IdentityPolicy policy)
     {
         ArgumentNullException.ThrowIfNull(policy);
-        if (policy.Kind != StorageIdentityKind.String)
-            throw new InvalidOperationException("Document Store identity schema requires a string identity policy.");
-
-        var comparisonPolicy = PortableStringComparison.ForIdentityPolicy(policy.StringCasePolicy);
+        var stringCasePolicy = policy.Kind == StorageIdentityKind.String
+            ? policy.StringCasePolicy
+            : StringIdentityCasePolicy.Ordinal;
+        var comparisonPolicy = PortableStringComparison.ForIdentityPolicy(stringCasePolicy);
         return new(
-            policy.StringCasePolicy,
+            stringCasePolicy,
             PortableStringComparison.GetAlgorithmId(comparisonPolicy),
             PortableStringComparison.LookupHashAlgorithmId);
     }

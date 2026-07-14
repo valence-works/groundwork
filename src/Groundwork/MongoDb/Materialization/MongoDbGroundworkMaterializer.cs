@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Physicalization;
@@ -14,6 +15,19 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
     private const int IndexOptionsConflictErrorCode = 85;
     private const int IndexKeySpecsConflictErrorCode = 86;
     private const int NamespaceExistsErrorCode = 48;
+    private const int DuplicateKeyErrorCode = 11000;
+    private const string IdentitySchemaLockId = "document-store-identity-schema";
+    private static readonly TimeSpan IdentitySchemaLeaseDuration = TimeSpan.FromMinutes(2);
+    private readonly MongoDbIdentitySchemaAdmissionHooks identitySchemaHooks =
+        MongoDbIdentitySchemaAdmissionHooks.None;
+
+    internal MongoDbGroundworkMaterializer(
+        IMongoDatabase database,
+        MongoDbIdentitySchemaAdmissionHooks identitySchemaHooks)
+        : this(database)
+    {
+        this.identitySchemaHooks = identitySchemaHooks;
+    }
 
     public Task<PhysicalSchemaApplicationResult> MaterializeAsync(
         MongoDbPhysicalStorageModel model,
@@ -63,11 +77,11 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
             await EnsureCollectionAsync(collections, MongoDbGroundworkNames.IdentitySchemaCollection, cancellationToken);
             await EnsureCollectionAsync(collections, MongoDbGroundworkNames.IdentitySchemaLockCollection, cancellationToken);
             var admissions = storageOperations
-                .Select(operation => new DocumentStoreIdentitySchemaAdmission(
+                .Select(operation => new IdentitySchemaAdmission(
                     new Groundwork.Core.Manifests.StorageUnitIdentity(operation.StorageUnit.Identity),
                     operation.StorageUnit.IdentitySchemaState))
                 .ToArray();
-            await new IdentitySchemaAdmission(this).AdmitAsync(admissions, cancellationToken);
+            await AdmitIdentitySchemasAsync(admissions, cancellationToken);
         }
 
         foreach (var operation in plan.Operations)
@@ -215,10 +229,14 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
     }
 
     private async Task AdmitIdentitySchemasAsync(
-        IReadOnlyList<DocumentStoreIdentitySchemaAdmission> admissions,
+        IReadOnlyList<IdentitySchemaAdmission> admissions,
         CancellationToken cancellationToken)
     {
-        var lockOwner = await AcquireIdentitySchemaLockAsync(cancellationToken);
+        await MongoDbTransactionCapability.ForDatabase(database).EnsureSupportedAsync(
+            admissions.Select(admission => admission.StorageUnit.Value).ToArray(),
+            "Document Store identity-schema admission",
+            cancellationToken);
+        var lease = await AcquireIdentitySchemaLeaseAsync(cancellationToken);
         try
         {
             var stateCollection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.IdentitySchemaCollection);
@@ -239,44 +257,74 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
                 plans.Add(await PlanIdentityEvolutionAsync(admission, retainedState is not null, cancellationToken));
             }
 
+            var committedRows = 0;
             foreach (var plan in plans)
             {
                 var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.CollectionName(plan.Admission.StorageUnit.Value));
                 foreach (var row in plan.Rows)
                 {
-                    var result = await collection.UpdateOneAsync(
-                        Builders<BsonDocument>.Filter.Eq("_id", row.Id),
-                        Builders<BsonDocument>.Update
-                            .Set("id_original", row.OriginalId)
-                            .Set("id_comparison_key", row.Projection.ComparisonKey)
-                            .Set("id_lookup_key", row.Projection.LookupKey),
-                        cancellationToken: cancellationToken);
-                    if (result.MatchedCount != 1)
-                        throw new InvalidOperationException("Document Store identity schema evolution lost its authoritative MongoDB document.");
+                    await ExecuteWithIdentitySchemaLeaseAsync(
+                        lease,
+                        async session =>
+                        {
+                            var result = await collection.UpdateOneAsync(
+                                session,
+                                Builders<BsonDocument>.Filter.Eq("_id", row.Id),
+                                Builders<BsonDocument>.Update
+                                    .Set("id_original", row.OriginalId)
+                                    .Set("id_comparison_key", row.Projection.ComparisonKey)
+                                    .Set("id_lookup_key", row.Projection.LookupKey),
+                                cancellationToken: cancellationToken);
+                            if (result.MatchedCount != 1)
+                            {
+                                throw new InvalidOperationException(
+                                    "Document Store identity schema evolution lost its authoritative MongoDB document.");
+                            }
+                        },
+                        cancellationToken);
+                    await identitySchemaHooks.BackfillRowCommitted(++committedRows, cancellationToken);
                 }
             }
 
             foreach (var plan in plans)
+            {
+                await AssertAndRenewIdentitySchemaLeaseAsync(lease, session: null, cancellationToken);
                 await PlanIdentityEvolutionAsync(plan.Admission, hasRecordedState: true, cancellationToken);
+            }
 
             foreach (var plan in plans)
-                await EnsureIdentityLookupIndexAsync(plan.Admission.StorageUnit.Value, cancellationToken);
-
-            foreach (var plan in plans.Where(plan => !plan.HasRecordedState))
             {
-                await stateCollection.InsertOneAsync(
-                    CreateIdentitySchemaDocument(plan.Admission),
-                    cancellationToken: cancellationToken);
+                await AssertAndRenewIdentitySchemaLeaseAsync(lease, session: null, cancellationToken);
+                await EnsureIdentityLookupIndexAsync(plan.Admission.StorageUnit.Value, cancellationToken);
+                await AssertAndRenewIdentitySchemaLeaseAsync(lease, session: null, cancellationToken);
+            }
+
+            var missingStates = plans.Where(plan => !plan.HasRecordedState).ToArray();
+            if (missingStates.Length > 0)
+            {
+                await ExecuteWithIdentitySchemaLeaseAsync(
+                    lease,
+                    async session =>
+                    {
+                        foreach (var plan in missingStates)
+                        {
+                            await stateCollection.InsertOneAsync(
+                                session,
+                                CreateIdentitySchemaDocument(plan.Admission),
+                                cancellationToken: cancellationToken);
+                        }
+                    },
+                    cancellationToken);
             }
         }
         finally
         {
-            await ReleaseIdentitySchemaLockAsync(lockOwner, CancellationToken.None);
+            await ReleaseIdentitySchemaLeaseAsync(lease, CancellationToken.None);
         }
     }
 
     private async Task<MongoIdentityEvolutionPlan> PlanIdentityEvolutionAsync(
-        DocumentStoreIdentitySchemaAdmission admission,
+        IdentitySchemaAdmission admission,
         bool hasRecordedState,
         CancellationToken cancellationToken)
     {
@@ -336,37 +384,58 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         return new(admission, hasRecordedState, rows);
     }
 
-    private async Task<string> AcquireIdentitySchemaLockAsync(CancellationToken cancellationToken)
+    private async Task<IdentitySchemaLease> AcquireIdentitySchemaLeaseAsync(CancellationToken cancellationToken)
     {
-        var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.IdentitySchemaLockCollection);
+        var collection = IdentitySchemaLeaseCollection();
         var owner = Guid.NewGuid().ToString("N");
-        var deadline = DateTime.UtcNow.AddSeconds(30);
-        while (DateTime.UtcNow < deadline)
+        try
         {
-            var now = DateTime.UtcNow;
-            var filter = Builders<BsonDocument>.Filter.Eq("_id", "document-store-identity-schema") &
-                         (Builders<BsonDocument>.Filter.Lt("expires_utc", now) |
-                          Builders<BsonDocument>.Filter.Eq("owner", owner));
-            var update = Builders<BsonDocument>.Update
-                .Set("owner", owner)
-                .Set("expires_utc", now.AddMinutes(2));
-            try
+            await collection.UpdateOneAsync(
+                Builders<BsonDocument>.Filter.Eq("_id", IdentitySchemaLockId),
+                Builders<BsonDocument>.Update
+                    .SetOnInsert("expires_utc", DateTime.UnixEpoch)
+                    .SetOnInsert("fence", 0L),
+                new UpdateOptions { IsUpsert = true },
+                cancellationToken);
+        }
+        catch (MongoCommandException exception) when (exception.Code == DuplicateKeyErrorCode)
+        {
+            // Another contender initialized the singleton lease document.
+        }
+        catch (MongoWriteException exception) when (exception.WriteError?.Code == DuplicateKeyErrorCode)
+        {
+            // Another contender initialized the singleton lease document.
+        }
+
+        var wait = Stopwatch.StartNew();
+        while (wait.Elapsed < TimeSpan.FromSeconds(30))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var filter = new BsonDocument
             {
-                var retained = await collection.FindOneAndUpdateAsync(
-                    filter,
-                    update,
-                    new FindOneAndUpdateOptions<BsonDocument>
+                ["_id"] = IdentitySchemaLockId,
+                ["$expr"] = new BsonDocument("$lte", new BsonArray
+                {
+                    new BsonDocument("$ifNull", new BsonArray
                     {
-                        IsUpsert = true,
-                        ReturnDocument = ReturnDocument.After
-                    },
-                    cancellationToken);
-                if (retained?["owner"].AsString == owner)
-                    return owner;
-            }
-            catch (MongoCommandException exception) when (exception.Code == 11000)
+                        "$expires_utc",
+                        new BsonDateTime(DateTime.UnixEpoch)
+                    }),
+                    "$$NOW"
+                })
+            };
+            var update = ServerTimedLeaseUpdate(owner, incrementFence: true);
+            var retained = await collection.FindOneAndUpdateAsync(
+                filter,
+                update,
+                new FindOneAndUpdateOptions<BsonDocument>
+                {
+                    ReturnDocument = ReturnDocument.After
+                },
+                cancellationToken);
+            if (retained?["owner"].AsString == owner)
             {
-                // Another materializer owns the lease created between our filter and upsert.
+                return new IdentitySchemaLease(owner, retained["fence"].ToInt64());
             }
 
             await Task.Delay(25, cancellationToken);
@@ -375,16 +444,100 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         throw new TimeoutException("Timed out acquiring the Document Store identity schema evolution lock.");
     }
 
-    private Task ReleaseIdentitySchemaLockAsync(string owner, CancellationToken cancellationToken)
+    private async Task AssertAndRenewIdentitySchemaLeaseAsync(
+        IdentitySchemaLease lease,
+        IClientSessionHandle? session,
+        CancellationToken cancellationToken)
     {
-        var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.IdentitySchemaLockCollection);
-        return collection.DeleteOneAsync(
-            Builders<BsonDocument>.Filter.Eq("_id", "document-store-identity-schema") &
-            Builders<BsonDocument>.Filter.Eq("owner", owner),
-            cancellationToken);
+        var collection = IdentitySchemaLeaseCollection();
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", IdentitySchemaLockId) &
+                     Builders<BsonDocument>.Filter.Eq("owner", lease.Owner) &
+                     Builders<BsonDocument>.Filter.Eq("fence", lease.Fence) &
+                     new BsonDocumentFilterDefinition<BsonDocument>(new BsonDocument(
+                         "$expr",
+                         new BsonDocument("$gt", new BsonArray { "$expires_utc", "$$NOW" })));
+        var update = ServerTimedLeaseUpdate(lease.Owner, incrementFence: false);
+        var result = session is null
+            ? await collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken)
+            : await collection.UpdateOneAsync(session, filter, update, cancellationToken: cancellationToken);
+        if (result.MatchedCount != 1)
+        {
+            throw new InvalidOperationException(
+                $"MongoDB Document Store identity-schema lease is no longer owned by fence {lease.Fence}.");
+        }
     }
 
-    private static BsonDocument CreateIdentitySchemaDocument(DocumentStoreIdentitySchemaAdmission admission) =>
+    private async Task ExecuteWithIdentitySchemaLeaseAsync(
+        IdentitySchemaLease lease,
+        Func<IClientSessionHandle, Task> body,
+        CancellationToken cancellationToken)
+    {
+        using var session = await database.Client.StartSessionAsync(cancellationToken: cancellationToken);
+        session.StartTransaction(new TransactionOptions(ReadConcern.Snapshot, writeConcern: WriteConcern.WMajority));
+        try
+        {
+            await AssertAndRenewIdentitySchemaLeaseAsync(lease, session, cancellationToken);
+            await body(session);
+            await session.CommitTransactionAsync(cancellationToken);
+        }
+        catch
+        {
+            if (session.IsInTransaction)
+                await session.AbortTransactionAsync(CancellationToken.None);
+            throw;
+        }
+    }
+
+    private async Task ReleaseIdentitySchemaLeaseAsync(
+        IdentitySchemaLease lease,
+        CancellationToken cancellationToken)
+    {
+        var collection = IdentitySchemaLeaseCollection();
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", IdentitySchemaLockId) &
+                     Builders<BsonDocument>.Filter.Eq("owner", lease.Owner) &
+                     Builders<BsonDocument>.Filter.Eq("fence", lease.Fence);
+        var update = new PipelineUpdateDefinition<BsonDocument>(new BsonDocument[]
+        {
+            new("$set", new BsonDocument("expires_utc", "$$NOW")),
+            new("$unset", "owner")
+        });
+        await collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken);
+    }
+
+    private IMongoCollection<BsonDocument> IdentitySchemaLeaseCollection() =>
+        database
+            .WithReadConcern(ReadConcern.Majority)
+            .WithWriteConcern(WriteConcern.WMajority)
+            .GetCollection<BsonDocument>(MongoDbGroundworkNames.IdentitySchemaLockCollection);
+
+    private static PipelineUpdateDefinition<BsonDocument> ServerTimedLeaseUpdate(
+        string owner,
+        bool incrementFence)
+    {
+        BsonValue fence = incrementFence
+            ? new BsonDocument("$add", new BsonArray
+            {
+                new BsonDocument("$ifNull", new BsonArray { "$fence", 0L }),
+                1L
+            })
+            : new BsonString("$fence");
+        return new PipelineUpdateDefinition<BsonDocument>(new BsonDocument[]
+        {
+            new("$set", new BsonDocument
+            {
+                ["owner"] = owner,
+                ["fence"] = fence,
+                ["expires_utc"] = new BsonDocument("$dateAdd", new BsonDocument
+                {
+                    ["startDate"] = "$$NOW",
+                    ["unit"] = "millisecond",
+                    ["amount"] = (long)IdentitySchemaLeaseDuration.TotalMilliseconds
+                })
+            })
+        });
+    }
+
+    private static BsonDocument CreateIdentitySchemaDocument(IdentitySchemaAdmission admission) =>
         new()
         {
             ["_id"] = admission.StorageUnit.Value,
@@ -392,7 +545,7 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         };
 
     private sealed record MongoIdentityEvolutionPlan(
-        DocumentStoreIdentitySchemaAdmission Admission,
+        IdentitySchemaAdmission Admission,
         bool HasRecordedState,
         IReadOnlyList<MongoIdentityEvolutionRow> Rows);
 
@@ -402,14 +555,11 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         string StorageScope,
         Groundwork.Core.Text.PortableStringIdentityProjection Projection);
 
-    private sealed class IdentitySchemaAdmission(MongoDbGroundworkMaterializer materializer)
-        : IDocumentStoreIdentitySchemaAdmission
-    {
-        public Task AdmitAsync(
-            IReadOnlyList<DocumentStoreIdentitySchemaAdmission> admissions,
-            CancellationToken cancellationToken = default) =>
-            materializer.AdmitIdentitySchemasAsync(admissions, cancellationToken);
-    }
+    private sealed record IdentitySchemaLease(string Owner, long Fence);
+
+    private sealed record IdentitySchemaAdmission(
+        Groundwork.Core.Manifests.StorageUnitIdentity StorageUnit,
+        DocumentStoreIdentitySchemaState RequiredState);
 
     private async Task EnsureIndexAsync(
         MaterializedIndex index,
@@ -474,4 +624,11 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
 
         await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true }, cancellationToken);
     }
+}
+
+internal sealed record MongoDbIdentitySchemaAdmissionHooks(
+    Func<int, CancellationToken, ValueTask> BackfillRowCommitted)
+{
+    public static MongoDbIdentitySchemaAdmissionHooks None { get; } = new(
+        static (_, _) => ValueTask.CompletedTask);
 }

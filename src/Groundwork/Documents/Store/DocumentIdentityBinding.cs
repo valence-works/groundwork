@@ -4,8 +4,9 @@ using Groundwork.Core.Text;
 namespace Groundwork.Documents.Store;
 
 /// <summary>
-/// Binds one declared string-identity policy to the portable comparison and lookup algorithms used
-/// by Document Store implementations. Providers persist the returned projection without re-deriving it.
+/// Binds one admitted identity policy to the portable string projection used by Document Store
+/// implementations. Declared string identities retain their case policy; other identity kinds preserve
+/// their ordinal string representation. Providers persist the returned projection without re-deriving it.
 /// </summary>
 public sealed class DocumentIdentityBinding
 {
@@ -19,13 +20,10 @@ public sealed class DocumentIdentityBinding
     public static DocumentIdentityBinding From(StorageUnit unit)
     {
         ArgumentNullException.ThrowIfNull(unit);
-        if (unit.IdentityPolicy.Kind != StorageIdentityKind.String)
-        {
-            throw new InvalidOperationException(
-                $"Document Store Storage Unit '{unit.Identity.Value}' requires a string identity policy.");
-        }
-
-        return new DocumentIdentityBinding(unit.IdentityPolicy.StringCasePolicy);
+        var stringCasePolicy = unit.IdentityPolicy.Kind == StorageIdentityKind.String
+            ? unit.IdentityPolicy.StringCasePolicy
+            : StringIdentityCasePolicy.Ordinal;
+        return new DocumentIdentityBinding(stringCasePolicy);
     }
 
     public static IReadOnlyDictionary<string, DocumentIdentityBinding> Bind(StorageManifest manifest)

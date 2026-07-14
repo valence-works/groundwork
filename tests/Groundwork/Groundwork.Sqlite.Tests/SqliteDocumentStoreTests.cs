@@ -369,6 +369,44 @@ public sealed class SqliteDocumentStoreTests
     }
 
     [Theory]
+    [InlineData(StorageIdentityKind.Guid)]
+    [InlineData(StorageIdentityKind.Composite)]
+    public async Task FactoryAndStorePreserveOrdinalProjectionForAdmittedNonStringIdentityKinds(
+        StorageIdentityKind identityKind)
+    {
+        var manifest = WithIdentityKind(identityKind);
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-{identityKind}-{Guid.NewGuid():N}.db");
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                $"Data Source={databasePath};Pooling=False",
+                manifest,
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+
+            var upper = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"upper"}"""));
+            var lower = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "a-b", "1.0.0", """{"key":"lower"}"""));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, upper.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Saved, lower.Status);
+            var updated = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"updated"}""", ExpectedVersion: 1));
+            var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
+                "configurationDocument", "a-b", ExpectedVersion: 1));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, updated.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+            Assert.Contains("updated", (await store.LoadAsync("configurationDocument", "A-B"))!.ContentJson);
+            Assert.Null(await store.LoadAsync("configurationDocument", "a-b"));
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Theory]
     [InlineData("Data Source=:memory:")]
     [InlineData("Data Source=groundwork;Mode=Memory")]
     public async Task FactoryRejectsPrivateInMemoryDatabase(string connectionString)
@@ -882,6 +920,21 @@ public sealed class SqliteDocumentStoreTests
                 manifest.StorageUnits.Single() with
                 {
                     IdentityPolicy = IdentityPolicy.StringId(stringCasePolicy: policy)
+                }
+            ]
+        };
+    }
+
+    private static StorageManifest WithIdentityKind(StorageIdentityKind kind)
+    {
+        var manifest = SqliteTestManifests.MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = new IdentityPolicy(kind, "id")
                 }
             ]
         };

@@ -33,7 +33,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
 
         var admissions = plan.Operations
             .OfType<CreateStorageUnitOperation>()
-            .Select(operation => new DocumentStoreIdentitySchemaAdmission(
+            .Select(operation => new IdentitySchemaAdmission(
                 new StorageUnitIdentity(operation.StorageUnit.Identity),
                 operation.StorageUnit.IdentitySchemaState))
             .ToArray();
@@ -43,7 +43,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         foreach (var statement in SchemaStatements)
             await ExecuteAsync(statement, transaction, cancellationToken);
 
-        await new IdentitySchemaAdmission(this, transaction).AdmitAsync(admissions, cancellationToken);
+        await AdmitIdentitySchemasAsync(admissions, transaction, cancellationToken);
 
         foreach (var operation in plan.Operations)
         {
@@ -102,7 +102,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
     protected abstract IReadOnlyList<string> RequiredIdentityLookupIndexColumns { get; }
 
     private async Task AdmitIdentitySchemasAsync(
-        IReadOnlyList<DocumentStoreIdentitySchemaAdmission> admissions,
+        IReadOnlyList<IdentitySchemaAdmission> admissions,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -166,7 +166,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
     }
 
     private async Task BackfillOrValidateIdentityRowsAsync(
-        IReadOnlyList<DocumentStoreIdentitySchemaAdmission> admissions,
+        IReadOnlyList<IdentitySchemaAdmission> admissions,
         IReadOnlySet<string> recordedUnits,
         DbTransaction transaction,
         CancellationToken cancellationToken)
@@ -254,7 +254,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
     }
 
     private async Task RecordIdentitySchemaStateAsync(
-        DocumentStoreIdentitySchemaAdmission admission,
+        IdentitySchemaAdmission admission,
         DbTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -281,15 +281,9 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         bool HasRecordedState,
         PortableStringIdentityProjection Required);
 
-    private sealed class IdentitySchemaAdmission(
-        RelationalMaterializerBase materializer,
-        DbTransaction transaction) : IDocumentStoreIdentitySchemaAdmission
-    {
-        public Task AdmitAsync(
-            IReadOnlyList<DocumentStoreIdentitySchemaAdmission> admissions,
-            CancellationToken cancellationToken = default) =>
-            materializer.AdmitIdentitySchemasAsync(admissions, transaction, cancellationToken);
-    }
+    private sealed record IdentitySchemaAdmission(
+        StorageUnitIdentity StorageUnit,
+        DocumentStoreIdentitySchemaState RequiredState);
 
     private static MaterializedIndex ToLegacyMaterializedIndex(BackfillCanonicalJsonOperation backfill)
     {

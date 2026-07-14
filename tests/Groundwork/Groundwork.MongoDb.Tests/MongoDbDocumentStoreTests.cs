@@ -1,4 +1,7 @@
 using System.Text.Json;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Text;
 using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
@@ -25,6 +28,46 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
     [Fact]
     public void DocumentStoreConstructionRequiresFactoryAdmission() =>
         Assert.Empty(typeof(MongoDbDocumentStore).GetConstructors());
+
+    [Theory]
+    [InlineData(StorageIdentityKind.Guid)]
+    [InlineData(StorageIdentityKind.Composite)]
+    public async Task FactoryAndStorePreserveOrdinalProjectionForAdmittedNonStringIdentityKinds(
+        StorageIdentityKind identityKind)
+    {
+        var databaseName = $"groundwork_{Guid.NewGuid():N}";
+        var client = new MongoClient(container.GetConnectionString());
+        var manifest = WithIdentityKind(identityKind);
+        try
+        {
+            await using var handle = await MongoDbDocumentStoreFactory.CreateAsync(
+                container.GetConnectionString(),
+                databaseName,
+                manifest,
+                MongoDbTestManifests.Provider,
+                DocumentStoreAccess.Global);
+
+            var upper = await handle.Store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"upper"}"""));
+            var lower = await handle.Store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "a-b", "1.0.0", """{"key":"lower"}"""));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, upper.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Saved, lower.Status);
+            var updated = await handle.Store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"updated"}""", ExpectedVersion: 1));
+            var deleted = await handle.Store.DeleteAsync(new DeleteDocumentRequest(
+                "configurationDocument", "a-b", ExpectedVersion: 1));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, updated.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+            Assert.Contains("updated", (await handle.Store.LoadAsync("configurationDocument", "A-B"))!.ContentJson);
+            Assert.Null(await handle.Store.LoadAsync("configurationDocument", "a-b"));
+        }
+        finally
+        {
+            await client.DropDatabaseAsync(databaseName);
+        }
+    }
 
     [Fact]
     public async Task UnicodeIdentitySpellingConflictPreservesAuthoritativeDocument()
@@ -223,6 +266,112 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
         }
         finally
         {
+            await client.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task LeaseLossDuringBackfillLetsTheNextPolicyConvergeEveryRowAndPublishAlone()
+    {
+        var client = new MongoClient(container.GetConnectionString());
+        var database = client.GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var firstRowCommitted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeFirstOwner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? firstMaterialization = null;
+        var firstManifest = MongoDbTestManifests.MetadataManifest();
+        var secondManifest = MongoDbTestManifests.UnicodeIdentityManifest();
+        var collectionName = Groundwork.MongoDb.MongoDbGroundworkNames.CollectionName(firstManifest.StorageUnits.Single());
+        try
+        {
+            await database.CreateCollectionAsync(
+                collectionName,
+                new CreateCollectionOptions { Collation = new Collation("simple") });
+            var documents = database.GetCollection<BsonDocument>(collectionName);
+            var legacyRows = new[]
+            {
+                LegacyMongoDocument("Straße-Σς"),
+                LegacyMongoDocument("second"),
+                LegacyMongoDocument("third")
+            };
+            foreach (var row in legacyRows)
+                row["content"].AsBsonDocument["key"] = row["_id"].AsBsonDocument["id"].AsString;
+            await documents.InsertManyAsync(legacyRows);
+            var hooks = new MongoDbIdentitySchemaAdmissionHooks(async (rowNumber, cancellationToken) =>
+            {
+                if (rowNumber != 1)
+                    return;
+                firstRowCommitted.TrySetResult();
+                await resumeFirstOwner.Task.WaitAsync(cancellationToken);
+            });
+            firstMaterialization = new MongoDbGroundworkMaterializer(database, hooks)
+                .MaterializeAsync(firstManifest, MongoDbTestManifests.Provider);
+            var timeout = Task.Delay(TimeSpan.FromSeconds(10));
+            var firstBoundary = await Task.WhenAny(
+                firstRowCommitted.Task,
+                firstMaterialization,
+                timeout);
+            if (firstBoundary == firstMaterialization)
+                await firstMaterialization;
+            Assert.Same(firstRowCommitted.Task, firstBoundary);
+
+            var locks = database.GetCollection<BsonDocument>(
+                Groundwork.MongoDb.MongoDbGroundworkNames.IdentitySchemaLockCollection);
+            var firstFence = (await locks.Find(
+                    Builders<BsonDocument>.Filter.Eq("_id", "document-store-identity-schema"))
+                .SingleAsync())["fence"].ToInt64();
+            var expireOnServer = new PipelineUpdateDefinition<BsonDocument>(
+                new[]
+                {
+                    new BsonDocument("$set", new BsonDocument("expires_utc", "$$NOW"))
+                });
+            Assert.Equal(1, (await locks.UpdateOneAsync(
+                Builders<BsonDocument>.Filter.Eq("_id", "document-store-identity-schema"),
+                expireOnServer)).ModifiedCount);
+
+            await new MongoDbGroundworkMaterializer(database)
+                .MaterializeAsync(secondManifest, MongoDbTestManifests.Provider);
+            var secondFence = (await locks.Find(
+                    Builders<BsonDocument>.Filter.Eq("_id", "document-store-identity-schema"))
+                .SingleAsync())["fence"].ToInt64();
+            resumeFirstOwner.TrySetResult();
+            var lostLease = await Assert.ThrowsAsync<InvalidOperationException>(() => firstMaterialization);
+
+            Assert.Contains("lease", lostLease.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.True(secondFence > firstFence);
+            var unicodePolicy = PortableStringComparison.ForIdentityPolicy(
+                StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+            foreach (var document in await documents.Find(FilterDefinition<BsonDocument>.Empty).ToListAsync())
+            {
+                var original = document["_id"].AsBsonDocument["id"].AsString;
+                var expected = PortableStringComparison.ProjectIdentity(original, unicodePolicy);
+                Assert.Equal(original, document["id_original"].AsString);
+                Assert.Equal(expected.ComparisonKey, document["id_comparison_key"].AsString);
+                Assert.Equal(expected.LookupKey, document["id_lookup_key"].AsString);
+            }
+
+            var states = await database
+                .GetCollection<BsonDocument>(Groundwork.MongoDb.MongoDbGroundworkNames.IdentitySchemaCollection)
+                .Find(FilterDefinition<BsonDocument>.Empty)
+                .ToListAsync();
+            var state = Assert.Single(states);
+            Assert.Equal(
+                DocumentStoreIdentitySchemaState.Capture(secondManifest.StorageUnits.Single().IdentityPolicy),
+                DocumentStoreIdentitySchemaState.FromCanonicalJson(state["state_json"].AsString));
+        }
+        finally
+        {
+            resumeFirstOwner.TrySetResult();
+            if (firstMaterialization is not null)
+            {
+                try
+                {
+                    await firstMaterialization;
+                }
+                catch
+                {
+                    // The test deliberately revokes the first materializer's lease.
+                }
+            }
             await client.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
         }
     }
@@ -811,6 +960,21 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
     private static string NewId() => $"doc-{Guid.NewGuid():N}";
 
     private static string NewValue(string prefix) => $"{prefix}-{Guid.NewGuid():N}";
+
+    private static StorageManifest WithIdentityKind(StorageIdentityKind kind)
+    {
+        var manifest = MongoDbTestManifests.MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = new IdentityPolicy(kind, "id")
+                }
+            ]
+        };
+    }
 
     private sealed class MongoDbDocumentStoreHarness : IAsyncDisposable
     {
