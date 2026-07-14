@@ -29,6 +29,10 @@ public readonly record struct PortableStringIdentityProjection(
 /// </summary>
 public static class PortableStringComparison
 {
+    /// <summary>
+    /// Maximum portable document-identity length shared by every provider.
+    /// </summary>
+    public const int MaximumIdentityCodeUnits = 450;
     public const string OrdinalAlgorithmId = "groundwork-utf16-hex-v1";
     public const string AsciiIgnoreCaseAlgorithmId = "groundwork-ascii-lower-v1";
     public const string LookupHashAlgorithmId = "groundwork-sha256-utf8-lowerhex-v1";
@@ -112,6 +116,7 @@ public static class PortableStringComparison
         string value,
         PortableStringComparisonPolicy policy)
     {
+        ValidateIdentity(value);
         var comparisonKey = Create(value, policy);
         return new(
             value,
@@ -119,6 +124,17 @@ public static class PortableStringComparison
             CreateHash(comparisonKey),
             GetAlgorithmId(policy),
             LookupHashAlgorithmId);
+    }
+
+    public static void ValidateIdentity(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Length > MaximumIdentityCodeUnits)
+        {
+            throw new ArgumentException(
+                $"Document identities may contain at most {MaximumIdentityCodeUnits} UTF-16 code units.",
+                nameof(value));
+        }
     }
 
     public static string GetAlgorithmId(PortableStringComparisonPolicy policy) => policy switch

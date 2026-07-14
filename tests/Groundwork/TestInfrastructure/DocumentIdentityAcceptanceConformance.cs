@@ -247,6 +247,25 @@ public abstract class DocumentIdentityAcceptanceConformance
     }
 
     [Fact]
+    public async Task Document_identity_over_four_hundred_fifty_utf16_code_units_is_rejected_on_every_surface()
+    {
+        await using var fixture = await CreateIdentityFixtureAsync(surface: DocumentIdentityAcceptanceSurface.Mutation);
+        var overlong = new string('x', 451);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Documents.SaveAsync(
+            DocumentIdentityAcceptanceModel.Save(overlong, "pending")));
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Documents.LoadAsync(
+            DocumentIdentityAcceptanceModel.DocumentKind,
+            overlong));
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Queries.QueryAsync(
+            DocumentIdentityAcceptanceModel.ExactQuery(DocumentQueryComparison.Equal(
+                PhysicalDocumentFieldPaths.Id,
+                overlong))));
+        await Assert.ThrowsAsync<ArgumentException>(() => Assert.IsAssignableFrom<IBoundedDocumentMutationStore>(fixture.Mutations)
+            .ExecuteAsync(DocumentIdentityAcceptanceModel.Delete("overlong-operation", overlong)));
+    }
+
+    [Fact]
     public async Task Native_query_explain_uses_the_derived_identity_index_without_a_full_scan()
     {
         await using var fixture = await CreateIdentityFixtureAsync();

@@ -135,7 +135,11 @@ public abstract class RelationalPhysicalDocumentDialect
         Groundwork.Core.Indexing.IndexValueKind valueKind,
         ProjectedColumnDefinition definition) =>
         RelationalPhysicalProjectionValues.ConvertScalar(value, valueKind, definition);
-    public virtual object ConvertDocumentIdentityOriginal(string value) => value;
+    public virtual object ConvertDocumentIdentityOriginal(string value)
+    {
+        PortableStringComparison.ValidateIdentity(value);
+        return value;
+    }
     public virtual object ConvertDocumentIdentityComparison(string value) => value;
     public virtual object ConvertDocumentIdentityLookup(string value) => value;
     public virtual RelationalPhysicalIdentityPrefixRange ConvertDocumentIdentityPrefix(string comparisonKey)

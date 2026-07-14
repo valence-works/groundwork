@@ -1,20 +1,16 @@
+using Groundwork.Core.Text;
+
 namespace Groundwork.SqlServer.PhysicalStorage;
 
 internal static class SqlServerDocumentIdentityEncoding
 {
-    public const int MaximumOriginalCodeUnits = 450;
-    public const int MaximumComparisonBytes = 1350;
+    public const int MaximumOriginalCodeUnits = PortableStringComparison.MaximumIdentityCodeUnits;
+    public const int MaximumComparisonBytes = MaximumOriginalCodeUnits * 3;
     public const int LookupBytes = 32;
 
     public static string Original(string value)
     {
-        ArgumentNullException.ThrowIfNull(value);
-        if (value.Length > MaximumOriginalCodeUnits)
-        {
-            throw new ArgumentException(
-                $"SQL Server document identities may contain at most {MaximumOriginalCodeUnits} UTF-16 code units.",
-                nameof(value));
-        }
+        PortableStringComparison.ValidateIdentity(value);
         return value;
     }
 

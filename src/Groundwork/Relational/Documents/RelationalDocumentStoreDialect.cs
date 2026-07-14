@@ -1,4 +1,5 @@
 using System.Data.Common;
+using Groundwork.Core.Text;
 
 namespace Groundwork.Relational.Documents;
 
@@ -11,7 +12,7 @@ public class RelationalDocumentStoreDialect
     public virtual object Boolean(bool value) => value ? 1 : 0;
 
     public virtual void ValidateDocumentIdentity(string value) =>
-        ArgumentNullException.ThrowIfNull(value);
+        PortableStringComparison.ValidateIdentity(value);
 
     /// <summary>Builds the offset-paging clause appended to a closed query. Skip/take are validated non-negative integers.</summary>
     public virtual string PaginationClause(int skip, int? take)

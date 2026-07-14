@@ -124,7 +124,7 @@ public sealed class PortableStringComparisonTests
     [Fact]
     public void Bounded_keys_preserve_exact_identity_order()
     {
-        var value = new string('Å', 2_048) + "😀";
+        var value = new string('Å', 448) + "😀";
         var comparison = PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(value);
         var projection = PortableStringComparison.ProjectIdentity(
             value,
@@ -144,5 +144,15 @@ public sealed class PortableStringComparisonTests
             PortableStringComparison.LookupHashAlgorithmId,
             projection.LookupAlgorithmId);
         Assert.Equal("groundwork-sha256-utf8-lowerhex-v1", PortableStringComparison.LookupHashAlgorithmId);
+    }
+
+    [Theory]
+    [InlineData(PortableStringComparisonPolicy.Ordinal)]
+    [InlineData(PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase)]
+    public void Document_identity_projection_rejects_values_beyond_the_portable_boundary(
+        PortableStringComparisonPolicy policy)
+    {
+        Assert.Equal(450, PortableStringComparison.MaximumIdentityCodeUnits);
+        Assert.Throws<ArgumentException>(() => PortableStringComparison.ProjectIdentity(new string('x', 451), policy));
     }
 }
