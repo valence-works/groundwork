@@ -410,6 +410,35 @@ public sealed class PhysicalSchemaDiffPlannerTests
     }
 
     [Fact]
+    public void AddingFirstLinkedIdentityMappingIsAnAdditiveEvolution()
+    {
+        var initial = CreateTarget(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            includeSecondProjection: false,
+            dedicatedWithoutLinked: true);
+        var applied = Complete(PhysicalSchemaDiffPlanner.Plan(
+            initial,
+            PhysicalSchemaHistoryState.Empty,
+            PlannedAt));
+        var additive = CreateTarget(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            includeSecondProjection: false);
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            additive,
+            PhysicalSchemaHistoryState.FromApplied(applied),
+            PlannedAt.AddHours(1));
+
+        Assert.True(plan.IsApplicable, string.Join("; ", plan.Diagnostics.Select(diagnostic => diagnostic.Message)));
+        Assert.Contains(plan.Operations, operation => operation is CreateLinkedStorageOperation);
+        Assert.Contains(plan.Operations, operation =>
+            operation is BackfillCanonicalJsonOperation
+            {
+                Target: ExecutableStorageObjectRole.LinkedIndexStorage
+            });
+    }
+
+    [Fact]
     public void Missing_identity_schema_state_fails_closed_with_a_dedicated_diagnostic()
     {
         var target = CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false);
@@ -674,7 +703,8 @@ public sealed class PhysicalSchemaDiffPlannerTests
         string firstIndexName = "by-category",
         StorageManifestVersion? manifestVersion = null,
         ProviderIdentity? provider = null,
-        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
+        bool dedicatedWithoutLinked = false)
     {
         var template = SampleManifests.MetadataManifest();
         var projectedColumns = new List<ProjectedColumnDefinition>
@@ -703,24 +733,26 @@ public sealed class PhysicalSchemaDiffPlannerTests
         }
 
         var binding = new SharedStorageBinding("runtime-documents");
-        var definition = form switch
-        {
-            PhysicalStorageForm.SharedDocuments => PhysicalTableDefinition.SharedDocuments(
-                binding,
-                projectedColumns,
-                indexes,
-                linkedProjectionLogicalName: "configuration_projection"),
-            PhysicalStorageForm.DedicatedDocumentTable => PhysicalTableDefinition.DedicatedDocumentTable(
-                "configuration_documents",
-                indexes: indexes,
-                linkedProjectedColumns: projectedColumns,
-                linkedProjectionLogicalName: "configuration_projection"),
-            PhysicalStorageForm.PhysicalEntityTable => PhysicalTableDefinition.PhysicalEntityTable(
-                "configuration_entities",
-                projectedColumns,
-                indexes: indexes),
-            _ => throw new ArgumentOutOfRangeException(nameof(form), form, null)
-        };
+        var definition = dedicatedWithoutLinked
+            ? PhysicalTableDefinition.DedicatedDocumentTable("configuration_documents")
+            : form switch
+            {
+                PhysicalStorageForm.SharedDocuments => PhysicalTableDefinition.SharedDocuments(
+                    binding,
+                    projectedColumns,
+                    indexes,
+                    linkedProjectionLogicalName: "configuration_projection"),
+                PhysicalStorageForm.DedicatedDocumentTable => PhysicalTableDefinition.DedicatedDocumentTable(
+                    "configuration_documents",
+                    indexes: indexes,
+                    linkedProjectedColumns: projectedColumns,
+                    linkedProjectionLogicalName: "configuration_projection"),
+                PhysicalStorageForm.PhysicalEntityTable => PhysicalTableDefinition.PhysicalEntityTable(
+                    "configuration_entities",
+                    projectedColumns,
+                    indexes: indexes),
+                _ => throw new ArgumentOutOfRangeException(nameof(form), form, null)
+            };
         var manifest = template with
         {
             Version = manifestVersion ?? template.Version,

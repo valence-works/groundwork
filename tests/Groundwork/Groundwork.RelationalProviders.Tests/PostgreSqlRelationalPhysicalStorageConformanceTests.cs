@@ -1,4 +1,5 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
@@ -31,9 +32,25 @@ public sealed class PostgreSqlPhysicalStorageContainer : IAsyncLifetime
 
 public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
     PostgreSqlPhysicalStorageContainer fixture)
-    : RelationalPhysicalStorageConformance, IClassFixture<PostgreSqlPhysicalStorageContainer>
+    : RelationalServerPhysicalIdentityConformance, IClassFixture<PostgreSqlPhysicalStorageContainer>
 {
     private readonly PostgreSqlContainer container = fixture.Container;
+
+    [Fact]
+    public void PrimaryInsertConflictTargetsOnlyTheCompiledIdentityKey()
+    {
+        var sql = new PostgreSqlPhysicalDocumentDialect().InsertPrimaryIfAbsent(
+            "documents",
+            ["kind", "scope", "lookup"],
+            ["@kind", "@scope", "@lookup"],
+            ["kind", "scope", "lookup"],
+            []);
+
+        Assert.Contains(
+            "ON CONFLICT (\"kind\", \"scope\", \"lookup\") DO NOTHING",
+            sql,
+            StringComparison.Ordinal);
+    }
 
     [Fact]
     public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
@@ -529,6 +546,41 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             dedicatedWithoutLinked: dedicatedWithoutLinked,
             normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames));
 
+    protected override async Task<RelationalServerIdentityFixture> CreateIdentityAsync(
+        PhysicalStorageForm form,
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            form,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: true,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            stringCasePolicy: stringCasePolicy);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        return new RelationalServerIdentityFixture(
+            store,
+            PostgreSqlPhysicalQueryRuntime.Create(store, model.Manifest, route, model.Target.Provider),
+            route,
+            synchronizeAfterPrimaryLock: true,
+            lookupKey => CorruptPrimaryLookupAsync(route, lookupKey),
+            (retainedId, comparisonKey) => CorruptLinkedIdentityAsync(route, retainedId, comparisonKey),
+            linked => ReadIdentitySchemaAsync(route, linked),
+            linked => DropComparisonEvidenceAsync(route, linked),
+            async () =>
+            {
+                await PhysicalSchemaApplication.ApplyAsync(
+                    model.Target,
+                    new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+            },
+            column => column,
+            () => ValueTask.CompletedTask);
+    }
+
     protected override async Task<RelationalScopedPhysicalStorageFixture> CreateScopedAsync(PhysicalStorageForm form)
     {
         var model = RelationalPhysicalStorageTestModels.Create(
@@ -647,6 +699,15 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         var id = category.Target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.Envelope.Id.Identifier
             : route.LinkedRelationship!.DocumentId.Identifier;
+        var identity = category.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.Envelope.Identity
+            : route.LinkedRelationship!.Identity;
+        var identityColumns = new HashSet<string>(StringComparer.Ordinal)
+        {
+            id,
+            identity.ComparisonKey.Identifier,
+            identity.LookupKey.Identifier
+        };
         await using var connection = new NpgsqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         var columns = new List<string>();
@@ -669,13 +730,101 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 SELECT * FROM {Q(table)} WHERE {Q(category.Column.Identifier)} = @category LIMIT 1
             )
             INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))})
-            SELECT {string.Join(", ", columns.Select(column => column == id
+            SELECT {string.Join(", ", columns.Select(column => identityColumns.Contains(column)
                 ? $"s.{Q(column)} || '-noise-' || n::text"
                 : column == category.Column.Identifier ? "'noise'" : $"s.{Q(column)}"))}
             FROM source s CROSS JOIN generate_series(1, 4096) AS n;
             """;
         seed.Parameters.AddWithValue("category", "tools");
         await seed.ExecuteNonQueryAsync();
+    }
+
+    private async Task CorruptPrimaryLookupAsync(ExecutableStorageRoute route, string lookupKey)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {Q(route.PrimaryStorage.Name.Identifier)} SET " +
+            $"{Q(route.Envelope.Identity.LookupKey.Identifier)} = @lookupKey;";
+        command.Parameters.AddWithValue("lookupKey", lookupKey);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task CorruptLinkedIdentityAsync(
+        ExecutableStorageRoute route,
+        string retainedId,
+        string comparisonKey)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {Q(route.LinkedIndexStorage!.Name.Identifier)} SET " +
+            $"{Q(route.LinkedRelationship!.DocumentId.Identifier)} = @retainedId, " +
+            $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey;";
+        command.Parameters.AddWithValue("retainedId", retainedId);
+        command.Parameters.AddWithValue("comparisonKey", comparisonKey);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task<RelationalIdentitySchemaEvidence> ReadIdentitySchemaAsync(
+        ExecutableStorageRoute route,
+        bool linked)
+    {
+        var table = linked
+            ? route.LinkedIndexStorage!.Name.Identifier
+            : route.PrimaryStorage.Name.Identifier;
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = @table;
+                """;
+            command.Parameters.AddWithValue("table", table);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                columns.Add(reader.GetString(0));
+        }
+        var primaryKey = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON kcu.constraint_schema = tc.constraint_schema
+                 AND kcu.constraint_name = tc.constraint_name
+                WHERE tc.table_schema = current_schema()
+                  AND tc.table_name = @table
+                  AND tc.constraint_type = 'PRIMARY KEY'
+                ORDER BY kcu.ordinal_position;
+                """;
+            command.Parameters.AddWithValue("table", table);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                primaryKey.Add(reader.GetString(0));
+        }
+        return new RelationalIdentitySchemaEvidence(columns, primaryKey);
+    }
+
+    private async Task DropComparisonEvidenceAsync(ExecutableStorageRoute route, bool linked)
+    {
+        var table = linked
+            ? route.LinkedIndexStorage!.Name.Identifier
+            : route.PrimaryStorage.Name.Identifier;
+        var comparison = linked
+            ? route.LinkedRelationship!.Identity.ComparisonKey.Identifier
+            : route.Envelope.Identity.ComparisonKey.Identifier;
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"ALTER TABLE {Q(table)} DROP COLUMN {Q(comparison)};";
+        await command.ExecuteNonQueryAsync();
     }
 
     private async Task TerminateSessionAsync(long sessionId)

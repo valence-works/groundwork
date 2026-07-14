@@ -72,6 +72,8 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
     public override string EnvelopeType(RelationalEnvelopeColumnKind kind) => kind switch
     {
         RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.Id => "nvarchar(450)",
+        RelationalEnvelopeColumnKind.IdentityComparison => "nvarchar(max)",
+        RelationalEnvelopeColumnKind.IdentityLookup => "nvarchar(450)",
         RelationalEnvelopeColumnKind.StorageScope => "nvarchar(128)",
         RelationalEnvelopeColumnKind.SchemaVersion => "nvarchar(100)",
         RelationalEnvelopeColumnKind.Version => "bigint",

@@ -1,4 +1,5 @@
 using Groundwork.Core.Capabilities;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
@@ -27,9 +28,28 @@ public sealed class SqlServerPhysicalStorageContainer : IAsyncLifetime
 
 public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     SqlServerPhysicalStorageContainer fixture)
-    : RelationalPhysicalStorageConformance, IClassFixture<SqlServerPhysicalStorageContainer>
+    : RelationalServerPhysicalIdentityConformance, IClassFixture<SqlServerPhysicalStorageContainer>
 {
     private readonly MsSqlContainer container = fixture.Container;
+
+    [Fact]
+    public void PrimaryInsertUsesGuardedKeyRangeLockWithoutMerge()
+    {
+        var sql = new SqlServerPhysicalDocumentDialect().InsertPrimaryIfAbsent(
+            "documents",
+            ["kind", "scope", "lookup"],
+            ["@kind", "@scope", "@lookup"],
+            ["kind", "scope", "lookup"],
+            [
+                new("kind", null, "@kind"),
+                new("scope", null, "@scope"),
+                new("lookup", null, "@lookup")
+            ]);
+
+        Assert.Contains("WHERE NOT EXISTS", sql, StringComparison.Ordinal);
+        Assert.Contains("UPDLOCK, HOLDLOCK", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("MERGE", sql, StringComparison.OrdinalIgnoreCase);
+    }
 
     [Fact]
     public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
@@ -628,6 +648,9 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             includePriority: false,
             instance: instance,
             normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        Assert.Null(initial.Target.Routes.Single().LinkedIndexStorage);
+        Assert.NotNull(additive.Target.Routes.Single().LinkedIndexStorage);
+        Assert.NotEqual(initial.Target.Fingerprint, additive.Target.Fingerprint);
         var connectionString = container.GetConnectionString();
         await PhysicalSchemaApplication.ApplyAsync(initial.Target, new SqlServerPhysicalSchemaExecutor(connectionString));
         var initialStore = new SqlServerPhysicalDocumentStore(
@@ -644,16 +667,20 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         }
 
         var route = additive.Target.Routes.Single();
-        var linkedId = route.LinkedRelationship!.DocumentId.Identifier;
-        var linkedIdExpression = Q(linkedId);
+        var linkedLookup = route.LinkedRelationship!.Identity.LookupKey.Identifier;
+        var linkedLookupExpression = Q(linkedLookup);
+        var collisionLookups = new[] { "zz-collision-a", "zz-collision-b" }
+            .Select(id => route.LinkedRelationship.Identity.Project(id).LookupKey)
+            .Select(value => $"N'{value.Replace("'", "''", StringComparison.Ordinal)}'")
+            .ToArray();
         var hash = new SqlServerPhysicalIdentityHash(value =>
-            string.Equals(value, linkedIdExpression, StringComparison.Ordinal) ||
-            string.Equals(value, "@collisionId", StringComparison.Ordinal) ||
-            string.Equals(value, "@v2", StringComparison.Ordinal)
-                ? $"CASE WHEN CONVERT(nvarchar(max), {value}) LIKE N'zz-collision-%' " +
+            string.Equals(value, linkedLookupExpression, StringComparison.Ordinal) ||
+            string.Equals(value, "@collisionLookup", StringComparison.Ordinal) ||
+            string.Equals(value, "@v4", StringComparison.Ordinal)
+                ? $"CASE WHEN {string.Join(" OR ", collisionLookups.Select(lookup => $"CONVERT(nvarchar(max), {value}) = {lookup}"))} " +
                   "THEN CONVERT(binary(32), 0x0000000000000000000000000000000000000000000000000000000000000000) " +
-                  $"ELSE CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(900), {value}))) END"
-                : $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(900), {value})))");
+                  $"ELSE CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {value}))) END"
+                : $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {value})))");
         var executor = new SqlServerPhysicalSchemaExecutor(connectionString, hash);
         PhysicalSchemaDiffPlan plan;
         await using (var applicationLock = await executor.AcquireApplicationLockAsync(additive.Target.Identity, CancellationToken.None))
@@ -692,6 +719,41 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             includePriority: true,
             dedicatedWithoutLinked: dedicatedWithoutLinked,
             normalizer: SqlServerGroundworkCapabilities.PhysicalNames));
+
+    protected override async Task<RelationalServerIdentityFixture> CreateIdentityAsync(
+        PhysicalStorageForm form,
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            form,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: true,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            stringCasePolicy: stringCasePolicy);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        return new RelationalServerIdentityFixture(
+            store,
+            SqlServerPhysicalQueryRuntime.Create(store, model.Manifest, route, model.Target.Provider),
+            route,
+            synchronizeAfterPrimaryLock: false,
+            lookupKey => CorruptPrimaryLookupAsync(route, lookupKey),
+            (retainedId, comparisonKey) => CorruptLinkedIdentityAsync(route, retainedId, comparisonKey),
+            linked => ReadIdentitySchemaAsync(route, linked),
+            linked => DropComparisonEvidenceAsync(route, linked),
+            async () =>
+            {
+                await PhysicalSchemaApplication.ApplyAsync(
+                    model.Target,
+                    new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+            },
+            SqlServerPhysicalIdentity.HiddenColumn,
+            () => ValueTask.CompletedTask);
+    }
 
     protected override async Task<RelationalScopedPhysicalStorageFixture> CreateScopedAsync(PhysicalStorageForm form)
     {
@@ -823,6 +885,15 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var id = category.Target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.Envelope.Id.Identifier
             : route.LinkedRelationship!.DocumentId.Identifier;
+        var identity = category.Target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.Envelope.Identity
+            : route.LinkedRelationship!.Identity;
+        var identityColumns = new HashSet<string>(StringComparer.Ordinal)
+        {
+            id,
+            identity.ComparisonKey.Identifier,
+            identity.LookupKey.Identifier
+        };
         await using var connection = new SqlConnection(container.GetConnectionString());
         await connection.OpenAsync();
         var columns = new List<string>();
@@ -843,13 +914,98 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                 FROM sys.all_objects a CROSS JOIN sys.all_objects b
             )
             INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))})
-            SELECT {string.Join(", ", columns.Select(column => column == id
+            SELECT {string.Join(", ", columns.Select(column => identityColumns.Contains(column)
                 ? $"CONCAT(s.{Q(column)}, N'-noise-', n.n)"
                 : column == category.Column.Identifier ? "N'noise'" : $"s.{Q(column)}"))}
             FROM source s CROSS JOIN numbers n;
             """;
         seed.Parameters.AddWithValue("@category", "tools");
         await seed.ExecuteNonQueryAsync();
+    }
+
+    private async Task CorruptPrimaryLookupAsync(ExecutableStorageRoute route, string lookupKey)
+    {
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {Q(route.PrimaryStorage.Name.Identifier)} SET " +
+            $"{Q(route.Envelope.Identity.LookupKey.Identifier)} = @lookupKey;";
+        command.Parameters.AddWithValue("@lookupKey", lookupKey);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task CorruptLinkedIdentityAsync(
+        ExecutableStorageRoute route,
+        string retainedId,
+        string comparisonKey)
+    {
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {Q(route.LinkedIndexStorage!.Name.Identifier)} SET " +
+            $"{Q(route.LinkedRelationship!.DocumentId.Identifier)} = @retainedId, " +
+            $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey;";
+        command.Parameters.AddWithValue("@retainedId", retainedId);
+        command.Parameters.AddWithValue("@comparisonKey", comparisonKey);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task<RelationalIdentitySchemaEvidence> ReadIdentitySchemaAsync(
+        ExecutableStorageRoute route,
+        bool linked)
+    {
+        var table = linked
+            ? route.LinkedIndexStorage!.Name.Identifier
+            : route.PrimaryStorage.Name.Identifier;
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(@table);";
+            command.Parameters.AddWithValue("@table", table);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                columns.Add(reader.GetString(0));
+        }
+        var primaryKey = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT c.name
+                FROM sys.indexes i
+                JOIN sys.index_columns ic
+                  ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                JOIN sys.columns c
+                  ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                WHERE i.object_id = OBJECT_ID(@table) AND i.is_primary_key = 1
+                ORDER BY ic.key_ordinal;
+                """;
+            command.Parameters.AddWithValue("@table", table);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                primaryKey.Add(reader.GetString(0));
+        }
+        return new RelationalIdentitySchemaEvidence(columns, primaryKey);
+    }
+
+    private async Task DropComparisonEvidenceAsync(ExecutableStorageRoute route, bool linked)
+    {
+        var table = linked
+            ? route.LinkedIndexStorage!.Name.Identifier
+            : route.PrimaryStorage.Name.Identifier;
+        var comparison = linked
+            ? route.LinkedRelationship!.Identity.ComparisonKey.Identifier
+            : route.Envelope.Identity.ComparisonKey.Identifier;
+        await using var connection = new SqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"ALTER TABLE {Q(table)} DROP COLUMN {Q(SqlServerPhysicalIdentity.HiddenColumn(comparison))}; " +
+            $"ALTER TABLE {Q(table)} DROP COLUMN {Q(comparison)};";
+        await command.ExecuteNonQueryAsync();
     }
 
     private async Task SeedMutationLedgerPlanNoiseAsync(string operationId)

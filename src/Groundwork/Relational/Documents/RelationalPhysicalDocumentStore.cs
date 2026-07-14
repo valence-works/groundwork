@@ -88,6 +88,15 @@ public abstract class RelationalPhysicalDocumentDialect
         return string.Join(" AND ", parts.Select(part =>
             $"{Qualified(part.Alias, part.ColumnIdentifier)} = {part.ValueExpression}"));
     }
+    public virtual string InsertPrimaryIfAbsent(
+        string tableIdentifier,
+        IReadOnlyList<string> columns,
+        IReadOnlyList<string> valueExpressions,
+        IReadOnlyList<string> logicalPrimaryKey,
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> lookupIdentity) =>
+        $"INSERT INTO {QuoteIdentifier(tableIdentifier)} ({string.Join(", ", columns.Select(QuoteIdentifier))}) " +
+        $"VALUES ({string.Join(", ", valueExpressions)});";
+    public virtual bool CanInspectIdentityAfterUniqueConstraintException => true;
     public virtual string ExactIdentityJoin(IReadOnlyList<RelationalPhysicalIdentityJoinPart> parts)
     {
         ArgumentNullException.ThrowIfNull(parts);
@@ -614,7 +623,25 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 ? await InsertPrimaryAsync(route, request, scope, version, createdAt, now, projectedValues, transaction, ct)
                 : await UpdatePrimaryAsync(route, request, scope, version, now, projectedValues, transaction, ct);
             if (affected != 1)
+            {
+                if (existing is null)
+                {
+                    var concurrent = await LoadCoreAsync(
+                        transaction.Connection!,
+                        request.DocumentKind,
+                        request.Id,
+                        transaction,
+                        ct,
+                        lockForWrite: true);
+                    if (concurrent is not null)
+                    {
+                        return string.Equals(concurrent.Id, request.Id, StringComparison.Ordinal)
+                            ? DocumentStoreWriteResult.ConcurrencyConflict
+                            : DocumentStoreWriteResult.IdentityConflict(concurrent.Id);
+                    }
+                }
                 return request.ExpectedVersion is null ? DocumentStoreWriteResult.NotFound : DocumentStoreWriteResult.ConcurrencyConflict;
+            }
             await MaintainLinkedAsync(route, request, scope, projectedValues, transaction, ct);
         }
         catch (DbException exception) when (dialect.IsUniqueConstraintException(exception))
@@ -681,18 +708,32 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             .Concat(projections.Select(column => column.Column.Identifier))
             .ToArray();
         var parameters = columns.Select((_, index) => P($"v{index}")).ToArray();
+        var lookupIdentity = new RelationalPhysicalIdentityPredicatePart[]
+        {
+            new(route.Discriminator.Column.Identifier, null, P("kind")),
+            new(route.ScopeKey.Column.Identifier, null, P("scope")),
+            new(route.Envelope.Identity.LookupKey.Identifier, null, P("idLookup"))
+        };
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"INSERT INTO {Q(route.PrimaryStorage.Name.Identifier)} ({string.Join(", ", columns.Select(Q))}) VALUES ({string.Join(", ", parameters)});",
+            dialect.InsertPrimaryIfAbsent(
+                route.PrimaryStorage.Name.Identifier,
+                columns,
+                parameters,
+                route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray(),
+                lookupIdentity),
             transaction);
         var values = EnvelopeValues(route, request, scope, version).Concat<object?>([createdAt.ToString("O"), updatedAt.ToString("O")])
             .Concat(ProjectedValues(projectedValues, projections));
         AddValues(command, values);
+        AddIdentityParameters(command, route, request.Id, scope);
         try
         {
             return await command.ExecuteNonQueryAsync(ct);
         }
-        catch (DbException exception) when (dialect.IsUniqueConstraintException(exception))
+        catch (DbException exception) when (
+            dialect.IsUniqueConstraintException(exception) &&
+            dialect.CanInspectIdentityAfterUniqueConstraintException)
         {
             await ThrowIfIdentityHashCollisionAsync(
                 route.PrimaryStorage.Name.Identifier,

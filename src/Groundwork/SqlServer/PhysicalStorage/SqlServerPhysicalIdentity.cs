@@ -153,7 +153,7 @@ internal sealed class SqlServerPhysicalIdentityHash
 
     public SqlServerPhysicalIdentityHash(Func<string, string>? expression = null) =>
         this.expression = expression ?? (value =>
-            $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(900), {value})))");
+            $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {value})))");
 
     public string Expression(string valueExpression) => expression(valueExpression);
 }

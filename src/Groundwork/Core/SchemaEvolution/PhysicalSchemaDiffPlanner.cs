@@ -221,7 +221,7 @@ public static class PhysicalSchemaDiffPlanner
                 continue;
 
             var expected = DocumentIdentitySchemaState.Capture(route);
-            if (appliedRoute.IdentitySchemaState == expected)
+            if (IsCompatibleIdentityEvolution(appliedRoute.IdentitySchemaState, expected))
                 continue;
 
             var reason = appliedRoute.IdentitySchemaState is null
@@ -234,6 +234,20 @@ public static class PhysicalSchemaDiffPlanner
         }
 
         return diagnostics;
+    }
+
+    private static bool IsCompatibleIdentityEvolution(
+        DocumentIdentitySchemaState? applied,
+        DocumentIdentitySchemaState expected)
+    {
+        if (applied is null)
+            return false;
+
+        return applied.StringCasePolicy == expected.StringCasePolicy &&
+               string.Equals(applied.ComparisonAlgorithmId, expected.ComparisonAlgorithmId, StringComparison.Ordinal) &&
+               string.Equals(applied.LookupAlgorithmId, expected.LookupAlgorithmId, StringComparison.Ordinal) &&
+               applied.Primary == expected.Primary &&
+               (applied.Linked is null || applied.Linked == expected.Linked);
     }
 
     private static PhysicalSchemaAppliedSnapshot CreateSnapshot(

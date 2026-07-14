@@ -47,6 +47,16 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
     public override string QuoteIdentifier(string identifier) => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation };
+    public override bool CanInspectIdentityAfterUniqueConstraintException => false;
+    public override string InsertPrimaryIfAbsent(
+        string tableIdentifier,
+        IReadOnlyList<string> columns,
+        IReadOnlyList<string> valueExpressions,
+        IReadOnlyList<string> logicalPrimaryKey,
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> lookupIdentity) =>
+        $"INSERT INTO {QuoteIdentifier(tableIdentifier)} ({string.Join(", ", columns.Select(QuoteIdentifier))}) " +
+        $"VALUES ({string.Join(", ", valueExpressions)}) " +
+        $"ON CONFLICT ({string.Join(", ", logicalPrimaryKey.Select(QuoteIdentifier))}) DO NOTHING;";
     public override string MutationOperationIdentityPredicate(
         IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts) =>
         PostgreSqlMutationOperationIdentity.ExactPredicate(parts, QuoteIdentifier);

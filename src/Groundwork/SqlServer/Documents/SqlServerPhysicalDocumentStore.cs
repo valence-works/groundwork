@@ -101,6 +101,19 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
     public override string QuoteIdentifier(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is SqlException { Number: 2601 or 2627 };
+    public override string InsertPrimaryIfAbsent(
+        string tableIdentifier,
+        IReadOnlyList<string> columns,
+        IReadOnlyList<string> valueExpressions,
+        IReadOnlyList<string> logicalPrimaryKey,
+        IReadOnlyList<RelationalPhysicalIdentityPredicatePart> lookupIdentity)
+    {
+        var identity = lookupIdentity.Select(part => part with { Alias = "p" }).ToArray();
+        return $"INSERT INTO {QuoteIdentifier(tableIdentifier)} ({string.Join(", ", columns.Select(QuoteIdentifier))}) " +
+               $"SELECT {string.Join(", ", valueExpressions)} WHERE NOT EXISTS (" +
+               $"SELECT 1 FROM {MutationQuerySource(tableIdentifier, "p", null)} WHERE " +
+               $"{ExactIdentityPredicate(identity)});";
+    }
 
     public override object? ConvertProjectionValue(object? value, ProjectedColumnDefinition definition) => value switch
     {
@@ -172,17 +185,21 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
     {
         var kindKey = SqlServerPhysicalIdentity.HiddenColumn(documentKindColumn);
         var scopeKey = SqlServerPhysicalIdentity.HiddenColumn(storageScopeColumn);
+        var originalIdKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdColumn);
+        var comparisonKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdComparisonColumn);
         var idKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdLookupColumn);
         return $"CREATE TABLE {tableExpression} (" +
                $"{QuoteIdentifier(documentKindColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(storageScopeColumn)} nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentIdColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
-               $"{QuoteIdentifier(documentIdComparisonColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentIdComparisonColumn)} nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentIdLookupColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
                $"{QuoteIdentifier(documentIncarnationColumn)} nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(kindKey)} AS {hash.Expression(QuoteIdentifier(documentKindColumn))} PERSISTED NOT NULL, " +
                $"{QuoteIdentifier(scopeKey)} AS {hash.Expression(QuoteIdentifier(storageScopeColumn))} PERSISTED NOT NULL, " +
+               $"{QuoteIdentifier(originalIdKey)} AS {hash.Expression(QuoteIdentifier(documentIdColumn))} PERSISTED NOT NULL, " +
+               $"{QuoteIdentifier(comparisonKey)} AS {hash.Expression(QuoteIdentifier(documentIdComparisonColumn))} PERSISTED NOT NULL, " +
                $"{QuoteIdentifier(idKey)} AS {hash.Expression(QuoteIdentifier(documentIdLookupColumn))} PERSISTED NOT NULL, " +
                $"PRIMARY KEY NONCLUSTERED ({QuoteIdentifier(kindKey)}, {QuoteIdentifier(scopeKey)}, {QuoteIdentifier(idKey)}));";
     }
