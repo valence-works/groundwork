@@ -58,6 +58,14 @@ public sealed class StorageManifestValidator
 
         if (unit.IdentityPolicy is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-007", "Storage unit identity policy is required.", $"{target}.identityPolicy"));
+        else if (unit.IdentityPolicy.Kind != StorageIdentityKind.String &&
+                 unit.IdentityPolicy.StringCasePolicy != StringIdentityCasePolicy.Ordinal)
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-UNIT-013",
+                $"String identity case policy '{unit.IdentityPolicy.StringCasePolicy}' is valid only for string identities.",
+                $"{target}.identityPolicy.stringCasePolicy"));
+        }
 
         if (unit.Tenancy is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-011", "Storage unit tenancy policy is required.", $"{target}.tenancy"));

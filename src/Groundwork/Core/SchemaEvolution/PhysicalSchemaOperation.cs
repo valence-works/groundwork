@@ -536,7 +536,7 @@ internal static class PhysicalSchemaOperationCanonicalizer
         new[]
         {
             Storage(route.PrimaryStorage),
-            Column(route.Envelope.Id),
+            IdentityColumns(route.Envelope.Identity),
             Column(route.Envelope.DocumentKind),
             Column(route.Envelope.StorageScope),
             Column(route.Envelope.Version),
@@ -554,7 +554,7 @@ internal static class PhysicalSchemaOperationCanonicalizer
         new[]
         {
             Storage(route.LinkedIndexStorage!),
-            Column(route.LinkedRelationship!.DocumentId),
+            IdentityColumns(route.LinkedRelationship!.Identity),
             Column(route.LinkedRelationship.DocumentKind),
             Column(route.LinkedRelationship.StorageScope),
             Key(route.AuxiliaryKey!)
@@ -616,6 +616,12 @@ internal static class PhysicalSchemaOperationCanonicalizer
 
     private static string Column(ExecutableColumnRoute column) =>
         $"{column.LogicalName}\u001e{column.Identifier}";
+
+    private static string IdentityColumns(ExecutableDocumentIdentityRoute identity) => string.Join(
+        '\u001e',
+        Column(identity.OriginalId),
+        Column(identity.ComparisonKey),
+        Column(identity.LookupKey));
 
     private static string Key(ExecutableKeyRoute key) => string.Join(
         '\u001e',

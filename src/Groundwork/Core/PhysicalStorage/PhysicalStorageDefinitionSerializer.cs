@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.Text;
 
 namespace Groundwork.Core.PhysicalStorage;
 
@@ -32,6 +34,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteString("storageUnit", resolved.StorageUnit.Value);
             writer.WriteString("provisioningMode", resolved.ProvisioningMode.ToString());
             writer.WriteString("scopePolicy", resolved.ScopePolicy.ToString());
+            WriteIdentityPolicy(writer, resolved.IdentityPolicy);
             WriteDefinition(writer, resolved.Definition);
             if (resolved.SharedStorageDefinition is not null)
                 WriteSharedStorageDefinition(writer, resolved.SharedStorageDefinition);
@@ -117,6 +120,8 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WritePropertyName("linkedKey");
             writer.WriteStartObject();
             writer.WriteString("documentId", definition.LinkedKey.DocumentIdColumn);
+            writer.WriteString("documentIdComparisonKey", definition.LinkedKey.DocumentIdComparisonKeyColumn);
+            writer.WriteString("documentIdLookupKey", definition.LinkedKey.DocumentIdLookupKeyColumn);
             writer.WriteString("documentKind", definition.LinkedKey.DocumentKindColumn);
             writer.WriteString("storageScope", definition.LinkedKey.StorageScopeColumn);
             writer.WriteEndObject();
@@ -128,6 +133,8 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WritePropertyName("envelope");
             writer.WriteStartObject();
             writer.WriteString("id", definition.Envelope.IdColumn);
+            writer.WriteString("idComparisonKey", definition.Envelope.IdComparisonKeyColumn);
+            writer.WriteString("idLookupKey", definition.Envelope.IdLookupKeyColumn);
             writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
             writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
             writer.WriteString("version", definition.Envelope.VersionColumn);
@@ -195,6 +202,8 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WritePropertyName("envelope");
         writer.WriteStartObject();
         writer.WriteString("id", definition.Envelope.IdColumn);
+        writer.WriteString("idComparisonKey", definition.Envelope.IdComparisonKeyColumn);
+        writer.WriteString("idLookupKey", definition.Envelope.IdLookupKeyColumn);
         writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
         writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
         writer.WriteString("version", definition.Envelope.VersionColumn);
@@ -202,6 +211,19 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
         writer.WriteEndObject();
         WriteEvolution(writer, definition.Evolution);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteIdentityPolicy(Utf8JsonWriter writer, IdentityPolicy policy)
+    {
+        var portablePolicy = ExecutableDocumentIdentityRoute.ToPortableComparisonPolicy(policy.StringCasePolicy);
+        writer.WritePropertyName("identityPolicy");
+        writer.WriteStartObject();
+        writer.WriteString("kind", policy.Kind.ToString());
+        writer.WriteString("fieldName", policy.FieldName);
+        writer.WriteString("stringCasePolicy", policy.StringCasePolicy.ToString());
+        writer.WriteString("comparisonAlgorithm", PortableStringComparison.GetAlgorithmId(portablePolicy));
+        writer.WriteString("lookupAlgorithm", PortableStringComparison.LookupHashAlgorithmId);
         writer.WriteEndObject();
     }
 

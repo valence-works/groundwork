@@ -13,8 +13,14 @@ public enum PortableStringComparisonPolicy
 }
 
 public readonly record struct PortableStringIdentityProjection(
+    string OriginalValue,
     string ComparisonKey,
-    string ComparisonKeyHash);
+    string LookupKey,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId)
+{
+    public string ComparisonKeyHash => LookupKey;
+}
 
 /// <summary>
 /// Owns provider-neutral, versioned string comparison and lookup projections that may be persisted
@@ -107,9 +113,20 @@ public static class PortableStringComparison
     {
         var comparisonKey = Create(value, policy);
         return new(
+            value,
             comparisonKey,
-            CreateHash(comparisonKey));
+            CreateHash(comparisonKey),
+            GetAlgorithmId(policy),
+            LookupHashAlgorithmId);
     }
+
+    public static string GetAlgorithmId(PortableStringComparisonPolicy policy) => policy switch
+    {
+        PortableStringComparisonPolicy.Ordinal => OrdinalAlgorithmId,
+        PortableStringComparisonPolicy.AsciiIgnoreCase => AsciiIgnoreCaseAlgorithmId,
+        PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase => UnicodeOrdinalIgnoreCaseAlgorithmId,
+        _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+    };
 
     public static bool IsAsciiIgnoreCaseValue(string value)
     {

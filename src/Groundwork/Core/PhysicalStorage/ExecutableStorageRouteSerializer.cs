@@ -42,7 +42,7 @@ public static class ExecutableStorageRouteSerializer
             ReadStorageObject(root.GetProperty("primaryStorage")),
             linkedStorage.ValueKind == JsonValueKind.Null ? null : ReadStorageObject(linkedStorage),
             new ExecutableDocumentEnvelopeRoute(
-                ReadColumn(envelope.GetProperty("id")),
+                ReadIdentity(envelope.GetProperty("identity")),
                 ReadColumn(envelope.GetProperty("documentKind")),
                 ReadColumn(envelope.GetProperty("storageScope")),
                 ReadColumn(envelope.GetProperty("version")),
@@ -51,7 +51,7 @@ public static class ExecutableStorageRouteSerializer
             linkedRelationship.ValueKind == JsonValueKind.Null
                 ? null
                 : new ExecutableLinkedRelationshipRoute(
-                    ReadColumn(linkedRelationship.GetProperty("documentId")),
+                    ReadIdentity(linkedRelationship.GetProperty("identity")),
                     ReadColumn(linkedRelationship.GetProperty("documentKind")),
                     ReadColumn(linkedRelationship.GetProperty("storageScope"))),
             new ExecutableDiscriminatorRoute(
@@ -146,7 +146,7 @@ public static class ExecutableStorageRouteSerializer
 
             writer.WritePropertyName("envelope");
             writer.WriteStartObject();
-            WriteColumn(writer, "id", route.Envelope.Id);
+            WriteIdentity(writer, "identity", route.Envelope.Identity);
             WriteColumn(writer, "documentKind", route.Envelope.DocumentKind);
             WriteColumn(writer, "storageScope", route.Envelope.StorageScope);
             WriteColumn(writer, "version", route.Envelope.Version);
@@ -162,7 +162,7 @@ public static class ExecutableStorageRouteSerializer
             {
                 writer.WritePropertyName("linkedRelationship");
                 writer.WriteStartObject();
-                WriteColumn(writer, "documentId", route.LinkedRelationship.DocumentId);
+                WriteIdentity(writer, "identity", route.LinkedRelationship.Identity);
                 WriteColumn(writer, "documentKind", route.LinkedRelationship.DocumentKind);
                 WriteColumn(writer, "storageScope", route.LinkedRelationship.StorageScope);
                 writer.WriteEndObject();
@@ -287,6 +287,15 @@ public static class ExecutableStorageRouteSerializer
             ReadName(element.GetProperty("name")),
             element.GetProperty("schemaVersion").GetInt32(),
             ReadEvolution(element));
+
+    private static ExecutableDocumentIdentityRoute ReadIdentity(JsonElement element) =>
+        new(
+            ReadEnum<StringIdentityCasePolicy>(element, "stringCasePolicy"),
+            element.GetProperty("comparisonAlgorithm").GetString()!,
+            element.GetProperty("lookupAlgorithm").GetString()!,
+            ReadColumn(element.GetProperty("original")),
+            ReadColumn(element.GetProperty("comparisonKey")),
+            ReadColumn(element.GetProperty("lookupKey")));
 
     private static ExecutableKeyRoute ReadKey(JsonElement element) =>
         new(
@@ -444,6 +453,22 @@ public static class ExecutableStorageRouteSerializer
     {
         writer.WritePropertyName(property);
         WriteColumnValue(writer, column);
+    }
+
+    private static void WriteIdentity(
+        Utf8JsonWriter writer,
+        string property,
+        ExecutableDocumentIdentityRoute identity)
+    {
+        writer.WritePropertyName(property);
+        writer.WriteStartObject();
+        writer.WriteString("stringCasePolicy", identity.StringCasePolicy.ToString());
+        writer.WriteString("comparisonAlgorithm", identity.ComparisonAlgorithmId);
+        writer.WriteString("lookupAlgorithm", identity.LookupAlgorithmId);
+        WriteColumn(writer, "original", identity.OriginalId);
+        WriteColumn(writer, "comparisonKey", identity.ComparisonKey);
+        WriteColumn(writer, "lookupKey", identity.LookupKey);
+        writer.WriteEndObject();
     }
 
     private static void WriteColumnValue(Utf8JsonWriter writer, ExecutableColumnRoute column)

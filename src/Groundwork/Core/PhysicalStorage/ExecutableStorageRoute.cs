@@ -1,5 +1,6 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -59,18 +60,56 @@ public sealed record ExecutableScopeKeyRoute(
     public bool UsesGlobalSentinel => Policy == StorageScopePolicy.Global;
 }
 
+public sealed record ExecutableDocumentIdentityRoute(
+    StringIdentityCasePolicy StringCasePolicy,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId,
+    ExecutableColumnRoute OriginalId,
+    ExecutableColumnRoute ComparisonKey,
+    ExecutableColumnRoute LookupKey)
+{
+    public PortableStringIdentityProjection Project(string originalId)
+    {
+        var projection = PortableStringComparison.ProjectIdentity(
+            originalId,
+            ToPortableComparisonPolicy(StringCasePolicy));
+        if (!string.Equals(projection.ComparisonAlgorithmId, ComparisonAlgorithmId, StringComparison.Ordinal) ||
+            !string.Equals(projection.LookupAlgorithmId, LookupAlgorithmId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The executable identity route algorithms do not match the portable string identity projection algorithms.");
+        }
+
+        return projection;
+    }
+
+    internal static PortableStringComparisonPolicy ToPortableComparisonPolicy(
+        StringIdentityCasePolicy policy) => policy switch
+        {
+            StringIdentityCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
+            _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+        };
+}
+
 public sealed record ExecutableDocumentEnvelopeRoute(
-    ExecutableColumnRoute Id,
+    ExecutableDocumentIdentityRoute Identity,
     ExecutableColumnRoute DocumentKind,
     ExecutableColumnRoute StorageScope,
     ExecutableColumnRoute Version,
     ExecutableColumnRoute SchemaVersion,
-    ExecutableColumnRoute CanonicalJson);
+    ExecutableColumnRoute CanonicalJson)
+{
+    public ExecutableColumnRoute Id => Identity.OriginalId;
+}
 
 public sealed record ExecutableLinkedRelationshipRoute(
-    ExecutableColumnRoute DocumentId,
+    ExecutableDocumentIdentityRoute Identity,
     ExecutableColumnRoute DocumentKind,
-    ExecutableColumnRoute StorageScope);
+    ExecutableColumnRoute StorageScope)
+{
+    public ExecutableColumnRoute DocumentId => Identity.OriginalId;
+}
 
 public sealed class ExecutableKeyRoute : IEquatable<ExecutableKeyRoute>
 {

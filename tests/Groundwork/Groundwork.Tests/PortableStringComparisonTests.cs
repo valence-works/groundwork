@@ -131,10 +131,18 @@ public sealed class PortableStringComparisonTests
             PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase);
         var prefix = PortableStringComparison.CreateBoundedPrefix(comparison, 256);
 
+        Assert.Equal(value, projection.OriginalValue);
         Assert.Equal(comparison, projection.ComparisonKey);
+        Assert.Equal(projection.LookupKey, projection.ComparisonKeyHash);
         Assert.Equal(256, prefix.Length);
         Assert.Equal(comparison[..256], prefix);
         Assert.Equal(64, projection.ComparisonKeyHash.Length);
+        Assert.Equal(
+            PortableStringComparison.UnicodeOrdinalIgnoreCaseAlgorithmId,
+            projection.ComparisonAlgorithmId);
+        Assert.Equal(
+            PortableStringComparison.LookupHashAlgorithmId,
+            projection.LookupAlgorithmId);
         Assert.Equal("groundwork-sha256-utf8-lowerhex-v1", PortableStringComparison.LookupHashAlgorithmId);
     }
 }

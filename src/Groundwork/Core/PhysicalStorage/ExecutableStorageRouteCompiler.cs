@@ -1,5 +1,6 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -131,6 +132,8 @@ public static class ExecutableStorageRouteCompiler
         if (linkedRelationship is not null)
         {
             linkedColumns.TryAdd(envelopeDefinition.IdColumn, linkedRelationship.DocumentId);
+            linkedColumns.TryAdd(envelopeDefinition.IdComparisonKeyColumn, linkedRelationship.Identity.ComparisonKey);
+            linkedColumns.TryAdd(envelopeDefinition.IdLookupKeyColumn, linkedRelationship.Identity.LookupKey);
             linkedColumns.TryAdd(envelopeDefinition.DocumentKindColumn, linkedRelationship.DocumentKind);
             linkedColumns.TryAdd(envelopeDefinition.StorageScopeColumn, linkedRelationship.StorageScope);
         }
@@ -227,16 +230,16 @@ public static class ExecutableStorageRouteCompiler
                 definition.SchemaVersion,
                 definition.Evolution);
         var primaryKeyColumns = shared
-            ? new[] { envelope.DocumentKind, envelope.StorageScope, envelope.Id }
-            : [envelope.StorageScope, envelope.Id];
+            ? new[] { envelope.DocumentKind, envelope.StorageScope, envelope.Identity.LookupKey }
+            : [envelope.StorageScope, envelope.Identity.LookupKey];
         var primaryKey = new ExecutableKeyRoute(ExecutableStorageObjectRole.PrimaryStorage, primaryKeyColumns);
         var auxiliaryKey = linkedRelationship is null
             ? null
             : new ExecutableKeyRoute(
                 ExecutableStorageObjectRole.LinkedIndexStorage,
                 shared
-                    ? [linkedRelationship.DocumentKind, linkedRelationship.StorageScope, linkedRelationship.DocumentId]
-                    : [linkedRelationship.StorageScope, linkedRelationship.DocumentId]);
+                    ? [linkedRelationship.DocumentKind, linkedRelationship.StorageScope, linkedRelationship.Identity.LookupKey]
+                    : [linkedRelationship.StorageScope, linkedRelationship.Identity.LookupKey]);
         var discriminator = new ExecutableDiscriminatorRoute(
             envelope.DocumentKind,
             providerDefinition.Resolved.StorageUnit.Value,
@@ -306,27 +309,35 @@ public static class ExecutableStorageRouteCompiler
         }
 
         var id = Resolve(envelope.IdColumn);
+        var idComparison = Resolve(envelope.IdComparisonKeyColumn);
+        var idLookup = Resolve(envelope.IdLookupKeyColumn);
         var kind = Resolve(envelope.DocumentKindColumn);
         var scope = Resolve(envelope.StorageScopeColumn);
         var version = Resolve(envelope.VersionColumn);
         var schemaVersion = Resolve(envelope.SchemaVersionColumn);
         var canonicalJson = Resolve(envelope.CanonicalJsonColumn);
-        var resolved = new[] { id, kind, scope, version, schemaVersion, canonicalJson };
+        var resolved = new[] { id, idComparison, idLookup, kind, scope, version, schemaVersion, canonicalJson };
         var distinctColumnCount = resolved
             .Where(column => column is not null)
             .Select(column => column!.LogicalName)
             .Distinct(StringComparer.Ordinal)
             .Count();
-        if (distinctColumnCount != 6)
+        if (distinctColumnCount != 8)
         {
             diagnostics.Add(Error(
                 "GW-ROUTE-003",
-                "Envelope roles require six distinct executable column mappings.",
+                "Envelope roles require eight distinct executable column mappings.",
                 $"{target}.envelope"));
         }
-        return resolved.Any(column => column is null) || distinctColumnCount != 6
+        return resolved.Any(column => column is null) || distinctColumnCount != 8
             ? null
-            : new ExecutableDocumentEnvelopeRoute(id!, kind!, scope!, version!, schemaVersion!, canonicalJson!);
+            : new ExecutableDocumentEnvelopeRoute(
+                CompileIdentity(definition.Resolved.IdentityPolicy, id!, idComparison!, idLookup!),
+                kind!,
+                scope!,
+                version!,
+                schemaVersion!,
+                canonicalJson!);
     }
 
     private static ExecutableLinkedRelationshipRoute? CompileLinkedRelationship(
@@ -349,24 +360,49 @@ public static class ExecutableStorageRouteCompiler
         }
 
         var documentId = Resolve(linkedKey.DocumentIdColumn);
+        var documentIdComparison = Resolve(linkedKey.DocumentIdComparisonKeyColumn);
+        var documentIdLookup = Resolve(linkedKey.DocumentIdLookupKeyColumn);
         var documentKind = Resolve(linkedKey.DocumentKindColumn);
         var storageScope = Resolve(linkedKey.StorageScopeColumn);
-        var resolved = new[] { documentId, documentKind, storageScope };
+        var resolved = new[] { documentId, documentIdComparison, documentIdLookup, documentKind, storageScope };
         var distinctColumnCount = resolved
             .Where(column => column is not null)
             .Select(column => column!.LogicalName)
             .Distinct(StringComparer.Ordinal)
             .Count();
-        if (distinctColumnCount != 3)
+        if (distinctColumnCount != 5)
         {
             diagnostics.Add(Error(
                 "GW-ROUTE-003",
-                "Linked document relationship roles require three distinct executable column mappings.",
+                "Linked document relationship roles require five distinct executable column mappings.",
                 $"{target}.linkedRelationship"));
         }
-        return resolved.Any(column => column is null) || distinctColumnCount != 3
+        return resolved.Any(column => column is null) || distinctColumnCount != 5
             ? null
-            : new ExecutableLinkedRelationshipRoute(documentId!, documentKind!, storageScope!);
+            : new ExecutableLinkedRelationshipRoute(
+                CompileIdentity(
+                    definition.Resolved.IdentityPolicy,
+                    documentId!,
+                    documentIdComparison!,
+                    documentIdLookup!),
+                documentKind!,
+                storageScope!);
+    }
+
+    private static ExecutableDocumentIdentityRoute CompileIdentity(
+        IdentityPolicy policy,
+        ExecutableColumnRoute originalId,
+        ExecutableColumnRoute comparisonKey,
+        ExecutableColumnRoute lookupKey)
+    {
+        var portablePolicy = ExecutableDocumentIdentityRoute.ToPortableComparisonPolicy(policy.StringCasePolicy);
+        return new ExecutableDocumentIdentityRoute(
+            policy.StringCasePolicy,
+            PortableStringComparison.GetAlgorithmId(portablePolicy),
+            PortableStringComparison.LookupHashAlgorithmId,
+            originalId,
+            comparisonKey,
+            lookupKey);
     }
 
     private static void ValidateForm(
@@ -578,6 +614,8 @@ public static class ExecutableStorageRouteCompiler
     private static IEnumerable<ExecutableColumnRoute> EnvelopeColumns(ExecutableDocumentEnvelopeRoute envelope)
     {
         yield return envelope.Id;
+        yield return envelope.Identity.ComparisonKey;
+        yield return envelope.Identity.LookupKey;
         yield return envelope.DocumentKind;
         yield return envelope.StorageScope;
         yield return envelope.Version;

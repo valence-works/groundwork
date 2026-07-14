@@ -14,9 +14,21 @@ public enum StorageLifecycleKind
     Retained
 }
 
-public sealed record IdentityPolicy(StorageIdentityKind Kind, string FieldName)
+public sealed record IdentityPolicy(
+    StorageIdentityKind Kind,
+    string FieldName,
+    StringIdentityCasePolicy StringCasePolicy = StringIdentityCasePolicy.Ordinal)
 {
-    public static IdentityPolicy StringId(string fieldName = "id") => new(StorageIdentityKind.String, fieldName);
+    public static IdentityPolicy StringId(
+        string fieldName = "id",
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal) =>
+        new(StorageIdentityKind.String, fieldName, stringCasePolicy);
+}
+
+public enum StringIdentityCasePolicy
+{
+    Ordinal,
+    UnicodeOrdinalIgnoreCase
 }
 
 public enum StorageIdentityKind

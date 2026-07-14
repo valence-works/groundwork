@@ -230,6 +230,8 @@ internal static class SchemaToolReportWriter
     {
         yield return Name(route, "primaryStorage", route.PrimaryStorage.Name, ExecutableStorageObjectRole.PrimaryStorage);
         yield return Name(route, "envelopeField", route.Envelope.Id, ExecutableStorageObjectRole.PrimaryStorage);
+        yield return Name(route, "envelopeField", route.Envelope.Identity.ComparisonKey, ExecutableStorageObjectRole.PrimaryStorage);
+        yield return Name(route, "envelopeField", route.Envelope.Identity.LookupKey, ExecutableStorageObjectRole.PrimaryStorage);
         yield return Name(route, "envelopeField", route.Envelope.DocumentKind, ExecutableStorageObjectRole.PrimaryStorage);
         yield return Name(route, "envelopeField", route.Envelope.StorageScope, ExecutableStorageObjectRole.PrimaryStorage);
         yield return Name(route, "envelopeField", route.Envelope.Version, ExecutableStorageObjectRole.PrimaryStorage);
@@ -240,6 +242,8 @@ internal static class SchemaToolReportWriter
         if (route.LinkedRelationship is not null)
         {
             yield return Name(route, "linkedRelationshipField", route.LinkedRelationship.DocumentId, ExecutableStorageObjectRole.LinkedIndexStorage);
+            yield return Name(route, "linkedRelationshipField", route.LinkedRelationship.Identity.ComparisonKey, ExecutableStorageObjectRole.LinkedIndexStorage);
+            yield return Name(route, "linkedRelationshipField", route.LinkedRelationship.Identity.LookupKey, ExecutableStorageObjectRole.LinkedIndexStorage);
             yield return Name(route, "linkedRelationshipField", route.LinkedRelationship.DocumentKind, ExecutableStorageObjectRole.LinkedIndexStorage);
             yield return Name(route, "linkedRelationshipField", route.LinkedRelationship.StorageScope, ExecutableStorageObjectRole.LinkedIndexStorage);
         }

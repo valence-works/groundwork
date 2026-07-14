@@ -42,6 +42,16 @@ public static class PhysicalSchemaDiffPlanner
                     "schemaHistory.identity")]);
         }
 
+        var identitySchemaDiagnostics = ValidateIdentitySchema(target, applied);
+        if (identitySchemaDiagnostics.Count != 0)
+        {
+            return PhysicalSchemaDiffPlan.Invalid(
+                target,
+                plannedAt,
+                identitySchemaDiagnostics,
+                expectedAppliedTargetFingerprint: applied?.TargetFingerprint);
+        }
+
         var unsupportedTransforms = target.Routes
             .SelectMany(route => route.ProjectedColumns
                 .Where(column => column.Definition.RebuildMode == ProjectionRebuildMode.SemanticMigrationRequired)
@@ -196,6 +206,36 @@ public static class PhysicalSchemaDiffPlanner
         return diagnostics;
     }
 
+    private static IReadOnlyList<GroundworkDiagnostic> ValidateIdentitySchema(
+        PhysicalSchemaTarget target,
+        PhysicalSchemaAppliedState? applied)
+    {
+        if (applied is null)
+            return [];
+
+        var appliedRoutes = applied.Snapshot.Routes.ToDictionary(route => route.StorageUnit);
+        var diagnostics = new List<GroundworkDiagnostic>();
+        foreach (var route in target.Routes)
+        {
+            if (!appliedRoutes.TryGetValue(route.StorageUnit, out var appliedRoute))
+                continue;
+
+            var expected = DocumentIdentitySchemaState.Capture(route);
+            if (appliedRoute.IdentitySchemaState == expected)
+                continue;
+
+            var reason = appliedRoute.IdentitySchemaState is null
+                ? "does not contain typed identity schema state"
+                : "does not match the target identity policy, algorithms, or column mappings";
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-SCHEMA-006",
+                $"Applied storage unit '{route.StorageUnit.Value}' {reason}. Groundwork does not infer or automatically re-key identity data; explicitly drop and recreate the schema before applying this target.",
+                $"schema.identity.{route.StorageUnit.Value}"));
+        }
+
+        return diagnostics;
+    }
+
     private static PhysicalSchemaAppliedSnapshot CreateSnapshot(
         PhysicalSchemaTarget target,
         IReadOnlyList<PhysicalSchemaOperation> semanticOperations)
@@ -205,7 +245,8 @@ public static class PhysicalSchemaDiffPlanner
             route.DefinitionFingerprint,
             route.Fingerprint,
             ResolvedNames(route),
-            ExecutableStorageRouteSerializer.Serialize(route))).ToArray();
+            ExecutableStorageRouteSerializer.Serialize(route),
+            DocumentIdentitySchemaState.Capture(route))).ToArray();
         var operations = semanticOperations.Select(operation => new AppliedSemanticOperationSnapshot(
             operation.Identity,
             operation.Fingerprint,
@@ -223,6 +264,8 @@ public static class PhysicalSchemaDiffPlanner
         {
             ObjectName(route.PrimaryStorage.Name, ExecutableStorageObjectRole.PrimaryStorage),
             ColumnName("EnvelopeId", route.Envelope.Id, ExecutableStorageObjectRole.PrimaryStorage),
+            ColumnName("EnvelopeIdComparisonKey", route.Envelope.Identity.ComparisonKey, ExecutableStorageObjectRole.PrimaryStorage),
+            ColumnName("EnvelopeIdLookupKey", route.Envelope.Identity.LookupKey, ExecutableStorageObjectRole.PrimaryStorage),
             ColumnName("EnvelopeDocumentKind", route.Envelope.DocumentKind, ExecutableStorageObjectRole.PrimaryStorage),
             ColumnName("EnvelopeStorageScope", route.Envelope.StorageScope, ExecutableStorageObjectRole.PrimaryStorage),
             ColumnName("EnvelopeVersion", route.Envelope.Version, ExecutableStorageObjectRole.PrimaryStorage),
@@ -235,6 +278,8 @@ public static class PhysicalSchemaDiffPlanner
         if (route.LinkedRelationship is not null)
         {
             names.Add(ColumnName("LinkedDocumentId", route.LinkedRelationship.DocumentId, ExecutableStorageObjectRole.LinkedIndexStorage));
+            names.Add(ColumnName("LinkedDocumentIdComparisonKey", route.LinkedRelationship.Identity.ComparisonKey, ExecutableStorageObjectRole.LinkedIndexStorage));
+            names.Add(ColumnName("LinkedDocumentIdLookupKey", route.LinkedRelationship.Identity.LookupKey, ExecutableStorageObjectRole.LinkedIndexStorage));
             names.Add(ColumnName("LinkedDocumentKind", route.LinkedRelationship.DocumentKind, ExecutableStorageObjectRole.LinkedIndexStorage));
             names.Add(ColumnName("LinkedStorageScope", route.LinkedRelationship.StorageScope, ExecutableStorageObjectRole.LinkedIndexStorage));
         }

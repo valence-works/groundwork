@@ -67,6 +67,39 @@ public sealed class ManifestValidationTests
     }
 
     [Fact]
+    public void Non_string_identity_cannot_select_a_non_ordinal_string_case_policy()
+    {
+        var manifest = WithSingleUnit(unit => unit with
+        {
+            IdentityPolicy = new IdentityPolicy(
+                StorageIdentityKind.Guid,
+                "id",
+                StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+        });
+
+        var result = _validator.Validate(manifest);
+
+        Assert.Contains(result.Errors, diagnostic =>
+            diagnostic.Code == "GW-UNIT-013" &&
+            diagnostic.Target == "manifest.storageUnits[0].identityPolicy.stringCasePolicy");
+    }
+
+    [Theory]
+    [InlineData(StorageIdentityKind.Guid)]
+    [InlineData(StorageIdentityKind.Composite)]
+    public void Non_string_identity_preserves_the_default_ordinal_declaration(StorageIdentityKind kind)
+    {
+        var manifest = WithSingleUnit(unit => unit with
+        {
+            IdentityPolicy = new IdentityPolicy(kind, "id")
+        });
+
+        var result = _validator.Validate(manifest);
+
+        Assert.DoesNotContain(result.Errors, diagnostic => diagnostic.Code == "GW-UNIT-013");
+    }
+
+    [Fact]
     public void MissingSchemaVersionFails()
     {
         var result = _validator.Validate(SampleManifests.MetadataManifest() with { Version = new StorageManifestVersion("") });

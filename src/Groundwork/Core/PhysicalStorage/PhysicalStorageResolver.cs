@@ -10,6 +10,7 @@ namespace Groundwork.Core.PhysicalStorage;
 public sealed record ResolvedPhysicalTableDefinition(
     StorageUnitIdentity StorageUnit,
     StorageUnitProvisioningMode ProvisioningMode,
+    IdentityPolicy IdentityPolicy,
     PhysicalTableDefinition Definition,
     SharedDocumentStorageDefinition? SharedStorageDefinition,
     IReadOnlyList<ScaleBearingPathDemand> ScaleBearingDemand,
@@ -24,6 +25,7 @@ public sealed record ResolvedPhysicalTableDefinition(
         other is not null &&
         StorageUnit == other.StorageUnit &&
         ProvisioningMode == other.ProvisioningMode &&
+        IdentityPolicy == other.IdentityPolicy &&
         Definition.Equals(other.Definition) &&
         Equals(SharedStorageDefinition, other.SharedStorageDefinition) &&
         ScaleBearingDemand.SequenceEqual(other.ScaleBearingDemand) &&
@@ -35,6 +37,7 @@ public sealed record ResolvedPhysicalTableDefinition(
         var hash = new HashCode();
         hash.Add(StorageUnit);
         hash.Add(ProvisioningMode);
+        hash.Add(IdentityPolicy);
         hash.Add(Definition);
         hash.Add(SharedStorageDefinition);
         foreach (var demand in ScaleBearingDemand)
@@ -173,6 +176,7 @@ public static class PhysicalStorageResolver
             var resolved = new ResolvedPhysicalTableDefinition(
                 unit.Identity,
                 unit.PhysicalStorage.ProvisioningMode,
+                unit.IdentityPolicy,
                 definition,
                 sharedStorageDefinition,
                 demand.ToArray(),
@@ -730,8 +734,7 @@ public static class PhysicalStorageResolver
             : EnvelopeColumnNames(envelope);
         var unavailableProjectedNames = definition.LinkedKey is null || envelope is null
             ? envelopeColumns
-            : envelopeColumns
-                .Take(3)
+            : EnvelopeRelationshipColumnNames(envelope)
                 .Concat(LinkedKeyColumnNames(definition.LinkedKey))
                 .ToArray();
         var duplicateColumnNames = definition.ProjectedColumns
@@ -806,8 +809,9 @@ public static class PhysicalStorageResolver
         var primaryAvailableColumns = definition.Form == PhysicalStorageForm.PhysicalEntityTable
             ? envelopeColumns.Concat(definition.ProjectedColumns.Select(column => column.LogicalName)).ToHashSet(StringComparer.Ordinal)
             : envelopeColumnSet;
-        var linkedAvailableColumns = envelopeColumns
-            .Take(3)
+        var linkedAvailableColumns = envelope is null
+            ? definition.ProjectedColumns.Select(column => column.LogicalName).ToHashSet(StringComparer.Ordinal)
+            : EnvelopeRelationshipColumnNames(envelope)
             .Concat(definition.ProjectedColumns.Select(column => column.LogicalName))
             .ToHashSet(StringComparer.Ordinal);
         if (definition.Indexes.GroupBy(x => x.LogicalName, StringComparer.Ordinal).Any(x => x.Count() > 1))
@@ -1081,14 +1085,27 @@ public static class PhysicalStorageResolver
         envelope.StorageScopeColumn,
         envelope.VersionColumn,
         envelope.SchemaVersionColumn,
-        envelope.CanonicalJsonColumn
+        envelope.CanonicalJsonColumn,
+        envelope.IdComparisonKeyColumn,
+        envelope.IdLookupKeyColumn
     ];
 
     private static string[] LinkedKeyColumnNames(LinkedDocumentKeyDefinition linkedKey) =>
     [
         linkedKey.DocumentIdColumn,
         linkedKey.DocumentKindColumn,
-        linkedKey.StorageScopeColumn
+        linkedKey.StorageScopeColumn,
+        linkedKey.DocumentIdComparisonKeyColumn,
+        linkedKey.DocumentIdLookupKeyColumn
+    ];
+
+    private static string[] EnvelopeRelationshipColumnNames(DocumentEnvelopeDefinition envelope) =>
+    [
+        envelope.IdColumn,
+        envelope.IdComparisonKeyColumn,
+        envelope.IdLookupKeyColumn,
+        envelope.DocumentKindColumn,
+        envelope.StorageScopeColumn
     ];
 
     private static IReadOnlyList<ProviderPhysicalObjectName> NormalizeNames(
