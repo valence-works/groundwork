@@ -1,8 +1,11 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
 using Groundwork.PostgreSql.Documents;
+using Groundwork.Provider.Relational;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.PhysicalStorage;
@@ -10,6 +13,7 @@ using Groundwork.SqlServer.Documents;
 using Groundwork.SqlServer.PhysicalStorage;
 using Groundwork.SqlServer;
 using Groundwork.PostgreSql;
+using Groundwork.TestInfrastructure;
 using System.Text;
 using Xunit;
 
@@ -73,6 +77,126 @@ public sealed class RelationalPhysicalProviderDialectTests
         Assert.Equal("Latin1_General_100_BIN2", dialect.ProjectedCollation(projected));
         Assert.Contains("COLLATE Latin1_General_100_BIN2", dialect.EnvelopeColumn("id", RelationalEnvelopeColumnKind.Id));
         Assert.Contains("PRIMARY KEY NONCLUSTERED", dialect.CreateTableSql("records", ["[id] nvarchar(450) NOT NULL"], ["id"]));
+    }
+
+    [Fact]
+    public void Sql_server_uses_lossless_bounded_binary_document_identity_evidence()
+    {
+        var dialect = new SqlServerPhysicalSchemaDialect();
+
+        Assert.Equal("varbinary(1350)", dialect.EnvelopeType(RelationalEnvelopeColumnKind.IdentityComparison));
+        Assert.Equal("binary(32)", dialect.EnvelopeType(RelationalEnvelopeColumnKind.IdentityLookup));
+        Assert.Null(dialect.EnvelopeCollation(RelationalEnvelopeColumnKind.IdentityComparison));
+        Assert.Null(dialect.EnvelopeCollation(RelationalEnvelopeColumnKind.IdentityLookup));
+        Assert.Contains(
+            "[id_comparison_key] varbinary(1350) NOT NULL",
+            dialect.EnvelopeColumn("id_comparison_key", RelationalEnvelopeColumnKind.IdentityComparison),
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "[id_lookup_key] binary(32) NOT NULL",
+            dialect.EnvelopeColumn("id_lookup_key", RelationalEnvelopeColumnKind.IdentityLookup),
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(DocumentIdentityAcceptanceSurface.Exact)]
+    [InlineData(DocumentIdentityAcceptanceSurface.OrderedRange)]
+    public void Sql_server_accepts_lossless_identity_indexes_within_its_native_key_limit(
+        DocumentIdentityAcceptanceSurface surface)
+    {
+        var route = SqlServerIdentityAcceptanceRoute(surface).Route;
+
+        new SqlServerPhysicalSchemaDialect().ValidateRoute(route);
+    }
+
+    [Fact]
+    public async Task Sql_server_rejects_overlong_document_identity_before_opening_a_session()
+    {
+        var (manifest, route) = SqlServerIdentityAcceptanceRoute(DocumentIdentityAcceptanceSurface.Exact);
+        var opened = false;
+        var sessions = RelationalSessionFactory.Concurrent(() =>
+        {
+            opened = true;
+            return new Microsoft.Data.SqlClient.SqlConnection();
+        });
+        var documents = new SqlServerPhysicalDocumentStore(
+            sessions,
+            manifest,
+            [route],
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => documents.LoadAsync(
+            DocumentIdentityAcceptanceModel.DocumentKind,
+            new string('x', 451)));
+        var queries = SqlServerPhysicalQueryRuntime.Create(
+            documents,
+            manifest,
+            route,
+            SqlServerGroundworkCapabilities.Provider);
+        await Assert.ThrowsAsync<ArgumentException>(() => queries.QueryAsync(
+            DocumentIdentityAcceptanceModel.ExactQuery(DocumentQueryComparison.Equal(
+                PhysicalDocumentFieldPaths.Id,
+                new string('x', 451)))));
+
+        Assert.False(opened);
+
+        var (mutationManifest, mutationRoute) = SqlServerIdentityAcceptanceRoute(
+            DocumentIdentityAcceptanceSurface.Mutation);
+        var mutationOpened = false;
+        var mutationSessions = RelationalSessionFactory.Concurrent(() =>
+        {
+            mutationOpened = true;
+            return new Microsoft.Data.SqlClient.SqlConnection();
+        });
+        var mutationDocuments = new SqlServerPhysicalDocumentStore(
+            mutationSessions,
+            mutationManifest,
+            [mutationRoute],
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var mutations = SqlServerPhysicalMutationRuntime.Create(
+            mutationDocuments,
+            mutationManifest,
+            mutationRoute,
+            SqlServerGroundworkCapabilities.Provider);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => mutations.ExecuteAsync(
+            DocumentIdentityAcceptanceModel.Delete("overlong", new string('x', 451))));
+
+        Assert.False(mutationOpened);
+    }
+
+    [Fact]
+    public void Sql_server_document_identity_encoding_preserves_portable_order_and_native_bounds()
+    {
+        const string lower = "000041";
+        const string upper = "000042";
+        var longest = string.Concat(Enumerable.Repeat("10FFFF", 450));
+
+        var lowerBytes = SqlServerDocumentIdentityEncoding.Comparison(lower);
+        var upperBytes = SqlServerDocumentIdentityEncoding.Comparison(upper);
+        var longestBytes = SqlServerDocumentIdentityEncoding.Comparison(longest);
+        var lookup = SqlServerDocumentIdentityEncoding.Lookup(new string('a', 64));
+        var prefixUpper = SqlServerDocumentIdentityEncoding.ComparisonPrefixUpperBound("00FF");
+        var dialect = new SqlServerPhysicalDocumentDialect();
+        var selectionSql = dialect.CreateMutationSelectionTable(
+            "#selection",
+            "kind",
+            "scope",
+            "id",
+            "id_comparison",
+            "id_lookup",
+            "version",
+            "incarnation");
+
+        Assert.True(lowerBytes.AsSpan().SequenceCompareTo(upperBytes) < 0);
+        Assert.Equal(1350, longestBytes.Length);
+        Assert.Equal(32, lookup.Length);
+        Assert.Equal(new byte[] { 1 }, prefixUpper);
+        Assert.Null(SqlServerDocumentIdentityEncoding.ComparisonPrefixUpperBound(string.Empty));
+        Assert.Contains("[id_comparison] varbinary(1350) NOT NULL", selectionSql, StringComparison.Ordinal);
+        Assert.Contains("[id_lookup] binary(32) NOT NULL", selectionSql, StringComparison.Ordinal);
+        Assert.Throws<ArgumentException>(() => SqlServerDocumentIdentityEncoding.Original(new string('x', 451)));
+        Assert.Equal(450, SqlServerDocumentIdentityEncoding.Original(new string('x', 450)).Length);
     }
 
     [Fact]
@@ -149,6 +273,162 @@ public sealed class RelationalPhysicalProviderDialectTests
 
         Assert.Contains("gw_hidden_collision_id_key", exception.Message, StringComparison.Ordinal);
         Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sql_server_rejects_case_only_visible_columns_that_collide_with_hidden_identity_keys(
+        bool linked)
+    {
+        var instance = linked ? "linked_case_visible_collision" : "primary_case_visible_collision";
+        var original = linked
+            ? $"gw_{instance}_document_id"
+            : $"gw_{instance}_id";
+        var hidden = $"{original}_key";
+        var projectedKind = linked
+            ? PhysicalObjectKind.LinkedProjectedField
+            : PhysicalObjectKind.ProjectedField;
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.ObjectKind == projectedKind &&
+                       context.LogicalName.EndsWith("_category", StringComparison.Ordinal)
+                ? hidden.ToUpperInvariant()
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            linked ? PhysicalStorageForm.SharedDocuments : PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains(hidden, exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sql_server_rejects_retained_identity_columns_that_collide_with_hidden_identity_keys(
+        bool linked)
+    {
+        var instance = linked ? "linked_identity_collision" : "primary_identity_collision";
+        var original = linked
+            ? $"gw_{instance}_document_id"
+            : $"gw_{instance}_id";
+        var comparisonSuffix = linked ? "_document_id_comparison_key" : "_id_comparison_key";
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.LogicalName.EndsWith(comparisonSuffix, StringComparison.Ordinal)
+                ? SqlServerPhysicalIdentity.HiddenColumn(original)
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            linked ? PhysicalStorageForm.SharedDocuments : PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains(SqlServerPhysicalIdentity.HiddenColumn(original), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sql_server_rejects_case_only_provider_owned_identity_column_collisions(bool linked)
+    {
+        var instance = linked ? "linked_case_hidden_collision" : "primary_case_hidden_collision";
+        var original = linked
+            ? $"gw_{instance}_document_id"
+            : $"gw_{instance}_id";
+        var comparisonSuffix = linked ? "_document_id_comparison_key" : "_id_comparison_key";
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.LogicalName.EndsWith(comparisonSuffix, StringComparison.Ordinal)
+                ? original.ToUpperInvariant()
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            linked ? PhysicalStorageForm.SharedDocuments : PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains("duplicate", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Sql_server_accepts_distinct_long_retained_identity_names_after_hidden_name_normalization()
+    {
+        var prefix = new string('x', 126);
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => (context.ObjectKind, context.LogicalName) switch
+            {
+                (PhysicalObjectKind.EnvelopeField, var name) when name.EndsWith("_id_comparison_key", StringComparison.Ordinal) => prefix + "pc",
+                (PhysicalObjectKind.EnvelopeField, var name) when name.EndsWith("_id_lookup_key", StringComparison.Ordinal) => prefix + "pl",
+                (PhysicalObjectKind.LinkedIndexField, var name) when name.EndsWith("_document_id_comparison_key", StringComparison.Ordinal) => prefix + "lc",
+                (PhysicalObjectKind.LinkedIndexField, var name) when name.EndsWith("_document_id_lookup_key", StringComparison.Ordinal) => prefix + "ll",
+                _ => SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context)
+            },
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: "long_retained_identity",
+            normalizer: normalizer);
+        var route = model.Target.Routes.Single();
+
+        _ = new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global);
+
+        var primaryHidden = IdentityColumns(route.Envelope.Identity, route.Envelope.DocumentKind, route.Envelope.StorageScope)
+            .Select(SqlServerPhysicalIdentity.HiddenColumn)
+            .ToArray();
+        var linkedHidden = IdentityColumns(
+                route.LinkedRelationship!.Identity,
+                route.LinkedRelationship.DocumentKind,
+                route.LinkedRelationship.StorageScope)
+            .Select(SqlServerPhysicalIdentity.HiddenColumn)
+            .ToArray();
+        Assert.All(primaryHidden.Concat(linkedHidden), name => Assert.True(name.Length <= 128));
+        Assert.Equal(primaryHidden.Length, primaryHidden.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(linkedHidden.Length, linkedHidden.Distinct(StringComparer.Ordinal).Count());
+
+        static string[] IdentityColumns(
+            ExecutableDocumentIdentityRoute identity,
+            ExecutableColumnRoute documentKind,
+            ExecutableColumnRoute storageScope) =>
+        [
+            documentKind.Identifier,
+            storageScope.Identifier,
+            identity.OriginalId.Identifier,
+            identity.ComparisonKey.Identifier,
+            identity.LookupKey.Identifier
+        ];
     }
 
     [Theory]
@@ -475,6 +755,24 @@ public sealed class RelationalPhysicalProviderDialectTests
         var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
         Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(x => x.Message)));
         return compilation.Routes.Single();
+    }
+
+    private static (StorageManifest Manifest, ExecutableStorageRoute Route) SqlServerIdentityAcceptanceRoute(
+        DocumentIdentityAcceptanceSurface surface)
+    {
+        var manifest = DocumentIdentityAcceptanceModel.Manifest(
+            PhysicalStorageForm.PhysicalEntityTable,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase,
+            surface,
+            Guid.NewGuid().ToString("N")[..8]);
+        var resolution = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            SqlServerGroundworkCapabilities.PhysicalNames);
+        Assert.True(resolution.IsValid, string.Join("; ", resolution.Diagnostics.Select(item => item.Message)));
+        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
+        Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(item => item.Message)));
+        return (manifest, Assert.Single(compilation.Routes));
     }
 
     private static string ReadConstraintName(string createTableSql)

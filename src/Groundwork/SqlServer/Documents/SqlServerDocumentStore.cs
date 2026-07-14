@@ -8,7 +8,7 @@ namespace Groundwork.SqlServer.Documents;
 
 public sealed class SqlServerDocumentStore : RelationalDocumentStore
 {
-    public SqlServerDocumentStore(SqlConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal SqlServerDocumentStore(SqlConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(connection, manifest, new SqlServerDocumentStoreDialect(), access, scopeObserver)
     {
     }
@@ -18,7 +18,7 @@ public sealed class SqlServerDocumentStore : RelationalDocumentStore
     {
     }
 
-    public SqlServerDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal SqlServerDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             manifest,

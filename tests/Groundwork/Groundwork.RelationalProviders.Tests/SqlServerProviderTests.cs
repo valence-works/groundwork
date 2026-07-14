@@ -17,6 +17,10 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
+    public void DocumentStoreConstructionRequiresFactoryAdmission() =>
+        Assert.Empty(typeof(SqlServerDocumentStore).GetConstructors());
+
+    [Fact]
     public async Task FactoryRejectsInvalidManifestBeforeCreatingAnyConnection()
     {
         var materializationConnections = 0;
@@ -90,6 +94,32 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
         Assert.True(await ReadLargestDeclaredIndexKeyBytesAsync(connection) <= 900);
     }
 
+    [Fact]
+    public async Task MaterializationRejectsDisabledIdentityLookupIndex()
+    {
+        var manifest = RelationalTestManifests.MetadataManifest();
+        var connectionString = container.GetConnectionString();
+        await SqlServerDocumentStoreFactory.CreateAsync(
+            connectionString,
+            manifest,
+            RelationalTestManifests.SqlServerProvider,
+            Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using (var disable = connection.CreateCommand())
+        {
+            disable.CommandText = "ALTER INDEX ux_groundwork_documents_identity_lookup ON groundwork_documents DISABLE;";
+            await disable.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqlServerGroundworkMaterializer(connection).MaterializeAsync(
+                manifest,
+                RelationalTestManifests.SqlServerProvider));
+
+        Assert.Contains("identity lookup index", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<int> ReadLargestDeclaredIndexKeyBytesAsync(SqlConnection connection)
     {
         await using var command = connection.CreateCommand();
@@ -140,11 +170,11 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
             blocker);
     }
 
-    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync()
+    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync(Groundwork.Core.Manifests.StorageManifest? manifest = null)
     {
         var connectionString = container.GetConnectionString();
         var connection = new SqlConnection(connectionString);
-        var manifest = RelationalTestManifests.MetadataManifest();
+        manifest ??= RelationalTestManifests.MetadataManifest();
         var store = await SqlServerDocumentStoreFactory.CreateAsync(
             connectionString,
             manifest,
@@ -199,8 +229,136 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
             return Convert.ToInt64(await command.ExecuteScalarAsync());
         }
 
+        public async Task<long> CountIdentitySchemaRowsAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM groundwork_document_identity_schema;";
+            return Convert.ToInt64(await command.ExecuteScalarAsync());
+        }
+
+        public async Task ReAdmitIdentitySchemaConcurrentlyAsync()
+        {
+            await EnsureOpenAsync();
+            await using (var reset = connection.CreateCommand())
+            {
+                reset.CommandText = """
+                    DELETE FROM groundwork_document_identity_schema;
+                    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ux_groundwork_documents_identity_lookup' AND object_id = OBJECT_ID(N'groundwork_documents'))
+                        DROP INDEX ux_groundwork_documents_identity_lookup ON groundwork_documents;
+                    """;
+                await reset.ExecuteNonQueryAsync();
+            }
+
+            await Task.WhenAll(Enumerable.Range(0, 8).Select(async _ =>
+            {
+                await using var concurrent = new SqlConnection(connectionString);
+                await new SqlServerGroundworkMaterializer(concurrent).MaterializeAsync(
+                    manifest,
+                    RelationalTestManifests.SqlServerProvider);
+            }));
+        }
+
+        public async Task ReplaceIdentityLookupWithFilteredIndexAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                DROP INDEX ux_groundwork_documents_identity_lookup ON groundwork_documents;
+                CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+                ON groundwork_documents(document_kind_key, storage_scope_key, id_lookup_key)
+                WHERE id_lookup_key = 'excluded-from-runtime';
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task PrepareLegacyIdentityRowsAsync(IReadOnlyList<string> ids)
+        {
+            await EnsureOpenAsync();
+            await using (var reset = connection.CreateCommand())
+            {
+                reset.CommandText = """
+                    DROP INDEX ux_groundwork_documents_identity_lookup ON groundwork_documents;
+                    DROP TABLE groundwork_document_identity_schema;
+                    ALTER TABLE groundwork_documents DROP COLUMN id_comparison_key, id_lookup_key;
+                    """;
+                await reset.ExecuteNonQueryAsync();
+            }
+
+            foreach (var id in ids)
+            {
+                await using var insert = connection.CreateCommand();
+                insert.CommandText = """
+                    INSERT INTO groundwork_documents
+                        (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                    VALUES
+                        (N'configurationDocument', N'__groundwork_global__', @id, N'1', 1, N'{"key":"legacy"}',
+                         N'2026-01-01T00:00:00Z', N'2026-01-01T00:00:00Z');
+                    """;
+                insert.Parameters.AddWithValue("@id", id);
+                await insert.ExecuteNonQueryAsync();
+            }
+        }
+
+        public async Task RemoveLegacyIdentityRowAsync(string id)
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM groundwork_documents WHERE id = @id;";
+            command.Parameters.AddWithValue("@id", id);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<int> CountIdentityProjectionColumnsAsync(bool requireNotNull)
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT COUNT(*)
+                FROM sys.columns
+                WHERE object_id = OBJECT_ID(N'groundwork_documents')
+                  AND name IN (N'id_comparison_key', N'id_lookup_key')
+                  AND (@requireNotNull = 0 OR is_nullable = 0);
+                """;
+            command.Parameters.AddWithValue("@requireNotNull", requireNotNull);
+            return Convert.ToInt32(await command.ExecuteScalarAsync());
+        }
+
+        public async Task<bool> IdentitySchemaExistsAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT CASE WHEN OBJECT_ID(N'groundwork_document_identity_schema', N'U') IS NULL THEN 0 ELSE 1 END;";
+            return Convert.ToBoolean(await command.ExecuteScalarAsync());
+        }
+
+        public async Task ForceLookupCollisionAsync(string retainedId, string requestedId)
+        {
+            await EnsureOpenAsync();
+            string lookup;
+            await using (var read = connection.CreateCommand())
+            {
+                read.CommandText = "SELECT id_lookup_key FROM groundwork_documents WHERE id = @id;";
+                read.Parameters.AddWithValue("id", requestedId);
+                lookup = (string)(await read.ExecuteScalarAsync())!;
+            }
+
+            await using var corrupt = connection.CreateCommand();
+            corrupt.CommandText = """
+                DELETE FROM groundwork_documents WHERE id = @requestedId;
+                UPDATE groundwork_documents SET id_lookup_key = @lookup WHERE id = @retainedId;
+                """;
+            corrupt.Parameters.AddWithValue("requestedId", requestedId);
+            corrupt.Parameters.AddWithValue("retainedId", retainedId);
+            corrupt.Parameters.AddWithValue("lookup", lookup);
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
         public async Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_documents", primaryKey: true);
+
+        public async Task<IReadOnlyList<string>> ReadIdentityLookupUniqueIndexColumnsAsync()
+            => await ReadIndexColumnsAsync("groundwork_documents", indexName: "ux_groundwork_documents_identity_lookup");
 
         public async Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_document_indexes", indexName: "ux_groundwork_document_indexes_unique");

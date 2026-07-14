@@ -2,6 +2,7 @@ using System.Collections.Frozen;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using Groundwork.Core.Manifests;
 
 namespace Groundwork.Core.Text;
 
@@ -13,8 +14,14 @@ public enum PortableStringComparisonPolicy
 }
 
 public readonly record struct PortableStringIdentityProjection(
+    string OriginalValue,
     string ComparisonKey,
-    string ComparisonKeyHash);
+    string LookupKey,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId)
+{
+    public string ComparisonKeyHash => LookupKey;
+}
 
 /// <summary>
 /// Owns provider-neutral, versioned string comparison and lookup projections that may be persisted
@@ -22,6 +29,10 @@ public readonly record struct PortableStringIdentityProjection(
 /// </summary>
 public static class PortableStringComparison
 {
+    /// <summary>
+    /// Maximum portable document-identity length shared by every provider.
+    /// </summary>
+    public const int MaximumIdentityCodeUnits = 450;
     public const string OrdinalAlgorithmId = "groundwork-utf16-hex-v1";
     public const string AsciiIgnoreCaseAlgorithmId = "groundwork-ascii-lower-v1";
     public const string LookupHashAlgorithmId = "groundwork-sha256-utf8-lowerhex-v1";
@@ -107,9 +118,38 @@ public static class PortableStringComparison
     {
         var comparisonKey = Create(value, policy);
         return new(
+            value,
             comparisonKey,
-            CreateHash(comparisonKey));
+            CreateHash(comparisonKey),
+            GetAlgorithmId(policy),
+            LookupHashAlgorithmId);
     }
+
+    public static void ValidateIdentity(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Length > MaximumIdentityCodeUnits)
+        {
+            throw new ArgumentException(
+                $"Document identities may contain at most {MaximumIdentityCodeUnits} UTF-16 code units.",
+                nameof(value));
+        }
+    }
+
+    public static string GetAlgorithmId(PortableStringComparisonPolicy policy) => policy switch
+    {
+        PortableStringComparisonPolicy.Ordinal => OrdinalAlgorithmId,
+        PortableStringComparisonPolicy.AsciiIgnoreCase => AsciiIgnoreCaseAlgorithmId,
+        PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase => UnicodeOrdinalIgnoreCaseAlgorithmId,
+        _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+    };
+
+    public static PortableStringComparisonPolicy ForIdentityPolicy(StringIdentityCasePolicy policy) => policy switch
+    {
+        StringIdentityCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+        StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
+        _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+    };
 
     public static bool IsAsciiIgnoreCaseValue(string value)
     {

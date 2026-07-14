@@ -43,6 +43,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
     private const string SelectionKind = "document_kind";
     private const string SelectionScope = "storage_scope";
     private const string SelectionId = "document_id";
+    private const string SelectionComparison = "document_id_comparison_key";
+    private const string SelectionLookup = "document_id_lookup_key";
     private const string SelectionVersion = "document_version";
     private const string SelectionIncarnation = "document_incarnation";
 
@@ -101,6 +103,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         PhysicalMutationPlan plan,
         CancellationToken cancellationToken)
     {
+        predicateBuilder.ValidateDocumentIdentityValues(mutation.Clauses);
         var scope = store.ResolveMutationScope(mutation.DocumentKind);
         if (scope.AcrossScopes || scope.StorageKey is null)
             throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
@@ -210,17 +213,22 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         var identity = linkedIdentityOnly
             ? $"l.{store.Q(route.LinkedRelationship!.DocumentKind.Identifier)}, " +
               $"l.{store.Q(route.LinkedRelationship.StorageScope.Identifier)}, " +
-              $"l.{store.Q(route.LinkedRelationship.DocumentId.Identifier)}"
+              $"l.{store.Q(route.LinkedRelationship.DocumentId.Identifier)}, " +
+              $"l.{store.Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)}, " +
+              $"l.{store.Q(route.LinkedRelationship.Identity.LookupKey.Identifier)}"
             : $"p.{store.Q(route.Envelope.DocumentKind.Identifier)}, " +
               $"p.{store.Q(route.Envelope.StorageScope.Identifier)}, " +
-              $"p.{store.Q(route.Envelope.Id.Identifier)}";
+              $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
+              $"p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)}, " +
+              $"p.{store.Q(route.Envelope.Identity.LookupKey.Identifier)}";
         var state = identityOnly
             ? "0, ''"
             : $"p.{store.Q(route.Envelope.Version.Identifier)}, " +
               $"p.{store.Q(RelationalPhysicalStorageColumns.CreatedUtc)}";
         return new RelationalPhysicalQueryCommand(
             $"SELECT {identity}, {state} {predicate.FromAndWhere}{restriction}",
-            predicate.Parameters);
+            predicate.Parameters,
+            predicate.PredicateFieldIdentifiers);
     }
 
     internal RelationalPhysicalQueryCommand BuildOperationReadCommand(
@@ -229,7 +237,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         DocumentScopeSelection scope) => new(
         $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
         $"WHERE {store.MutationOperationIdentityPredicate(OperationIdentityPredicate())};",
-        OperationIdentity(mutation, plan, scope));
+        OperationIdentity(mutation, plan, scope),
+        OperationIdentityPredicate().Select(part => part.ColumnIdentifier).ToArray());
 
     private static DocumentQuery PredicateQuery(DocumentMutation mutation, PhysicalMutationPlan plan)
     {
@@ -273,6 +282,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             DiscoveryTableExpression,
             BuildSelectionCommand(mutation, plan, scope, identityOnly: true),
             ct);
+        await ThrowIfDiscoveryIdentityCollisionAsync(connection, transaction, route, ct);
         await InterceptAsync(RelationalPhysicalMutationExecutionPoint.AfterCandidateDiscovery, connection, transaction, ct);
         await InsertCandidatePrimaryRowsAsync(connection, transaction, route, ct);
         await InterceptAsync(RelationalPhysicalMutationExecutionPoint.BeforePrimaryLocks, connection, transaction, ct);
@@ -319,6 +329,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
                 SelectionKind,
                 SelectionScope,
                 SelectionId,
+                SelectionComparison,
+                SelectionLookup,
                 SelectionVersion,
                 SelectionIncarnation),
             [],
@@ -349,6 +361,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             $"SELECT p.{store.Q(route.Envelope.DocumentKind.Identifier)}, " +
             $"p.{store.Q(route.Envelope.StorageScope.Identifier)}, " +
             $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
+            $"p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)}, " +
+            $"p.{store.Q(route.Envelope.Identity.LookupKey.Identifier)}, " +
             $"p.{store.Q(route.Envelope.Version.Identifier)}, " +
             $"p.{store.Q(RelationalPhysicalStorageColumns.CreatedUtc)} " +
             $"FROM {store.Q(route.PrimaryStorage.Name.Identifier)} AS p " +
@@ -369,6 +383,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             $"SELECT p.{store.Q(route.Envelope.DocumentKind.Identifier)}, " +
             $"p.{store.Q(route.Envelope.StorageScope.Identifier)}, " +
             $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
+            $"p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)}, " +
+            $"p.{store.Q(route.Envelope.Identity.LookupKey.Identifier)}, " +
             $"p.{store.Q(route.Envelope.Version.Identifier)}, " +
             $"p.{store.Q(RelationalPhysicalStorageColumns.CreatedUtc)} " +
             $"FROM {store.Q(route.PrimaryStorage.Name.Identifier)} AS p " +
@@ -376,6 +392,42 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             PrimarySelectionJoin(route, "p", "s", includeVersion: false) + ");",
             [],
             ct);
+
+    private async Task ThrowIfDiscoveryIdentityCollisionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        ExecutableStorageRoute route,
+        CancellationToken ct)
+    {
+        if (route.LinkedRelationship is null)
+            return;
+
+        var join = store.ExactPhysicalIdentityJoin(
+        [
+            new(route.Envelope.DocumentKind.Identifier, "p", SelectionKind, "s"),
+            new(route.Envelope.StorageScope.Identifier, "p", SelectionScope, "s"),
+            new(route.Envelope.Identity.LookupKey.Identifier, "p", SelectionLookup, "s")
+        ]);
+        var sql = store.ApplyFirst(
+            $"SELECT s.{store.Q(SelectionId)}, p.{store.Q(route.Envelope.Id.Identifier)}, " +
+            $"s.{store.Q(SelectionLookup)} FROM {DiscoveryTableExpression} AS s " +
+            $"JOIN {store.Q(route.PrimaryStorage.Name.Identifier)} AS p ON {join} " +
+            $"WHERE p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)} <> " +
+            $"s.{store.Q(SelectionComparison)}");
+        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
+            connection,
+            sql,
+            transaction);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return;
+
+        throw new DocumentIdentityLookupCollisionException(
+            route.Discriminator.Value,
+            reader.GetString(0),
+            reader.GetString(1),
+            store.ReadDocumentIdentityLookup(reader, 2));
+    }
 
     private async Task LockRowsAsync(
         DbConnection connection,
@@ -388,12 +440,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         var table = linked ? route.LinkedIndexStorage!.Name.Identifier : route.PrimaryStorage.Name.Identifier;
         var join = linked
             ? LinkedSelectionJoin(route, "p", "s")
-            : store.ExactPhysicalIdentityJoin(
-            [
-                new(route.Envelope.DocumentKind.Identifier, "p", SelectionKind, "s"),
-                new(route.Envelope.StorageScope.Identifier, "p", SelectionScope, "s"),
-                new(route.Envelope.Id.Identifier, "p", SelectionId, "s")
-            ]);
+            : PrimarySelectionJoin(route, "p", "s", includeVersion: false);
         await InterceptAsync(RelationalPhysicalMutationExecutionPoint.BeforeRowLockCommand, connection, transaction, ct);
         await ExecuteAsync(
             connection,
@@ -683,6 +730,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
     private string SelectionTableExpression => store.MutationSelectionTable(SelectionTable);
     private string SelectionColumns =>
         $"{store.Q(SelectionKind)}, {store.Q(SelectionScope)}, {store.Q(SelectionId)}, " +
+        $"{store.Q(SelectionComparison)}, {store.Q(SelectionLookup)}, " +
         $"{store.Q(SelectionVersion)}, {store.Q(SelectionIncarnation)}";
 
     private async Task<int> ExecuteAsync(
@@ -708,7 +756,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         [
             new(route.Envelope.DocumentKind.Identifier, primaryAlias, SelectionKind, selectionAlias),
             new(route.Envelope.StorageScope.Identifier, primaryAlias, SelectionScope, selectionAlias),
-            new(route.Envelope.Id.Identifier, primaryAlias, SelectionId, selectionAlias)
+            new(route.Envelope.Identity.LookupKey.Identifier, primaryAlias, SelectionLookup, selectionAlias),
+            new(route.Envelope.Identity.ComparisonKey.Identifier, primaryAlias, SelectionComparison, selectionAlias)
         ]) +
         (includeVersion
             ? $" AND {primaryAlias}.{store.Q(route.Envelope.Version.Identifier)} = {selectionAlias}.{store.Q(SelectionVersion)}"
@@ -722,7 +771,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         [
             new(route.LinkedRelationship!.DocumentKind.Identifier, linkedAlias, SelectionKind, selectionAlias),
             new(route.LinkedRelationship.StorageScope.Identifier, linkedAlias, SelectionScope, selectionAlias),
-            new(route.LinkedRelationship.DocumentId.Identifier, linkedAlias, SelectionId, selectionAlias)
+            new(route.LinkedRelationship.Identity.LookupKey.Identifier, linkedAlias, SelectionLookup, selectionAlias),
+            new(route.LinkedRelationship.Identity.ComparisonKey.Identifier, linkedAlias, SelectionComparison, selectionAlias)
         ]);
 
     private static void EnsureAffectedCount(string operation, int actual, long expected)

@@ -74,6 +74,9 @@ public sealed class SqliteStorageScopeTests
             new[] { "document_kind", "storage_scope", "id" },
             await ReadKeyColumns(connection, "PRAGMA table_info(groundwork_documents);", nameOrdinal: 1, keyOrdinal: 5));
         Assert.Equal(
+            new[] { "document_kind", "storage_scope", "id_lookup_key" },
+            await ReadKeyColumns(connection, "PRAGMA index_info(ux_groundwork_documents_identity_lookup);", nameOrdinal: 2, keyOrdinal: 0));
+        Assert.Equal(
             new[] { "document_kind", "storage_scope", "index_name", "index_value" },
             await ReadKeyColumns(connection, "PRAGMA index_info(ux_groundwork_document_indexes_unique);", nameOrdinal: 2, keyOrdinal: 0));
         var projectionTable = RelationalPhysicalizationNames.TableName("configurationDocument");

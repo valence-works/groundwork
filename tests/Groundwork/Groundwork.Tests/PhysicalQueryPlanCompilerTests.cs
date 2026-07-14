@@ -13,6 +13,272 @@ namespace Groundwork.Tests;
 
 public sealed class PhysicalQueryPlanCompilerTests
 {
+    [Fact]
+    public void Exact_identity_query_binding_projects_provider_neutral_linked_evidence()
+    {
+        var fixture = CreateIntrinsicMutationFixture(
+            linked: true,
+            BoundedMutationAction.Delete(),
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.LinkedIndex)));
+        var binding = plan.DocumentIdentity;
+        var value = binding.Bind(
+            PortableQueryOperation.Equal,
+            "METRIC-\U00010400-\u00c9");
+        var equivalent = binding.Bind(
+            PortableQueryOperation.Equal,
+            "metric-\U00010428-\u00e9");
+        var exact = Assert.IsType<PhysicalQueryIdentityValue.Exact>(value);
+        var equivalentExact = Assert.IsType<PhysicalQueryIdentityValue.Exact>(equivalent);
+
+        Assert.Equal(fixture.Route.LinkedRelationship!.Identity.OriginalId.Identifier, binding.Original.Identifier);
+        Assert.Equal(fixture.Route.LinkedRelationship.Identity.ComparisonKey.Identifier, binding.Comparison.Identifier);
+        Assert.Equal(fixture.Route.LinkedRelationship.Identity.LookupKey.Identifier, binding.Lookup.Identifier);
+        Assert.Equal("00004D00004500005400005200004900004300002D01040000002D0000C9", value.ComparisonKey);
+        Assert.Equal("61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181", exact.LookupKey);
+        Assert.Equal(value.ComparisonKey, equivalent.ComparisonKey);
+        Assert.Equal(exact.LookupKey, equivalentExact.LookupKey);
+    }
+
+    [Theory]
+    [InlineData(PhysicalQuerySourceKind.PrimaryEnvelope, PhysicalQueryFieldSource.Envelope, "id")]
+    [InlineData(PhysicalQuerySourceKind.NativeDocumentFields, PhysicalQueryFieldSource.NativeDocumentField, "_id.id")]
+    public void Identity_query_binding_uses_the_selected_primary_or_native_source(
+        PhysicalQuerySourceKind source,
+        PhysicalQueryFieldSource expectedFieldSource,
+        string expectedOriginalIdentifier)
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(source)));
+
+        Assert.Equal(expectedFieldSource, plan.DocumentIdentity.Original.Source);
+        Assert.Equal(expectedOriginalIdentifier, plan.DocumentIdentity.Original.Identifier);
+        Assert.Equal(fixture.Route.Envelope.Identity.ComparisonKey.Identifier, plan.DocumentIdentity.Comparison.Identifier);
+        Assert.Equal(fixture.Route.Envelope.Identity.LookupKey.Identifier, plan.DocumentIdentity.Lookup.Identifier);
+    }
+
+    [Fact]
+    public void Identity_contains_is_rejected_before_a_physical_plan_is_published()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains });
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-011" &&
+            diagnostic.Message.Contains("identity", StringComparison.OrdinalIgnoreCase) &&
+            diagnostic.Message.Contains("Contains", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Canonical_query_plan_serializes_the_complete_identity_binding()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope)));
+
+        var canonical = PhysicalQueryPlanSerializer.Serialize(plan);
+
+        Assert.Contains("\"documentIdentity\":", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"stringCasePolicy\":\"UnicodeOrdinalIgnoreCase\"", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"original\":{\"path\":\"id.original\",\"identifier\":\"id\"", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"comparison\":{\"path\":\"id.comparison\",\"identifier\":\"id_comparison_key\"", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"lookup\":{\"path\":\"id.lookup\",\"identifier\":\"id_lookup_key\"", canonical, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.Equal, true)]
+    [InlineData(PortableQueryOperation.In, true)]
+    [InlineData(PortableQueryOperation.NotEqual, true)]
+    [InlineData(PortableQueryOperation.StartsWith, false)]
+    [InlineData(PortableQueryOperation.GreaterThan, false)]
+    [InlineData(PortableQueryOperation.GreaterThanOrEqual, false)]
+    [InlineData(PortableQueryOperation.LessThan, false)]
+    [InlineData(PortableQueryOperation.LessThanOrEqual, false)]
+    public void Identity_operators_bind_structurally_valid_exact_or_ordered_evidence_without_adapter_policy(
+        PortableQueryOperation operation,
+        bool exact)
+    {
+        var fixture = CreateIdentityQueryFixture(new HashSet<PortableQueryOperation> { operation });
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope)));
+
+        var value = plan.DocumentIdentity.Bind(operation, "metric-\U00010428-\u00e9");
+
+        Assert.Equal("00004D00004500005400005200004900004300002D01040000002D0000C9", value.ComparisonKey);
+        if (exact)
+        {
+            var exactValue = Assert.IsType<PhysicalQueryIdentityValue.Exact>(value);
+            Assert.Equal("61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181", exactValue.LookupKey);
+        }
+        else
+        {
+            Assert.IsType<PhysicalQueryIdentityValue.Ordered>(value);
+        }
+        var tieBreak = Assert.Single(plan.Order, order =>
+            order.Path == PhysicalDocumentFieldPaths.Id && order.IsIdentityTieBreak);
+        Assert.Equal(plan.DocumentIdentity.Comparison, tieBreak.Field);
+    }
+
+    [Fact]
+    public void Identity_binding_rejects_null_instead_of_publishing_partial_evidence()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope)));
+
+        Assert.Throws<ArgumentNullException>(() =>
+            plan.DocumentIdentity.Bind(PortableQueryOperation.Equal, null!));
+    }
+
+    [Theory]
+    [InlineData(PhysicalQuerySourceKind.PrimaryEnvelope)]
+    [InlineData(PhysicalQuerySourceKind.LinkedIndex)]
+    [InlineData(PhysicalQuerySourceKind.NativeDocumentFields)]
+    public void Exact_identity_plan_certifies_only_lookup_leading_full_comparison_indexes(
+        PhysicalQuerySourceKind source)
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            source: source,
+            indexLayout: IdentityIndexLayout.Exact);
+
+        var result = PhysicalQueryPlanCompiler.Compile(fixture.Route, fixture.Storage, Capabilities(source));
+
+        var plan = AssertPlan(result);
+        Assert.NotNull(plan.IndexName);
+        Assert.Equal(plan.DocumentIdentity.Comparison, plan.Predicates.Single().Field);
+    }
+
+    [Theory]
+    [InlineData(PhysicalQuerySourceKind.PrimaryEnvelope)]
+    [InlineData(PhysicalQuerySourceKind.LinkedIndex)]
+    [InlineData(PhysicalQuerySourceKind.NativeDocumentFields)]
+    public void Ordered_identity_plan_certifies_only_comparison_key_indexes(
+        PhysicalQuerySourceKind source)
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.GreaterThan },
+            source: source,
+            indexLayout: IdentityIndexLayout.Ordered);
+
+        var result = PhysicalQueryPlanCompiler.Compile(fixture.Route, fixture.Storage, Capabilities(source));
+
+        var plan = AssertPlan(result);
+        Assert.NotNull(plan.IndexName);
+        Assert.Equal(plan.DocumentIdentity.Comparison, plan.Predicates.Single().Field);
+    }
+
+    [Theory]
+    [InlineData(PhysicalQuerySourceKind.PrimaryEnvelope)]
+    [InlineData(PhysicalQuerySourceKind.LinkedIndex)]
+    [InlineData(PhysicalQuerySourceKind.NativeDocumentFields)]
+    public void Retained_original_identity_index_cannot_certify_projected_query_evidence(
+        PhysicalQuerySourceKind source)
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            source: source,
+            indexLayout: IdentityIndexLayout.Original);
+
+        var result = PhysicalQueryPlanCompiler.Compile(fixture.Route, fixture.Storage, Capabilities(source));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-006" &&
+            diagnostic.Message.Contains("id.lookup", StringComparison.Ordinal) &&
+            diagnostic.Message.Contains("id.comparison", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Scale_bearing_mixed_exact_and_ordered_identity_demand_is_rejected_without_choosing_index_order()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan
+            },
+            indexLayout: IdentityIndexLayout.Exact);
+        var ordinary = fixture.Storage.BoundedQueries.Single();
+        var scaleBearing = new BoundedQueryDeclaration(
+            ordinary.Identity,
+            ordinary.IndexIdentity,
+            ordinary.Operations,
+            ordinary.SortSupport,
+            ordinary.PagingSupport,
+            BoundedQueryExecutionClass.ScaleBearing,
+            ordinary.SupportsDisjunction,
+            ordinary.SupportsTotalCount,
+            ordinary.SortFields,
+            ordinary.PredicateFields,
+            ordinary.ResultOperations,
+            ordinary.LatestPerKeyPath);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [scaleBearing],
+            fixture.Storage.NameOverrides,
+            fixture.Storage.BoundedMutations);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-012" &&
+            diagnostic.Message.Contains("mixed exact and ordered", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Ordinary_mixed_exact_and_ordered_identity_demand_uses_server_execution_without_certifying_one_index_shape()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan
+            },
+            indexLayout: IdentityIndexLayout.Exact);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        var plan = AssertPlan(result);
+        Assert.Null(plan.IndexName);
+        Assert.False(plan.IsScaleBearing);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments, PhysicalQueryAccessKind.LinkedIndexThenPrimary)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable, PhysicalQueryAccessKind.LinkedIndexThenPrimary)]
@@ -359,7 +625,7 @@ public sealed class PhysicalQueryPlanCompilerTests
         Assert.Collection(
             plan.Order.Where(order => order.IsIdentityTieBreak),
             order => Assert.Equal("storage_scope", order.Field.Identifier),
-            order => Assert.Equal("_id.id", order.Field.Identifier));
+            order => Assert.Equal(plan.DocumentIdentity.Comparison.Identifier, order.Field.Identifier));
     }
 
     [Fact]
@@ -682,6 +948,64 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void Mutation_request_fingerprint_uses_canonical_identity_evidence_but_not_operation_id_case()
+    {
+        var fixture = CreateIntrinsicMutationFixture(
+            linked: true,
+            BoundedMutationAction.Delete(),
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        var plan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.LinkedIndex)).Plans);
+        var retainedSpelling = new DocumentMutation(
+            "workflowTriggerBinding",
+            plan.MutationIdentity,
+            "Operation-A",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal(
+                PhysicalDocumentFieldPaths.Id,
+                "metric-\U00010428-\u00e9"))]);
+        var equivalentSpelling = new DocumentMutation(
+            "workflowTriggerBinding",
+            plan.MutationIdentity,
+            "operation-a",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal(
+                PhysicalDocumentFieldPaths.Id,
+                "METRIC-\U00010400-\u00c9"))]);
+
+        Assert.NotEqual(retainedSpelling.OperationId, equivalentSpelling.OperationId);
+        Assert.Equal(
+            BoundedMutationRequestFingerprint.Create(retainedSpelling, plan, "tenant-a"),
+            BoundedMutationRequestFingerprint.Create(equivalentSpelling, plan, "tenant-a"));
+    }
+
+    [Fact]
+    public void Bounded_mutation_selection_receives_the_same_canonical_identity_values_as_replay()
+    {
+        var fixture = CreateIntrinsicMutationFixture(
+            linked: true,
+            BoundedMutationAction.Delete(),
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        var plan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.LinkedIndex)).Plans);
+        var comparison = DocumentQueryComparison.In(
+            PhysicalDocumentFieldPaths.Id,
+            ["metric-\U00010428-\u00e9", "METRIC-\U00010400-\u00c9"]);
+
+        var bound = PhysicalDocumentIdentityQuery.Bind(plan.Predicate, comparison);
+
+        Assert.Equal(plan.Predicate.DocumentIdentity, bound.Identity);
+        var value = Assert.Single(bound.Values);
+        Assert.IsType<PhysicalQueryIdentityValue.Exact>(value);
+        Assert.Equal("00004D00004500005400005200004900004300002D01040000002D0000C9", value.ComparisonKey);
+        Assert.Equal(
+            "61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181",
+            ((PhysicalQueryIdentityValue.Exact)value).LookupKey);
+    }
+
+    [Fact]
     public void MutationRequestFingerprintIsStableAcrossProviderVersionUpgrades()
     {
         var fixture = CreateFixture(
@@ -852,6 +1176,32 @@ public sealed class PhysicalQueryPlanCompilerTests
         var handler = new RecordingHandler(
             plan.HandlerIdentity,
             PhysicalQuerySourceKind.PrimaryProjectedColumns,
+            certifications: [CertificationFor(plan, fieldIdentifiers: fields)]);
+
+        var exception = Assert.Throws<ArgumentException>(() => new PhysicalQueryDocumentStore(
+            fixture.Route,
+            fixture.Storage,
+            capabilities,
+            [handler]));
+
+        Assert.Contains("certify", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Runtime_seam_rejects_an_incomplete_identity_binding_certification()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        var capabilities = Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope);
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            capabilities));
+        var fields = PlanFieldIdentifiers(plan);
+        fields.Remove(plan.DocumentIdentity.Lookup.Path);
+        var handler = new RecordingHandler(
+            plan.HandlerIdentity,
+            PhysicalQuerySourceKind.PrimaryEnvelope,
             certifications: [CertificationFor(plan, fieldIdentifiers: fields)]);
 
         var exception = Assert.Throws<ArgumentException>(() => new PhysicalQueryDocumentStore(
@@ -1420,7 +1770,10 @@ public sealed class PhysicalQueryPlanCompilerTests
         return Resolve(storage, form == PhysicalStorageForm.SharedDocuments ? binding : null);
     }
 
-    private static PlanningFixture CreateIntrinsicMutationFixture(bool linked, BoundedMutationAction action)
+    private static PlanningFixture CreateIntrinsicMutationFixture(
+        bool linked,
+        BoundedMutationAction action,
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal)
     {
         var path = linked ? "id" : "schemaVersion";
         var index = new LogicalIndexDeclaration(
@@ -1438,10 +1791,18 @@ public sealed class PhysicalQueryPlanCompilerTests
             BoundedQueryExecutionClass.ScaleBearing);
         var physicalIndex = new PhysicalIndexDefinition(
             index.Identity,
-            [
-                new PhysicalIndexColumnDefinition("storage_scope", 0),
-                new PhysicalIndexColumnDefinition(linked ? "id" : "schema_version", 1)
-            ],
+            linked
+                ?
+                [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("id_lookup_key", 1),
+                    new PhysicalIndexColumnDefinition("id_comparison_key", 2)
+                ]
+                :
+                [
+                    new PhysicalIndexColumnDefinition("storage_scope", 0),
+                    new PhysicalIndexColumnDefinition("schema_version", 1)
+                ],
             target: linked
                 ? PhysicalIndexStorageTarget.LinkedIndexStorage
                 : PhysicalIndexStorageTarget.PrimaryStorage);
@@ -1458,7 +1819,81 @@ public sealed class PhysicalQueryPlanCompilerTests
             [index],
             [query],
             boundedMutations: [new BoundedMutationDeclaration("mutate-intrinsic", query.Identity, action)]);
-        return Resolve(storage, null);
+        return Resolve(storage, null, identityCasePolicy: identityCasePolicy);
+    }
+
+    private static PlanningFixture CreateIdentityQueryFixture(
+        IReadOnlySet<PortableQueryOperation> operations,
+        QuerySortSupport sortSupport = QuerySortSupport.None,
+        IReadOnlyList<BoundedQuerySortField>? sortFields = null,
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase,
+        PhysicalQuerySourceKind source = PhysicalQuerySourceKind.PrimaryEnvelope,
+        IdentityIndexLayout? indexLayout = null)
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-id",
+            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-id",
+            index.Identity,
+            operations,
+            sortSupport,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.Ordinary,
+            sortFields: sortFields);
+        var layout = indexLayout ?? (operations.All(IsExactIdentityOperation)
+            ? IdentityIndexLayout.Exact
+            : IdentityIndexLayout.Ordered);
+        var identityColumns = layout switch
+        {
+            IdentityIndexLayout.Exact => new[] { "id_lookup_key", "id_comparison_key" },
+            IdentityIndexLayout.Ordered => ["id_comparison_key"],
+            IdentityIndexLayout.Original => ["id"],
+            _ => throw new ArgumentOutOfRangeException(nameof(indexLayout), indexLayout, null)
+        };
+        var physicalColumns = new List<PhysicalIndexColumnDefinition>
+        {
+            new("storage_scope", 0)
+        };
+        physicalColumns.AddRange(identityColumns.Select((column, order) =>
+            new PhysicalIndexColumnDefinition(column, order + 1)));
+        var linked = source == PhysicalQuerySourceKind.LinkedIndex;
+        var definition = PhysicalTableDefinition.DedicatedDocumentTable(
+            "identity_documents",
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    index.Identity,
+                    physicalColumns,
+                    target: linked
+                        ? PhysicalIndexStorageTarget.LinkedIndexStorage
+                        : PhysicalIndexStorageTarget.PrimaryStorage)
+            ],
+            linkedProjectedColumns: linked
+                ? [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)]
+                : null,
+            linkedProjectionLogicalName: linked ? "identity_index" : null);
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Explicit(definition),
+            [index],
+            [query]);
+        return Resolve(storage, null, identityCasePolicy: identityCasePolicy);
+    }
+
+    private static bool IsExactIdentityOperation(PortableQueryOperation operation) => operation is
+        PortableQueryOperation.Equal or
+        PortableQueryOperation.In or
+        PortableQueryOperation.NotEqual;
+
+    private enum IdentityIndexLayout
+    {
+        Exact,
+        Ordered,
+        Original
     }
 
     private static PlanningFixture CreateEntityFixture(
@@ -1581,12 +2016,14 @@ public sealed class PhysicalQueryPlanCompilerTests
     private static PlanningFixture Resolve(
         StorageUnitPhysicalStorage storage,
         SharedStorageBinding? binding,
-        TenancyPolicy? tenancy = null)
+        TenancyPolicy? tenancy = null,
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal)
     {
         var template = SampleManifests.MetadataManifest();
         var unit = template.StorageUnits.Single() with
         {
             Identity = new StorageUnitIdentity("workflowTriggerBinding"),
+            IdentityPolicy = IdentityPolicy.StringId(stringCasePolicy: identityCasePolicy),
             Tenancy = tenancy ?? template.StorageUnits.Single().Tenancy,
             PhysicalStorage = storage
         };
@@ -1722,9 +2159,7 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     private static Dictionary<string, string> PlanFieldIdentifiers(PhysicalQueryPlan plan) =>
-        new[] { plan.Scope.Field, plan.Discriminator }
-            .Concat(plan.Predicates.Select(predicate => predicate.Field))
-            .Concat(plan.Order.Select(order => order.Field))
+        plan.RequiredFields
             .GroupBy(field => field.Path, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.First().Identifier, StringComparer.Ordinal);
 

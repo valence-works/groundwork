@@ -16,6 +16,278 @@ namespace Groundwork.Sqlite.Tests;
 public sealed class SqliteDocumentStoreTests
 {
     [Fact]
+    public void Document_store_construction_requires_factory_admission()
+    {
+        Assert.Empty(typeof(SqliteDocumentStore).GetConstructors());
+        Assert.Empty(typeof(RelationalDocumentStore).GetConstructors());
+    }
+
+    [Fact]
+    public async Task Unicode_identity_spelling_conflict_preserves_the_authoritative_document()
+    {
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await using var harness = await SqliteDocumentStoreHarness.Create(manifest);
+
+        var saved = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+        var conflict = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "straße-σΣ",
+            "1.0.0",
+            """{"key":"replacement","category":"system"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal("Straße-Σς", conflict.AuthoritativeId);
+        var authoritative = await harness.Store.LoadAsync("configurationDocument", "Straße-Σς");
+        Assert.Equal(1, authoritative!.Version);
+        Assert.Contains("alpha", authoritative.ContentJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Unicode_identity_load_and_delete_return_the_authoritative_original()
+    {
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await using var harness = await SqliteDocumentStoreHarness.Create(manifest);
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        var loaded = await harness.Store.LoadAsync("configurationDocument", "straße-σΣ");
+        var deleted = await harness.Store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "STRAßE-Σσ",
+            ExpectedVersion: 1));
+
+        Assert.Equal("Straße-Σς", loaded!.Id);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("Straße-Σς", deleted.AuthoritativeId);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", "Straße-Σς"));
+    }
+
+    [Fact]
+    public async Task Lookup_hash_collision_throws_the_dedicated_integrity_exception()
+    {
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await using var harness = await SqliteDocumentStoreHarness.Create(manifest);
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "retained",
+            "1.0.0",
+            """{"key":"retained","category":"system"}"""));
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "requested",
+            "1.0.0",
+            """{"key":"requested","category":"system"}"""));
+
+        var lookupCommand = harness.Connection.CreateCommand();
+        lookupCommand.CommandText = "SELECT id_lookup_key FROM groundwork_documents WHERE id = 'requested';";
+        var requestedLookup = Assert.IsType<string>(await lookupCommand.ExecuteScalarAsync());
+        await harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "requested"));
+        var corruptCommand = harness.Connection.CreateCommand();
+        corruptCommand.CommandText = "UPDATE groundwork_documents SET id_lookup_key = @lookup WHERE id = 'retained';";
+        corruptCommand.Parameters.AddWithValue("lookup", requestedLookup);
+        await corruptCommand.ExecuteNonQueryAsync();
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            harness.Store.LoadAsync("configurationDocument", "requested"));
+
+        Assert.Equal("requested", exception.RequestedId);
+        Assert.Equal("retained", exception.RetainedId);
+    }
+
+    [Fact]
+    public async Task Materialization_rejects_document_identity_policy_drift()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var materializer = new SqliteGroundworkMaterializer(connection);
+        await materializer.MaterializeAsync(
+            SqliteTestManifests.MetadataManifest(),
+            SqliteTestManifests.Provider);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            materializer.MaterializeAsync(
+                WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("identity schema", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Materialization_rejects_partial_identity_lookup_index()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var manifest = SqliteTestManifests.MetadataManifest();
+        var materializer = new SqliteGroundworkMaterializer(connection);
+        await materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        await using (var replaceIndex = connection.CreateCommand())
+        {
+            replaceIndex.CommandText = """
+                DROP INDEX ux_groundwork_documents_identity_lookup;
+                CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+                ON groundwork_documents(document_kind, storage_scope, id_lookup_key)
+                WHERE id_lookup_key = 'excluded-from-runtime';
+                """;
+            await replaceIndex.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider));
+
+        Assert.Contains("identity lookup index", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Restart_validation_does_not_repair_rows_behind_recorded_identity_schema_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        var materializer = new SqliteGroundworkMaterializer(connection);
+        await materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        var store = new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+        await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "retained", "1", """{"key":"retained"}"""));
+        await using (var corrupt = connection.CreateCommand())
+        {
+            corrupt.CommandText = "UPDATE groundwork_documents SET id_comparison_key = 'tampered' WHERE id = 'retained';";
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider));
+
+        Assert.Contains("recorded original identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+        await using var read = connection.CreateCommand();
+        read.CommandText = "SELECT id_comparison_key FROM groundwork_documents WHERE id = 'retained';";
+        Assert.Equal("tampered", (string)(await read.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task Materialization_evolves_pre_policy_rows_before_recording_identity_schema_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await CreateLegacyDocumentTableAsync(connection);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                INSERT INTO groundwork_documents
+                    (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                VALUES
+                    ('configurationDocument', '__groundwork_global__', '𐐀', '1', 1, '{"key":"legacy"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var manifest = WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        var store = new SqliteDocumentStore(
+            connection,
+            manifest,
+            Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+
+        var loaded = await store.LoadAsync("configurationDocument", "𐐨");
+
+        Assert.Equal("𐐀", loaded!.Id);
+        await using var shape = connection.CreateCommand();
+        shape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key') AND "notnull" = 1;
+            """;
+        Assert.Equal(2L, (long)(await shape.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task Materialization_rolls_back_pre_policy_identity_collisions_without_recording_state()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await CreateLegacyDocumentTableAsync(connection);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                INSERT INTO groundwork_documents
+                    (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                VALUES
+                    ('configurationDocument', '__groundwork_global__', 'A', '1', 1, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('configurationDocument', '__groundwork_global__', 'a', '1', 1, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+                WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("collide", exception.Message, StringComparison.OrdinalIgnoreCase);
+        await using var shape = connection.CreateCommand();
+        shape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key');
+            """;
+        Assert.Equal(0L, (long)(await shape.ExecuteScalarAsync())!);
+        await using var state = connection.CreateCommand();
+        state.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groundwork_document_identity_schema';";
+        Assert.Equal(0L, (long)(await state.ExecuteScalarAsync())!);
+
+        await using (var reconcile = connection.CreateCommand())
+        {
+            reconcile.CommandText = "DELETE FROM groundwork_documents WHERE id = 'a';";
+            await reconcile.ExecuteNonQueryAsync();
+        }
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+            WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            SqliteTestManifests.Provider);
+
+        await using var retryShape = connection.CreateCommand();
+        retryShape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key') AND "notnull" = 1;
+            """;
+        Assert.Equal(2L, (long)(await retryShape.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task Materialization_fails_closed_when_pre_policy_storage_has_no_original_identity()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                CREATE TABLE groundwork_documents (
+                    document_kind TEXT NOT NULL,
+                    storage_scope TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    content_json TEXT NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL
+                );
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+                WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+                SqliteTestManifests.Provider));
+
+        Assert.Contains("original identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task FactoryRejectsInvalidManifestBeforeCreatingAnyConnection()
     {
         var materializationConnections = 0;
@@ -83,6 +355,7 @@ public sealed class SqliteDocumentStoreTests
         var deleted = await store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "doc-1", ExpectedVersion: 2));
 
         Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("doc-1", deleted.AuthoritativeId);
         Assert.Null(await store.LoadAsync("configurationDocument", "doc-1"));
         Assert.Empty(await store.QueryAsync(new DocumentStoreQuery("configurationDocument", "by-key", "beta")));
     }
@@ -136,6 +409,44 @@ public sealed class SqliteDocumentStoreTests
 
             Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
             Assert.NotNull(await store.LoadAsync("configurationDocument", "doc-1"));
+        }
+        finally
+        {
+            File.Delete(databasePath);
+        }
+    }
+
+    [Theory]
+    [InlineData(StorageIdentityKind.Guid)]
+    [InlineData(StorageIdentityKind.Composite)]
+    public async Task FactoryAndStorePreserveOrdinalProjectionForAdmittedNonStringIdentityKinds(
+        StorageIdentityKind identityKind)
+    {
+        var manifest = WithIdentityKind(identityKind);
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-{identityKind}-{Guid.NewGuid():N}.db");
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.CreateAsync(
+                $"Data Source={databasePath};Pooling=False",
+                manifest,
+                SqliteTestManifests.Provider,
+                Groundwork.Documents.Scoping.DocumentStoreAccess.Global);
+
+            var upper = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"upper"}"""));
+            var lower = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "a-b", "1.0.0", """{"key":"lower"}"""));
+
+            Assert.Equal(DocumentStoreWriteStatus.Saved, upper.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Saved, lower.Status);
+            var updated = await store.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", "A-B", "1.0.0", """{"key":"updated"}""", ExpectedVersion: 1));
+            var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
+                "configurationDocument", "a-b", ExpectedVersion: 1));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, updated.Status);
+            Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+            Assert.Contains("updated", (await store.LoadAsync("configurationDocument", "A-B"))!.ContentJson);
+            Assert.Null(await store.LoadAsync("configurationDocument", "a-b"));
         }
         finally
         {
@@ -636,15 +947,64 @@ public sealed class SqliteDocumentStoreTests
         public SqliteConnection Connection { get; }
         public SqliteDocumentStore Store { get; }
 
-        public static async Task<SqliteDocumentStoreHarness> Create()
+        public static async Task<SqliteDocumentStoreHarness> Create(StorageManifest? manifest = null)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
-            var manifest = SqliteTestManifests.MetadataManifest();
+            manifest ??= SqliteTestManifests.MetadataManifest();
             await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
             return new SqliteDocumentStoreHarness(connection, new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
         }
 
         public async ValueTask DisposeAsync() => await Connection.DisposeAsync();
+    }
+
+    private static StorageManifest WithIdentityCasePolicy(StringIdentityCasePolicy policy)
+    {
+        var manifest = SqliteTestManifests.MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = IdentityPolicy.StringId(stringCasePolicy: policy)
+                }
+            ]
+        };
+    }
+
+    private static StorageManifest WithIdentityKind(StorageIdentityKind kind)
+    {
+        var manifest = SqliteTestManifests.MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = new IdentityPolicy(kind, "id")
+                }
+            ]
+        };
+    }
+
+    private static async Task CreateLegacyDocumentTableAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE groundwork_documents (
+                document_kind TEXT NOT NULL,
+                storage_scope TEXT NOT NULL,
+                id TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content_json TEXT NOT NULL,
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL,
+                PRIMARY KEY (document_kind, storage_scope, id)
+            );
+            """;
+        await command.ExecuteNonQueryAsync();
     }
 
     private static StorageManifest WithCompoundIndex(StorageManifest manifest)

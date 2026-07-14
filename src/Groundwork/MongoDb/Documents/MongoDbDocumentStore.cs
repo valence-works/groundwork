@@ -5,6 +5,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Physicalization;
 using Groundwork.Core.Transactions;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.UnitOfWork;
@@ -18,6 +19,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
 {
     private readonly IMongoDatabase database;
     private readonly StorageManifest manifest;
+    private readonly IReadOnlyDictionary<string, DocumentIdentityBinding> identityBindings;
     private readonly DocumentStoreAccess access;
     private readonly IStorageScopeObserver scopeObserver;
     private readonly Func<CancellationToken, Task<bool>> supportsTransactionsAsync;
@@ -25,7 +27,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
 
     public DocumentStoreAccess Access => access;
 
-    public MongoDbDocumentStore(
+    internal MongoDbDocumentStore(
         IMongoDatabase database,
         StorageManifest manifest,
         DocumentStoreAccess access,
@@ -44,6 +46,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     {
         this.database = database ?? throw new ArgumentNullException(nameof(database));
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
+        identityBindings = DocumentIdentityBinding.Bind(manifest);
         this.access = access ?? throw new ArgumentNullException(nameof(access));
         this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
         this.supportsTransactionsAsync = supportsTransactionsAsync ??
@@ -63,7 +66,12 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private async Task<DocumentStoreWriteResult> SaveCoreAsync(StorageUnit unit, SaveDocumentRequest request, DocumentScopeSelection scope, IClientSessionHandle? session, CancellationToken cancellationToken)
     {
         var collection = GetCollection(unit);
-        var existing = await LoadCoreAsync(unit, request.Id, scope, session, cancellationToken);
+        var identity = identityBindings[request.DocumentKind];
+        var requestedIdentity = identity.Project(request.Id);
+        var existing = await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken);
+
+        if (existing is not null && !string.Equals(existing.Id, request.Id, StringComparison.Ordinal))
+            return DocumentStoreWriteResult.IdentityConflict(existing.Id);
 
         if (existing is not null && request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
@@ -77,7 +85,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         var now = DateTimeOffset.UtcNow;
         var version = existing is null ? 1 : existing.Version + 1;
         var createdAt = existing?.CreatedAt ?? now;
-        var document = CreateDocument(unit, request, scope, version, createdAt, now);
+        var document = CreateDocument(unit, request, requestedIdentity, scope, version, createdAt, now);
 
         if (existing is null)
         {
@@ -85,22 +93,25 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             {
                 await InsertOneAsync(collection, session, document, cancellationToken);
             }
-            catch (MongoWriteException exception) when (IsDuplicateKey(exception))
+            catch (MongoWriteException exception) when (session is null && IsDuplicateKey(exception))
             {
-                return DocumentStoreWriteResult.ConcurrencyConflict;
+                var retained = await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken);
+                return retained is not null && !string.Equals(retained.Id, request.Id, StringComparison.Ordinal)
+                    ? DocumentStoreWriteResult.IdentityConflict(retained.Id)
+                    : DocumentStoreWriteResult.ConcurrencyConflict;
             }
         }
         else
         {
             var filter = request.ExpectedVersion is null
-                ? DocumentIdentityFilter(scope.StorageKey!, request.Id)
-                : DocumentIdentityFilter(scope.StorageKey!, request.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
+                ? AuthoritativeIdentityFilter(scope.StorageKey!, requestedIdentity, existing.Id)
+                : AuthoritativeIdentityFilter(scope.StorageKey!, requestedIdentity, existing.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
             ReplaceOneResult result;
             try
             {
                 result = await ReplaceOneAsync(collection, session, filter, document, cancellationToken);
             }
-            catch (MongoWriteException exception) when (IsDuplicateKey(exception))
+            catch (MongoWriteException exception) when (session is null && IsDuplicateKey(exception))
             {
                 return DocumentStoreWriteResult.ConcurrencyConflict;
             }
@@ -110,7 +121,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
                 if (request.ExpectedVersion is null)
                     return DocumentStoreWriteResult.NotFound;
 
-                return await LoadCoreAsync(unit, request.Id, scope, session, cancellationToken) is null
+                return await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken) is null
                     ? DocumentStoreWriteResult.NotFound
                     : DocumentStoreWriteResult.ConcurrencyConflict;
             }
@@ -131,7 +142,8 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     {
         var unit = GetUnit(documentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Load);
-        return await LoadCoreAsync(unit, id, scope, session: null, cancellationToken);
+        var identity = identityBindings[documentKind];
+        return await LoadCoreAsync(unit, identity.Project(id), identity, scope, session: null, cancellationToken);
     }
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
@@ -144,15 +156,24 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private async Task<DocumentStoreWriteResult> DeleteCoreAsync(StorageUnit unit, DeleteDocumentRequest request, DocumentScopeSelection scope, IClientSessionHandle? session, CancellationToken cancellationToken)
     {
         var collection = GetCollection(unit);
+        var identity = identityBindings[request.DocumentKind];
+        var requestedIdentity = identity.Project(request.Id);
+        var existing = await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken);
+        if (existing is null)
+            return DocumentStoreWriteResult.NotFound;
+
+        if (request.ExpectedVersion is not null && existing.Version != request.ExpectedVersion)
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+
         var filter = request.ExpectedVersion is null
-            ? DocumentIdentityFilter(scope.StorageKey!, request.Id)
-            : DocumentIdentityFilter(scope.StorageKey!, request.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
+            ? AuthoritativeIdentityFilter(scope.StorageKey!, requestedIdentity, existing.Id)
+            : AuthoritativeIdentityFilter(scope.StorageKey!, requestedIdentity, existing.Id) & Builders<BsonDocument>.Filter.Eq("version", request.ExpectedVersion.Value);
 
-        var result = await DeleteOneAsync(collection, session, filter, cancellationToken);
-        if (result.DeletedCount == 1)
-            return DocumentStoreWriteResult.Deleted;
+        var deleted = await FindOneAndDeleteAsync(collection, session, filter, cancellationToken);
+        if (deleted is not null)
+            return DocumentStoreWriteResult.Deleted(deleted["id_original"].AsString);
 
-        return await LoadCoreAsync(unit, request.Id, scope, session, cancellationToken) is null
+        return await LoadCoreAsync(unit, requestedIdentity, identity, scope, session, cancellationToken) is null
             ? DocumentStoreWriteResult.NotFound
             : DocumentStoreWriteResult.ConcurrencyConflict;
     }
@@ -208,10 +229,10 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             ? collection.ReplaceOneAsync(filter, document, cancellationToken: cancellationToken)
             : collection.ReplaceOneAsync(session, filter, document, cancellationToken: cancellationToken);
 
-    private static Task<DeleteResult> DeleteOneAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, CancellationToken cancellationToken) =>
+    private static async Task<BsonDocument?> FindOneAndDeleteAsync(IMongoCollection<BsonDocument> collection, IClientSessionHandle? session, FilterDefinition<BsonDocument> filter, CancellationToken cancellationToken) =>
         session is null
-            ? collection.DeleteOneAsync(filter, cancellationToken)
-            : collection.DeleteOneAsync(session, filter, cancellationToken: cancellationToken);
+            ? await collection.FindOneAndDeleteAsync(filter, cancellationToken: cancellationToken)
+            : await collection.FindOneAndDeleteAsync(session, filter, cancellationToken: cancellationToken);
 
     public async Task<IReadOnlyList<DocumentEnvelope>> QueryAsync(DocumentStoreQuery query, CancellationToken cancellationToken = default)
     {
@@ -365,14 +386,29 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private static FilterDefinition<BsonDocument> MatchNone { get; } =
         Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true);
 
-    private async Task<DocumentEnvelope?> LoadCoreAsync(StorageUnit unit, string id, DocumentScopeSelection scope, IClientSessionHandle? session, CancellationToken cancellationToken)
+    private async Task<DocumentEnvelope?> LoadCoreAsync(
+        StorageUnit unit,
+        PortableStringIdentityProjection requestedIdentity,
+        DocumentIdentityBinding identity,
+        DocumentScopeSelection scope,
+        IClientSessionHandle? session,
+        CancellationToken cancellationToken)
     {
         var collection = GetCollection(unit);
-        var filter = DocumentIdentityFilter(scope.StorageKey!, id);
+        var filter = DocumentLookupFilter(scope.StorageKey!, requestedIdentity.LookupKey);
         var find = session is null ? collection.Find(filter) : collection.Find(session, filter);
         var document = await find.SingleOrDefaultAsync(cancellationToken);
+        if (document is null)
+            return null;
 
-        return document is null ? null : ReadEnvelope(unit, document);
+        var retainedId = document["id_original"].AsString;
+        identity.EnsureLookupIntegrity(
+            unit.Identity.Value,
+            requestedIdentity,
+            retainedId,
+            document["id_comparison_key"].AsString,
+            document["id_lookup_key"].AsString);
+        return ReadEnvelope(unit, document);
     }
 
     private IMongoCollection<BsonDocument> GetCollection(StorageUnit unit) =>
@@ -393,13 +429,23 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             ? StorageScopePolicy.Scoped
             : StorageScopePolicy.Global;
 
-    private static BsonDocument CreateDocument(StorageUnit unit, SaveDocumentRequest request, DocumentScopeSelection scope, long version, DateTimeOffset createdAt, DateTimeOffset updatedAt)
+    private static BsonDocument CreateDocument(
+        StorageUnit unit,
+        SaveDocumentRequest request,
+        PortableStringIdentityProjection identity,
+        DocumentScopeSelection scope,
+        long version,
+        DateTimeOffset createdAt,
+        DateTimeOffset updatedAt)
     {
         var content = BsonDocument.Parse(request.ContentJson);
         var document = new BsonDocument
         {
             ["_id"] = new BsonDocument { ["scope"] = scope.StorageKey, ["id"] = request.Id },
             ["storage_scope"] = scope.StorageKey,
+            ["id_original"] = identity.OriginalValue,
+            ["id_comparison_key"] = identity.ComparisonKey,
+            ["id_lookup_key"] = identity.LookupKey,
             ["schema_version"] = request.SchemaVersion,
             ["version"] = version,
             ["content"] = content,
@@ -418,7 +464,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private static DocumentEnvelope ReadEnvelope(StorageUnit unit, BsonDocument document) =>
         new(
             unit.Identity.Value,
-            document.GetValue("_id").AsBsonDocument.GetValue("id").AsString,
+            document.GetValue("id_original").AsString,
             document.GetValue("schema_version").AsString,
             document.GetValue("version").ToInt64(),
             ReadContentJson(document),
@@ -428,14 +474,17 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             Scope = DocumentStoreScopeResolver.ReadScope(document.GetValue("storage_scope").AsString)
         };
 
-    private static FilterDefinition<BsonDocument> DocumentIdentityFilter(string storageScope, string id) =>
-        Builders<BsonDocument>.Filter.Eq(
-            "_id",
-            new BsonDocument
-            {
-                ["scope"] = storageScope,
-                ["id"] = id
-            });
+    private static FilterDefinition<BsonDocument> DocumentLookupFilter(string storageScope, string lookupKey) =>
+        Builders<BsonDocument>.Filter.Eq("storage_scope", storageScope) &
+        Builders<BsonDocument>.Filter.Eq("id_lookup_key", lookupKey);
+
+    private static FilterDefinition<BsonDocument> AuthoritativeIdentityFilter(
+        string storageScope,
+        PortableStringIdentityProjection identity,
+        string authoritativeId) =>
+        DocumentLookupFilter(storageScope, identity.LookupKey) &
+        Builders<BsonDocument>.Filter.Eq("id_comparison_key", identity.ComparisonKey) &
+        Builders<BsonDocument>.Filter.Eq("id_original", authoritativeId);
 
     private static string ReadContentJson(BsonDocument document) =>
         document.TryGetValue("content_json", out var contentJson)
@@ -480,6 +529,57 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private static bool IsDuplicateKey(MongoWriteException exception) =>
         exception.WriteError?.Code == 11000;
 
+    private static bool IsTerminalTransactionWriteConflict(MongoException exception) =>
+        MongoDbPhysicalDocumentStore.IsTransientTransactionConflict(exception) ||
+        exception switch
+        {
+            MongoCommandException command => command.Code == 11000,
+            MongoWriteException write =>
+                write.WriteError?.Code == 11000 || write.WriteConcernError?.Code == 11000,
+            MongoBulkWriteException bulk =>
+                bulk.WriteErrors.Any(error => error.Code == 11000) || bulk.WriteConcernError?.Code == 11000,
+            _ => false
+        };
+
+    private async Task<DocumentStoreWriteResult> ClassifySaveConflictOutsideSessionAsync(
+        StorageUnit unit,
+        SaveDocumentRequest request,
+        DocumentScopeSelection scope,
+        CancellationToken cancellationToken)
+    {
+        var identity = identityBindings[request.DocumentKind];
+        var requestedIdentity = identity.Project(request.Id);
+        var retained = await LoadCoreAsync(
+            unit,
+            requestedIdentity,
+            identity,
+            scope,
+            session: null,
+            cancellationToken);
+        return retained is not null && !string.Equals(retained.Id, request.Id, StringComparison.Ordinal)
+            ? DocumentStoreWriteResult.IdentityConflict(retained.Id)
+            : DocumentStoreWriteResult.ConcurrencyConflict;
+    }
+
+    private async Task<DocumentStoreWriteResult> ClassifyDeleteConflictOutsideSessionAsync(
+        StorageUnit unit,
+        DeleteDocumentRequest request,
+        DocumentScopeSelection scope,
+        CancellationToken cancellationToken)
+    {
+        var identity = identityBindings[request.DocumentKind];
+        var retained = await LoadCoreAsync(
+            unit,
+            identity.Project(request.Id),
+            identity,
+            scope,
+            session: null,
+            cancellationToken);
+        return retained is null
+            ? DocumentStoreWriteResult.NotFound
+            : DocumentStoreWriteResult.ConcurrencyConflict;
+    }
+
     private sealed class MongoDocumentUnitOfWork(
         MongoDbDocumentStore store,
         IClientSessionHandle session,
@@ -499,6 +599,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
                 if (result.Status != DocumentStoreWriteStatus.Saved)
                     await AbortAsync(CancellationToken.None);
                 return result;
+            }
+            catch (MongoException exception) when (IsTerminalTransactionWriteConflict(exception))
+            {
+                await AbortAsync(CancellationToken.None);
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Save);
+                return await store.ClassifySaveConflictOutsideSessionAsync(unit, request, scope, cancellationToken);
             }
             catch
             {
@@ -520,6 +627,13 @@ public sealed class MongoDbDocumentStore : IDocumentStore
                     await AbortAsync(CancellationToken.None);
                 return result;
             }
+            catch (MongoException exception) when (IsTerminalTransactionWriteConflict(exception))
+            {
+                await AbortAsync(CancellationToken.None);
+                var unit = store.GetUnit(request.DocumentKind);
+                var scope = store.ResolveScope(unit, StorageScopeOperation.Delete);
+                return await store.ClassifyDeleteConflictOutsideSessionAsync(unit, request, scope, cancellationToken);
+            }
             catch
             {
                 await AbortAsync(CancellationToken.None);
@@ -533,7 +647,8 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             commitScope.EnsureIncludes(documentKind);
             var unit = store.GetUnit(documentKind);
             var scope = store.ResolveScope(unit, StorageScopeOperation.Load);
-            return await store.LoadCoreAsync(unit, id, scope, session, cancellationToken);
+            var identity = store.identityBindings[documentKind];
+            return await store.LoadCoreAsync(unit, identity.Project(id), identity, scope, session, cancellationToken);
         }
 
         public async Task CommitAsync(CancellationToken cancellationToken = default)

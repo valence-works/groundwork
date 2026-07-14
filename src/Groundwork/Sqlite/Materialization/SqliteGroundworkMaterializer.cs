@@ -9,13 +9,139 @@ namespace Groundwork.Sqlite.Materialization;
 
 public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : RelationalMaterializerBase(connection)
 {
-    protected override IReadOnlyList<string> SchemaStatements { get; } = [DocumentTableSql, IndexTableSql, SchemaHistorySql];
+    private const string IdentityRebuildTable = "groundwork_documents_identity_rebuild";
+    private bool identityColumnsRequireRebuild;
+
+    protected override IReadOnlyList<string> SchemaStatements { get; } =
+        [CreateDocumentTableSql("groundwork_documents", ifNotExists: true), IndexTableSql, IdentitySchemaSql, SchemaHistorySql];
 
     protected override string InsertSchemaHistorySql => """
         INSERT OR IGNORE INTO groundwork_schema_history
         (manifest_id, manifest_version, provider_name, provider_version, applied_utc)
         VALUES (@manifestId, @manifestVersion, @providerName, @providerVersion, @appliedUtc);
         """;
+
+    protected override ValueTask<DbTransaction> BeginMaterializationTransactionAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromResult<DbTransaction>(connection.BeginTransaction(deferred: false));
+
+    protected override Task AcquireIdentitySchemaLockAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+
+    protected override async Task<IReadOnlySet<string>> ReadDocumentColumnsAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = CreateCommand("PRAGMA table_info(groundwork_documents);", transaction);
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        identityColumnsRequireRebuild = false;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var name = reader.GetString(1);
+            columns.Add(name);
+            if (name is "id_comparison_key" or "id_lookup_key" && reader.GetInt64(3) == 0)
+                identityColumnsRequireRebuild = true;
+        }
+
+        identityColumnsRequireRebuild =
+            identityColumnsRequireRebuild ||
+            !columns.Contains("id_comparison_key") ||
+            !columns.Contains("id_lookup_key");
+
+        return columns;
+    }
+
+    protected override async Task<IdentityLookupIndexShape> ReadIdentityLookupIndexShapeAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var exists = false;
+        var unique = false;
+        var coversAllRows = true;
+        await using (var command = CreateCommand("PRAGMA index_list(groundwork_documents);", transaction))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (reader.GetString(1) == "ux_groundwork_documents_identity_lookup")
+                {
+                    exists = true;
+                    unique = reader.GetInt64(2) == 1;
+                    coversAllRows = reader.GetInt64(4) == 0;
+                    break;
+                }
+            }
+        }
+
+        var columns = new List<string>();
+        if (exists)
+        {
+            await using var command = CreateCommand(
+                "PRAGMA index_info(ux_groundwork_documents_identity_lookup);",
+                transaction);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                columns.Add(reader.GetString(2));
+        }
+
+        return new(exists, unique, columns, coversAllRows);
+    }
+
+    protected override async Task AddIdentityColumnsAsync(
+        IReadOnlySet<string> existingColumns,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        if (!existingColumns.Contains("id_comparison_key"))
+        {
+            await ExecuteAsync(
+                "ALTER TABLE groundwork_documents ADD COLUMN id_comparison_key TEXT NULL;",
+                transaction,
+                cancellationToken);
+        }
+
+        if (!existingColumns.Contains("id_lookup_key"))
+        {
+            await ExecuteAsync(
+                "ALTER TABLE groundwork_documents ADD COLUMN id_lookup_key TEXT NULL;",
+                transaction,
+                cancellationToken);
+        }
+    }
+
+    protected override Task EnsureIdentityLookupIndexAsync(DbTransaction transaction, CancellationToken cancellationToken) =>
+        ExecuteAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_documents_identity_lookup
+            ON groundwork_documents(document_kind, storage_scope, id_lookup_key);
+            """,
+            transaction,
+            cancellationToken);
+
+    protected override IReadOnlyList<string> RequiredIdentityLookupIndexColumns { get; } =
+        ["document_kind", "storage_scope", "id_lookup_key"];
+
+    protected override async Task FinalizeIdentityColumnsAsync(
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        if (!identityColumnsRequireRebuild)
+            return;
+
+        await ExecuteAsync($"DROP TABLE IF EXISTS {IdentityRebuildTable};", transaction, cancellationToken);
+        await ExecuteAsync(CreateDocumentTableSql(IdentityRebuildTable, ifNotExists: false), transaction, cancellationToken);
+        await ExecuteAsync(
+            $"""
+            INSERT INTO {IdentityRebuildTable}
+                (document_kind, storage_scope, id, id_comparison_key, id_lookup_key, schema_version, version, content_json, created_utc, updated_utc)
+            SELECT document_kind, storage_scope, id, id_comparison_key, id_lookup_key, schema_version, version, content_json, created_utc, updated_utc
+            FROM groundwork_documents;
+            DROP TABLE groundwork_documents;
+            ALTER TABLE {IdentityRebuildTable} RENAME TO groundwork_documents;
+            """,
+            transaction,
+            cancellationToken);
+    }
 
     protected override IReadOnlyList<string> CreateOptimizedProjectionStatements(MaterializedProjection projection)
     {
@@ -209,11 +335,13 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private const string DocumentTableSql = """
-        CREATE TABLE IF NOT EXISTS groundwork_documents (
+    private static string CreateDocumentTableSql(string tableName, bool ifNotExists) => $"""
+        CREATE TABLE {(ifNotExists ? "IF NOT EXISTS " : string.Empty)}{tableName} (
             document_kind TEXT NOT NULL,
             storage_scope TEXT NOT NULL,
             id TEXT NOT NULL,
+            id_comparison_key TEXT NOT NULL,
+            id_lookup_key TEXT NOT NULL,
             schema_version TEXT NOT NULL,
             version INTEGER NOT NULL,
             content_json TEXT NOT NULL,
@@ -240,6 +368,13 @@ public sealed class SqliteGroundworkMaterializer(SqliteConnection connection) : 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_groundwork_document_indexes_unique
         ON groundwork_document_indexes(document_kind, storage_scope, index_name, index_value)
         WHERE is_unique = 1;
+        """;
+
+    private const string IdentitySchemaSql = """
+        CREATE TABLE IF NOT EXISTS groundwork_document_identity_schema (
+            storage_unit TEXT NOT NULL PRIMARY KEY,
+            state_json TEXT NOT NULL
+        );
         """;
 
     private const string SchemaHistorySql = """

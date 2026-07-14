@@ -63,6 +63,42 @@ public sealed class SqliteBoundedMutationTests
         Assert.Equal(1, await fixture.CountAsync("active"));
     }
 
+    [Fact]
+    public async Task Linked_mutation_hydrates_primary_through_Unicode_equivalent_identity_evidence()
+    {
+        await using var fixture = await CreateAsync(
+            stringCasePolicy: Groundwork.Core.Manifests.StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await fixture.SaveAsync("Configuration-One", "pending");
+        await fixture.ChangeLinkedIdentityEvidenceAsync(originalId: "configuration-one");
+
+        var result = await fixture.Mutations.ExecuteAsync(Transition("unicode-equivalent-identity"));
+
+        Assert.Equal(new BoundedMutationResult(BoundedMutationStatus.Completed, 1), result);
+        var retained = await fixture.Documents.LoadAsync(DocumentKind, "Configuration-One");
+        Assert.Equal("revoked", Category(retained!.ContentJson));
+        Assert.Equal(1, await fixture.CountAsync("revoked"));
+    }
+
+    [Fact]
+    public async Task Linked_mutation_rejects_lookup_collision_evidence_and_rolls_back_operation()
+    {
+        await using var fixture = await CreateAsync();
+        await fixture.SaveAsync("Primary-Id", "pending");
+        await fixture.ChangeLinkedIdentityEvidenceAsync(
+            originalId: "Collision-Id",
+            comparisonKey: "different-comparison");
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            fixture.Mutations.ExecuteAsync(Transition("lookup-collision")));
+
+        Assert.Equal(DocumentKind, exception.DocumentKind);
+        Assert.Equal("Collision-Id", exception.RequestedId);
+        Assert.Equal("Primary-Id", exception.RetainedId);
+        Assert.Equal(fixture.Route.Envelope.Identity.Project("Primary-Id").LookupKey, exception.LookupKey);
+        Assert.Equal("pending", Category((await fixture.Documents.LoadAsync(DocumentKind, "Primary-Id"))!.ContentJson));
+        Assert.Equal(0, await fixture.CountMutationOperationsAsync());
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments, 2)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable, 2)]
@@ -652,13 +688,15 @@ public sealed class SqliteBoundedMutationTests
     private static async Task<Fixture> CreateAsync(
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null,
         Func<DbTransaction, IRelationalPhysicalMutationTransaction>? mutationTransactionFactory = null,
-        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable)
+        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable,
+        Groundwork.Core.Manifests.StringIdentityCasePolicy stringCasePolicy =
+            Groundwork.Core.Manifests.StringIdentityCasePolicy.Ordinal)
     {
         var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
         try
         {
-            var (manifest, target) = CreateModel(form: form);
+            var (manifest, target) = CreateModel(form: form, stringCasePolicy: stringCasePolicy);
             await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
             var route = target.Routes.Single();
             var documents = mutationTransactionFactory is null
@@ -690,12 +728,15 @@ public sealed class SqliteBoundedMutationTests
 
     private static (Groundwork.Core.Manifests.StorageManifest Manifest, PhysicalSchemaTarget Target) CreateModel(
         bool scoped = false,
-        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable)
+        PhysicalStorageForm form = PhysicalStorageForm.DedicatedDocumentTable,
+        Groundwork.Core.Manifests.StringIdentityCasePolicy stringCasePolicy =
+            Groundwork.Core.Manifests.StringIdentityCasePolicy.Ordinal)
     {
         var (template, _) = SqlitePhysicalSchemaExecutorTests.CreateModel(
             form,
             includePriority: true,
-            scoped: scoped);
+            scoped: scoped,
+            stringCasePolicy: stringCasePolicy);
         var unit = template.StorageUnits.Single();
         var storage = unit.PhysicalStorage!;
         var compound = storage.LogicalIndexes.Single(index => index.Identity == "by-category-priority");
@@ -775,6 +816,24 @@ public sealed class SqliteBoundedMutationTests
         public Task SaveAsync(string id, string category, int priority = 1) =>
             SqliteBoundedMutationTests.SaveAsync(Documents, id, category, priority);
 
+        public async Task ChangeLinkedIdentityEvidenceAsync(
+            string originalId,
+            string? comparisonKey = null)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"UPDATE {Q(Route.LinkedIndexStorage!.Name.Identifier)} SET " +
+                $"{Q(Route.LinkedRelationship!.DocumentId.Identifier)} = @originalId" +
+                (comparisonKey is null
+                    ? string.Empty
+                    : $", {Q(Route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey") +
+                ";";
+            command.Parameters.AddWithValue("@originalId", originalId);
+            if (comparisonKey is not null)
+                command.Parameters.AddWithValue("@comparisonKey", comparisonKey);
+            await command.ExecuteNonQueryAsync();
+        }
+
         public IBoundedDocumentMutationStore CreateMutationRuntime() =>
             SqlitePhysicalMutationRuntime.Create(Documents, manifest, Route, target.Provider);
 
@@ -797,6 +856,14 @@ public sealed class SqliteBoundedMutationTests
                 "list-by-category",
                 [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", category))],
                 resultOperation: BoundedQueryResultOperation.Count));
+        }
+
+        public async Task<long> CountMutationOperationsAsync()
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT COUNT(*) FROM {Q(RelationalPhysicalStorageColumns.MutationOperationsTable)};";
+            return Convert.ToInt64(await command.ExecuteScalarAsync());
         }
 
         public async Task<string> ExplainDeleteAsync(string category) =>

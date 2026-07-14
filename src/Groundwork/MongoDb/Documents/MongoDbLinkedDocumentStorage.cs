@@ -51,12 +51,15 @@ internal static class MongoDbLinkedDocumentStorage
             throw new InvalidOperationException($"Route '{route.StorageUnit.Value}' has no linked relationship.");
         var document = new BsonDocument
         {
-            [relationship.DocumentId.Identifier] = primary[route.Envelope.Id.Identifier],
             [relationship.DocumentKind.Identifier] = route.Discriminator.Value,
             [relationship.StorageScope.Identifier] = primary[route.Envelope.StorageScope.Identifier],
             [MongoDbPhysicalStorageFields.LinkedPrimaryVersion] = primary[route.Envelope.Version.Identifier],
             [MongoDbPhysicalStorageFields.Incarnation] = primary[MongoDbPhysicalStorageFields.Incarnation]
         };
+        MongoDbPhysicalDocumentIdentity.WriteLinked(
+            document,
+            route,
+            primary[route.Envelope.Id.Identifier].AsString);
         var absent = new List<string>();
         foreach (var projection in route.ProjectedColumns.Where(column =>
                      column.Target == ExecutableStorageObjectRole.LinkedIndexStorage))

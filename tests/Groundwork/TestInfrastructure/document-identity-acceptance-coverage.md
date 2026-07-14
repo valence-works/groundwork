@@ -1,0 +1,15 @@
+# Groundwork issue #71 acceptance coverage
+
+This map links the [issue #71 required outcome](https://github.com/valence-works/Groundwork/issues/71) to canonical tests. Keep it aligned with test renames; do not duplicate these scenarios in the provider matrix.
+
+| Requirement | Canonical test evidence |
+|---|---|
+| Equivalent save returns an authoritative conflict without overwriting | `SqliteDocumentStoreTests.Unicode_identity_spelling_conflict_preserves_the_authoritative_document`; `RelationalProviderContractTests.UnicodeIdentityConflictPreservesAuthoritativeOriginal` (PostgreSQL and SQL Server); `MongoDbDocumentStoreTests.UnicodeIdentitySpellingConflictPreservesAuthoritativeDocument` |
+| Direct load and delete accept an equivalent spelling and retain the original ID | `SqliteDocumentStoreTests.Unicode_identity_load_and_delete_return_the_authoritative_original`; `RelationalProviderContractTests.UnicodeIdentityLoadAndDeleteReturnAuthoritativeOriginal` (PostgreSQL and SQL Server); `MongoDbDocumentStoreTests.UnicodeIdentityLoadAndDeleteReturnAuthoritativeOriginal` |
+| A terminal unit-of-work failure rolls back prior writes | `SqliteDocumentUnitOfWorkTests.NonSuccessRollsBackAndMakesTheUnitOfWorkTerminal`; `RelationalServerPhysicalIdentityConformance.LookupCollisionTerminatesUnitOfWorkAndRollsBackPriorWrite` (PostgreSQL and SQL Server); `MongoDbPhysicalStorageConformanceTests.Unit_of_work_identity_conflict_is_terminal_and_rolls_back_prior_writes` |
+| Lookup-key collisions expose deterministic provider-neutral diagnostics | `DocumentStoreResultTests.Lookup_collision_exposes_provider_neutral_diagnostic_identity`; provider integrity checks: `SqliteDocumentStoreTests.Lookup_hash_collision_throws_the_dedicated_integrity_exception`, `RelationalProviderContractTests.ForcedLookupCollisionFailsWithDedicatedIntegrityError`, and `MongoDbDocumentStoreTests.LookupHashCollisionThrowsDedicatedIntegrityException` |
+| Versioned comparison/lookup algorithm drift fails schema evolution closed | `PhysicalSchemaDiffPlannerTests.Identity_algorithm_drift_fails_closed_with_a_dedicated_diagnostic` (`comparisonAlgorithm` and `lookupAlgorithm`) |
+| Omitting the case-policy selection remains ordinal | `ExecutableStorageRouteCompilerTests.String_identity_policy_compiles_one_portable_primary_and_linked_identity_route` |
+| Cross-provider Unicode, supplementary-scalar, query, mutation, and native-plan parity | Every inherited fact/theory in `DocumentIdentityAcceptanceConformance`, instantiated by `SqliteDocumentIdentityAcceptanceTests`, `PostgreSqlDocumentIdentityAcceptanceTests`, `SqlServerDocumentIdentityAcceptanceTests`, and `MongoDbDocumentIdentityAcceptanceTests` |
+
+Provider-neutral `Contains` rejection remains canonical in `PhysicalQueryPlanCompilerTests.Identity_contains_is_rejected_before_a_physical_plan_is_published`; it is intentionally not repeated by the provider acceptance matrix. Empty identity `StartsWith` is part of the shared matrix because the public comparison contract admits an empty prefix.

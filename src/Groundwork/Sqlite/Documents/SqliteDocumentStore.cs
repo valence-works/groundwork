@@ -8,7 +8,7 @@ namespace Groundwork.Sqlite.Documents;
 
 public sealed class SqliteDocumentStore : RelationalDocumentStore
 {
-    public SqliteDocumentStore(SqliteConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal SqliteDocumentStore(SqliteConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(connection, manifest, new SqliteDocumentStoreDialect(), access, scopeObserver)
     {
     }
@@ -18,7 +18,7 @@ public sealed class SqliteDocumentStore : RelationalDocumentStore
     {
     }
 
-    public SqliteDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal SqliteDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(
             SqliteRelationalSessions.CreateSerialized(connectionString),
             manifest,

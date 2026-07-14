@@ -1,6 +1,8 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.Materialization;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.SchemaEvolution;
 
 namespace Groundwork.Materialization;
 
@@ -39,7 +41,12 @@ public sealed record MaterializedStorageUnit(
     string IdentityField,
     string? ConcurrencyField,
     string? StorageScopeField,
-    string? SchemaField);
+    string? SchemaField,
+    IdentityPolicy IdentityPolicy)
+{
+    public DocumentStoreIdentitySchemaState IdentitySchemaState =>
+        DocumentStoreIdentitySchemaState.Capture(IdentityPolicy);
+}
 
 public sealed record MaterializedIndex(
     string UnitIdentity,

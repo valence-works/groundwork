@@ -3,7 +3,11 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -50,10 +54,10 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.True(route.Discriminator.ParticipatesInPrimaryKey);
         Assert.Equal(StorageScopePolicy.Scoped, route.ScopeKey.Policy);
         Assert.Equal(
-            new[] { "document_kind", "storage_scope", "id" },
+            new[] { "document_kind", "storage_scope", "id_lookup_key" },
             route.PrimaryKey.Columns.Select(column => column.LogicalName));
         Assert.Equal(
-            new[] { "document_kind", "storage_scope", "document_id" },
+            new[] { "document_kind", "storage_scope", "document_id_lookup_key" },
             route.AuxiliaryKey!.Columns.Select(column => column.LogicalName));
         Assert.Equal("document_id", route.LinkedRelationship!.DocumentId.Identifier);
         Assert.Equal(ExecutableStorageObjectRole.LinkedIndexStorage, Assert.Single(route.ProjectedColumns).Target);
@@ -71,6 +75,90 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.Equal(new[] { "list-by-category" }, query.QueryIdentities);
         Assert.True(query.IsScaleBearing);
         Assert.Contains(ExecutableStorageCapability.ScaleBearingQuery, route.CapabilityRequirements);
+    }
+
+    [Fact]
+    public void String_identity_policy_compiles_one_portable_primary_and_linked_identity_route()
+    {
+        var ordinalManifest = SharedScaleBearingManifest();
+        var unicodeManifest = ordinalManifest with
+        {
+            StorageUnits =
+            [
+                ordinalManifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = IdentityPolicy.StringId(
+                        stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+                }
+            ]
+        };
+        var ordinalDefinition = Resolve(ordinalManifest);
+        var unicodeDefinition = Resolve(unicodeManifest);
+        var ordinal = AssertRoute(ExecutableStorageRouteCompiler.Compile(ordinalDefinition));
+        var unicode = AssertRoute(ExecutableStorageRouteCompiler.Compile(unicodeDefinition));
+
+        Assert.Equal(StringIdentityCasePolicy.Ordinal, ordinal.Envelope.Identity.StringCasePolicy);
+        Assert.Equal(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase, unicode.Envelope.Identity.StringCasePolicy);
+        Assert.Equal("id", unicode.Envelope.Identity.OriginalId.LogicalName);
+        Assert.Equal("id_comparison_key", unicode.Envelope.Identity.ComparisonKey.LogicalName);
+        Assert.Equal("id_lookup_key", unicode.Envelope.Identity.LookupKey.LogicalName);
+        Assert.Equal(
+            PortableStringComparison.UnicodeOrdinalIgnoreCaseAlgorithmId,
+            unicode.Envelope.Identity.ComparisonAlgorithmId);
+        Assert.Equal(
+            PortableStringComparison.LookupHashAlgorithmId,
+            unicode.Envelope.Identity.LookupAlgorithmId);
+        Assert.Equal("document_id", unicode.LinkedRelationship!.Identity.OriginalId.LogicalName);
+        Assert.Equal("document_id_comparison_key", unicode.LinkedRelationship.Identity.ComparisonKey.LogicalName);
+        Assert.Equal("document_id_lookup_key", unicode.LinkedRelationship.Identity.LookupKey.LogicalName);
+        Assert.Equal(
+            new[] { "document_kind", "storage_scope", "id_lookup_key" },
+            unicode.PrimaryKey.Columns.Select(column => column.LogicalName));
+        Assert.Equal(
+            new[] { "document_kind", "storage_scope", "document_id_lookup_key" },
+            unicode.AuxiliaryKey!.Columns.Select(column => column.LogicalName));
+
+        var canonical = ExecutableStorageRouteSerializer.Serialize(unicode);
+        Assert.Equal(unicode, ExecutableStorageRouteSerializer.Deserialize(canonical));
+        Assert.Contains("\"stringCasePolicy\":\"UnicodeOrdinalIgnoreCase\"", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"comparisonKey\"", canonical, StringComparison.Ordinal);
+        Assert.Contains("\"lookupKey\"", canonical, StringComparison.Ordinal);
+        Assert.NotEqual(ordinalDefinition.Fingerprint, unicodeDefinition.Fingerprint);
+        Assert.NotEqual(ordinal.Fingerprint, unicode.Fingerprint);
+    }
+
+    [Fact]
+    public void Executable_identity_route_owns_the_portable_projection()
+    {
+        var route = AssertRoute(ExecutableStorageRouteCompiler.Compile(Resolve(SharedScaleBearingManifest())));
+
+        var projection = route.Envelope.Identity.Project("Straße-Σς");
+
+        Assert.Equal("Straße-Σς", projection.OriginalValue);
+        Assert.Equal(route.Envelope.Identity.ComparisonAlgorithmId, projection.ComparisonAlgorithmId);
+        Assert.Equal(route.Envelope.Identity.LookupAlgorithmId, projection.LookupAlgorithmId);
+        Assert.Equal(
+            PortableStringComparison.ProjectIdentity("Straße-Σς", PortableStringComparisonPolicy.Ordinal),
+            projection);
+    }
+
+    [Theory]
+    [InlineData("comparisonAlgorithm")]
+    [InlineData("lookupAlgorithm")]
+    public void Public_route_deserialization_rejects_unsupported_identity_algorithms(string algorithmProperty)
+    {
+        var route = AssertRoute(ExecutableStorageRouteCompiler.Compile(Resolve(SharedScaleBearingManifest())));
+        var root = JsonNode.Parse(ExecutableStorageRouteSerializer.Serialize(route))!.AsObject();
+        root["envelope"]!["identity"]![algorithmProperty] = "unsupported-v2";
+        root["linkedRelationship"]!["identity"]![algorithmProperty] = "unsupported-v2";
+        root.Remove("fingerprint");
+        root["fingerprint"] = Fingerprint(root.ToJsonString());
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            ExecutableStorageRouteSerializer.Deserialize(root.ToJsonString()));
+
+        Assert.Contains("identity", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("algorithm", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -94,7 +182,7 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.False(route.Discriminator.ParticipatesInPrimaryKey);
         Assert.Equal(StorageScopePolicy.Global, route.ScopeKey.Policy);
         Assert.True(route.ScopeKey.UsesGlobalSentinel);
-        Assert.Equal(new[] { "storage_scope", "id" }, route.PrimaryKey.Columns.Select(column => column.LogicalName));
+        Assert.Equal(new[] { "storage_scope", "id_lookup_key" }, route.PrimaryKey.Columns.Select(column => column.LogicalName));
         Assert.All(route.MaintenanceRoutes, maintenance =>
             Assert.Equal(new[] { ExecutableStorageObjectRole.PrimaryStorage }, maintenance.Targets));
         Assert.Single(route.CandidateQueryPaths, path => path.Kind == ExecutableQueryPathKind.PrimaryIdentity);
@@ -182,7 +270,7 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.Equal(ExecutableStorageObjectRole.LinkedIndexStorage, linkedIndex.Target);
         Assert.Equal(3, linkedIndex.Definition.SchemaVersion);
         Assert.True(linkedIndex.Definition.Evolution!.RequiresBackfill);
-        Assert.Equal(new[] { "scope_fk", "document_fk" }, route.AuxiliaryKey!.Columns.Select(column => column.LogicalName));
+        Assert.Equal(new[] { "scope_fk", "document_id_lookup_key" }, route.AuxiliaryKey!.Columns.Select(column => column.LogicalName));
         Assert.Equal("document_fk", route.LinkedRelationship!.DocumentId.Identifier);
         Assert.Equal("scope_fk", linkedIndex.Columns[0].Column.Identifier);
         Assert.DoesNotContain(ExecutableStorageCapability.CompoundIndexLookup, route.CapabilityRequirements);
@@ -212,6 +300,10 @@ public sealed class ExecutableStorageRouteCompilerTests
                                 "doc_fk"),
                             new PhysicalObjectNameOverride(
                                 PhysicalObjectKind.LinkedIndexField,
+                                "document_id_lookup_key",
+                                "doc_lookup_fk"),
+                            new PhysicalObjectNameOverride(
+                                PhysicalObjectKind.LinkedIndexField,
                                 "storage_scope",
                                 "scope_fk"),
                             new PhysicalObjectNameOverride(
@@ -232,7 +324,7 @@ public sealed class ExecutableStorageRouteCompilerTests
 
         Assert.Equal("DOC_FK", route.LinkedRelationship!.DocumentId.Identifier);
         Assert.Equal("SCOPE_FK", route.LinkedRelationship.StorageScope.Identifier);
-        Assert.Equal("DOC_FK", route.AuxiliaryKey!.Columns.Last().Identifier);
+        Assert.Equal("DOC_LOOKUP_FK", route.AuxiliaryKey!.Columns.Last().Identifier);
         Assert.Equal("CATEGORY_LOOKUP", Assert.Single(route.ProjectedColumns).Column.Identifier);
         Assert.Equal("SCOPE_FK", Assert.Single(route.Indexes).Columns[0].Column.Identifier);
         Assert.DoesNotContain(ExecutableStorageCapability.CompoundIndexLookup, route.CapabilityRequirements);
@@ -569,6 +661,9 @@ public sealed class ExecutableStorageRouteCompilerTests
         Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(diagnostic => diagnostic.Message)));
         return Assert.Single(result.Routes);
     }
+
+    private static string Fingerprint(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
     private static ProviderPhysicalTableDefinition Resolve(StorageManifest manifest)
     {

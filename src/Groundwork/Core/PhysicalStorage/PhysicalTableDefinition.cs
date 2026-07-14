@@ -35,13 +35,17 @@ public sealed record DocumentEnvelopeDefinition(
     string StorageScopeColumn = "storage_scope",
     string VersionColumn = "version",
     string SchemaVersionColumn = "schema_version",
-    string CanonicalJsonColumn = "document");
+    string CanonicalJsonColumn = "document",
+    string IdComparisonKeyColumn = "id_comparison_key",
+    string IdLookupKeyColumn = "id_lookup_key");
 
 /// <summary>Relationship fields stored in one unit-owned linked projection/index object.</summary>
 public sealed record LinkedDocumentKeyDefinition(
     string DocumentIdColumn = "document_id",
     string DocumentKindColumn = "document_kind",
-    string StorageScopeColumn = "storage_scope");
+    string StorageScopeColumn = "storage_scope",
+    string DocumentIdComparisonKeyColumn = "document_id_comparison_key",
+    string DocumentIdLookupKeyColumn = "document_id_lookup_key");
 
 /// <summary>Schema-evolution hints that remain provider-neutral.</summary>
 public sealed record PhysicalEvolutionMetadata(

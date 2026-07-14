@@ -1,7 +1,9 @@
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Text;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Relational.Documents;
@@ -14,6 +16,75 @@ namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqlitePhysicalQueryRuntimeTests
 {
+    [Fact]
+    public async Task Exact_identity_query_binds_equivalent_unicode_spelling_to_the_same_plan_evidence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = CreateIdentityModel();
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        var lower = RelationalPhysicalQueryRuntime.BuildCountCommand(
+            store,
+            manifest,
+            route,
+            target.Provider,
+            "sqlite",
+            IdentityQuery("metric-\U00010428-\u00e9"));
+        var upper = RelationalPhysicalQueryRuntime.BuildCountCommand(
+            store,
+            manifest,
+            route,
+            target.Provider,
+            "sqlite",
+            IdentityQuery("METRIC-\U00010400-\u00c9"));
+
+        var lowerEvidence = lower.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
+        var upperEvidence = upper.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
+        Assert.Equal(lowerEvidence, upperEvidence);
+        Assert.Equal(
+            [
+                "61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181",
+                "00004D00004500005400005200004900004300002D01040000002D0000C9"
+            ],
+            lowerEvidence.Select(parameter => parameter.Value));
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.GreaterThan)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public async Task Ordered_identity_query_binds_equivalent_unicode_spelling_to_the_same_comparison_key(
+        PortableQueryOperation operation)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = CreateIdentityModel(operation);
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+
+        var lower = RelationalPhysicalQueryRuntime.BuildCountCommand(
+            store, manifest, route, target.Provider, "sqlite",
+            IdentityQuery("metric-\U00010428-\u00e9", operation));
+        var upper = RelationalPhysicalQueryRuntime.BuildCountCommand(
+            store, manifest, route, target.Provider, "sqlite",
+            IdentityQuery("METRIC-\U00010400-\u00c9", operation));
+
+        var lowerEvidence = lower.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
+        var upperEvidence = upper.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
+        Assert.Equal(lowerEvidence, upperEvidence);
+        const string comparisonKey = "00004D00004500005400005200004900004300002D01040000002D0000C9";
+        Assert.Equal(comparisonKey, Assert.IsType<string>(lowerEvidence[0].Value));
+        if (operation == PortableQueryOperation.StartsWith)
+        {
+            Assert.Equal(2, lowerEvidence.Length);
+            Assert.Equal(
+                comparisonKey[..^1] + (char)(comparisonKey[^1] + 1),
+                Assert.IsType<string>(lowerEvidence[1].Value));
+        }
+        else
+            Assert.Single(lowerEvidence);
+    }
+
     [Fact]
     public async Task Linked_index_count_command_does_not_join_the_primary_envelope_table()
     {
@@ -90,6 +161,71 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         Assert.Equal(2, compoundCount);
         Assert.Contains(route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier,
             await ExplainCategoryLookupAsync(connection, route));
+    }
+
+    [Fact]
+    public async Task LinkedQueryHydratesPrimaryThroughUnicodeEquivalentIdentityEvidence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true,
+            stringCasePolicy: Groundwork.Core.Manifests.StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("Configuration-One", "tools"));
+        await using (var changeOriginalSpelling = connection.CreateCommand())
+        {
+            changeOriginalSpelling.CommandText =
+                $"UPDATE \"{route.LinkedIndexStorage!.Name.Identifier}\" " +
+                $"SET \"{route.LinkedRelationship!.DocumentId.Identifier}\" = 'configuration-one';";
+            await changeOriginalSpelling.ExecuteNonQueryAsync();
+        }
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+
+        var result = await queries.QueryAsync(new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))]));
+
+        Assert.Equal(1, result.TotalCount);
+        Assert.Equal("Configuration-One", Assert.Single(result.Documents).Id);
+    }
+
+    [Fact]
+    public async Task LinkedQueryRejectsLookupCollisionEvidence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("Primary-Id", "tools"));
+        await using (var corruptEvidence = connection.CreateCommand())
+        {
+            corruptEvidence.CommandText =
+                $"UPDATE \"{route.LinkedIndexStorage!.Name.Identifier}\" SET " +
+                $"\"{route.LinkedRelationship!.DocumentId.Identifier}\" = 'Collision-Id', " +
+                $"\"{route.LinkedRelationship.Identity.ComparisonKey.Identifier}\" = 'different-comparison';";
+            await corruptEvidence.ExecuteNonQueryAsync();
+        }
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() => queries.QueryAsync(
+            new DocumentQuery(
+                "configurationDocument",
+                "list-by-category",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))])));
+
+        Assert.Equal("configurationDocument", exception.DocumentKind);
+        Assert.Equal("Collision-Id", exception.RequestedId);
+        Assert.Equal("Primary-Id", exception.RetainedId);
+        Assert.Equal(route.Envelope.Identity.Project("Primary-Id").LookupKey, exception.LookupKey);
     }
 
     [Fact]
@@ -299,6 +435,85 @@ public sealed class SqlitePhysicalQueryRuntimeTests
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("value", "-99999999999999.9999"))]));
         Assert.Equal("negative-max-exponent", Assert.Single(negativeMaxExponent.Documents).Id);
     }
+
+    private static (StorageManifest Manifest, PhysicalSchemaTarget Target) CreateIdentityModel(
+        PortableQueryOperation operation = PortableQueryOperation.Equal)
+    {
+        var template = SqliteTestManifests.MetadataManifest();
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-id",
+            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-id",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { operation },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.Ordinary);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "identity_entities",
+            [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        ..(operation == PortableQueryOperation.Equal
+                            ? new[]
+                            {
+                                new PhysicalIndexColumnDefinition("id_lookup_key", 1),
+                                new PhysicalIndexColumnDefinition("id_comparison_key", 2)
+                            }
+                            : [new PhysicalIndexColumnDefinition("id_comparison_key", 1)])
+                    ])
+            ]);
+        var unit = template.StorageUnits.Single() with
+        {
+            IdentityPolicy = IdentityPolicy.StringId(
+                stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query])
+        };
+        var manifest = template with { StorageUnits = [unit] };
+        var resolution = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+        Assert.True(resolution.IsValid, string.Join("; ", resolution.Diagnostics.Select(x => x.Message)));
+        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
+        Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(x => x.Message)));
+        return (
+            manifest,
+            new PhysicalSchemaTarget(
+                manifest.Identity,
+                manifest.Version,
+                SqliteTestManifests.Provider,
+                compilation.Routes));
+    }
+
+    private static DocumentQuery IdentityQuery(
+        string id,
+        PortableQueryOperation operation = PortableQueryOperation.Equal) => new(
+        "configurationDocument",
+        "find-by-id",
+        [DocumentQueryClause.Of(new DocumentQueryComparison(
+            PhysicalDocumentFieldPaths.Id,
+            operation switch
+            {
+                PortableQueryOperation.Equal => QueryComparisonOperator.Equal,
+                PortableQueryOperation.GreaterThan => QueryComparisonOperator.GreaterThan,
+                PortableQueryOperation.StartsWith => QueryComparisonOperator.StartsWith,
+                _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
+            },
+            [id]))],
+        resultOperation: BoundedQueryResultOperation.Count);
 
     [Theory]
     [InlineData("100000000000000.0000", "precision")]

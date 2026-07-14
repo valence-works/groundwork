@@ -16,7 +16,9 @@ public static class RelationalPhysicalStorageColumns
         {
             route.Envelope.DocumentKind.Identifier,
             route.Envelope.StorageScope.Identifier,
-            route.Envelope.Id.Identifier,
+            route.Envelope.Identity.OriginalId.Identifier,
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            route.Envelope.Identity.LookupKey.Identifier,
             route.Envelope.SchemaVersion.Identifier,
             route.Envelope.Version.Identifier,
             route.Envelope.CanonicalJson.Identifier

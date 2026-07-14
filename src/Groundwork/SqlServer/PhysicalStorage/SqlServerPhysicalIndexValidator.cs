@@ -81,6 +81,10 @@ internal static class SqlServerPhysicalIndexValidator
     {
         if (index.Target == ExecutableStorageObjectRole.PrimaryStorage)
         {
+            if (column == route.Envelope.Identity.ComparisonKey.Identifier)
+                return SqlServerDocumentIdentityEncoding.MaximumComparisonBytes;
+            if (column == route.Envelope.Identity.LookupKey.Identifier)
+                return SqlServerDocumentIdentityEncoding.LookupBytes;
             if (column == route.Envelope.DocumentKind.Identifier || column == route.Envelope.Id.Identifier)
                 return 450 * 2;
             if (column == route.Envelope.StorageScope.Identifier)
@@ -94,6 +98,10 @@ internal static class SqlServerPhysicalIndexValidator
         }
         else if (route.LinkedRelationship is { } relationship)
         {
+            if (column == relationship.Identity.ComparisonKey.Identifier)
+                return SqlServerDocumentIdentityEncoding.MaximumComparisonBytes;
+            if (column == relationship.Identity.LookupKey.Identifier)
+                return SqlServerDocumentIdentityEncoding.LookupBytes;
             if (column == relationship.DocumentKind.Identifier || column == relationship.DocumentId.Identifier)
                 return 450 * 2;
             if (column == relationship.StorageScope.Identifier)

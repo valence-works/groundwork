@@ -70,6 +70,22 @@ internal static class MongoDbTestManifests
 
     public static ProviderIdentity Provider { get; } = new("groundwork-mongodb", "1.0.0");
 
+    public static StorageManifest UnicodeIdentityManifest()
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = IdentityPolicy.StringId(
+                        stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+                }
+            ]
+        };
+    }
+
     public static StorageManifest TenantManifest() =>
         new(
             new StorageManifestIdentity("closed.query.scoped"),

@@ -11,6 +11,65 @@ namespace Groundwork.Tests;
 public sealed class PhysicalStorageResolutionTests
 {
     [Fact]
+    public void Resolver_rejects_non_string_identity_with_a_non_ordinal_string_case_policy()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var manifest = WithPhysicalStorage(
+            template with
+            {
+                StorageUnits =
+                [
+                    template.StorageUnits.Single() with
+                    {
+                        IdentityPolicy = new IdentityPolicy(
+                            StorageIdentityKind.Guid,
+                            "id",
+                            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+                    }
+                ]
+            },
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default()));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-UNIT-013" &&
+            diagnostic.Target == "storageUnits.configurationDocument.identityPolicy.stringCasePolicy");
+    }
+
+    [Fact]
+    public void Resolver_reports_a_missing_identity_policy_structurally()
+    {
+        var template = SampleManifests.MetadataManifest();
+        var manifest = WithPhysicalStorage(
+            template with
+            {
+                StorageUnits = [template.StorageUnits.Single() with { IdentityPolicy = null! }]
+            },
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default()));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-UNIT-007" &&
+            diagnostic.Target == "storageUnits.configurationDocument.identityPolicy");
+    }
+
+    [Fact]
     public void BoundedMutationMustReferenceOneScaleBearingPredicateDeclaration()
     {
         var index = new LogicalIndexDeclaration(
@@ -1054,7 +1113,7 @@ public sealed class PhysicalStorageResolutionTests
         var snapshot = PhysicalStorageDefinitionSerializer.Serialize(definition);
 
         Assert.Equal(
-            "{\"storageUnit\":\"configurationDocument\",\"provisioningMode\":\"Declared\",\"scopePolicy\":\"Scoped\",\"definition\":{\"form\":\"DedicatedDocumentTable\",\"featureDefaultLogicalName\":\"configurationDocument\",\"sharedStorage\":null,\"schemaVersion\":1,\"envelope\":{\"id\":\"id\",\"documentKind\":\"document_kind\",\"storageScope\":\"storage_scope\",\"version\":\"version\",\"schemaVersion\":\"schema_version\",\"canonicalJson\":\"document\"},\"projectedColumns\":[],\"indexes\":[]},\"scaleBearingDemand\":[],\"names\":[{\"kind\":\"PrimaryStorage\",\"featureDefault\":\"configurationDocument\",\"logical\":\"configurationDocument\",\"identifier\":\"configurationDocument\",\"collisionScope\":\"primary-storage\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"document\",\"logical\":\"document\",\"identifier\":\"document\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"document_kind\",\"logical\":\"document_kind\",\"identifier\":\"document_kind\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"id\",\"logical\":\"id\",\"identifier\":\"id\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"schema_version\",\"logical\":\"schema_version\",\"identifier\":\"schema_version\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"storage_scope\",\"logical\":\"storage_scope\",\"identifier\":\"storage_scope\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"version\",\"logical\":\"version\",\"identifier\":\"version\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"}]}",
+            "{\"storageUnit\":\"configurationDocument\",\"provisioningMode\":\"Declared\",\"scopePolicy\":\"Scoped\",\"identityPolicy\":{\"kind\":\"String\",\"fieldName\":\"id\",\"stringCasePolicy\":\"Ordinal\",\"comparisonAlgorithm\":\"groundwork-utf16-hex-v1\",\"lookupAlgorithm\":\"groundwork-sha256-utf8-lowerhex-v1\"},\"definition\":{\"form\":\"DedicatedDocumentTable\",\"featureDefaultLogicalName\":\"configurationDocument\",\"sharedStorage\":null,\"schemaVersion\":1,\"envelope\":{\"id\":\"id\",\"idComparisonKey\":\"id_comparison_key\",\"idLookupKey\":\"id_lookup_key\",\"documentKind\":\"document_kind\",\"storageScope\":\"storage_scope\",\"version\":\"version\",\"schemaVersion\":\"schema_version\",\"canonicalJson\":\"document\"},\"projectedColumns\":[],\"indexes\":[]},\"scaleBearingDemand\":[],\"names\":[{\"kind\":\"PrimaryStorage\",\"featureDefault\":\"configurationDocument\",\"logical\":\"configurationDocument\",\"identifier\":\"configurationDocument\",\"collisionScope\":\"primary-storage\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"document\",\"logical\":\"document\",\"identifier\":\"document\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"document_kind\",\"logical\":\"document_kind\",\"identifier\":\"document_kind\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"id\",\"logical\":\"id\",\"identifier\":\"id\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"id_comparison_key\",\"logical\":\"id_comparison_key\",\"identifier\":\"id_comparison_key\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"id_lookup_key\",\"logical\":\"id_lookup_key\",\"identifier\":\"id_lookup_key\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"schema_version\",\"logical\":\"schema_version\",\"identifier\":\"schema_version\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"storage_scope\",\"logical\":\"storage_scope\",\"identifier\":\"storage_scope\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"},{\"kind\":\"EnvelopeField\",\"featureDefault\":\"version\",\"logical\":\"version\",\"identifier\":\"version\",\"collisionScope\":\"configurationDocument:columns\",\"namingOwner\":\"configurationDocument\"}]}",
             snapshot);
     }
 
@@ -1201,6 +1260,54 @@ public sealed class PhysicalStorageResolutionTests
         Assert.False(result.IsValid);
         Assert.Empty(result.Definitions);
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-025");
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingExactIdentityDemandAcceptsLookupLeadingComparisonEvidence()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal],
+            ["id_lookup_key", "id_comparison_key"]);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Single(result.Definitions);
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingOrderedIdentityDemandAcceptsComparisonEvidenceOnly()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.GreaterThan, PortableQueryOperation.StartsWith],
+            ["id_comparison_key"]);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Single(result.Definitions);
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingIdentityDemandRejectsRawOriginalIdentityEvidence()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal],
+            ["id"]);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-025");
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingMixedIdentityDemandReportsUnsupportedEvidenceShape()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal, PortableQueryOperation.GreaterThan],
+            ["id_lookup_key", "id_comparison_key"]);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        var diagnostic = Assert.Single(result.Diagnostics, item => item.Code == "GW-PHYSICAL-035");
+        Assert.Contains("mixed exact and ordered document-identity demand", diagnostic.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(result.Diagnostics, item => item.Code == "GW-PHYSICAL-025");
     }
 
     [Fact]
@@ -1470,6 +1577,49 @@ public sealed class PhysicalStorageResolutionTests
         {
             StorageUnits = [manifest.StorageUnits.Single() with { PhysicalStorage = physicalStorage }]
         };
+
+    private static PhysicalStorageResolutionResult ResolveExplicitIdentityIndex(
+        IReadOnlyList<PortableQueryOperation> operations,
+        IReadOnlyList<string> physicalColumns)
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-id",
+            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-id",
+            logicalIndex.Identity,
+            operations.ToHashSet(),
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "configurationDocument",
+            [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    new[] { "storage_scope" }
+                        .Concat(physicalColumns)
+                        .Select((column, order) => new PhysicalIndexColumnDefinition(column, order))
+                        .ToArray())
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query]));
+
+        return PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+    }
 
     private static StorageManifest DedicatedWithLinkedStorage()
     {

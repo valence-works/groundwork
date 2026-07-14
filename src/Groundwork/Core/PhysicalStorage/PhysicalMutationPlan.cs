@@ -60,7 +60,22 @@ public static class PhysicalMutationPlanCompiler
         ArgumentNullException.ThrowIfNull(storage);
         ArgumentNullException.ThrowIfNull(predicateCapabilities);
 
-        var queryCompilation = PhysicalQueryPlanCompiler.Compile(route, storage, predicateCapabilities);
+        if (storage.BoundedMutations.Count == 0)
+            return new([], []);
+
+        var predicateQueryIdentities = storage.BoundedMutations
+            .Select(mutation => mutation.PredicateQueryIdentity)
+            .ToHashSet(StringComparer.Ordinal);
+        var predicateStorage = new StorageUnitPhysicalStorage(
+            storage.ProvisioningMode,
+            storage.Policy,
+            storage.LogicalIndexes,
+            storage.BoundedQueries
+                .Where(query => predicateQueryIdentities.Contains(query.Identity))
+                .ToArray(),
+            storage.NameOverrides,
+            storage.BoundedMutations);
+        var queryCompilation = PhysicalQueryPlanCompiler.Compile(route, predicateStorage, predicateCapabilities);
         var diagnostics = queryCompilation.Diagnostics.ToList();
         if (!queryCompilation.IsValid)
             return new([], diagnostics);

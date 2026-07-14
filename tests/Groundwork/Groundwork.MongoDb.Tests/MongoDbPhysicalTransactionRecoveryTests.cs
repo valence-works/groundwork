@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
@@ -327,6 +328,16 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
         var databaseName = $"groundwork_replica_factory_{Guid.NewGuid():N}";
         var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
 
+        await using (var created = await MongoDbDocumentStoreFactory.CreatePhysicalAsync(
+                         container.GetConnectionString(),
+                         databaseName,
+                         model.Manifest,
+                         model.Provider,
+                         DocumentStoreAccess.Scoped(new("tenant-a"))))
+        {
+            Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, created.SchemaApplication.Outcome);
+        }
+
         await using var handle = await MongoDbDocumentStoreFactory.CreatePhysicalAsync(
             container.GetConnectionString(),
             databaseName,
@@ -334,6 +345,7 @@ public sealed class MongoDbPhysicalTransactionRecoveryTests : IAsyncLifetime
             model.Provider,
             DocumentStoreAccess.Scoped(new("tenant-a")));
 
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, handle.SchemaApplication.Outcome);
         Assert.Equal(TransactionBoundary.CrossUnitAtomic, handle.Store.TransactionBoundary);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await handle.Store.SaveAsync(new SaveDocumentRequest(
             "workItem", "replica", "1", """{"status":"open","rank":1}""", ExpectedVersion: 0))).Status);

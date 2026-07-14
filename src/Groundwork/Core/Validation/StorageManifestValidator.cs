@@ -56,8 +56,12 @@ public sealed class StorageManifestValidator
         if (unit.Lifecycle is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-006", "Storage unit lifecycle policy is required.", $"{target}.lifecycle"));
 
-        if (unit.IdentityPolicy is null)
-            diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-007", "Storage unit identity policy is required.", $"{target}.identityPolicy"));
+        if (IdentityPolicyAdmission.Validate(
+                unit.IdentityPolicy,
+                $"{target}.identityPolicy") is { } identityPolicyDiagnostic)
+        {
+            diagnostics.Add(identityPolicyDiagnostic);
+        }
 
         if (unit.Tenancy is null)
             diagnostics.Add(GroundworkDiagnostic.Error("GW-UNIT-011", "Storage unit tenancy policy is required.", $"{target}.tenancy"));

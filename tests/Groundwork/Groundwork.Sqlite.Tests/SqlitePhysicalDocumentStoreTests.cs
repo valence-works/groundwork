@@ -101,9 +101,131 @@ public sealed class SqlitePhysicalDocumentStoreTests
 
         var deleted = await store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "one", 2));
         Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("one", deleted.AuthoritativeId);
         Assert.Null(await store.LoadAsync("configurationDocument", "one"));
         if (route.LinkedIndexStorage is not null)
             Assert.Equal(0L, Convert.ToInt64(await ScalarAsync(connection, $"SELECT COUNT(*) FROM \"{route.LinkedIndexStorage.Name.Identifier}\";")));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task UnicodeIgnoreCaseLoadsEquivalentSpellingAndRejectsItsSave(PhysicalStorageForm form)
+    {
+        await using var harness = await CreateHarnessAsync(
+            form,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        var saved = await harness.Store.SaveAsync(Save("Configuration-One", "tools", 7, 0));
+        var loaded = await harness.Store.LoadAsync("configurationDocument", "configuration-one");
+        var conflict = await harness.Store.SaveAsync(Save("configuration-one", "gadgets", 8, 1));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal("Configuration-One", loaded!.Id);
+        Assert.Equal(1, loaded.Version);
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal("Configuration-One", conflict.AuthoritativeId);
+        Assert.Contains("\"category\":\"tools\"", loaded.ContentJson);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task UnicodeIgnoreCaseDeleteUsesEquivalentSpellingWithoutBypassingOcc(PhysicalStorageForm form)
+    {
+        await using var harness = await CreateHarnessAsync(
+            form,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await harness.Store.SaveAsync(Save("Configuration-One", "tools", 7, 0));
+
+        var stale = await harness.Store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "configuration-one",
+            ExpectedVersion: 2));
+        var deleted = await harness.Store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "configuration-one",
+            ExpectedVersion: 1));
+
+        Assert.Equal(DocumentStoreWriteStatus.ConcurrencyConflict, stale.Status);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("Configuration-One", deleted.AuthoritativeId);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", "Configuration-One"));
+    }
+
+    [Fact]
+    public async Task UnicodeIgnoreCaseSupportsSupplementaryPlaneIdentitySpelling()
+    {
+        await using var harness = await CreateHarnessAsync(
+            PhysicalStorageForm.PhysicalEntityTable,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        var retained = $"document-{char.ConvertFromUtf32(0x10428)}";
+        var equivalent = $"document-{char.ConvertFromUtf32(0x10400)}";
+
+        await harness.Store.SaveAsync(Save(retained, "tools", 7, 0));
+        var loaded = await harness.Store.LoadAsync("configurationDocument", equivalent);
+        var conflict = await harness.Store.SaveAsync(Save(equivalent, "gadgets", 8, 1));
+
+        Assert.Equal(retained, loaded!.Id);
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal(retained, conflict.AuthoritativeId);
+    }
+
+    [Fact]
+    public async Task LookupCollisionEvidenceFailsLoadSaveAndDeleteClosed()
+    {
+        await using var harness = await CreateHarnessAsync(PhysicalStorageForm.PhysicalEntityTable);
+        var route = harness.Route;
+        await harness.Store.SaveAsync(Save("Retained-Id", "tools", 7, 0));
+        var requestedId = "Requested-Id";
+        var requestedLookup = route.Envelope.Identity.Project(requestedId).LookupKey;
+        await using (var corrupt = harness.Connection.CreateCommand())
+        {
+            corrupt.CommandText =
+                $"UPDATE \"{route.PrimaryStorage.Name.Identifier}\" " +
+                $"SET \"{route.Envelope.Identity.LookupKey.Identifier}\" = @lookup;";
+            corrupt.Parameters.AddWithValue("@lookup", requestedLookup);
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
+        var load = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(
+            () => harness.Store.LoadAsync("configurationDocument", requestedId));
+        var save = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(
+            () => harness.Store.SaveAsync(Save(requestedId, "gadgets", 8, 0)));
+        var delete = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(
+            () => harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", requestedId)));
+
+        AssertCollision(load, requestedId, requestedLookup);
+        AssertCollision(save, requestedId, requestedLookup);
+        AssertCollision(delete, requestedId, requestedLookup);
+    }
+
+    [Fact]
+    public async Task LinkedLookupCollisionEvidenceFailsSaveClosed()
+    {
+        await using var harness = await CreateHarnessAsync(PhysicalStorageForm.SharedDocuments);
+        var route = harness.Route;
+        const string requestedId = "Requested-Id";
+        await harness.Store.SaveAsync(Save(requestedId, "tools", 7, 0));
+        var requestedLookup = route.LinkedRelationship!.Identity.Project(requestedId).LookupKey;
+        await using (var corrupt = harness.Connection.CreateCommand())
+        {
+            corrupt.CommandText =
+                $"UPDATE \"{route.LinkedIndexStorage!.Name.Identifier}\" SET " +
+                $"\"{route.LinkedRelationship.DocumentId.Identifier}\" = 'Collision-Retained', " +
+                $"\"{route.LinkedRelationship.Identity.ComparisonKey.Identifier}\" = 'different-comparison';";
+            await corrupt.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(
+            () => harness.Store.SaveAsync(Save(requestedId, "gadgets", 8, 1)));
+
+        Assert.Equal("configurationDocument", exception.DocumentKind);
+        Assert.Equal(requestedId, exception.RequestedId);
+        Assert.Equal("Collision-Retained", exception.RetainedId);
+        Assert.Equal(requestedLookup, exception.LookupKey);
     }
 
     [Theory]
@@ -387,10 +509,46 @@ public sealed class SqlitePhysicalDocumentStoreTests
     private static SaveDocumentRequest Save(string id, string category, int priority, long? expectedVersion = null) =>
         new("configurationDocument", id, "1", $"{{\"category\":\"{category}\",\"priority\":{priority}}}", expectedVersion);
 
+    private static async Task<PhysicalStoreHarness> CreateHarnessAsync(
+        PhysicalStorageForm form,
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            form,
+            includePriority: true,
+            stringCasePolicy: stringCasePolicy);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        return new PhysicalStoreHarness(
+            connection,
+            new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global),
+            target.Routes.Single());
+    }
+
+    private static void AssertCollision(
+        DocumentIdentityLookupCollisionException exception,
+        string requestedId,
+        string lookupKey)
+    {
+        Assert.Equal("configurationDocument", exception.DocumentKind);
+        Assert.Equal(requestedId, exception.RequestedId);
+        Assert.Equal("Retained-Id", exception.RetainedId);
+        Assert.Equal(lookupKey, exception.LookupKey);
+    }
+
     private static async Task<object?> ScalarAsync(SqliteConnection connection, string sql)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         return await command.ExecuteScalarAsync();
+    }
+
+    private sealed record PhysicalStoreHarness(
+        SqliteConnection Connection,
+        IDocumentStore Store,
+        ExecutableStorageRoute Route) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() => Connection.DisposeAsync();
     }
 }

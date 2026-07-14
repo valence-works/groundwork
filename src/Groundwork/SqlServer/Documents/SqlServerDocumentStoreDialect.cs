@@ -1,11 +1,15 @@
 using System.Data.Common;
 using Groundwork.Relational.Documents;
+using Groundwork.SqlServer.PhysicalStorage;
 using Microsoft.Data.SqlClient;
 
 namespace Groundwork.SqlServer.Documents;
 
 internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDialect
 {
+    public override void ValidateDocumentIdentity(string value) =>
+        _ = SqlServerDocumentIdentityEncoding.Original(value);
+
     public override string ExactEqualityPredicate(string columnExpression, string parameterReference) =>
         $"{columnExpression}_key = {HashParameter(parameterReference)} AND {columnExpression} = {parameterReference}";
 
@@ -31,7 +35,9 @@ internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDia
             updated_utc = {{Parameter("updatedUtc")}}
         WHERE {{ExactEqualityPredicate("document_kind", Parameter("kind"))}}
           AND {{ExactEqualityPredicate("storage_scope", Parameter("scope"))}}
-          AND {{ExactEqualityPredicate("id", Parameter("id"))}};
+          AND id_lookup_key = {{Parameter("idLookupKey")}}
+          AND id_comparison_key = {{Parameter("idComparisonKey")}}
+          AND {{ExactEqualityPredicate("id", Parameter("authoritativeId"))}};
         """;
 
     public override string UpdateDocumentCommandSql(bool checkVersion) =>
@@ -44,24 +50,29 @@ internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDia
                   updated_utc = {{Parameter("updatedUtc")}}
               WHERE {{ExactEqualityPredicate("document_kind", Parameter("kind"))}}
                 AND {{ExactEqualityPredicate("storage_scope", Parameter("scope"))}}
-                AND {{ExactEqualityPredicate("id", Parameter("id"))}}
+                AND id_lookup_key = {{Parameter("idLookupKey")}}
+                AND id_comparison_key = {{Parameter("idComparisonKey")}}
+                AND {{ExactEqualityPredicate("id", Parameter("authoritativeId"))}}
                 AND version = {{Parameter("expectedVersion")}};
               """
             : UpdateDocumentSql;
 
     public override string LoadDocumentSql => $$"""
-        SELECT document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc
+        SELECT document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc,
+               id_comparison_key, id_lookup_key
         FROM groundwork_documents
         WHERE {{ExactEqualityPredicate("document_kind", Parameter("kind"))}}
           AND {{ExactEqualityPredicate("storage_scope", Parameter("scope"))}}
-          AND {{ExactEqualityPredicate("id", Parameter("id"))}};
+          AND id_lookup_key = {{Parameter("idLookupKey")}};
         """;
 
     public override string DeleteDocumentSql => $$"""
         DELETE FROM groundwork_documents
         WHERE {{ExactEqualityPredicate("document_kind", Parameter("kind"))}}
           AND {{ExactEqualityPredicate("storage_scope", Parameter("scope"))}}
-          AND {{ExactEqualityPredicate("id", Parameter("id"))}};
+          AND id_lookup_key = {{Parameter("idLookupKey")}}
+          AND id_comparison_key = {{Parameter("idComparisonKey")}}
+          AND {{ExactEqualityPredicate("id", Parameter("authoritativeId"))}};
         """;
 
     public override string DeleteDocumentCommandSql(bool checkVersion) =>
@@ -70,7 +81,9 @@ internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDia
               DELETE FROM groundwork_documents
               WHERE {{ExactEqualityPredicate("document_kind", Parameter("kind"))}}
                 AND {{ExactEqualityPredicate("storage_scope", Parameter("scope"))}}
-                AND {{ExactEqualityPredicate("id", Parameter("id"))}}
+                AND id_lookup_key = {{Parameter("idLookupKey")}}
+                AND id_comparison_key = {{Parameter("idComparisonKey")}}
+                AND {{ExactEqualityPredicate("id", Parameter("authoritativeId"))}}
                 AND version = {{Parameter("expectedVersion")}};
               """
             : DeleteDocumentSql;
@@ -147,7 +160,8 @@ internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDia
 
     public override bool IsDuplicateDocumentKeyException(DbException exception) =>
         exception is SqlException { Number: 2627 or 2601 } sqlException &&
-        sqlException.Message.Contains("pk_groundwork_documents", StringComparison.OrdinalIgnoreCase);
+        (sqlException.Message.Contains("pk_groundwork_documents", StringComparison.OrdinalIgnoreCase) ||
+         sqlException.Message.Contains("ux_groundwork_documents_identity_lookup", StringComparison.OrdinalIgnoreCase));
 
     public override bool IsUniqueIndexException(DbException exception) =>
         exception is SqlException { Number: 2627 or 2601 };

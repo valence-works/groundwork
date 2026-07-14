@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
@@ -456,6 +457,45 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
         Assert.Equal(originalModel.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
     }
 
+    [Fact]
+    public async Task Linked_identity_collision_fails_closed_during_public_schema_validation()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model();
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel);
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(documents, "canonical", "stale");
+        var route = Assert.Single(mutationModel.Routes);
+        var relationship = route.LinkedRelationship!;
+        var linkedCollection = database.GetCollection<BsonDocument>(
+            route.LinkedIndexStorage!.Name.Identifier);
+        var linked = await linkedCollection.Find(FilterDefinition<BsonDocument>.Empty).SingleAsync();
+        var requested = route.Envelope.Identity.Project("collision");
+        var retainedLookup = linked[relationship.Identity.LookupKey.Identifier].AsString;
+        linked[relationship.Identity.OriginalId.Identifier] = requested.OriginalValue;
+        linked[relationship.Identity.ComparisonKey.Identifier] = requested.ComparisonKey;
+        await linkedCollection.ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq(
+                MongoDbPhysicalStorageFields.Id,
+                linked[MongoDbPhysicalStorageFields.Id]),
+            linked);
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel));
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(mutationModel.Target, CancellationToken.None);
+
+        Assert.Equal(DocumentKind, exception.DocumentKind);
+        Assert.Equal(requested.OriginalValue, exception.RequestedId);
+        Assert.Equal("canonical", exception.RetainedId);
+        Assert.Equal(retainedLookup, exception.LookupKey);
+        Assert.Equal(mutationModel.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
@@ -892,6 +932,122 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Identity_mutation_explain_and_replay_use_projected_evidence_for_primary_and_linked_storage()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var model = IdentityMutationModel();
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        const string savedId = "metric-\U00010428-\u00e9";
+        const string equivalentId = "METRIC-\U00010400-\u00c9";
+        await SaveAsync(documents, savedId, "stale");
+        var route = Assert.Single(model.Routes);
+        var request = new DocumentMutation(
+            DocumentKind,
+            "prune-by-id",
+            "identity-prune-1",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal(PhysicalDocumentFieldPaths.Id, equivalentId))]);
+
+        var explanation = await MongoDbPhysicalMutationRuntime.ExplainAsync(
+            documents,
+            model.Manifest,
+            route,
+            model.Provider,
+            request);
+
+        AssertIdentityExplanation(explanation["primary"].AsBsonDocument, route.Envelope.Identity);
+        AssertIdentityExplanation(explanation["linked"].AsBsonDocument, route.LinkedRelationship!.Identity);
+        var mutations = MongoDbPhysicalMutationRuntime.Create(documents, model.Manifest, route, model.Provider);
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await mutations.ExecuteAsync(request));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Replayed, 1),
+            await mutations.ExecuteAsync(request));
+        Assert.Null(await documents.LoadAsync(DocumentKind, savedId));
+    }
+
+    [Fact]
+    public void Compound_mutation_selector_certifies_a_non_predicate_identity_tail_for_primary_and_linked_storage()
+    {
+        var model = IdentityMutationModel(includeStatusPrefix: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                MongoDbPhysicalMutationStorage.PrimaryField(route, "status"),
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            [
+                route.LinkedRelationship!.DocumentKind.Identifier,
+                route.LinkedRelationship.StorageScope.Identifier,
+                MongoDbPhysicalMutationStorage.LinkedField(route, "status"),
+                route.LinkedRelationship.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Linked!.IndexKeys.Names);
+        Assert.DoesNotContain(
+            PhysicalDocumentIdentityFieldPaths.Lookup,
+            binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(
+            PhysicalDocumentIdentityFieldPaths.Lookup,
+            binding.Certification.Linked!.FieldIdentifiers.Keys);
+    }
+
+    [Fact]
+    public async Task Identity_prefix_mutation_uses_indexed_comparison_ranges_for_primary_and_linked_storage()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var model = IdentityMutationModel(PortableQueryOperation.StartsWith);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(documents, "metric-\U00010428-\u00e9-one", "stale");
+        await SaveAsync(documents, "METRIC-\U00010400-\u00c9-two", "stale");
+        await SaveAsync(documents, "other", "current");
+        var route = Assert.Single(model.Routes);
+        var request = new DocumentMutation(
+            DocumentKind,
+            "prune-by-id",
+            "identity-prefix-prune-1",
+            [
+                DocumentQueryClause.Of(new DocumentQueryComparison(
+                    PhysicalDocumentFieldPaths.Id,
+                    QueryComparisonOperator.StartsWith,
+                    ["METRIC-\U00010400-\u00c9-"]))
+            ]);
+
+        var explanation = await MongoDbPhysicalMutationRuntime.ExplainAsync(
+            documents,
+            model.Manifest,
+            route,
+            model.Provider,
+            request);
+
+        AssertOrderedIdentityExplanation(explanation["primary"].AsBsonDocument, route.Envelope.Identity);
+        AssertOrderedIdentityExplanation(explanation["linked"].AsBsonDocument, route.LinkedRelationship!.Identity);
+        var mutations = MongoDbPhysicalMutationRuntime.Create(documents, model.Manifest, route, model.Provider);
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 2),
+            await mutations.ExecuteAsync(request));
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Replayed, 2),
+            await mutations.ExecuteAsync(request));
+        Assert.NotNull(await documents.LoadAsync(DocumentKind, "other"));
+    }
+
+    [Fact]
     public async Task Transition_and_delete_use_set_based_multi_writes_without_reading_physical_documents()
     {
         var commands = new ConcurrentQueue<(string Name, BsonDocument Command)>();
@@ -1299,6 +1455,148 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             ]
         };
         return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel IdentityMutationModel(
+        PortableQueryOperation operation = PortableQueryOperation.Equal,
+        bool includeStatusPrefix = false)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-id",
+            includeStatusPrefix
+                ?
+                [
+                    new IndexField("status"),
+                    new IndexField(PhysicalDocumentFieldPaths.Id)
+                ]
+                : [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var physicalIndex = new PhysicalIndexDefinition(
+            logicalIndex.Identity,
+            [
+                new PhysicalIndexColumnDefinition("storage_scope", 0),
+                ..(includeStatusPrefix
+                    ? new[] { new PhysicalIndexColumnDefinition("status", 1) }
+                    : []),
+                ..(operation == PortableQueryOperation.Equal && !includeStatusPrefix
+                    ? new[]
+                    {
+                        new PhysicalIndexColumnDefinition("id_lookup_key", 1),
+                        new PhysicalIndexColumnDefinition("id_comparison_key", 2)
+                    }
+                    : [new PhysicalIndexColumnDefinition("id_comparison_key", includeStatusPrefix ? 2 : 1)])
+            ]);
+        var definition = PhysicalTableDefinition.SharedDocuments(
+            binding,
+            linkedProjectedColumns: includeStatusPrefix
+                ? [new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false)]
+                : null,
+            linkedIndexes: [physicalIndex],
+            linkedProjectionLogicalName: "work_items_lookup");
+        var query = new BoundedQueryDeclaration(
+            "find-by-id",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { operation },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            supportsTotalCount: true,
+            predicateFields: includeStatusPrefix
+                ?
+                [
+                    new BoundedQueryPredicateField(
+                        "status",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ]
+                : null);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity(DocumentKind),
+            "Work item",
+            StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable,
+            IdentityPolicy.StringId(stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(),
+            SerializationPolicy.Json(),
+            [],
+            [],
+            PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query],
+                boundedMutations:
+                [
+                    new BoundedMutationDeclaration(
+                        "prune-by-id",
+                        query.Identity,
+                        BoundedMutationAction.Delete())
+                ])
+        };
+        var manifest = new StorageManifest(
+            new StorageManifestIdentity("mongo.identity-mutation"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages =
+            [
+                new SharedDocumentStorageDefinition(binding, "documents", new DocumentEnvelopeDefinition())
+            ]
+        };
+        return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static void AssertIdentityExplanation(
+        BsonDocument explanation,
+        ExecutableDocumentIdentityRoute identity)
+    {
+        var fields = BsonFieldNames(explanation["filter"])
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Contains(identity.LookupKey.Identifier, fields);
+        Assert.Contains(identity.ComparisonKey.Identifier, fields);
+        Assert.DoesNotContain(identity.OriginalId.Identifier, fields);
+        Assert.Equal(explanation["indexName"], explanation["winningPlanIndex"]);
+    }
+
+    private static void AssertOrderedIdentityExplanation(
+        BsonDocument explanation,
+        ExecutableDocumentIdentityRoute identity)
+    {
+        var fields = BsonFieldNames(explanation["filter"])
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Contains(identity.ComparisonKey.Identifier, fields);
+        Assert.Contains("$gte", fields);
+        Assert.Contains("$lt", fields);
+        Assert.DoesNotContain("$regularExpression", fields);
+        Assert.DoesNotContain(identity.LookupKey.Identifier, fields);
+        Assert.DoesNotContain(identity.OriginalId.Identifier, fields);
+        Assert.Equal(explanation["indexName"], explanation["winningPlanIndex"]);
+    }
+
+    private static IEnumerable<string> BsonFieldNames(BsonValue value)
+    {
+        if (value.IsBsonDocument)
+        {
+            foreach (var element in value.AsBsonDocument)
+            {
+                yield return element.Name;
+                foreach (var nested in BsonFieldNames(element.Value))
+                    yield return nested;
+            }
+            yield break;
+        }
+        if (!value.IsBsonArray)
+            yield break;
+        foreach (var nested in value.AsBsonArray.SelectMany(BsonFieldNames))
+            yield return nested;
     }
 
     private async Task<Fixture> CreateAsync(

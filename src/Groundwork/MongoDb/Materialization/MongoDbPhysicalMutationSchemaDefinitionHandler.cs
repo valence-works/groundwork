@@ -525,8 +525,15 @@ internal sealed class MongoDbPhysicalMutationSchemaDefinitionHandler
         {
             foreach (var linked in cursor.Current)
             {
-                if (!linked.TryGetValue(relationship.DocumentId.Identifier, out var documentId) ||
+                var linkedIdentity = relationship.Identity;
+                if (!linked.TryGetValue(linkedIdentity.OriginalId.Identifier, out var documentId) ||
+                    !documentId.IsString ||
+                    !linked.TryGetValue(linkedIdentity.ComparisonKey.Identifier, out var comparisonKey) ||
+                    !comparisonKey.IsString ||
+                    !linked.TryGetValue(linkedIdentity.LookupKey.Identifier, out var lookupKey) ||
+                    !lookupKey.IsString ||
                     !linked.TryGetValue(relationship.StorageScope.Identifier, out var storageScope) ||
+                    !storageScope.IsString ||
                     !linked.TryGetValue(MongoDbPhysicalStorageFields.Incarnation, out var incarnation) ||
                     !linked.TryGetValue(MongoDbPhysicalStorageFields.LinkedPrimaryVersion, out var primaryVersion))
                 {
@@ -534,25 +541,40 @@ internal sealed class MongoDbPhysicalMutationSchemaDefinitionHandler
                         $"MongoDB bounded-mutation selector '{definition.LogicalIndexIdentity}' has malformed linked mirror state.");
                 }
 
-                var identityValues = new BsonDocument
-                {
-                    [relationship.DocumentId.Identifier] = documentId,
-                    [relationship.DocumentKind.Identifier] = selector.DiscriminatorValue,
-                    [relationship.StorageScope.Identifier] = storageScope
-                };
-                var expectedIdentity = MongoDbPhysicalSchemaExecutor.KeyDocument(route.AuxiliaryKey!, identityValues);
+                var expectedIdentity = MongoDbPhysicalDocumentIdentity.LinkedKeyDocument(route, linked);
                 var hasCanonicalIdentity = linked.TryGetValue(MongoDbPhysicalStorageFields.Id, out var actualIdentity) &&
                                            actualIdentity.Equals(expectedIdentity);
-                var hasPrimary = hasCanonicalIdentity && await database
-                    .GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-                    .Find(
-                        Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, documentId) &
-                        Builders<BsonDocument>.Filter.Eq(route.Envelope.DocumentKind.Identifier, route.Discriminator.Value) &
-                        Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, storageScope) &
-                        Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Incarnation, incarnation) &
-                        Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, primaryVersion))
-                    .Limit(1)
-                    .AnyAsync(cancellationToken);
+                var primaryCollection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
+                var primary = hasCanonicalIdentity
+                    ? await primaryCollection.Find(
+                            MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, linked) &
+                            Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Incarnation, incarnation) &
+                            Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, primaryVersion))
+                        .SingleOrDefaultAsync(cancellationToken)
+                    : null;
+                var hasPrimary = primary is not null &&
+                                 string.Equals(
+                                     primary[route.Envelope.Identity.OriginalId.Identifier].AsString,
+                                     documentId.AsString,
+                                     StringComparison.Ordinal);
+                if (!hasPrimary && hasCanonicalIdentity)
+                {
+                    var retained = await primaryCollection.Find(
+                            MongoDbPhysicalDocumentIdentity.PrimaryLookupFilter(
+                                route,
+                                storageScope.AsString,
+                                lookupKey.AsString))
+                        .SingleOrDefaultAsync(cancellationToken);
+                    if (retained is not null)
+                    {
+                        MongoDbPhysicalDocumentIdentity.ThrowIfCollision(
+                            route,
+                            documentId.AsString,
+                            comparisonKey.AsString,
+                            lookupKey.AsString,
+                            retained);
+                    }
+                }
                 if (!hasPrimary)
                 {
                     throw new InvalidOperationException(

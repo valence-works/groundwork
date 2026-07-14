@@ -63,6 +63,10 @@ storage unit, route-derived scope, mutation identity, fixed action, and canonica
 Provider implementation name/version and handler identity are deliberately excluded: a retry after
 a rolling provider upgrade must resolve the same durable operation. Clause order, comparison order
 inside an OR clause, and IN-value order do not change the fingerprint.
+Document-identity predicate values pass through the predicate plan's identity binding before
+selection and fingerprinting, so case-policy-equivalent spellings share one replay fingerprint.
+Operation identities themselves remain ordinal and are never projected through document identity
+policy.
 
 The durable ledger key is manifest identity, provider name, storage unit, route-derived scope, and
 operation identity. Provider version is retained only as completion evidence, not as operation

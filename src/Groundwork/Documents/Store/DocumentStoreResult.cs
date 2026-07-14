@@ -34,10 +34,16 @@ public sealed record DeleteDocumentRequest(
     string Id,
     long? ExpectedVersion = null);
 
-public sealed record DocumentStoreWriteResult(DocumentStoreWriteStatus Status, DocumentEnvelope? Document = null)
+public sealed record DocumentStoreWriteResult(
+    DocumentStoreWriteStatus Status,
+    DocumentEnvelope? Document = null,
+    string? AuthoritativeId = null)
 {
     public static DocumentStoreWriteResult Saved(DocumentEnvelope document) => new(DocumentStoreWriteStatus.Saved, document);
-    public static DocumentStoreWriteResult Deleted { get; } = new(DocumentStoreWriteStatus.Deleted);
+    public static DocumentStoreWriteResult Deleted(string authoritativeId) =>
+        new(DocumentStoreWriteStatus.Deleted, AuthoritativeId: authoritativeId);
+    public static DocumentStoreWriteResult IdentityConflict(string authoritativeId) =>
+        new(DocumentStoreWriteStatus.IdentityConflict, AuthoritativeId: authoritativeId);
     public static DocumentStoreWriteResult NotFound { get; } = new(DocumentStoreWriteStatus.NotFound);
     public static DocumentStoreWriteResult ConcurrencyConflict { get; } = new(DocumentStoreWriteStatus.ConcurrencyConflict);
 }
@@ -46,6 +52,7 @@ public enum DocumentStoreWriteStatus
 {
     Saved,
     Deleted,
+    IdentityConflict,
     NotFound,
     ConcurrencyConflict
 }

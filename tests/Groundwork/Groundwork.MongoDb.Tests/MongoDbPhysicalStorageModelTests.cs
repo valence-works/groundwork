@@ -6,12 +6,15 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.Transactions;
+using Groundwork.Core.Text;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Events;
 using Xunit;
@@ -20,6 +23,209 @@ namespace Groundwork.MongoDb.Tests;
 
 public sealed class MongoDbPhysicalStorageModelTests
 {
+    [Fact]
+    public void Exact_identity_filter_binds_equivalent_unicode_spelling_to_the_same_plan_evidence()
+    {
+        var model = IdentityModel();
+        var route = Assert.Single(model.Routes);
+        var storage = Assert.Single(model.Manifest.StorageUnits).PhysicalStorage!;
+        var capabilities = MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
+            model.Provider,
+            MongoDbPhysicalQueryHandler.Operations);
+        var plan = Assert.Single(PhysicalQueryPlanCompiler.Compile(route, storage, capabilities).Plans);
+        var scope = DocumentScopeSelection.Global;
+
+        var lower = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery("metric-\U00010428-\u00e9"), plan, scope, storage, route));
+        var upper = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery("METRIC-\U00010400-\u00c9"), plan, scope, storage, route));
+
+        Assert.Equal(lower, upper);
+        Assert.Contains("61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181", lower.ToJson(), StringComparison.Ordinal);
+        Assert.Contains("00004D00004500005400005200004900004300002D01040000002D0000C9", lower.ToJson(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Exact_identity_mutation_filter_consumes_the_same_plan_evidence_as_query_execution()
+    {
+        var model = IdentityModel(includeMutation: true);
+        var plan = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings)).Plan;
+
+        var lower = Render(MongoDbPhysicalDocumentMutationHandler.BuildIdentityMutationFilter(
+            Assert.Single(Assert.Single(IdentityQuery("metric-\U00010428-\u00e9").Clauses).Comparisons),
+            plan));
+        var upper = Render(MongoDbPhysicalDocumentMutationHandler.BuildIdentityMutationFilter(
+            Assert.Single(Assert.Single(IdentityQuery("METRIC-\U00010400-\u00c9").Clauses).Comparisons),
+            plan));
+
+        Assert.Equal(lower, upper);
+        Assert.Contains("61c4070c8bb733ab75c6a4366219266bcf058446787a62365c57dd598de56181", lower.ToJson(), StringComparison.Ordinal);
+        Assert.Contains("00004D00004500005400005200004900004300002D01040000002D0000C9", lower.ToJson(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Exact_identity_mutation_selector_certifies_and_indexes_the_executed_projected_evidence()
+    {
+        var model = IdentityModel(includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                route.Envelope.Identity.LookupKey.Identifier,
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            route.Envelope.Identity.LookupKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Lookup]);
+        Assert.Equal(
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Comparison]);
+        Assert.DoesNotContain(PhysicalDocumentFieldPaths.Id, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(route.Envelope.Identity.OriginalId.Identifier, binding.Schema.Primary.IndexKeys.Names);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.GreaterThan)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Ordered_identity_mutation_selector_certifies_only_the_comparison_evidence(
+        PortableQueryOperation operation)
+    {
+        var model = IdentityModel(operation, includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Comparison]);
+        Assert.DoesNotContain(PhysicalDocumentIdentityFieldPaths.Lookup, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(PhysicalDocumentFieldPaths.Id, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(route.Envelope.Identity.OriginalId.Identifier, binding.Schema.Primary.IndexKeys.Names);
+    }
+
+    [Fact]
+    public void Identity_contains_surfaces_the_core_identity_diagnostic_before_provider_execution()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            IdentityModel(PortableQueryOperation.Contains, includeMutation: true));
+
+        Assert.Contains("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-003", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Compound_identity_contains_surfaces_the_core_diagnostic_for_queries_and_mutations(
+        bool includeMutation)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+        {
+            var model = CompoundIdentityContainsModel(includeMutation);
+            if (!includeMutation)
+            {
+                _ = new MongoDbPhysicalDocumentStore(
+                    new MongoClient("mongodb://localhost").GetDatabase("groundwork_identity_diagnostic"),
+                    model,
+                    DocumentStoreAccess.Global);
+            }
+        });
+
+        Assert.Contains("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Contains", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-003", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("regular-expression semantics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.GreaterThan)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Ordered_identity_filter_binds_equivalent_unicode_spelling_to_the_same_comparison_key(
+        PortableQueryOperation operation)
+    {
+        var model = IdentityModel(operation == PortableQueryOperation.StartsWith
+            ? PortableQueryOperation.GreaterThan
+            : operation);
+        var route = Assert.Single(model.Routes);
+        var storage = Assert.Single(model.Manifest.StorageUnits).PhysicalStorage!;
+        var capabilities = MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
+            model.Provider,
+            MongoDbPhysicalQueryHandler.Operations);
+        var plan = Assert.Single(PhysicalQueryPlanCompiler.Compile(route, storage, capabilities).Plans);
+
+        var lower = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery("metric-\U00010428-\u00e9", operation),
+            plan,
+            DocumentScopeSelection.Global,
+            storage,
+            route));
+        var upper = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery("METRIC-\U00010400-\u00c9", operation),
+            plan,
+            DocumentScopeSelection.Global,
+            storage,
+            route));
+
+        Assert.Equal(lower, upper);
+        Assert.Contains("00004D00004500005400005200004900004300002D01040000002D0000C9", lower.ToJson(), StringComparison.Ordinal);
+        Assert.DoesNotContain(plan.DocumentIdentity.Lookup.Identifier, lower.ToJson(), StringComparison.Ordinal);
+        if (operation == PortableQueryOperation.StartsWith)
+        {
+            Assert.Contains("$gte", lower.ToJson(), StringComparison.Ordinal);
+            Assert.Contains("$lt", lower.ToJson(), StringComparison.Ordinal);
+            Assert.DoesNotContain("$regularExpression", lower.ToJson(), StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Empty_identity_prefix_uses_a_lower_only_indexed_range_for_queries_and_mutations()
+    {
+        var model = IdentityModel(PortableQueryOperation.StartsWith, includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var storage = Assert.Single(model.Manifest.StorageUnits).PhysicalStorage!;
+        var capabilities = MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
+            model.Provider,
+            MongoDbPhysicalQueryHandler.Operations);
+        var queryPlan = Assert.Single(PhysicalQueryPlanCompiler.Compile(route, storage, capabilities).Plans);
+        var comparison = Assert.Single(Assert.Single(
+            IdentityQuery(string.Empty, PortableQueryOperation.StartsWith).Clauses).Comparisons);
+
+        var queryFilter = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery(string.Empty, PortableQueryOperation.StartsWith),
+            queryPlan,
+            DocumentScopeSelection.Global,
+            storage,
+            route));
+        var mutationFilter = Render(MongoDbPhysicalDocumentMutationHandler.BuildIdentityMutationFilter(
+            comparison,
+            Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings)).Plan));
+
+        foreach (var filter in new[] { queryFilter, mutationFilter })
+        {
+            var json = filter.ToJson();
+            Assert.Contains("id_comparison_key", json, StringComparison.Ordinal);
+            Assert.Contains("$gte", json, StringComparison.Ordinal);
+            Assert.DoesNotContain("$lt", json, StringComparison.Ordinal);
+            Assert.DoesNotContain("$regularExpression", json, StringComparison.Ordinal);
+        }
+    }
+
     [Fact]
     public void Compilation_preserves_all_three_forms_and_uses_resolved_collection_names()
     {
@@ -144,6 +350,26 @@ public sealed class MongoDbPhysicalStorageModelTests
 
         Assert.Contains(reserved, exception.Message, StringComparison.Ordinal);
         Assert.Contains("reserved", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.Contains)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Query_compilation_preserves_provider_diagnostics_for_case_insensitive_regex_operations(
+        PortableQueryOperation operation)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            operations: new HashSet<PortableQueryOperation> { operation });
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new MongoDbPhysicalDocumentStore(
+            new MongoClient("mongodb://localhost").GetDatabase("groundwork_provider_diagnostic"),
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Contains(operation.ToString(), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("regular-expression semantics", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -909,6 +1135,145 @@ public sealed class MongoDbPhysicalStorageModelTests
             new HashSet<string>(),
             []));
     }
+
+    private static MongoDbPhysicalStorageModel IdentityModel(
+        PortableQueryOperation operation = PortableQueryOperation.Equal,
+        bool includeMutation = false)
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-id",
+            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-id",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { operation },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            includeMutation ? BoundedQueryExecutionClass.ScaleBearing : BoundedQueryExecutionClass.Ordinary);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "identity_entities",
+            [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        ..(operation == PortableQueryOperation.Equal
+                            ? new[]
+                            {
+                                new PhysicalIndexColumnDefinition("id_lookup_key", 0),
+                                new PhysicalIndexColumnDefinition("id_comparison_key", 1)
+                            }
+                            : [new PhysicalIndexColumnDefinition("id_comparison_key", 0)])
+                    ])
+            ]);
+        var unit = Unit("configurationDocument", definition) with
+        {
+            IdentityPolicy = IdentityPolicy.StringId(
+                stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            Tenancy = TenancyPolicy.Global,
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query],
+                boundedMutations: includeMutation
+                    ? [new BoundedMutationDeclaration("delete-by-id", query.Identity, BoundedMutationAction.Delete())]
+                    : [])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.identity-query"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
+
+    private static MongoDbPhysicalStorageModel CompoundIdentityContainsModel(bool includeMutation)
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-status-id",
+            [new IndexField("status"), new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-status-id",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Contains,
+                PortableQueryOperation.StartsWith
+            },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "status",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.StartsWith }),
+                new BoundedQueryPredicateField(
+                    PhysicalDocumentFieldPaths.Id,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains })
+            ]);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "compound_identity_entities",
+            [new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("status", 0),
+                        new PhysicalIndexColumnDefinition("id_comparison_key", 1)
+                    ])
+            ]);
+        var unit = Unit("configurationDocument", definition) with
+        {
+            IdentityPolicy = IdentityPolicy.StringId(
+                stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            Tenancy = TenancyPolicy.Global,
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query],
+                boundedMutations: includeMutation
+                    ? [new BoundedMutationDeclaration("delete-by-status-id", query.Identity, BoundedMutationAction.Delete())]
+                    : [])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.compound-identity-diagnostic"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
+
+    private static DocumentQuery IdentityQuery(
+        string id,
+        PortableQueryOperation operation = PortableQueryOperation.Equal) => new(
+        "configurationDocument",
+        "find-by-id",
+        [DocumentQueryClause.Of(new DocumentQueryComparison(
+            PhysicalDocumentFieldPaths.Id,
+            operation switch
+            {
+                PortableQueryOperation.Equal => QueryComparisonOperator.Equal,
+                PortableQueryOperation.GreaterThan => QueryComparisonOperator.GreaterThan,
+                PortableQueryOperation.StartsWith => QueryComparisonOperator.StartsWith,
+                _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
+            },
+            [id]))]);
+
+    private static BsonDocument Render(FilterDefinition<BsonDocument> filter) => filter.Render(
+        new RenderArgs<BsonDocument>(BsonDocumentSerializer.Instance, BsonSerializer.SerializerRegistry));
 
     private class FailingSessionProxy : DispatchProxy
     {

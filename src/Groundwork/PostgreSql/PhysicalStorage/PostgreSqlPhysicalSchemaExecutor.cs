@@ -46,7 +46,8 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
     public override string EnvelopeType(RelationalEnvelopeColumnKind kind) => kind switch
     {
         RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.StorageScope or
-            RelationalEnvelopeColumnKind.Id or RelationalEnvelopeColumnKind.SchemaVersion or
+            RelationalEnvelopeColumnKind.Id or RelationalEnvelopeColumnKind.IdentityComparison or
+            RelationalEnvelopeColumnKind.IdentityLookup or RelationalEnvelopeColumnKind.SchemaVersion or
             RelationalEnvelopeColumnKind.CanonicalJson or RelationalEnvelopeColumnKind.Timestamp => "text",
         RelationalEnvelopeColumnKind.Version => "bigint",
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
@@ -55,7 +56,8 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
     public override string? EnvelopeCollation(RelationalEnvelopeColumnKind kind) => kind switch
     {
         RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.StorageScope or
-            RelationalEnvelopeColumnKind.Id or RelationalEnvelopeColumnKind.SchemaVersion or
+            RelationalEnvelopeColumnKind.Id or RelationalEnvelopeColumnKind.IdentityComparison or
+            RelationalEnvelopeColumnKind.IdentityLookup or RelationalEnvelopeColumnKind.SchemaVersion or
             RelationalEnvelopeColumnKind.Timestamp => "C",
         _ => null
     };

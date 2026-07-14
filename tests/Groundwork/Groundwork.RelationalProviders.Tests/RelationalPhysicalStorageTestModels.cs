@@ -35,7 +35,8 @@ internal static class RelationalPhysicalStorageTestModels
         bool categoryNullable = false,
         string documentKind = "configurationDocument",
         Func<PhysicalNameContext, string>? namePolicy = null,
-        RelationalMutationScenarioOptions? mutationOptions = null)
+        RelationalMutationScenarioOptions? mutationOptions = null,
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
     {
         mutationOptions ??= new RelationalMutationScenarioOptions();
         var typedTransitions = mutationOptions.TypedTransitions ?? new RelationalTypedTransitionTestOptions();
@@ -251,6 +252,7 @@ internal static class RelationalPhysicalStorageTestModels
                 template.StorageUnits.Single() with
                 {
                     Identity = new StorageUnitIdentity(documentKind),
+                    IdentityPolicy = IdentityPolicy.StringId(stringCasePolicy: stringCasePolicy),
                     Tenancy = scoped ? TenancyPolicy.Scoped : TenancyPolicy.Global,
                     PhysicalStorage = new StorageUnitPhysicalStorage(
                         StorageUnitProvisioningMode.Declared,

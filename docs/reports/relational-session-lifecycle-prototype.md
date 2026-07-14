@@ -14,7 +14,7 @@ Adopt `RelationalSessionFactory` as the provider-neutral relational lifecycle se
 - An explicit unit of work owns one connection and one transaction until commit, rollback, failed commit, or disposal.
 - SQL Server and PostgreSQL use `RelationalSessionFactory.Concurrent` and therefore have no Groundwork-wide serialization gate.
 - SQLite uses `RelationalSessionFactory.Serialized`. It still receives an owned connection per operation, but Groundwork admits only one operation at a time for the store instance.
-- Private SQLite in-memory databases cannot support per-operation ownership because every connection sees a different database. Stateless SQLite constructors reject that configuration and direct callers to the existing direct-connection constructor, whose serialization and lifetime are explicit.
+- Private SQLite in-memory databases cannot support per-operation ownership because every connection sees a different database. The stateless SQLite factory rejects that configuration; development and test callers that intentionally retain an in-memory connection use the public connection-taking factory overload so materialization and identity-schema admission still precede store construction.
 
 The interface is deliberately small: create concurrent or serialized factories, execute one independent operation, obtain an autonomous transactional executor for operational stores, or begin one explicit unit of work. Connection opening, cancellation cleanup, rollback-on-dispose, transaction disposal, connection disposal, and SQLite gate release remain inside the module.
 
@@ -32,7 +32,7 @@ This made SQL Server and PostgreSQL concurrency measurements unrepresentative an
 
 ## Prototype behavior and evidence
 
-The relational document facade now has a session-factory constructor while retaining the direct-connection constructor as a compatibility path. SQLite, SQL Server, and PostgreSQL expose connection-string constructors that select the correct policy. The relational operational facade and SQLite operational adapter expose the same stateless path.
+The relational document implementation has internal connection and session-factory construction seams used by the built-in provider adapters. Public callers acquire admitted SQLite, SQL Server, and PostgreSQL stores through provider factories, which select the provider session policy and complete materialization and identity-schema admission before returning a store. The relational operational facade and SQLite operational adapter expose the same stateless lifecycle pattern.
 
 The conventional SQLite, SQL Server, and PostgreSQL document-store factories now use that lifecycle
 as well. Each factory materializes through a short-lived owned connection, disposes it before
@@ -66,7 +66,12 @@ Keep `RelationalSessionFactory` in `Groundwork.Provider.Relational` as the lifec
 - SQL Server: concurrent factory over `SqlConnection`.
 - PostgreSQL: concurrent factory over `NpgsqlConnection`.
 - SQLite file database: serialized factory over `SqliteConnection`.
-- SQLite private in-memory database: explicitly retained direct connection, limited to development/test scenarios. The provider's session-factory injection seam is internal so public callers cannot bypass this policy or select concurrent SQLite access.
+- SQLite private in-memory database: explicitly retained connection passed to `SqliteDocumentStoreFactory.CreateAsync(SqliteConnection, ...)`, limited to development/test scenarios. The provider's construction and session-factory seams remain internal so callers cannot bypass schema admission or select concurrent SQLite access.
+
+`RelationalDocumentStore` inheritance is not a public provider-extension seam. External adapters implement
+`IDocumentStore` and expose a provider-owned factory that validates the manifest, materializes the required
+schema, admits durable identity semantics, and only then returns the adapter. Reusing the built-in relational
+implementation is reserved for the provider assemblies shipped and conformance-tested with Groundwork.
 
 Provider-facing registration should eventually accept an async connection/session source so future providers can use native data sources (`NpgsqlDataSource`, for example) without changing document or operational contracts. Do not expose provider pools, gates, or ambient transactions to feature modules.
 
@@ -79,11 +84,12 @@ stateless facade. `CreateAsync` now returns the concrete provider store directly
 `.Store`, `await using`, and handle disposal. This is an intentional pre-1.0 source break; a
 source-compatible connection property could only expose a closed or unrelated connection.
 
-Direct-connection constructors remain available as an explicit retained compatibility path and for
-private SQLite in-memory tests/development. They remain single-connection and serialized. Future
-work may add provider-native async sources and separately obsolete retained relational
-constructors. Session/pool diagnostics required by ADR 0003 also remain a provider-conformance
-follow-up.
+Direct store constructors are intentionally internal in this greenfield release because they could expose a
+store before durable identity-schema admission. SQLite retains the explicit-connection development/test path
+through its connection-taking factory overload; SQL Server and PostgreSQL use their stateless public factories.
+This supersedes the earlier prototype note that promised public direct constructors. Future work may add
+provider-native async sources behind admitted factories. Session/pool diagnostics required by ADR 0003 remain
+a provider-conformance follow-up.
 
 No consuming `IDocumentStore`, `IDocumentUnitOfWork`, `IOperationalSessionFactory`, or operational-store interface changes are required.
 

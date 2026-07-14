@@ -1,5 +1,6 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -59,18 +60,83 @@ public sealed record ExecutableScopeKeyRoute(
     public bool UsesGlobalSentinel => Policy == StorageScopePolicy.Global;
 }
 
+public sealed record ExecutableDocumentIdentityRoute(
+    StringIdentityCasePolicy StringCasePolicy,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId,
+    ExecutableColumnRoute OriginalId,
+    ExecutableColumnRoute ComparisonKey,
+    ExecutableColumnRoute LookupKey)
+{
+    public PortableStringIdentityProjection Project(string originalId)
+    {
+        return Project(
+            StringCasePolicy,
+            ComparisonAlgorithmId,
+            LookupAlgorithmId,
+            originalId);
+    }
+
+    internal void EnsureSupportedAlgorithms()
+    {
+        EnsureSupportedAlgorithms(StringCasePolicy, ComparisonAlgorithmId, LookupAlgorithmId);
+    }
+
+    internal static PortableStringIdentityProjection Project(
+        StringIdentityCasePolicy stringCasePolicy,
+        string comparisonAlgorithmId,
+        string lookupAlgorithmId,
+        string originalId)
+    {
+        EnsureSupportedAlgorithms(stringCasePolicy, comparisonAlgorithmId, lookupAlgorithmId);
+        PortableStringComparison.ValidateIdentity(originalId);
+        return PortableStringComparison.ProjectIdentity(
+            originalId,
+            ToPortableComparisonPolicy(stringCasePolicy));
+    }
+
+    private static void EnsureSupportedAlgorithms(
+        StringIdentityCasePolicy stringCasePolicy,
+        string comparisonAlgorithmId,
+        string lookupAlgorithmId)
+    {
+        var portablePolicy = ToPortableComparisonPolicy(stringCasePolicy);
+        var expectedComparison = PortableStringComparison.GetAlgorithmId(portablePolicy);
+        if (!string.Equals(comparisonAlgorithmId, expectedComparison, StringComparison.Ordinal) ||
+            !string.Equals(lookupAlgorithmId, PortableStringComparison.LookupHashAlgorithmId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The executable identity route contains an unsupported comparison or lookup algorithm.");
+        }
+    }
+
+    internal static PortableStringComparisonPolicy ToPortableComparisonPolicy(
+        StringIdentityCasePolicy policy) => policy switch
+        {
+            StringIdentityCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+            StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
+            _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+        };
+}
+
 public sealed record ExecutableDocumentEnvelopeRoute(
-    ExecutableColumnRoute Id,
+    ExecutableDocumentIdentityRoute Identity,
     ExecutableColumnRoute DocumentKind,
     ExecutableColumnRoute StorageScope,
     ExecutableColumnRoute Version,
     ExecutableColumnRoute SchemaVersion,
-    ExecutableColumnRoute CanonicalJson);
+    ExecutableColumnRoute CanonicalJson)
+{
+    public ExecutableColumnRoute Id => Identity.OriginalId;
+}
 
 public sealed record ExecutableLinkedRelationshipRoute(
-    ExecutableColumnRoute DocumentId,
+    ExecutableDocumentIdentityRoute Identity,
     ExecutableColumnRoute DocumentKind,
-    ExecutableColumnRoute StorageScope);
+    ExecutableColumnRoute StorageScope)
+{
+    public ExecutableColumnRoute DocumentId => Identity.OriginalId;
+}
 
 public sealed class ExecutableKeyRoute : IEquatable<ExecutableKeyRoute>
 {
@@ -353,6 +419,28 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
             CapabilityRequirements,
             DefinitionFingerprint,
             fingerprint);
+
+    internal void EnsureSupportedIdentityAlgorithms()
+    {
+        Envelope.Identity.EnsureSupportedAlgorithms();
+        if (LinkedRelationship is null)
+            return;
+
+        LinkedRelationship.Identity.EnsureSupportedAlgorithms();
+        if (LinkedRelationship.Identity.StringCasePolicy != Envelope.Identity.StringCasePolicy ||
+            !string.Equals(
+                LinkedRelationship.Identity.ComparisonAlgorithmId,
+                Envelope.Identity.ComparisonAlgorithmId,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                LinkedRelationship.Identity.LookupAlgorithmId,
+                Envelope.Identity.LookupAlgorithmId,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The executable primary and linked identity routes do not use the same identity policy and algorithms.");
+        }
+    }
 
     public bool Equals(ExecutableStorageRoute? other) =>
         other is not null &&

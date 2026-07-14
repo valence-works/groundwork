@@ -7,6 +7,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Queries;
 using Groundwork.Core.Scoping;
+using Groundwork.Core.Text;
 using Groundwork.Core.Validation;
 
 namespace Groundwork.Core.PhysicalStorage;
@@ -195,6 +196,86 @@ public sealed record PhysicalQueryScope(
     bool IsMandatory,
     bool UsesGlobalSentinel);
 
+public static class PhysicalDocumentIdentityFieldPaths
+{
+    public const string Original = "id.original";
+    public const string Comparison = "id.comparison";
+    public const string Lookup = "id.lookup";
+}
+
+public abstract record PhysicalQueryIdentityValue
+{
+    private PhysicalQueryIdentityValue(string comparisonKey)
+    {
+        ComparisonKey = comparisonKey ?? throw new ArgumentNullException(nameof(comparisonKey));
+    }
+
+    public string ComparisonKey { get; }
+
+    public sealed record Exact : PhysicalQueryIdentityValue
+    {
+        public Exact(string comparisonKey, string lookupKey)
+            : base(comparisonKey)
+        {
+            LookupKey = lookupKey ?? throw new ArgumentNullException(nameof(lookupKey));
+        }
+
+        public string LookupKey { get; }
+    }
+
+    public sealed record Ordered : PhysicalQueryIdentityValue
+    {
+        public Ordered(string comparisonKey)
+            : base(comparisonKey)
+        {
+        }
+    }
+}
+
+/// <summary>
+/// Owns provider-neutral document-identity projection and the exact physical evidence selected by
+/// one compiled query plan. Provider adapters consume these fields and values without reapplying
+/// the manifest's case policy.
+/// </summary>
+public sealed record PhysicalQueryDocumentIdentityBinding(
+    StringIdentityCasePolicy StringCasePolicy,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId,
+    PhysicalQueryField Original,
+    PhysicalQueryField Comparison,
+    PhysicalQueryField Lookup)
+{
+    public PortableStringIdentityProjection Project(string originalId) =>
+        ExecutableDocumentIdentityRoute.Project(
+            StringCasePolicy,
+            ComparisonAlgorithmId,
+            LookupAlgorithmId,
+            originalId);
+
+    public PhysicalQueryIdentityValue Bind(PortableQueryOperation operation, string originalId)
+    {
+        ArgumentNullException.ThrowIfNull(originalId);
+        var projection = Project(originalId);
+        return operation switch
+        {
+            PortableQueryOperation.Equal or
+                PortableQueryOperation.In or
+                PortableQueryOperation.NotEqual => new PhysicalQueryIdentityValue.Exact(
+                    projection.ComparisonKey,
+                    projection.LookupKey),
+            PortableQueryOperation.StartsWith or
+                PortableQueryOperation.GreaterThan or
+                PortableQueryOperation.GreaterThanOrEqual or
+                PortableQueryOperation.LessThan or
+                PortableQueryOperation.LessThanOrEqual => new PhysicalQueryIdentityValue.Ordered(
+                    projection.ComparisonKey),
+            PortableQueryOperation.Contains => throw new NotSupportedException(
+                "Document identity does not support Contains because no bounded identity projection preserves substring semantics."),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
+        };
+    }
+}
+
 public sealed record PhysicalQueryPredicate(
     string Path,
     PhysicalQueryField Field,
@@ -240,6 +321,7 @@ public sealed class PhysicalQueryPlan : IEquatable<PhysicalQueryPlan>
         ProviderPhysicalObjectName? indexName,
         PhysicalQueryScope scope,
         PhysicalQueryField discriminator,
+        PhysicalQueryDocumentIdentityBinding documentIdentity,
         IReadOnlyList<PhysicalQueryPredicate> predicates,
         IReadOnlyList<PhysicalQueryOrder> order,
         IReadOnlyList<string> requiredEqualityPrefixPaths,
@@ -265,8 +347,22 @@ public sealed class PhysicalQueryPlan : IEquatable<PhysicalQueryPlan>
         IndexName = indexName;
         Scope = scope;
         Discriminator = discriminator;
+        DocumentIdentity = documentIdentity;
         Predicates = Array.AsReadOnly(predicates.ToArray());
         Order = Array.AsReadOnly(order.ToArray());
+        RequiredFields = Array.AsReadOnly(
+            new[]
+                {
+                    Scope.Field,
+                    Discriminator,
+                    DocumentIdentity.Original,
+                    DocumentIdentity.Comparison,
+                    DocumentIdentity.Lookup
+                }
+                .Concat(Predicates.Select(predicate => predicate.Field))
+                .Concat(Order.Select(item => item.Field))
+                .Distinct()
+                .ToArray());
         RequiredEqualityPrefixPaths = Array.AsReadOnly(requiredEqualityPrefixPaths.ToArray());
         PagingSupport = pagingSupport;
         ResultOperations = resultOperations.ToFrozenSet();
@@ -291,8 +387,10 @@ public sealed class PhysicalQueryPlan : IEquatable<PhysicalQueryPlan>
     public ProviderPhysicalObjectName? IndexName { get; }
     public PhysicalQueryScope Scope { get; }
     public PhysicalQueryField Discriminator { get; }
+    public PhysicalQueryDocumentIdentityBinding DocumentIdentity { get; }
     public IReadOnlyList<PhysicalQueryPredicate> Predicates { get; }
     public IReadOnlyList<PhysicalQueryOrder> Order { get; }
+    public IReadOnlyList<PhysicalQueryField> RequiredFields { get; }
     public IReadOnlyList<string> RequiredEqualityPrefixPaths { get; }
     public QueryPagingSupport PagingSupport { get; }
     public IReadOnlySet<BoundedQueryResultOperation> ResultOperations { get; }
@@ -318,6 +416,7 @@ public sealed class PhysicalQueryPlan : IEquatable<PhysicalQueryPlan>
             IndexName,
             Scope,
             Discriminator,
+            DocumentIdentity,
             Predicates,
             Order,
             RequiredEqualityPrefixPaths,
@@ -345,6 +444,7 @@ public sealed class PhysicalQueryPlan : IEquatable<PhysicalQueryPlan>
         IndexName == other.IndexName &&
         Scope == other.Scope &&
         Discriminator == other.Discriminator &&
+        DocumentIdentity == other.DocumentIdentity &&
         Predicates.SequenceEqual(other.Predicates) &&
         Order.SequenceEqual(other.Order) &&
         RequiredEqualityPrefixPaths.SequenceEqual(other.RequiredEqualityPrefixPaths) &&
@@ -416,6 +516,15 @@ public static class PhysicalQueryPlanSerializer
             writer.WriteBoolean("scopeMandatory", plan.Scope.IsMandatory);
             writer.WriteBoolean("globalSentinel", plan.Scope.UsesGlobalSentinel);
             WriteField(writer, "discriminator", plan.Discriminator);
+            writer.WritePropertyName("documentIdentity");
+            writer.WriteStartObject();
+            writer.WriteString("stringCasePolicy", plan.DocumentIdentity.StringCasePolicy.ToString());
+            writer.WriteString("comparisonAlgorithm", plan.DocumentIdentity.ComparisonAlgorithmId);
+            writer.WriteString("lookupAlgorithm", plan.DocumentIdentity.LookupAlgorithmId);
+            WriteField(writer, "original", plan.DocumentIdentity.Original);
+            WriteField(writer, "comparison", plan.DocumentIdentity.Comparison);
+            WriteField(writer, "lookup", plan.DocumentIdentity.Lookup);
+            writer.WriteEndObject();
             writer.WritePropertyName("predicates");
             writer.WriteStartArray();
             foreach (var predicate in plan.Predicates)

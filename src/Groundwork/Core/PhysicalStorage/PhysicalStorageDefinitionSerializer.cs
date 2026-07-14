@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.Text;
 
 namespace Groundwork.Core.PhysicalStorage;
 
@@ -32,6 +34,7 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WriteString("storageUnit", resolved.StorageUnit.Value);
             writer.WriteString("provisioningMode", resolved.ProvisioningMode.ToString());
             writer.WriteString("scopePolicy", resolved.ScopePolicy.ToString());
+            WriteIdentityPolicy(writer, resolved.IdentityPolicy);
             WriteDefinition(writer, resolved.Definition);
             if (resolved.SharedStorageDefinition is not null)
                 WriteSharedStorageDefinition(writer, resolved.SharedStorageDefinition);
@@ -117,6 +120,8 @@ public static class PhysicalStorageDefinitionSerializer
             writer.WritePropertyName("linkedKey");
             writer.WriteStartObject();
             writer.WriteString("documentId", definition.LinkedKey.DocumentIdColumn);
+            writer.WriteString("documentIdComparisonKey", definition.LinkedKey.DocumentIdComparisonKeyColumn);
+            writer.WriteString("documentIdLookupKey", definition.LinkedKey.DocumentIdLookupKeyColumn);
             writer.WriteString("documentKind", definition.LinkedKey.DocumentKindColumn);
             writer.WriteString("storageScope", definition.LinkedKey.StorageScopeColumn);
             writer.WriteEndObject();
@@ -124,17 +129,7 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteNumber("schemaVersion", definition.SchemaVersion);
         WriteEvolution(writer, definition.Evolution);
         if (definition.Envelope is not null)
-        {
-            writer.WritePropertyName("envelope");
-            writer.WriteStartObject();
-            writer.WriteString("id", definition.Envelope.IdColumn);
-            writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-            writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
-            writer.WriteString("version", definition.Envelope.VersionColumn);
-            writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
-            writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
-            writer.WriteEndObject();
-        }
+            WriteEnvelopeDefinition(writer, definition.Envelope);
 
         writer.WritePropertyName("projectedColumns");
         writer.WriteStartArray();
@@ -192,16 +187,38 @@ public static class PhysicalStorageDefinitionSerializer
         writer.WriteString("binding", definition.Binding.Value);
         writer.WriteString("featureDefaultLogicalName", definition.FeatureDefaultLogicalName);
         writer.WriteNumber("schemaVersion", definition.SchemaVersion);
+        WriteEnvelopeDefinition(writer, definition.Envelope);
+        WriteEvolution(writer, definition.Evolution);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteEnvelopeDefinition(
+        Utf8JsonWriter writer,
+        DocumentEnvelopeDefinition envelope)
+    {
         writer.WritePropertyName("envelope");
         writer.WriteStartObject();
-        writer.WriteString("id", definition.Envelope.IdColumn);
-        writer.WriteString("documentKind", definition.Envelope.DocumentKindColumn);
-        writer.WriteString("storageScope", definition.Envelope.StorageScopeColumn);
-        writer.WriteString("version", definition.Envelope.VersionColumn);
-        writer.WriteString("schemaVersion", definition.Envelope.SchemaVersionColumn);
-        writer.WriteString("canonicalJson", definition.Envelope.CanonicalJsonColumn);
+        writer.WriteString("id", envelope.IdColumn);
+        writer.WriteString("idComparisonKey", envelope.IdComparisonKeyColumn);
+        writer.WriteString("idLookupKey", envelope.IdLookupKeyColumn);
+        writer.WriteString("documentKind", envelope.DocumentKindColumn);
+        writer.WriteString("storageScope", envelope.StorageScopeColumn);
+        writer.WriteString("version", envelope.VersionColumn);
+        writer.WriteString("schemaVersion", envelope.SchemaVersionColumn);
+        writer.WriteString("canonicalJson", envelope.CanonicalJsonColumn);
         writer.WriteEndObject();
-        WriteEvolution(writer, definition.Evolution);
+    }
+
+    private static void WriteIdentityPolicy(Utf8JsonWriter writer, IdentityPolicy policy)
+    {
+        var portablePolicy = PortableStringComparison.ForIdentityPolicy(policy.StringCasePolicy);
+        writer.WritePropertyName("identityPolicy");
+        writer.WriteStartObject();
+        writer.WriteString("kind", policy.Kind.ToString());
+        writer.WriteString("fieldName", policy.FieldName);
+        writer.WriteString("stringCasePolicy", policy.StringCasePolicy.ToString());
+        writer.WriteString("comparisonAlgorithm", PortableStringComparison.GetAlgorithmId(portablePolicy));
+        writer.WriteString("lookupAlgorithm", PortableStringComparison.LookupHashAlgorithmId);
         writer.WriteEndObject();
     }
 

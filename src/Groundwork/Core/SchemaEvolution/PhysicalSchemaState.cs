@@ -21,6 +21,18 @@ public sealed class PhysicalSchemaTarget
         Routes = Array.AsReadOnly(routes?
             .OrderBy(route => route.StorageUnit.Value, StringComparer.Ordinal)
             .ToArray() ?? throw new ArgumentNullException(nameof(routes)));
+        try
+        {
+            foreach (var route in Routes)
+                route.EnsureSupportedIdentityAlgorithms();
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new ArgumentException(
+                "Physical schema targets require supported executable identity policies and algorithms.",
+                nameof(routes),
+                exception);
+        }
 
         var duplicate = Routes
             .GroupBy(route => route.StorageUnit.Value, StringComparer.Ordinal)
@@ -95,6 +107,51 @@ public sealed record PhysicalSchemaResolvedName(
     string Identifier,
     ExecutableStorageObjectRole Target);
 
+public sealed record DocumentIdentityColumnMapping(
+    ExecutableColumnRoute OriginalId,
+    ExecutableColumnRoute ComparisonKey,
+    ExecutableColumnRoute LookupKey);
+
+public sealed record DocumentIdentitySchemaState(
+    StringIdentityCasePolicy StringCasePolicy,
+    string ComparisonAlgorithmId,
+    string LookupAlgorithmId,
+    DocumentIdentityColumnMapping Primary,
+    DocumentIdentityColumnMapping? Linked)
+{
+    public bool Matches(ExecutableStorageRoute route)
+    {
+        ArgumentNullException.ThrowIfNull(route);
+        return this == Capture(route);
+    }
+
+    internal static DocumentIdentitySchemaState Capture(ExecutableStorageRoute route)
+    {
+        ArgumentNullException.ThrowIfNull(route);
+
+        var primary = route.Envelope.Identity;
+        var linked = route.LinkedRelationship?.Identity;
+        if (linked is not null &&
+            (linked.StringCasePolicy != primary.StringCasePolicy ||
+             !string.Equals(linked.ComparisonAlgorithmId, primary.ComparisonAlgorithmId, StringComparison.Ordinal) ||
+             !string.Equals(linked.LookupAlgorithmId, primary.LookupAlgorithmId, StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"Storage unit '{route.StorageUnit.Value}' has inconsistent primary and linked identity algorithms.");
+        }
+
+        return new DocumentIdentitySchemaState(
+            primary.StringCasePolicy,
+            primary.ComparisonAlgorithmId,
+            primary.LookupAlgorithmId,
+            Map(primary),
+            linked is null ? null : Map(linked));
+    }
+
+    private static DocumentIdentityColumnMapping Map(ExecutableDocumentIdentityRoute identity) =>
+        new(identity.OriginalId, identity.ComparisonKey, identity.LookupKey);
+}
+
 public sealed class AppliedStorageRouteSnapshot
 {
     internal AppliedStorageRouteSnapshot(
@@ -102,13 +159,15 @@ public sealed class AppliedStorageRouteSnapshot
         string definitionFingerprint,
         string routeFingerprint,
         IReadOnlyList<PhysicalSchemaResolvedName> resolvedNames,
-        string canonicalRouteJson)
+        string canonicalRouteJson,
+        DocumentIdentitySchemaState? identitySchemaState)
     {
         StorageUnit = storageUnit;
         DefinitionFingerprint = definitionFingerprint;
         RouteFingerprint = routeFingerprint;
         ResolvedNames = Array.AsReadOnly(resolvedNames.ToArray());
         CanonicalRouteJson = canonicalRouteJson;
+        IdentitySchemaState = identitySchemaState;
     }
 
     public StorageUnitIdentity StorageUnit { get; }
@@ -120,6 +179,8 @@ public sealed class AppliedStorageRouteSnapshot
     public IReadOnlyList<PhysicalSchemaResolvedName> ResolvedNames { get; }
 
     public string CanonicalRouteJson { get; }
+
+    public DocumentIdentitySchemaState? IdentitySchemaState { get; }
 }
 
 public sealed record AppliedSemanticOperationSnapshot(
@@ -142,7 +203,7 @@ public sealed class PhysicalSchemaAppliedSnapshot
         SemanticOperations = Array.AsReadOnly(semanticOperations.OrderBy(operation => operation.Identity, StringComparer.Ordinal).ToArray());
         ProviderDefinitions = Array.AsReadOnly(
             ProviderPhysicalSchemaDefinition.Canonicalize(providerDefinitions));
-        foreach (var route in Routes)
+        foreach (var route in Routes.Where(route => route.IdentitySchemaState is not null))
         {
             ExecutableStorageRouteSerializer.ValidateCanonicalSnapshot(
                 route.CanonicalRouteJson,
@@ -216,7 +277,10 @@ public sealed class PhysicalSchemaAppliedSnapshot
                         name.GetProperty("identifier").GetString()!,
                         Enum.Parse<ExecutableStorageObjectRole>(name.GetProperty("target").GetString()!)))
                     .ToArray(),
-                route.GetProperty("canonicalRoute").GetString()!))
+                route.GetProperty("canonicalRoute").GetString()!,
+                route.TryGetProperty("identitySchema", out var identitySchema)
+                    ? ReadIdentitySchemaState(identitySchema)
+                    : null))
             .ToArray();
         var operations = root.GetProperty("semanticOperations").EnumerateArray().Select(operation =>
         {
@@ -261,6 +325,11 @@ public sealed class PhysicalSchemaAppliedSnapshot
                 writer.WriteString("definitionFingerprint", route.DefinitionFingerprint);
                 writer.WriteString("routeFingerprint", route.RouteFingerprint);
                 writer.WriteString("canonicalRoute", route.CanonicalRouteJson);
+                if (route.IdentitySchemaState is not null)
+                {
+                    writer.WritePropertyName("identitySchema");
+                    WriteIdentitySchemaState(writer, route.IdentitySchemaState);
+                }
                 writer.WritePropertyName("resolvedNames");
                 writer.WriteStartArray();
                 foreach (var name in route.ResolvedNames
@@ -316,6 +385,68 @@ public sealed class PhysicalSchemaAppliedSnapshot
 
         return Encoding.UTF8.GetString(stream.ToArray());
     }
+
+    private static void WriteIdentitySchemaState(
+        Utf8JsonWriter writer,
+        DocumentIdentitySchemaState state)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("stringCasePolicy", state.StringCasePolicy.ToString());
+        writer.WriteString("comparisonAlgorithm", state.ComparisonAlgorithmId);
+        writer.WriteString("lookupAlgorithm", state.LookupAlgorithmId);
+        writer.WritePropertyName("primary");
+        WriteIdentityColumnMapping(writer, state.Primary);
+        writer.WritePropertyName("linked");
+        if (state.Linked is null)
+            writer.WriteNullValue();
+        else
+            WriteIdentityColumnMapping(writer, state.Linked);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteIdentityColumnMapping(
+        Utf8JsonWriter writer,
+        DocumentIdentityColumnMapping mapping)
+    {
+        writer.WriteStartObject();
+        writer.WritePropertyName("original");
+        WriteColumn(writer, mapping.OriginalId);
+        writer.WritePropertyName("comparisonKey");
+        WriteColumn(writer, mapping.ComparisonKey);
+        writer.WritePropertyName("lookupKey");
+        WriteColumn(writer, mapping.LookupKey);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteColumn(Utf8JsonWriter writer, ExecutableColumnRoute column)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("logicalName", column.LogicalName);
+        writer.WriteString("identifier", column.Identifier);
+        writer.WriteEndObject();
+    }
+
+    private static DocumentIdentitySchemaState ReadIdentitySchemaState(JsonElement element)
+    {
+        var linked = element.GetProperty("linked");
+        return new DocumentIdentitySchemaState(
+            Enum.Parse<StringIdentityCasePolicy>(element.GetProperty("stringCasePolicy").GetString()!),
+            element.GetProperty("comparisonAlgorithm").GetString()!,
+            element.GetProperty("lookupAlgorithm").GetString()!,
+            ReadIdentityColumnMapping(element.GetProperty("primary")),
+            linked.ValueKind == JsonValueKind.Null ? null : ReadIdentityColumnMapping(linked));
+    }
+
+    private static DocumentIdentityColumnMapping ReadIdentityColumnMapping(JsonElement element) =>
+        new(
+            ReadColumn(element.GetProperty("original")),
+            ReadColumn(element.GetProperty("comparisonKey")),
+            ReadColumn(element.GetProperty("lookupKey")));
+
+    private static ExecutableColumnRoute ReadColumn(JsonElement element) =>
+        new(
+            element.GetProperty("logicalName").GetString()!,
+            element.GetProperty("identifier").GetString()!);
 }
 
 public sealed record PhysicalSchemaAppliedOperation(

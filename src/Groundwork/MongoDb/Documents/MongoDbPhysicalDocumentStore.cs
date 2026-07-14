@@ -35,7 +35,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
     private readonly MongoDbTransactionCapability transactionCapability;
 
-    public MongoDbPhysicalDocumentStore(
+    internal MongoDbPhysicalDocumentStore(
         IMongoDatabase database,
         MongoDbPhysicalStorageModel model,
         DocumentStoreAccess access,
@@ -91,6 +91,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         return ExecuteAtomicAsync(
             [request.DocumentKind],
             session => SaveCoreAsync(request, route, scope, session, cancellationToken),
+            () => ClassifyDuplicateIdentityAsync(route, request.Id, scope.StorageKey!, cancellationToken),
             cancellationToken);
     }
 
@@ -115,6 +116,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         return ExecuteAtomicAsync(
             [request.DocumentKind],
             session => DeleteCoreAsync(request, route, scope, session, cancellationToken),
+            duplicateKeyResult: null,
             cancellationToken);
     }
 
@@ -243,13 +245,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private PhysicalQueryDocumentStore CreateQueryStore(ExecutableStorageRoute route)
     {
         var storage = model.StorageByStorageUnit[route.StorageUnit.Value];
-        ValidateScaleBearingOperations(storage);
-        ValidateTypedPaths(route, storage);
         var capabilities = Capabilities(route, storage);
         var plans = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
         if (!plans.IsValid)
             throw new InvalidOperationException(string.Join(Environment.NewLine, plans.Diagnostics.Select(x => $"{x.Code}: {x.Message}")));
 
+        ValidateScaleBearingOperations(storage);
+        ValidateTypedPaths(route, storage);
         var linkedPlans = plans.Plans.Where(plan => plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary).ToArray();
         var nativePlans = plans.Plans.Where(plan => plan.AccessKind != PhysicalQueryAccessKind.LinkedIndexThenPrimary).ToArray();
         var handlers = new IPhysicalDocumentQueryHandler[]
@@ -337,15 +339,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private static void ValidateScaleBearingOperations(StorageUnitPhysicalStorage storage)
     {
-        var nonIndexable = new HashSet<PortableQueryOperation>
-        {
-            PortableQueryOperation.Contains,
-            PortableQueryOperation.StartsWith
-        };
         foreach (var query in storage.BoundedQueries.Where(query =>
                      query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing))
         {
-            var unsupported = query.Operations.Intersect(nonIndexable).Order().ToArray();
+            var unsupported = MongoDbScaleBearingOperationValidation.UnsupportedOperations(storage, query);
             if (unsupported.Length == 0)
                 continue;
 
@@ -368,9 +365,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             plan.LookupObject,
             plan.PrimaryObject,
             plan.IndexName,
-            new[] { plan.Scope.Field, plan.Discriminator }
-                .Concat(plan.Predicates.Select(predicate => predicate.Field))
-                .Concat(plan.Order.Select(order => order.Field))
+            plan.RequiredFields
                 .GroupBy(field => field.Path, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.First().Identifier, StringComparer.Ordinal),
             plan.RouteFingerprint);
@@ -387,6 +382,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private async Task<DocumentStoreWriteResult> ExecuteAtomicAsync(
         IReadOnlyList<string> documentKinds,
         Func<IClientSessionHandle, Task<DocumentStoreWriteResult>> action,
+        Func<Task<DocumentStoreWriteResult>>? duplicateKeyResult,
         CancellationToken cancellationToken)
     {
         await transactionCapability.EnsureSupportedAsync(documentKinds, "physical storage", cancellationToken);
@@ -410,7 +406,9 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 IsDuplicateKey(exception))
             {
                 await AbortTransactionIgnoringFailureAsync(session);
-                return DocumentStoreWriteResult.ConcurrencyConflict;
+                return duplicateKeyResult is null
+                    ? DocumentStoreWriteResult.ConcurrencyConflict
+                    : await duplicateKeyResult();
             }
             catch (MongoException exception) when (
                 IsTransientTransactionConflict(exception) &&
@@ -564,6 +562,12 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         CancellationToken cancellationToken)
     {
         var current = await LoadDocumentAsync(route, request.Id, scope.StorageKey!, session, cancellationToken);
+        if (current is not null)
+        {
+            var authoritativeId = current[route.Envelope.Identity.OriginalId.Identifier].AsString;
+            if (!string.Equals(authoritativeId, request.Id, StringComparison.Ordinal))
+                return DocumentStoreWriteResult.IdentityConflict(authoritativeId);
+        }
         if (current is not null && request.ExpectedVersion is not null && current[route.Envelope.Version.Identifier].ToInt64() != request.ExpectedVersion)
             return DocumentStoreWriteResult.ConcurrencyConflict;
         if (current is null && request.ExpectedVersion is { } expected && expected != 0)
@@ -593,7 +597,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         }
         else
         {
-            var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
+            var filter = MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, request.Id, scope.StorageKey!);
             if (request.ExpectedVersion is not null)
                 filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
             var result = await primary.ReplaceOneAsync(session, filter, document, cancellationToken: cancellationToken);
@@ -617,25 +621,26 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         IClientSessionHandle session,
         CancellationToken cancellationToken)
     {
-        var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
+        var filter = MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, request.Id, scope.StorageKey!);
         if (request.ExpectedVersion is not null)
             filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
-        var result = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .DeleteOneAsync(session, filter, cancellationToken: cancellationToken);
-        if (result.DeletedCount == 0)
+        var deleted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .FindOneAndDeleteAsync(session, filter, cancellationToken: cancellationToken);
+        if (deleted is null)
         {
             var exists = await LoadDocumentAsync(route, request.Id, scope.StorageKey!, session, cancellationToken);
             return exists is null ? DocumentStoreWriteResult.NotFound : DocumentStoreWriteResult.ConcurrencyConflict;
         }
         if (route.LinkedIndexStorage is not null)
         {
-            var linkedFilter = Builders<BsonDocument>.Filter.Eq(route.LinkedRelationship!.DocumentId.Identifier, request.Id) &
-                               Builders<BsonDocument>.Filter.Eq(route.LinkedRelationship.StorageScope.Identifier, scope.StorageKey) &
-                               Builders<BsonDocument>.Filter.Eq(route.LinkedRelationship.DocumentKind.Identifier, route.Discriminator.Value);
+            var linkedFilter = MongoDbPhysicalDocumentIdentity.LinkedExactFilter(
+                route,
+                request.Id,
+                scope.StorageKey!);
             await database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier)
                 .DeleteOneAsync(session, linkedFilter, cancellationToken: cancellationToken);
         }
-        return DocumentStoreWriteResult.Deleted;
+        return DocumentStoreWriteResult.Deleted(deleted[route.Envelope.Id.Identifier].AsString);
     }
 
     private async Task<DocumentEnvelope?> LoadCoreAsync(
@@ -657,10 +662,46 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         CancellationToken cancellationToken)
     {
         var collection = database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier);
-        var filter = IdentityFilter(route, id, scope);
-        return session is null
+        var identity = route.Envelope.Identity.Project(id);
+        var filter = MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, identity, scope);
+        var exact = session is null
             ? await collection.Find(filter).SingleOrDefaultAsync(cancellationToken)
             : await collection.Find(session, filter).SingleOrDefaultAsync(cancellationToken);
+        if (exact is not null)
+            return exact;
+
+        var lookupFilter = MongoDbPhysicalDocumentIdentity.PrimaryLookupFilter(
+            route,
+            scope,
+            identity.LookupKey);
+        var retained = session is null
+            ? await collection.Find(lookupFilter).SingleOrDefaultAsync(cancellationToken)
+            : await collection.Find(session, lookupFilter).SingleOrDefaultAsync(cancellationToken);
+        if (retained is null)
+            return null;
+        MongoDbPhysicalDocumentIdentity.ThrowIfCollision(route, identity, retained);
+        throw new InvalidDataException(
+            $"MongoDB physical identity lookup for '{route.StorageUnit.Value}' returned inconsistent comparison evidence.");
+    }
+
+    private async Task<DocumentStoreWriteResult> ClassifyDuplicateIdentityAsync(
+        ExecutableStorageRoute route,
+        string requestedId,
+        string scope,
+        CancellationToken cancellationToken)
+    {
+        var requested = route.Envelope.Identity.Project(requestedId);
+        var retained = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
+            .Find(MongoDbPhysicalDocumentIdentity.PrimaryLookupFilter(route, scope, requested.LookupKey))
+            .SingleOrDefaultAsync(cancellationToken);
+        if (retained is null)
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+
+        MongoDbPhysicalDocumentIdentity.ThrowIfCollision(route, requested, retained);
+        var authoritativeId = retained[route.Envelope.Identity.OriginalId.Identifier].AsString;
+        return string.Equals(authoritativeId, requestedId, StringComparison.Ordinal)
+            ? DocumentStoreWriteResult.ConcurrencyConflict
+            : DocumentStoreWriteResult.IdentityConflict(authoritativeId);
     }
 
     private static BsonDocument CreatePrimary(
@@ -677,7 +718,6 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     {
         var document = new BsonDocument
         {
-            [route.Envelope.Id.Identifier] = request.Id,
             [route.Envelope.DocumentKind.Identifier] = route.Discriminator.Value,
             [route.Envelope.StorageScope.Identifier] = scope,
             [route.Envelope.Version.Identifier] = version,
@@ -688,6 +728,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             [CreatedField] = created.UtcDateTime,
             [UpdatedField] = updated.UtcDateTime
         };
+        MongoDbPhysicalDocumentIdentity.WritePrimary(document, route, request.Id);
         foreach (var projection in route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage))
         {
             var value = projectedValues[projection];
@@ -732,11 +773,6 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             new ReplaceOptions { IsUpsert = true },
             cancellationToken);
     }
-
-    private static FilterDefinition<BsonDocument> IdentityFilter(ExecutableStorageRoute route, string id, string scope) =>
-        Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, id) &
-        Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, scope) &
-        Builders<BsonDocument>.Filter.Eq(route.Discriminator.Column.Identifier, route.Discriminator.Value);
 
     internal static DocumentEnvelope ReadEnvelope(ExecutableStorageRoute route, BsonDocument document) =>
         new(
@@ -874,9 +910,9 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         {
             EnsureActive();
             scope.EnsureIncludes(request.DocumentKind);
+            var (route, selection) = store.ResolveOperation(request.DocumentKind, StorageScopeOperation.Save);
             try
             {
-                var (route, selection) = store.ResolveOperation(request.DocumentKind, StorageScopeOperation.Save);
                 var result = await store.SaveCoreAsync(request, route, selection, session, cancellationToken);
                 if (result.Status != DocumentStoreWriteStatus.Saved)
                     await AbortAsync(CancellationToken.None);
@@ -887,7 +923,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
                 (IsDuplicateKey(exception) || IsTransientTransactionConflict(exception)))
             {
                 await AbortAsync(CancellationToken.None);
-                return DocumentStoreWriteResult.ConcurrencyConflict;
+                return IsDuplicateKey(exception)
+                    ? await store.ClassifyDuplicateIdentityAsync(
+                        route,
+                        request.Id,
+                        selection.StorageKey!,
+                        cancellationToken)
+                    : DocumentStoreWriteResult.ConcurrencyConflict;
             }
             catch
             {
@@ -1192,6 +1234,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
                 Comparison(
                     comparison,
+                    plan,
                     plan.Predicates.Single(predicate => predicate.Path == comparison.Path).Field,
                     route))));
         }
@@ -1221,33 +1264,39 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     {
         if (linked.Count == 0) return [];
         var rel = route.LinkedRelationship!;
-        var keys = linked.Select(document => new BsonDocument
-        {
-            [route.Envelope.Id.Identifier] = document[rel.DocumentId.Identifier],
-            [route.Envelope.DocumentKind.Identifier] = document[rel.DocumentKind.Identifier],
-            [route.Envelope.StorageScope.Identifier] = document[rel.StorageScope.Identifier]
-        }).ToArray();
-        var filters = keys.Select(key => Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, key[route.Envelope.Id.Identifier]) &
-                                         Builders<BsonDocument>.Filter.Eq(route.Envelope.DocumentKind.Identifier, key[route.Envelope.DocumentKind.Identifier]) &
-                                         Builders<BsonDocument>.Filter.Eq(route.Envelope.StorageScope.Identifier, key[route.Envelope.StorageScope.Identifier]));
+        var filters = linked.Select(document =>
+            MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, document));
         await hooks.QueryPrimaryHydrationStarting(session, attempt, cancellationToken);
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .Find(session, Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);
-        var byKey = primary.ToDictionary(document => Key(document, route.Envelope.Id.Identifier, route.Envelope.StorageScope.Identifier));
-        return linked.Select(document => byKey[Key(document, rel.DocumentId.Identifier, rel.StorageScope.Identifier)])
+        var byKey = primary.ToDictionary(document => Key(
+            document,
+            route.Envelope.Identity,
+            route.Envelope.StorageScope));
+        return linked.Select(document => byKey[Key(document, rel.Identity, rel.StorageScope)])
             .Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
     }
 
-    private static DocumentIdentity Key(BsonDocument document, string id, string scope) =>
-        new(document[scope].AsString, document[id].AsString);
+    private static DocumentIdentity Key(
+        BsonDocument document,
+        ExecutableDocumentIdentityRoute identity,
+        ExecutableColumnRoute scope) =>
+        new(
+            document[scope.Identifier].AsString,
+            document[identity.LookupKey.Identifier].AsString,
+            document[identity.ComparisonKey.Identifier].AsString);
 
-    private readonly record struct DocumentIdentity(string Scope, string Id);
+    private readonly record struct DocumentIdentity(string Scope, string LookupKey, string ComparisonKey);
 
     private static FilterDefinition<BsonDocument> Comparison(
         DocumentQueryComparison comparison,
+        PhysicalQueryPlan plan,
         PhysicalQueryField queryField,
         ExecutableStorageRoute route)
     {
+        if (comparison.Path == PhysicalDocumentFieldPaths.Id)
+            return MongoDbPhysicalIdentityQuery.Build(comparison, plan);
+
         var field = queryField.Identifier;
         var projection = route.ProjectedColumns.SingleOrDefault(candidate =>
             candidate.Target == queryField.Target &&

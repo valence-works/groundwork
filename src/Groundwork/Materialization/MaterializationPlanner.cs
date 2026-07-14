@@ -102,7 +102,8 @@ public sealed class MaterializationPlanner
                     unit.IdentityPolicy.FieldName,
                     unit.Concurrency.TokenField,
                     "storage_scope",
-                    unit.Serialization.SchemaField)));
+                    unit.Serialization.SchemaField,
+                    unit.IdentityPolicy)));
 
             foreach (var index in unit.Indexes)
             {

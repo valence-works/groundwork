@@ -15,7 +15,9 @@ namespace Groundwork.MongoDb.Tests;
 /// </summary>
 public sealed class MongoDbAddedIndexBackfillTests : IAsyncLifetime
 {
-    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24").Build();
+    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24")
+        .WithReplicaSet("groundwork-added-index-rs")
+        .Build();
 
     public async Task InitializeAsync() => await container.StartAsync();
 

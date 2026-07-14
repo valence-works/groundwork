@@ -71,6 +71,37 @@ internal static class RelationalTestManifests
     public static ProviderIdentity SqlServerProvider { get; } = new("groundwork-sqlserver", "1.0.0");
     public static ProviderIdentity PostgreSqlProvider { get; } = new("groundwork-postgresql", "1.0.0");
 
+    public static StorageManifest UnicodeIdentityManifest()
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = IdentityPolicy.StringId(
+                        stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase)
+                }
+            ]
+        };
+    }
+
+    public static StorageManifest WithIdentityKind(StorageIdentityKind kind)
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = new IdentityPolicy(kind, "id")
+                }
+            ]
+        };
+    }
+
     public static StorageManifest ScopedManifest()
     {
         var manifest = MetadataManifest();

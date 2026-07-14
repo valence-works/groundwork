@@ -72,6 +72,8 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
     public override string EnvelopeType(RelationalEnvelopeColumnKind kind) => kind switch
     {
         RelationalEnvelopeColumnKind.DocumentKind or RelationalEnvelopeColumnKind.Id => "nvarchar(450)",
+        RelationalEnvelopeColumnKind.IdentityComparison => "varbinary(1350)",
+        RelationalEnvelopeColumnKind.IdentityLookup => "binary(32)",
         RelationalEnvelopeColumnKind.StorageScope => "nvarchar(128)",
         RelationalEnvelopeColumnKind.SchemaVersion => "nvarchar(100)",
         RelationalEnvelopeColumnKind.Version => "bigint",
@@ -82,7 +84,8 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
 
     public override string? EnvelopeCollation(RelationalEnvelopeColumnKind kind) => kind switch
     {
-        RelationalEnvelopeColumnKind.Version => null,
+        RelationalEnvelopeColumnKind.Version or RelationalEnvelopeColumnKind.IdentityComparison or
+            RelationalEnvelopeColumnKind.IdentityLookup => null,
         _ => "Latin1_General_100_BIN2"
     };
 
@@ -198,6 +201,21 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
         DateTimeOffset dateTime => dateTime.ToUniversalTime(),
         _ => value
     };
+
+    public override object ConvertDocumentIdentityOriginal(string value) =>
+        SqlServerDocumentIdentityEncoding.Original(value);
+
+    public override object ConvertDocumentIdentityComparison(string value) =>
+        SqlServerDocumentIdentityEncoding.Comparison(value);
+
+    public override object ConvertDocumentIdentityLookup(string value) =>
+        SqlServerDocumentIdentityEncoding.Lookup(value);
+
+    public override string ReadDocumentIdentityComparison(DbDataReader reader, int ordinal) =>
+        SqlServerDocumentIdentityEncoding.ReadComparison(reader.GetValue(ordinal));
+
+    public override bool PhysicalIdentityValueEquals(object retained, object expected) =>
+        SqlServerDocumentIdentityEncoding.ValueEquals(retained, expected);
 
     public override void Validate(ProjectedColumnDefinition definition)
     {

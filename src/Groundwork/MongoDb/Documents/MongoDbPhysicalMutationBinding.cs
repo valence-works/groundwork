@@ -52,7 +52,6 @@ internal sealed class MongoDbPhysicalMutationBinding
         StorageUnitPhysicalStorage storage,
         ProviderIdentity provider)
     {
-        MongoDbPhysicalMutationModelValidation.Validate(route, storage);
         var capabilities = MongoDbPhysicalMutationCapabilities.Create(route, storage, provider);
         var compilation = PhysicalMutationPlanCompiler.Compile(route, storage, capabilities);
         if (!compilation.IsValid)
@@ -62,6 +61,7 @@ internal sealed class MongoDbPhysicalMutationBinding
                 compilation.Diagnostics.Select(item => $"{item.Code}: {item.Message}")));
         }
 
+        MongoDbPhysicalMutationModelValidation.Validate(route, storage);
         return compilation.Plans
             .OrderBy(plan => plan.MutationIdentity, StringComparer.Ordinal)
             .Select(plan => new MongoDbPhysicalMutationBinding(
@@ -74,9 +74,7 @@ internal sealed class MongoDbPhysicalMutationBinding
 internal static class MongoDbPhysicalMutationCapabilities
 {
     public static IReadOnlySet<PortableQueryOperation> Operations { get; } =
-        Enum.GetValues<PortableQueryOperation>()
-            .Except([PortableQueryOperation.Contains, PortableQueryOperation.StartsWith])
-            .ToFrozenSet();
+        Enum.GetValues<PortableQueryOperation>().ToFrozenSet();
 
     public static PhysicalQueryPlannerCapabilities Create(
         ExecutableStorageRoute route,
@@ -137,21 +135,17 @@ internal static class MongoDbPhysicalMutationModelValidation
             .ToArray();
         foreach (var query in mutationQueries)
         {
-            var unsupported = query.Operations
-                .Where(operation => operation is
-                    PortableQueryOperation.Contains or PortableQueryOperation.StartsWith)
-                .Order()
-                .ToArray();
+            var logicalIndex = storage.LogicalIndexes.Single(index =>
+                index.Identity == query.IndexIdentity);
+            var unsupported = MongoDbScaleBearingOperationValidation.UnsupportedOperations(storage, query);
             if (unsupported.Length != 0)
             {
                 throw new InvalidOperationException(
-                    $"MongoDB cannot certify scale-bearing bounded mutation query '{query.Identity}' operations " +
+                    $"GW-QUERY-003: MongoDB cannot certify scale-bearing bounded mutation query '{query.Identity}' operations " +
                     $"{string.Join(", ", unsupported)} as indexed: case-insensitive regular-expression semantics " +
                     "cannot be served by the declared ordinary MongoDB B-tree index.");
             }
 
-            var logicalIndex = storage.LogicalIndexes.Single(index =>
-                index.Identity == query.IndexIdentity);
             foreach (var field in logicalIndex.Fields.Where(field =>
                          !PhysicalDocumentFieldPaths.IsEnvelope(field.Path)))
             {
@@ -178,6 +172,28 @@ internal static class MongoDbPhysicalMutationModelValidation
                 }
             }
         }
+    }
+}
+
+internal static class MongoDbScaleBearingOperationValidation
+{
+    public static PortableQueryOperation[] UnsupportedOperations(
+        StorageUnitPhysicalStorage storage,
+        BoundedQueryDeclaration query)
+    {
+        var logicalIndex = storage.LogicalIndexes.Single(index => index.Identity == query.IndexIdentity);
+        var predicates = query.PredicateFields.Count == 0
+            ? logicalIndex.Fields.Take(1)
+                .Select(field => new BoundedQueryPredicateField(field.Path, query.Operations))
+            : query.PredicateFields;
+        return predicates
+            .SelectMany(predicate => predicate.Operations.Select(operation => (predicate.Path, Operation: operation)))
+            .Where(item => item.Path != PhysicalDocumentFieldPaths.Id &&
+                           item.Operation is PortableQueryOperation.Contains or PortableQueryOperation.StartsWith)
+            .Select(item => item.Operation)
+            .Distinct()
+            .Order()
+            .ToArray();
     }
 }
 
@@ -258,14 +274,14 @@ internal sealed class MongoDbPhysicalMutationSchemaBinding
         var primary = MongoDbPhysicalMutationSelector.Create(
             route,
             logicalIndex,
-            query,
+            plan.Predicate,
             ExecutableStorageObjectRole.PrimaryStorage);
         var linked = route.LinkedIndexStorage is null
             ? null
             : MongoDbPhysicalMutationSelector.Create(
                 route,
                 logicalIndex,
-                query,
+                plan.Predicate,
                 ExecutableStorageObjectRole.LinkedIndexStorage);
         var transition = plan.Action as PhysicalTransitionMutationAction;
         return new MongoDbPhysicalMutationSchemaBinding(
@@ -414,13 +430,13 @@ internal sealed class MongoDbPhysicalMutationSelector
     public static MongoDbPhysicalMutationSelector Create(
         ExecutableStorageRoute route,
         LogicalIndexDeclaration logicalIndex,
-        BoundedQueryDeclaration query,
+        PhysicalQueryPlan query,
         ExecutableStorageObjectRole target)
     {
         var storageObject = target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.PrimaryStorage.Name
             : route.LinkedIndexStorage!.Name;
-        var indexName = MongoDbPhysicalMutationStorage.IndexName(route, query, target);
+        var indexName = MongoDbPhysicalMutationStorage.IndexName(route, query.LogicalIndexIdentity, target);
         var index = new ProviderPhysicalObjectName(
             PhysicalObjectKind.PhysicalIndex,
             indexName,
@@ -428,12 +444,18 @@ internal sealed class MongoDbPhysicalMutationSelector
             indexName,
             $"mongodb:{storageObject.Identifier}:indexes",
             route.StorageUnit);
-        var fields = logicalIndex.Fields.Select(field => new MongoDbPhysicalMutationMirrorField(
-            field.Path,
-            target == ExecutableStorageObjectRole.PrimaryStorage
-                ? MongoDbPhysicalMutationStorage.PrimaryField(route, field.Path)
-                : MongoDbPhysicalMutationStorage.LinkedField(route, field.Path),
-            logicalIndex.GetValueKind(field))).ToArray();
+        var fields = logicalIndex.Fields.SelectMany(field =>
+            field.Path == PhysicalDocumentFieldPaths.Id
+                ? IdentityFields(route, query, target)
+                :
+                [
+                    new MongoDbPhysicalMutationMirrorField(
+                        field.Path,
+                        target == ExecutableStorageObjectRole.PrimaryStorage
+                            ? MongoDbPhysicalMutationStorage.PrimaryField(route, field.Path)
+                            : MongoDbPhysicalMutationStorage.LinkedField(route, field.Path),
+                        logicalIndex.GetValueKind(field))
+                ]).ToArray();
         return new MongoDbPhysicalMutationSelector(
             logicalIndex.Identity,
             target,
@@ -448,6 +470,34 @@ internal sealed class MongoDbPhysicalMutationSelector
                 : route.LinkedRelationship!.StorageScope.Identifier,
             logicalIndex.MissingValueBehavior,
             fields);
+    }
+
+    private static IReadOnlyList<MongoDbPhysicalMutationMirrorField> IdentityFields(
+        ExecutableStorageRoute route,
+        PhysicalQueryPlan query,
+        ExecutableStorageObjectRole target)
+    {
+        var identity = target == ExecutableStorageObjectRole.PrimaryStorage
+            ? route.Envelope.Identity
+            : route.LinkedRelationship!.Identity;
+        var operations = query.Predicates.SingleOrDefault(predicate =>
+            predicate.Path == PhysicalDocumentFieldPaths.Id)?.Operations;
+        var fields = new List<MongoDbPhysicalMutationMirrorField>();
+        if (operations?.Any(operation => operation is
+                PortableQueryOperation.Equal or
+                PortableQueryOperation.In or
+                PortableQueryOperation.NotEqual) == true)
+        {
+            fields.Add(new MongoDbPhysicalMutationMirrorField(
+                PhysicalDocumentIdentityFieldPaths.Lookup,
+                identity.LookupKey.Identifier,
+                IndexValueKind.Keyword));
+        }
+        fields.Add(new MongoDbPhysicalMutationMirrorField(
+            PhysicalDocumentIdentityFieldPaths.Comparison,
+            identity.ComparisonKey.Identifier,
+            IndexValueKind.Keyword));
+        return fields;
     }
 
     public BsonDocument Serialize() => new()

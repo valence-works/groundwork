@@ -59,6 +59,22 @@ standalone equality comparison for every skipped prefix field; an absent prefix 
 a disjunction is rejected before dispatch. Every ordered plan appends the document identity as an
 ascending total-order tie-breaker.
 
+Every compiled plan also owns one document-identity binding for its selected primary, linked, or
+native source. The binding carries the original, comparison-key, and lookup-key fields plus the
+versioned projection algorithms. Equality, membership, and inequality bind lookup plus full
+comparison evidence; prefix and range operations bind the comparison key; identity ordering and
+the implicit identity tie-break use the comparison key. Identity substring matching is rejected
+during plan compilation. Provider handlers consume these fields and projected values and do not
+reapply the manifest's case policy.
+
+An explicit physical index certifies the evidence shape that execution actually consumes. Exact
+identity predicates require lookup-key-leading comparison-key evidence, while prefix and range
+predicates require comparison-key evidence only. An index over the retained original identity does
+not certify either projected shape. A scale-bearing declaration that mixes exact and ordered
+identity operations is rejected with an explicit unsupported-shape diagnostic; this work does not
+choose an automatic synthesized index order for that mixed demand, and automatic index synthesis
+otherwise remains unchanged.
+
 ## Isolation and failure rules
 
 Every plan contains a mandatory scope field and the scoped/global-sentinel policy compiled from the
