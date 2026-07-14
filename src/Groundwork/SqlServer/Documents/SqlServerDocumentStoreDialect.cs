@@ -1,11 +1,15 @@
 using System.Data.Common;
 using Groundwork.Relational.Documents;
+using Groundwork.SqlServer.PhysicalStorage;
 using Microsoft.Data.SqlClient;
 
 namespace Groundwork.SqlServer.Documents;
 
 internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDialect
 {
+    public override void ValidateDocumentIdentity(string value) =>
+        _ = SqlServerDocumentIdentityEncoding.Original(value);
+
     public override string ExactEqualityPredicate(string columnExpression, string parameterReference) =>
         $"{columnExpression}_key = {HashParameter(parameterReference)} AND {columnExpression} = {parameterReference}";
 

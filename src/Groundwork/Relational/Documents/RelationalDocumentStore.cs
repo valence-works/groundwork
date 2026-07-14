@@ -61,6 +61,8 @@ public class RelationalDocumentStore : IDocumentStore
 
     public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        dialect.ValidateDocumentIdentity(request.Id);
         var unit = GetUnit(request.DocumentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Save);
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
@@ -186,6 +188,7 @@ public class RelationalDocumentStore : IDocumentStore
 
     public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
     {
+        dialect.ValidateDocumentIdentity(id);
         var unit = GetUnit(documentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Load);
         var identity = identityBindings[documentKind];
@@ -205,6 +208,8 @@ public class RelationalDocumentStore : IDocumentStore
 
     public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        dialect.ValidateDocumentIdentity(request.Id);
         var unit = GetUnit(request.DocumentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Delete);
         return await ExecuteWithConnectionAsync(async (currentConnection, ct) =>
@@ -678,6 +683,8 @@ public class RelationalDocumentStore : IDocumentStore
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            ArgumentNullException.ThrowIfNull(request);
+            store.dialect.ValidateDocumentIdentity(request.Id);
             this.scope.EnsureIncludes(request.DocumentKind);
             try
             {
@@ -700,6 +707,8 @@ public class RelationalDocumentStore : IDocumentStore
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            ArgumentNullException.ThrowIfNull(request);
+            store.dialect.ValidateDocumentIdentity(request.Id);
             this.scope.EnsureIncludes(request.DocumentKind);
             try
             {
@@ -722,6 +731,7 @@ public class RelationalDocumentStore : IDocumentStore
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            store.dialect.ValidateDocumentIdentity(id);
             this.scope.EnsureIncludes(documentKind);
             var unit = store.GetUnit(documentKind);
             var scope = store.ResolveScope(unit, StorageScopeOperation.Load);
