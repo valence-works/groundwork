@@ -171,6 +171,82 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
             }));
         }
 
+        public async Task ReplaceIdentityLookupWithFilteredIndexAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                DROP INDEX ux_groundwork_documents_identity_lookup;
+                CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+                ON groundwork_documents(document_kind, storage_scope, id_lookup_key)
+                WHERE id_lookup_key = 'excluded-from-runtime';
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task PrepareLegacyIdentityRowsAsync(IReadOnlyList<string> ids)
+        {
+            await EnsureOpenAsync();
+            await using (var reset = connection.CreateCommand())
+            {
+                reset.CommandText = """
+                    DROP INDEX IF EXISTS ux_groundwork_documents_identity_lookup;
+                    DROP TABLE groundwork_document_identity_schema;
+                    ALTER TABLE groundwork_documents
+                        DROP COLUMN id_comparison_key,
+                        DROP COLUMN id_lookup_key;
+                    """;
+                await reset.ExecuteNonQueryAsync();
+            }
+
+            foreach (var id in ids)
+            {
+                await using var insert = connection.CreateCommand();
+                insert.CommandText = """
+                    INSERT INTO groundwork_documents
+                        (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
+                    VALUES
+                        ('configurationDocument', '__groundwork_global__', @id, '1', 1, '{"key":"legacy"}',
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                    """;
+                insert.Parameters.AddWithValue("@id", id);
+                await insert.ExecuteNonQueryAsync();
+            }
+        }
+
+        public async Task RemoveLegacyIdentityRowAsync(string id)
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM groundwork_documents WHERE id = @id;";
+            command.Parameters.AddWithValue("@id", id);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<int> CountIdentityProjectionColumnsAsync(bool requireNotNull)
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT COUNT(*)
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'groundwork_documents'
+                  AND column_name IN ('id_comparison_key', 'id_lookup_key')
+                  AND (@requireNotNull = FALSE OR is_nullable = 'NO');
+                """;
+            command.Parameters.AddWithValue("@requireNotNull", requireNotNull);
+            return Convert.ToInt32(await command.ExecuteScalarAsync());
+        }
+
+        public async Task<bool> IdentitySchemaExistsAsync()
+        {
+            await EnsureOpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT to_regclass('groundwork_document_identity_schema') IS NOT NULL;";
+            return (bool)(await command.ExecuteScalarAsync())!;
+        }
+
         public async Task ForceLookupCollisionAsync(string retainedId, string requestedId)
         {
             await EnsureOpenAsync();

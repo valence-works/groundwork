@@ -12,6 +12,28 @@ namespace Groundwork.RelationalProviders.Tests;
 
 public abstract class RelationalProviderContractTests
 {
+    [Theory]
+    [InlineData(StorageIdentityKind.Guid)]
+    [InlineData(StorageIdentityKind.Composite)]
+    public async Task NonStringIdentityKindsPreserveOrdinalProjection(StorageIdentityKind identityKind)
+    {
+        await using var harness = await CreateHarnessAsync(RelationalTestManifests.WithIdentityKind(identityKind));
+
+        var upper = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "A-B", "1", """{"key":"upper"}"""));
+        var lower = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "a-b", "1", """{"key":"lower"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, upper.Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, lower.Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "A-B", "1", """{"key":"updated"}""", ExpectedVersion: 1))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, (await harness.Store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument", "a-b", ExpectedVersion: 1))).Status);
+        Assert.Contains("updated", (await harness.Store.LoadAsync("configurationDocument", "A-B"))!.ContentJson);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", "a-b"));
+    }
+
     [Fact]
     public async Task UnicodeIdentityConflictPreservesAuthoritativeOriginal()
     {
@@ -247,6 +269,37 @@ public abstract class RelationalProviderContractTests
 
         Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
         Assert.Contains("identity schema", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task LegacyIdentityCollisionRollsBackAndReconciledRetryFinishesRequiredColumns()
+    {
+        await using var harness = await CreateHarnessAsync();
+        await harness.PrepareLegacyIdentityRowsAsync(["A", "a"]);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.ApplyManifestAsync(RelationalTestManifests.UnicodeIdentityManifest()));
+
+        Assert.Contains("collide", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, await harness.CountIdentityProjectionColumnsAsync(requireNotNull: false));
+        Assert.False(await harness.IdentitySchemaExistsAsync());
+
+        await harness.RemoveLegacyIdentityRowAsync("a");
+        var store = await harness.ApplyManifestAsync(RelationalTestManifests.UnicodeIdentityManifest());
+
+        Assert.Equal(2, await harness.CountIdentityProjectionColumnsAsync(requireNotNull: true));
+        Assert.Equal("A", (await store.LoadAsync("configurationDocument", "a"))!.Id);
+    }
+
+    [Fact]
+    public async Task MaterializationRejectsFilteredIdentityLookupIndex()
+    {
+        await using var harness = await CreateHarnessAsync();
+        await harness.ReplaceIdentityLookupWithFilteredIndexAsync();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.MaterializeAsync());
+
+        Assert.Contains("identity lookup index", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -635,5 +688,10 @@ public interface IRelationalProviderHarness : IAsyncDisposable
     Task<long> CountSchemaHistoryRowsAsync();
     Task<long> CountIdentitySchemaRowsAsync();
     Task ReAdmitIdentitySchemaConcurrentlyAsync();
+    Task ReplaceIdentityLookupWithFilteredIndexAsync();
+    Task PrepareLegacyIdentityRowsAsync(IReadOnlyList<string> ids);
+    Task RemoveLegacyIdentityRowAsync(string id);
+    Task<int> CountIdentityProjectionColumnsAsync(bool requireNotNull);
+    Task<bool> IdentitySchemaExistsAsync();
     Task ForceLookupCollisionAsync(string retainedId, string requestedId);
 }

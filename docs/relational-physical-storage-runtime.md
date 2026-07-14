@@ -84,10 +84,13 @@ numeric scale-bearing storage therefore requires an explicit physical table defi
 
 The reusable store accepts `RelationalSessionFactory`: autonomous calls own one pooled provider
 connection for the duration of that call, and explicit units of work own one connection and
-transaction until completion. SQLite's public connection-string facade selects the provider's
-serialized session policy and rejects private in-memory databases; the direct-connection constructor
-is retained for explicitly owned in-memory/test sessions. SQL Server and PostgreSQL can bind the same
-kernel to concurrent per-operation factories in #47 without introducing retained shared connections.
+transaction until completion. SQLite's public connection-string factory selects the provider's serialized
+session policy and rejects private in-memory databases; explicitly owned in-memory/test sessions use the
+connection-taking factory overload so schema and identity admission still run before construction. SQL Server
+and PostgreSQL bind the same kernel to concurrent per-operation factories without introducing retained shared
+connections. Store constructors and the reusable relational implementation seam are internal to the built-in,
+conformance-tested provider adapters; external providers implement `IDocumentStore` and expose their own
+admission-first factory.
 
 `RelationalPhysicalDocumentQueryHandler` executes `PhysicalQueryPlan` mappings server-side. Linked
 plans join to the primary envelope; primary and entity plans read it directly. Scope and

@@ -9,7 +9,9 @@ namespace Groundwork.MongoDb.Tests;
 
 public sealed class MongoDbGroundworkMaterializerTests : IAsyncLifetime
 {
-    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24").Build();
+    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24")
+        .WithReplicaSet("groundwork-materializer-rs")
+        .Build();
 
     public async Task InitializeAsync() => await container.StartAsync();
 

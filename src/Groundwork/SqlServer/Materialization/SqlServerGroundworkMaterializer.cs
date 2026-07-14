@@ -64,7 +64,7 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
     {
         await using var command = CreateCommand(
             """
-            SELECT i.is_unique, c.name
+            SELECT i.is_unique, i.has_filter, i.is_disabled, i.is_hypothetical, c.name
             FROM sys.indexes i
             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -75,14 +75,20 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
             """,
             transaction);
         var columns = new List<string>();
+        var exists = false;
         var unique = false;
+        var coversAllRows = true;
+        var usable = true;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
+            exists = true;
             unique = reader.GetBoolean(0);
-            columns.Add(reader.GetString(1));
+            coversAllRows = !reader.GetBoolean(1);
+            usable = !reader.GetBoolean(2) && !reader.GetBoolean(3);
+            columns.Add(reader.GetString(4));
         }
-        return new(unique, columns);
+        return new(exists, unique, columns, coversAllRows, usable);
     }
 
     protected override async Task AddIdentityColumnsAsync(

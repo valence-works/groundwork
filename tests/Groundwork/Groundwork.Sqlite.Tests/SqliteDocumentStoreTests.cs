@@ -121,6 +121,30 @@ public sealed class SqliteDocumentStoreTests
     }
 
     [Fact]
+    public async Task Materialization_rejects_partial_identity_lookup_index()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var manifest = SqliteTestManifests.MetadataManifest();
+        var materializer = new SqliteGroundworkMaterializer(connection);
+        await materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider);
+        await using (var replaceIndex = connection.CreateCommand())
+        {
+            replaceIndex.CommandText = """
+                DROP INDEX ux_groundwork_documents_identity_lookup;
+                CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+                ON groundwork_documents(document_kind, storage_scope, id_lookup_key)
+                WHERE id_lookup_key = 'excluded-from-runtime';
+                """;
+            await replaceIndex.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            materializer.MaterializeAsync(manifest, SqliteTestManifests.Provider));
+
+        Assert.Contains("identity lookup index", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Restart_validation_does_not_repair_rows_behind_recorded_identity_schema_state()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -172,6 +196,13 @@ public sealed class SqliteDocumentStoreTests
         var loaded = await store.LoadAsync("configurationDocument", "𐐨");
 
         Assert.Equal("𐐀", loaded!.Id);
+        await using var shape = connection.CreateCommand();
+        shape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key') AND "notnull" = 1;
+            """;
+        Assert.Equal(2L, (long)(await shape.ExecuteScalarAsync())!);
     }
 
     [Fact]
@@ -208,6 +239,23 @@ public sealed class SqliteDocumentStoreTests
         await using var state = connection.CreateCommand();
         state.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groundwork_document_identity_schema';";
         Assert.Equal(0L, (long)(await state.ExecuteScalarAsync())!);
+
+        await using (var reconcile = connection.CreateCommand())
+        {
+            reconcile.CommandText = "DELETE FROM groundwork_documents WHERE id = 'a';";
+            await reconcile.ExecuteNonQueryAsync();
+        }
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(
+            WithIdentityCasePolicy(StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            SqliteTestManifests.Provider);
+
+        await using var retryShape = connection.CreateCommand();
+        retryShape.CommandText = """
+            SELECT COUNT(*)
+            FROM pragma_table_info('groundwork_documents')
+            WHERE name IN ('id_comparison_key', 'id_lookup_key') AND "notnull" = 1;
+            """;
+        Assert.Equal(2L, (long)(await retryShape.ExecuteScalarAsync())!);
     }
 
     [Fact]

@@ -48,26 +48,36 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
     {
         await using var command = CreateCommand(
             """
-            SELECT i.indisunique, attribute.attname
+            SELECT i.indisunique,
+                   i.indpred IS NULL,
+                   i.indisvalid AND i.indisready,
+                   attribute.attname
             FROM pg_class table_class
             JOIN pg_index i ON i.indrelid = table_class.oid
             JOIN pg_class index_class ON index_class.oid = i.indexrelid
             JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinal) ON TRUE
-            JOIN pg_attribute attribute ON attribute.attrelid = table_class.oid AND attribute.attnum = key.attnum
+            LEFT JOIN pg_attribute attribute ON attribute.attrelid = table_class.oid AND attribute.attnum = key.attnum
             WHERE table_class.relname = 'groundwork_documents'
               AND index_class.relname = 'ux_groundwork_documents_identity_lookup'
             ORDER BY key.ordinal;
             """,
             transaction);
         var columns = new List<string>();
+        var exists = false;
         var unique = false;
+        var coversAllRows = true;
+        var usable = true;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
+            exists = true;
             unique = reader.GetBoolean(0);
-            columns.Add(reader.GetString(1));
+            coversAllRows = reader.GetBoolean(1);
+            usable = reader.GetBoolean(2);
+            if (!reader.IsDBNull(3))
+                columns.Add(reader.GetString(3));
         }
-        return new(unique, columns);
+        return new(exists, unique, columns, coversAllRows, usable);
     }
 
     protected override async Task AddIdentityColumnsAsync(

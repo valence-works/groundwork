@@ -87,6 +87,21 @@ internal static class RelationalTestManifests
         };
     }
 
+    public static StorageManifest WithIdentityKind(StorageIdentityKind kind)
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    IdentityPolicy = new IdentityPolicy(kind, "id")
+                }
+            ]
+        };
+    }
+
     public static StorageManifest ScopedManifest()
     {
         var manifest = MetadataManifest();

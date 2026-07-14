@@ -57,6 +57,15 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         if (!plan.IsPlannable)
             throw new InvalidOperationException("Cannot execute an unplannable materialization plan.");
 
+        var storageOperations = plan.Operations.OfType<CreateStorageUnitOperation>().ToArray();
+        if (storageOperations.Length > 0)
+        {
+            await MongoDbTransactionCapability.ForDatabase(database).EnsureSupportedAsync(
+                storageOperations.Select(operation => operation.StorageUnit.Identity).ToArray(),
+                "Document Store identity-schema admission",
+                cancellationToken);
+        }
+
         var collections = await GetCollectionsAsync(cancellationToken);
         var physicalizedFields = plan.Operations
             .OfType<CreateOptimizedProjectionOperation>()
@@ -69,7 +78,6 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
                 item => (item.UnitIdentity, item.Field.Name),
                 item => item.Field);
 
-        var storageOperations = plan.Operations.OfType<CreateStorageUnitOperation>().ToArray();
         foreach (var operation in storageOperations)
             await EnsureCollectionAsync(collections, MongoDbGroundworkNames.CollectionName(operation.StorageUnit.Identity), cancellationToken);
         if (storageOperations.Length > 0)
@@ -232,10 +240,6 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         IReadOnlyList<IdentitySchemaAdmission> admissions,
         CancellationToken cancellationToken)
     {
-        await MongoDbTransactionCapability.ForDatabase(database).EnsureSupportedAsync(
-            admissions.Select(admission => admission.StorageUnit.Value).ToArray(),
-            "Document Store identity-schema admission",
-            cancellationToken);
         var lease = await AcquireIdentitySchemaLeaseAsync(cancellationToken);
         try
         {

@@ -133,14 +133,15 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
 
         await AddIdentityColumnsAsync(columns, transaction, cancellationToken);
         await BackfillOrValidateIdentityRowsAsync(admissions, recordedUnits, transaction, cancellationToken);
+        var retainedIndexShape = await ReadIdentityLookupIndexShapeAsync(transaction, cancellationToken);
+        if (retainedIndexShape.Exists && !IsRequiredIdentityLookupIndex(retainedIndexShape))
+            throw InvalidIdentityLookupIndex();
+
         await FinalizeIdentityColumnsAsync(transaction, cancellationToken);
         await EnsureIdentityLookupIndexAsync(transaction, cancellationToken);
         var indexShape = await ReadIdentityLookupIndexShapeAsync(transaction, cancellationToken);
-        if (!indexShape.IsUnique || !indexShape.Columns.SequenceEqual(RequiredIdentityLookupIndexColumns, StringComparer.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "The Document Store identity lookup index does not have the required unique key shape.");
-        }
+        if (!IsRequiredIdentityLookupIndex(indexShape))
+            throw InvalidIdentityLookupIndex();
 
         foreach (var admission in admissions.Where(x => !recordedUnits.Contains(x.StorageUnit.Value)))
             await RecordIdentitySchemaStateAsync(admission, transaction, cancellationToken);
@@ -270,7 +271,22 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    protected sealed record IdentityLookupIndexShape(bool IsUnique, IReadOnlyList<string> Columns);
+    protected sealed record IdentityLookupIndexShape(
+        bool Exists,
+        bool IsUnique,
+        IReadOnlyList<string> Columns,
+        bool CoversAllRows = true,
+        bool IsUsable = true);
+
+    private bool IsRequiredIdentityLookupIndex(IdentityLookupIndexShape shape) =>
+        shape.Exists &&
+        shape.IsUnique &&
+        shape.CoversAllRows &&
+        shape.IsUsable &&
+        shape.Columns.SequenceEqual(RequiredIdentityLookupIndexColumns, StringComparer.Ordinal);
+
+    private static InvalidOperationException InvalidIdentityLookupIndex() =>
+        new("The Document Store identity lookup index does not have the required unique, unfiltered, usable key shape.");
 
     private sealed record RetainedIdentityRow(
         string StorageUnit,
