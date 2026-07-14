@@ -59,6 +59,7 @@ public static class PhysicalQueryPlanCompiler
         List<GroundworkDiagnostic> diagnostics)
     {
         var predicateDeclarations = ResolvePredicates(logicalIndex, query, target, diagnostics);
+        var hasMixedIdentityDemand = HasMixedIdentityDemand(predicateDeclarations);
         if (query.LatestPerKeyPath is not null &&
             logicalIndex.Fields.All(field => field.Path != query.LatestPerKeyPath))
         {
@@ -68,11 +69,14 @@ public static class PhysicalQueryPlanCompiler
                 target));
         }
         ValidateOperations(predicateDeclarations, query, capabilities, target, diagnostics);
-        ValidateIdentityOperations(predicateDeclarations, target, diagnostics);
+        ValidateIdentityOperations(predicateDeclarations, query, hasMixedIdentityDemand, target, diagnostics);
         ValidateShape(query, predicateDeclarations.Count, capabilities, target, diagnostics);
         ValidateEnvelopeKinds(logicalIndex, target, diagnostics);
+        if (query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing && hasMixedIdentityDemand)
+            return null;
 
         var physicalIndex = route.Indexes.SingleOrDefault(index => index.Identity == logicalIndex.Identity);
+        var certifiedPhysicalIndex = hasMixedIdentityDemand ? null : physicalIndex;
         var selectedSource = SelectSource(route, logicalIndex, physicalIndex, query, capabilities);
         var hasBoundScalePath = route.CandidateQueryPaths.Any(path =>
             path.Kind == ExecutableQueryPathKind.PhysicalIndex &&
@@ -82,7 +86,7 @@ public static class PhysicalQueryPlanCompiler
         if (query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing &&
             (physicalIndex is null ||
              selectedSource is null ||
-             !HasIndexedAccess(selectedSource.Value, physicalIndex) ||
+             !HasIndexedAccess(selectedSource.Value, certifiedPhysicalIndex) ||
              !hasBoundScalePath))
         {
             diagnostics.Add(Error(
@@ -117,9 +121,9 @@ public static class PhysicalQueryPlanCompiler
         ValidateExecutableCompatibility(route, predicates, target, diagnostics);
 
         IReadOnlyList<string> requiredEqualityPrefixPaths = [];
-        if (HasIndexedAccess(selectedSource.Value, physicalIndex) &&
+        if (HasIndexedAccess(selectedSource.Value, certifiedPhysicalIndex) &&
             !ValidatePhysicalCompatibility(
-                physicalIndex!,
+                certifiedPhysicalIndex!,
                 identityFields,
                 predicateDeclarations,
                 query,
@@ -199,7 +203,7 @@ public static class PhysicalQueryPlanCompiler
             access,
             lookupObject,
             route.PrimaryStorage.Name,
-            HasIndexedAccess(selectedSource.Value, physicalIndex) ? physicalIndex?.Name : null,
+            HasIndexedAccess(selectedSource.Value, certifiedPhysicalIndex) ? certifiedPhysicalIndex?.Name : null,
             scope,
             discriminator,
             documentIdentity,
@@ -302,6 +306,8 @@ public static class PhysicalQueryPlanCompiler
 
     private static void ValidateIdentityOperations(
         IReadOnlyList<BoundedQueryPredicateField> predicates,
+        BoundedQueryDeclaration query,
+        bool hasMixedIdentityDemand,
         string target,
         List<GroundworkDiagnostic> diagnostics)
     {
@@ -314,10 +320,7 @@ public static class PhysicalQueryPlanCompiler
                 "Document identity does not support Contains because no bounded identity projection preserves substring semantics.",
                 target));
         }
-        if (predicates.Any(predicate =>
-                predicate.Path == PhysicalDocumentFieldPaths.Id &&
-                PhysicalQueryIdentityDemand.Resolve(predicate.Operations) ==
-                PhysicalQueryIdentityEvidenceDemand.Mixed))
+        if (query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing && hasMixedIdentityDemand)
         {
             diagnostics.Add(Error(
                 "GW-QUERY-012",
@@ -325,6 +328,12 @@ public static class PhysicalQueryPlanCompiler
                 target));
         }
     }
+
+    private static bool HasMixedIdentityDemand(IEnumerable<BoundedQueryPredicateField> predicates) =>
+        predicates.Any(predicate =>
+            predicate.Path == PhysicalDocumentFieldPaths.Id &&
+            PhysicalQueryIdentityDemand.Resolve(predicate.Operations) ==
+            PhysicalQueryIdentityEvidenceDemand.Mixed);
 
     private static void ValidateExecutableCompatibility(
         ExecutableStorageRoute route,
@@ -431,14 +440,6 @@ public static class PhysicalQueryPlanCompiler
         out IReadOnlyList<string> requiredEqualityPrefixPaths)
     {
         requiredEqualityPrefixPaths = [];
-        if (predicates.Any(predicate =>
-                predicate.Path == PhysicalDocumentFieldPaths.Id &&
-                PhysicalQueryIdentityDemand.Resolve(predicate.Operations) ==
-                PhysicalQueryIdentityEvidenceDemand.Mixed))
-        {
-            return false;
-        }
-
         var paths = physicalIndex.Columns
             .Select(column => identityFields.ResolveIndexPath(physicalIndex.Target, column.Column))
             .Where(path => path != PhysicalDocumentFieldPaths.StorageScope)

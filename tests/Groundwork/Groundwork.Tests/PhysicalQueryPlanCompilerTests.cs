@@ -215,7 +215,51 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
-    public void Mixed_exact_and_ordered_identity_demand_is_rejected_without_choosing_index_order()
+    public void Scale_bearing_mixed_exact_and_ordered_identity_demand_is_rejected_without_choosing_index_order()
+    {
+        var fixture = CreateIdentityQueryFixture(
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan
+            },
+            indexLayout: IdentityIndexLayout.Exact);
+        var ordinary = fixture.Storage.BoundedQueries.Single();
+        var scaleBearing = new BoundedQueryDeclaration(
+            ordinary.Identity,
+            ordinary.IndexIdentity,
+            ordinary.Operations,
+            ordinary.SortSupport,
+            ordinary.PagingSupport,
+            BoundedQueryExecutionClass.ScaleBearing,
+            ordinary.SupportsDisjunction,
+            ordinary.SupportsTotalCount,
+            ordinary.SortFields,
+            ordinary.PredicateFields,
+            ordinary.ResultOperations,
+            ordinary.LatestPerKeyPath);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [scaleBearing],
+            fixture.Storage.NameOverrides,
+            fixture.Storage.BoundedMutations);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-012" &&
+            diagnostic.Message.Contains("mixed exact and ordered", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Ordinary_mixed_exact_and_ordered_identity_demand_uses_server_execution_without_certifying_one_index_shape()
     {
         var fixture = CreateIdentityQueryFixture(
             new HashSet<PortableQueryOperation>
@@ -230,11 +274,9 @@ public sealed class PhysicalQueryPlanCompilerTests
             fixture.Storage,
             Capabilities(PhysicalQuerySourceKind.PrimaryEnvelope));
 
-        Assert.False(result.IsValid);
-        Assert.Empty(result.Plans);
-        Assert.Contains(result.Diagnostics, diagnostic =>
-            diagnostic.Code == "GW-QUERY-012" &&
-            diagnostic.Message.Contains("mixed exact and ordered", StringComparison.OrdinalIgnoreCase));
+        var plan = AssertPlan(result);
+        Assert.Null(plan.IndexName);
+        Assert.False(plan.IsScaleBearing);
     }
 
     [Theory]
