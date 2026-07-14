@@ -335,9 +335,12 @@ public sealed record DocumentIdentityNativePlanEvidence(
             .ToArray();
         var indexCoversSelector = materialized.Length == 1 &&
             materialized[0].IsUsable &&
-            ContainsOrderedSequence(materialized[0].KeyFields, expected.SelectorFields);
+            HasMandatoryLeadingShape(
+                materialized[0].KeyFields,
+                expected.MandatoryLeadingKeyFields);
         var structuredDetails = $"""
             EXPECTED INDEX: {expected.Name} ({string.Join(", ", expected.SelectorFields)})
+            MANDATORY LEADING KEYS: {string.Join(", ", expected.MandatoryLeadingKeyFields)}
             ACCESS PATHS: {string.Join("; ", accessPaths.Select(path => path.ToString()))}
             MATERIALIZED INDEXES: {string.Join("; ", materializedIndexes.Select(index => index.ToString()))}
             {details}
@@ -351,27 +354,29 @@ public sealed record DocumentIdentityNativePlanEvidence(
             structuredDetails);
     }
 
-    private static bool ContainsOrderedSequence(
+    private static bool HasMandatoryLeadingShape(
         IReadOnlyList<string> actual,
         IReadOnlyList<string> required)
     {
-        if (required.Count == 0)
-            return true;
-        for (var start = 0; start <= actual.Count - required.Count; start++)
-        {
-            if (required.Select((field, offset) => (field, offset)).All(item =>
-                    actual[start + item.offset].Equals(item.field, StringComparison.Ordinal)))
-            {
-                return true;
-            }
-        }
-        return false;
+        return actual.Count >= required.Count &&
+               required.Select((field, offset) => (field, offset)).All(item =>
+                   actual[item.offset].Equals(item.field, StringComparison.Ordinal));
     }
 }
 
 public sealed record DocumentIdentityExpectedIndex(
     string Name,
-    IReadOnlyList<string> SelectorFields);
+    IReadOnlyList<string> SelectorFields,
+    IReadOnlyList<string>? RequiredLeadingKeyFields = null)
+{
+    public IReadOnlyList<string> MandatoryLeadingKeyFields => RequiredLeadingKeyFields ?? SelectorFields;
+
+    public IReadOnlyList<string> SelectorFieldsBoundBy(IEnumerable<string> predicateFieldIdentifiers)
+    {
+        var predicateFields = predicateFieldIdentifiers.ToHashSet(StringComparer.Ordinal);
+        return SelectorFields.Where(predicateFields.Contains).ToArray();
+    }
+}
 
 public sealed record DocumentIdentityAccessPath(string? IndexName, bool IsFullScan)
 {
@@ -385,13 +390,18 @@ public sealed record DocumentIdentityMaterializedIndex(
     bool IsReady = true,
     bool IsUnfiltered = true,
     bool IsEnabled = true,
-    bool IsHypothetical = false)
+    bool IsHypothetical = false,
+    bool IsPartial = false,
+    bool IsSparse = false,
+    bool IsHidden = false)
 {
-    public bool IsUsable => IsValid && IsReady && IsUnfiltered && IsEnabled && !IsHypothetical;
+    public bool IsUsable => IsValid && IsReady && IsUnfiltered && IsEnabled && !IsHypothetical &&
+                            !IsPartial && !IsSparse && !IsHidden;
 
     public override string ToString() =>
         $"{Name} ({string.Join(", ", KeyFields)}); " +
-        $"valid={IsValid}; ready={IsReady}; unfiltered={IsUnfiltered}; enabled={IsEnabled}; hypothetical={IsHypothetical}";
+        $"valid={IsValid}; ready={IsReady}; unfiltered={IsUnfiltered}; enabled={IsEnabled}; " +
+        $"hypothetical={IsHypothetical}; partial={IsPartial}; sparse={IsSparse}; hidden={IsHidden}";
 }
 
 public static class DocumentIdentityAcceptanceModel
@@ -417,7 +427,8 @@ public static class DocumentIdentityAcceptanceModel
             [
                 route.Envelope.Identity.LookupKey.Identifier,
                 route.Envelope.Identity.ComparisonKey.Identifier
-            ]);
+            ],
+            index.Columns.Select(column => column.Column.Identifier).ToArray());
     }
 
     public static StorageManifest Manifest(

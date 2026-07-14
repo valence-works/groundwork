@@ -39,6 +39,55 @@ internal static class SqliteIdentityPlanInspector
     }
 }
 
+internal static class SqliteIdentityIndexCatalog
+{
+    public static async Task<IReadOnlyList<DocumentIdentityMaterializedIndex>> ReadAsync(
+        SqliteConnection connection,
+        string tableName,
+        string indexName)
+    {
+        bool? isPartial = null;
+        await using (var list = connection.CreateCommand())
+        {
+            list.CommandText = $"PRAGMA index_list({Quote(tableName)});";
+            await using var reader = await list.ExecuteReaderAsync();
+            var nameOrdinal = reader.GetOrdinal("name");
+            var partialOrdinal = reader.GetOrdinal("partial");
+            while (await reader.ReadAsync())
+            {
+                if (!reader.GetString(nameOrdinal).Equals(indexName, StringComparison.Ordinal))
+                    continue;
+                isPartial = reader.GetInt64(partialOrdinal) != 0;
+                break;
+            }
+        }
+        if (isPartial is null)
+            return [];
+
+        await using var details = connection.CreateCommand();
+        details.CommandText = $"PRAGMA index_xinfo({Quote(indexName)});";
+        var fields = new List<(long Ordinal, string Name)>();
+        await using (var reader = await details.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                if (reader.GetInt64(5) != 1 || reader.IsDBNull(2))
+                    continue;
+                fields.Add((reader.GetInt64(0), reader.GetString(2)));
+            }
+        }
+        return
+        [
+            new DocumentIdentityMaterializedIndex(
+                indexName,
+                fields.OrderBy(field => field.Ordinal).Select(field => field.Name).ToArray(),
+                IsPartial: isPartial.Value)
+        ];
+    }
+
+    private static string Quote(string identifier) => $"\"{identifier.Replace("\"", "\"\"")}\"";
+}
+
 public sealed class SqliteDocumentIdentityAcceptanceEvidenceTests
 {
     [Fact]
@@ -50,6 +99,64 @@ public sealed class SqliteDocumentIdentityAcceptanceEvidenceTests
         Assert.True(paths[0].IsFullScan);
         Assert.Null(paths[0].IndexName);
     }
+
+    [Fact]
+    public void Projected_selector_fields_do_not_count_as_predicate_bound_fields()
+    {
+        var command = new RelationalPhysicalQueryCommand(
+            "SELECT id_lookup_key, id_comparison_key FROM documents WHERE status = @status",
+            [("status", "pending")],
+            ["status"]);
+        var expected = ExpectedIndex();
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            expected,
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            [new DocumentIdentityMaterializedIndex(
+                "ix_identity",
+                ["storage_scope", "id_lookup_key", "id_comparison_key"])],
+            expected.SelectorFieldsBoundBy(command.PredicateFieldIdentifiers),
+            command.CommandText);
+
+        Assert.False(evidence.SelectorUsesLookupKey);
+        Assert.False(evidence.SelectorUsesComparisonKey);
+    }
+
+    [Fact]
+    public async Task Partial_sqlite_index_does_not_cover_the_selector()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using (var create = connection.CreateCommand())
+        {
+            create.CommandText = """
+                CREATE TABLE documents (
+                    storage_scope TEXT NOT NULL,
+                    id_lookup_key TEXT NOT NULL,
+                    id_comparison_key TEXT NOT NULL,
+                    status TEXT NOT NULL);
+                CREATE INDEX ix_identity
+                    ON documents (storage_scope, id_lookup_key, id_comparison_key)
+                    WHERE status = 'pending';
+                """;
+            await create.ExecuteNonQueryAsync();
+        }
+
+        var indexes = await SqliteIdentityIndexCatalog.ReadAsync(connection, "documents", "ix_identity");
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            ExpectedIndex(),
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            indexes,
+            ["id_lookup_key", "id_comparison_key"],
+            "partial SQLite catalog index");
+
+        Assert.True(Assert.Single(indexes).IsPartial);
+        Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    private static DocumentIdentityExpectedIndex ExpectedIndex() => new(
+        "ix_identity",
+        ["id_lookup_key", "id_comparison_key"],
+        ["storage_scope", "id_lookup_key", "id_comparison_key"]);
 }
 
 public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcceptanceConformance
@@ -167,10 +274,11 @@ public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcce
         }
         var plan = string.Join(Environment.NewLine, details);
         var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
-        var materializedIndexes = await ReadIndexAsync(connection, expectedIndex.Name);
-        var selectorFields = expectedIndex.SelectorFields
-            .Where(field => command.CommandText.Contains(field, StringComparison.Ordinal))
-            .ToArray();
+        var materializedIndexes = await SqliteIdentityIndexCatalog.ReadAsync(
+            connection,
+            route.PrimaryStorage.Name.Identifier,
+            expectedIndex.Name);
+        var selectorFields = expectedIndex.SelectorFieldsBoundBy(command.PredicateFieldIdentifiers);
         return DocumentIdentityNativePlanEvidence.Create(
             expectedIndex,
             SqliteIdentityPlanInspector.Parse(details),
@@ -179,27 +287,4 @@ public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcce
             $"SQL:{Environment.NewLine}{command.CommandText}{Environment.NewLine}PLAN:{Environment.NewLine}{plan}");
     }
 
-    private static async Task<IReadOnlyList<DocumentIdentityMaterializedIndex>> ReadIndexAsync(
-        SqliteConnection connection,
-        string indexName)
-    {
-        await using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA index_xinfo(\"{indexName.Replace("\"", "\"\"")}\");";
-        var fields = new List<(long Ordinal, string Name)>();
-        await using var reader = await command.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            if (reader.GetInt64(5) != 1 || reader.IsDBNull(2))
-                continue;
-            fields.Add((reader.GetInt64(0), reader.GetString(2)));
-        }
-        return fields.Count == 0
-            ? []
-            :
-            [
-                new DocumentIdentityMaterializedIndex(
-                    indexName,
-                    fields.OrderBy(field => field.Ordinal).Select(field => field.Name).ToArray())
-            ];
-    }
 }

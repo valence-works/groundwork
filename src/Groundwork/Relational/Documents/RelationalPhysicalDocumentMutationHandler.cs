@@ -227,7 +227,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
               $"p.{store.Q(RelationalPhysicalStorageColumns.CreatedUtc)}";
         return new RelationalPhysicalQueryCommand(
             $"SELECT {identity}, {state} {predicate.FromAndWhere}{restriction}",
-            predicate.Parameters);
+            predicate.Parameters,
+            predicate.PredicateFieldIdentifiers);
     }
 
     internal RelationalPhysicalQueryCommand BuildOperationReadCommand(
@@ -236,7 +237,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         DocumentScopeSelection scope) => new(
         $"SELECT request_fingerprint, affected_count FROM {store.Q(RelationalPhysicalStorageColumns.MutationOperationsTable)} " +
         $"WHERE {store.MutationOperationIdentityPredicate(OperationIdentityPredicate())};",
-        OperationIdentity(mutation, plan, scope));
+        OperationIdentity(mutation, plan, scope),
+        OperationIdentityPredicate().Select(part => part.ColumnIdentifier).ToArray());
 
     private static DocumentQuery PredicateQuery(DocumentMutation mutation, PhysicalMutationPlan plan)
     {

@@ -97,7 +97,7 @@ public sealed class RelationalDocumentIdentityAcceptanceEvidenceTests
     public void Same_name_index_with_wrong_catalog_shape_does_not_cover_the_selector()
     {
         var evidence = DocumentIdentityNativePlanEvidence.Create(
-            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            ExpectedIndex(),
             [new DocumentIdentityAccessPath("ix_identity", false)],
             [new DocumentIdentityMaterializedIndex(
                 "ix_identity",
@@ -110,6 +110,43 @@ public sealed class RelationalDocumentIdentityAcceptanceEvidenceTests
 
         Assert.True(evidence.UsesExpectedIndex);
         Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    [Fact]
+    public void Same_name_index_with_an_extra_leading_key_does_not_cover_the_selector()
+    {
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            ExpectedIndex(),
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            [new DocumentIdentityMaterializedIndex(
+                "ix_identity",
+                ["decoy", "storage_scope", "id_lookup_key", "id_comparison_key"])],
+            ["id_lookup_key", "id_comparison_key"],
+            "same name, extra leading key");
+
+        Assert.True(evidence.UsesExpectedIndex);
+        Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    [Fact]
+    public void Projected_selector_fields_do_not_count_as_predicate_bound_fields()
+    {
+        var command = new RelationalPhysicalQueryCommand(
+            "SELECT id_lookup_key, id_comparison_key FROM documents WHERE status = @status",
+            [("status", "pending")],
+            ["status"]);
+        var expected = ExpectedIndex();
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            expected,
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            [new DocumentIdentityMaterializedIndex(
+                "ix_identity",
+                ["storage_scope", "id_lookup_key", "id_comparison_key"])],
+            expected.SelectorFieldsBoundBy(command.PredicateFieldIdentifiers),
+            command.CommandText);
+
+        Assert.False(evidence.SelectorUsesLookupKey);
+        Assert.False(evidence.SelectorUsesComparisonKey);
     }
 
     [Theory]
@@ -126,7 +163,7 @@ public sealed class RelationalDocumentIdentityAcceptanceEvidenceTests
         bool isHypothetical)
     {
         var evidence = DocumentIdentityNativePlanEvidence.Create(
-            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            ExpectedIndex(),
             [new DocumentIdentityAccessPath("ix_identity", false)],
             [new DocumentIdentityMaterializedIndex(
                 "ix_identity",
@@ -141,6 +178,11 @@ public sealed class RelationalDocumentIdentityAcceptanceEvidenceTests
 
         Assert.False(evidence.IndexCoversSelectorFields);
     }
+
+    private static DocumentIdentityExpectedIndex ExpectedIndex() => new(
+        "ix_identity",
+        ["id_lookup_key", "id_comparison_key"],
+        ["storage_scope", "id_lookup_key", "id_comparison_key"]);
 
     [Fact]
     public void Postgre_sql_plan_text_cannot_impersonate_a_winning_index_access_path()
@@ -249,9 +291,7 @@ public abstract class RelationalDocumentIdentityAcceptanceConformance : Document
     {
         var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
         var native = await ExplainNativeAsync(command, route, expectedIndex);
-        var selectorFields = expectedIndex.SelectorFields
-            .Where(field => command.CommandText.Contains(field, StringComparison.Ordinal))
-            .ToArray();
+        var selectorFields = expectedIndex.SelectorFieldsBoundBy(command.PredicateFieldIdentifiers);
         return DocumentIdentityNativePlanEvidence.Create(
             expectedIndex,
             native.AccessPaths,

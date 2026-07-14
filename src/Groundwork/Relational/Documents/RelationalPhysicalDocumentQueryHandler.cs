@@ -100,7 +100,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}",
                 store.P("take"),
                 store.P("skip")),
-            parameters);
+            parameters,
+            built.PredicateFieldIdentifiers);
     }
 
     public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
@@ -177,7 +178,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     }
 
     private static RelationalPhysicalQueryCommand RenderCount(RelationalPhysicalQueryPredicate built) =>
-        new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters);
+        new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters, built.PredicateFieldIdentifiers);
 
     private RelationalPhysicalQueryPredicate Build(
         DocumentQuery query,
@@ -203,6 +204,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)}"
                 : $"FROM {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", plan.IndexName?.Identifier)}";
         var parameters = new List<(string Name, object? Value)>();
+        var predicateFieldIdentifiers = new HashSet<string>(StringComparer.Ordinal);
         var predicates = new List<string>();
         var scope = fixedScope ?? store.ResolveQueryScope(query.DocumentKind);
         if (!scope.AcrossScopes)
@@ -210,10 +212,12 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             predicates.Add(store.ExactPhysicalIdentityPredicate(
                 [new(plan.Scope.Field.Identifier, Alias(plan.Scope.Field), store.P("scope"))]));
             parameters.Add(("scope", scope.StorageKey));
+            predicateFieldIdentifiers.Add(plan.Scope.Field.Identifier);
         }
         predicates.Add(store.ExactPhysicalIdentityPredicate(
             [new(plan.Discriminator.Identifier, Alias(plan.Discriminator), store.P("kind"))]));
         parameters.Add(("kind", route.Discriminator.Value));
+        predicateFieldIdentifiers.Add(plan.Discriminator.Identifier);
 
         if (detectIdentityCollision)
         {
@@ -231,7 +235,13 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 continue;
             }
             var alternatives = clause.Comparisons.Select(comparison =>
-                Comparison(plan, route, comparison, parameters, ref parameterIndex)).ToArray();
+                Comparison(
+                    plan,
+                    route,
+                    comparison,
+                    parameters,
+                    predicateFieldIdentifiers,
+                    ref parameterIndex)).ToArray();
             predicates.Add($"({string.Join(" OR ", alternatives)})");
         }
         if (parameters.Count > store.MaxPhysicalParameters - 2)
@@ -242,7 +252,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         var fromAndWhere = $"{from} WHERE {string.Join(" AND ", predicates)}";
         return new RelationalPhysicalQueryPredicate(
             fromAndWhere,
-            parameters);
+            parameters,
+            predicateFieldIdentifiers.ToArray());
     }
 
     private static IReadOnlyList<RelationalPhysicalIdentityJoinPart> LinkedPrimaryJoin(
@@ -310,10 +321,18 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         ExecutableStorageRoute route,
         DocumentQueryComparison comparison,
         List<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
         ref int parameterIndex)
     {
         if (comparison.Path == PhysicalDocumentFieldPaths.Id)
-            return IdentityComparison(plan, comparison, parameters, ref parameterIndex);
+        {
+            return IdentityComparison(
+                plan,
+                comparison,
+                parameters,
+                predicateFieldIdentifiers,
+                ref parameterIndex);
+        }
 
         var predicate = plan.Predicates.Single(item => item.Path == comparison.Path);
         var field = Field(predicate.Field);
@@ -333,16 +352,33 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 return "0 = 1";
             var parts = new List<string>();
             foreach (var value in comparison.Values)
-                parts.Add(ScalarComparison(predicate.Field, field, QueryComparisonOperator.Equal, Convert(value), parameters, ref parameterIndex));
+            {
+                parts.Add(ScalarComparison(
+                    predicate.Field,
+                    field,
+                    QueryComparisonOperator.Equal,
+                    Convert(value),
+                    parameters,
+                    predicateFieldIdentifiers,
+                    ref parameterIndex));
+            }
             return $"({string.Join(" OR ", parts)})";
         }
-        return ScalarComparison(predicate.Field, field, comparison.Operator, Convert(comparison.Values[0]), parameters, ref parameterIndex);
+        return ScalarComparison(
+            predicate.Field,
+            field,
+            comparison.Operator,
+            Convert(comparison.Values[0]),
+            parameters,
+            predicateFieldIdentifiers,
+            ref parameterIndex);
     }
 
     private string IdentityComparison(
         PhysicalQueryPlan plan,
         DocumentQueryComparison comparison,
         List<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
         ref int parameterIndex)
     {
         var bound = PhysicalDocumentIdentityQuery.Bind(plan, comparison);
@@ -358,6 +394,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                     RequireExact(value),
                     QueryComparisonOperator.Equal,
                     parameters,
+                    predicateFieldIdentifiers,
                     ref parameterIndex));
             }
             return $"({string.Join(" OR ", alternatives)})";
@@ -371,6 +408,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 exact,
                 comparison.Operator,
                 parameters,
+                predicateFieldIdentifiers,
                 ref parameterIndex),
             PhysicalQueryIdentityValue.Ordered ordered => ScalarComparison(
                 plan.DocumentIdentity.Comparison,
@@ -378,6 +416,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 comparison.Operator,
                 ordered.ComparisonKey,
                 parameters,
+                predicateFieldIdentifiers,
                 ref parameterIndex),
             _ => throw new ArgumentOutOfRangeException(nameof(evidence), evidence, null)
         };
@@ -388,6 +427,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         PhysicalQueryIdentityValue.Exact evidence,
         QueryComparisonOperator operation,
         List<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
         ref int parameterIndex)
     {
         var comparison = operation == QueryComparisonOperator.NotEqual
@@ -399,6 +439,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             comparison,
             evidence.LookupKey,
             parameters,
+            predicateFieldIdentifiers,
             ref parameterIndex);
         var comparisonPredicate = ScalarComparison(
             identity.Comparison,
@@ -406,6 +447,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             comparison,
             evidence.ComparisonKey,
             parameters,
+            predicateFieldIdentifiers,
             ref parameterIndex);
         var conjunction = operation == QueryComparisonOperator.NotEqual ? " OR " : " AND ";
         return $"({lookupPredicate}{conjunction}{comparisonPredicate})";
@@ -426,8 +468,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         QueryComparisonOperator operation,
         object? value,
         List<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
         ref int parameterIndex)
     {
+        predicateFieldIdentifiers.Add(queryField.Identifier);
         if (value is null)
             return operation == QueryComparisonOperator.NotEqual ? $"{field} IS NOT NULL" : $"{field} IS NULL";
         if (IsDocumentIdentityField(queryField) &&
@@ -530,8 +574,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
 internal sealed record RelationalPhysicalQueryPredicate(
     string FromAndWhere,
-    IReadOnlyList<(string Name, object? Value)> Parameters);
+    IReadOnlyList<(string Name, object? Value)> Parameters,
+    IReadOnlyList<string> PredicateFieldIdentifiers);
 
 internal sealed record RelationalPhysicalQueryCommand(
     string CommandText,
-    IReadOnlyList<(string Name, object? Value)> Parameters);
+    IReadOnlyList<(string Name, object? Value)> Parameters,
+    IReadOnlyList<string> PredicateFieldIdentifiers);

@@ -2,9 +2,22 @@ using MongoDB.Bson;
 
 namespace Groundwork.MongoDb.Documents;
 
+internal sealed record MongoDbWinningIndexBound(
+    string Field,
+    IReadOnlyList<string> Intervals,
+    bool HasExactIntervalEvidence)
+{
+    public bool IsConstrained => HasExactIntervalEvidence && Intervals.Count > 0 &&
+                                 Intervals.All(interval => !IsUnbounded(interval));
+
+    private static bool IsUnbounded(string interval) => string.Concat(interval.Where(character =>
+            !char.IsWhiteSpace(character)))
+        .Equals("[MinKey,MaxKey]", StringComparison.Ordinal);
+}
+
 internal sealed record MongoDbWinningIndexScan(
     string IndexName,
-    IReadOnlyList<string> BoundFields);
+    IReadOnlyList<MongoDbWinningIndexBound> Bounds);
 
 internal sealed record MongoDbWinningPlanObservation(
     bool HasCollectionScan,
@@ -39,13 +52,28 @@ internal static class MongoDbWinningPlanInspector
             .Select(document => new MongoDbWinningIndexScan(
                 document["indexName"].AsString,
                 document.TryGetValue("indexBounds", out var bounds) && bounds.IsBsonDocument
-                    ? bounds.AsBsonDocument.Names.ToArray()
+                    ? bounds.AsBsonDocument.Elements.Select(ReadBound).ToArray()
                     : []))
             .ToArray();
         return new MongoDbWinningPlanObservation(
             stages.Any(document =>
                 document["stage"].AsString.Equals("COLLSCAN", StringComparison.OrdinalIgnoreCase)),
             indexScans);
+    }
+
+    private static MongoDbWinningIndexBound ReadBound(BsonElement element)
+    {
+        if (!element.Value.IsBsonArray)
+            return new MongoDbWinningIndexBound(element.Name, [], false);
+        var values = element.Value.AsBsonArray;
+        var intervals = values
+            .Where(value => value.IsString)
+            .Select(value => value.AsString)
+            .ToArray();
+        return new MongoDbWinningIndexBound(
+            element.Name,
+            intervals,
+            intervals.Length == values.Count);
     }
 
     private static IEnumerable<BsonDocument> Descendants(BsonValue value)
