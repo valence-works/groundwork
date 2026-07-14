@@ -1274,13 +1274,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         if (linked.Count == 0) return [];
         var rel = route.LinkedRelationship!;
         var filters = linked.Select(document =>
-            MongoDbPhysicalDocumentIdentity.PrimaryLookupFilter(
-                route,
-                document[rel.StorageScope.Identifier].AsString,
-                document[rel.Identity.LookupKey.Identifier].AsString) &
-            Builders<BsonDocument>.Filter.Eq(
-                route.Envelope.Identity.ComparisonKey.Identifier,
-                document[rel.Identity.ComparisonKey.Identifier].AsString));
+            MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, document));
         await hooks.QueryPrimaryHydrationStarting(session, attempt, cancellationToken);
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .Find(session, Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);

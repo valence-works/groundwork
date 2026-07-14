@@ -456,6 +456,45 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
         Assert.Equal(originalModel.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
     }
 
+    [Fact]
+    public async Task Linked_identity_collision_fails_closed_during_public_schema_validation()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var mutationModel = Model();
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel);
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            mutationModel,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await SaveAsync(documents, "canonical", "stale");
+        var route = Assert.Single(mutationModel.Routes);
+        var relationship = route.LinkedRelationship!;
+        var linkedCollection = database.GetCollection<BsonDocument>(
+            route.LinkedIndexStorage!.Name.Identifier);
+        var linked = await linkedCollection.Find(FilterDefinition<BsonDocument>.Empty).SingleAsync();
+        var requested = route.Envelope.Identity.Project("collision");
+        var retainedLookup = linked[relationship.Identity.LookupKey.Identifier].AsString;
+        linked[relationship.Identity.OriginalId.Identifier] = requested.OriginalValue;
+        linked[relationship.Identity.ComparisonKey.Identifier] = requested.ComparisonKey;
+        await linkedCollection.ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq(
+                MongoDbPhysicalStorageFields.Id,
+                linked[MongoDbPhysicalStorageFields.Id]),
+            linked);
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            new MongoDbGroundworkMaterializer(database).MaterializeAsync(mutationModel));
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(mutationModel.Target, CancellationToken.None);
+
+        Assert.Equal(DocumentKind, exception.DocumentKind);
+        Assert.Equal(requested.OriginalValue, exception.RequestedId);
+        Assert.Equal("canonical", exception.RetainedId);
+        Assert.Equal(retainedLookup, exception.LookupKey);
+        Assert.Equal(mutationModel.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
