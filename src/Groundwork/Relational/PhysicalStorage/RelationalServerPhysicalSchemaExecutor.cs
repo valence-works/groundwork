@@ -485,8 +485,8 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                     Add(command, $"v{index}", dialect.ConvertStorageValue(values[selected[index].Definition.LogicalName], selected[index].Definition));
                 Add(command, "kind", route.Discriminator.Value);
                 Add(command, "scope", document.Scope);
-                Add(command, "idLookup", identity.LookupKey);
-                Add(command, "idComparison", identity.ComparisonKey);
+                Add(command, "idLookup", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
+                Add(command, "idComparison", dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey));
                 if (await command.ExecuteNonQueryAsync(ct) != 1)
                     throw new InvalidOperationException($"Canonical backfill lost document '{document.Id}' in scope '{document.Scope}'.");
             });
@@ -522,9 +522,9 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 linked.Select(column => column.Column.Identifier).ToArray()));
             Add(command, "v0", route.Discriminator.Value);
             Add(command, "v1", document.Scope);
-            Add(command, "v2", identity.OriginalValue);
-            Add(command, "v3", identity.ComparisonKey);
-            Add(command, "v4", identity.LookupKey);
+            Add(command, "v2", dialect.ConvertDocumentIdentityOriginal(identity.OriginalValue));
+            Add(command, "v3", dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey));
+            Add(command, "v4", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
             for (var index = 0; index < linked.Length; index++)
                 Add(command, $"v{index + 5}", dialect.ConvertStorageValue(values[linked[index].Definition.LogicalName], linked[index].Definition));
             try
@@ -540,7 +540,9 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                     [
                         (relationship.DocumentKind.Identifier, route.Discriminator.Value, "collisionKind"),
                         (relationship.StorageScope.Identifier, document.Scope, "collisionScope"),
-                        (relationship.Identity.LookupKey.Identifier, identity.LookupKey, "collisionLookup")
+                        (relationship.Identity.LookupKey.Identifier,
+                            dialect.ConvertDocumentIdentityLookup(identity.LookupKey),
+                            "collisionLookup")
                     ],
                     ct);
                 throw;
@@ -571,12 +573,15 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
             ]) + ";");
         Add(command, "collisionKind", route.Discriminator.Value);
         Add(command, "collisionScope", scope);
-        Add(command, "collisionLookup", identity.LookupKey);
+        Add(command, "collisionLookup", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return;
         var retainedId = reader.GetString(0);
-        if (!string.Equals(reader.GetString(1), identity.ComparisonKey, StringComparison.Ordinal))
+        if (!string.Equals(
+                dialect.ReadDocumentIdentityComparison(reader, 1),
+                identity.ComparisonKey,
+                StringComparison.Ordinal))
         {
             throw new DocumentIdentityLookupCollisionException(
                 route.Discriminator.Value,
@@ -590,7 +595,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         DbConnection connection,
         DbTransaction transaction,
         string table,
-        IReadOnlyList<(string Column, string Value, string Parameter)> identity,
+        IReadOnlyList<(string Column, object Value, string Parameter)> identity,
         CancellationToken ct)
     {
         var parts = identity.Select(item => new RelationalPhysicalIdentityPredicatePart(
@@ -609,8 +614,9 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return;
-        var retained = Enumerable.Range(0, identity.Count).Select(reader.GetString).ToArray();
-        if (!retained.SequenceEqual(identity.Select(item => item.Value), StringComparer.Ordinal))
+        var matches = identity.Select((item, index) =>
+            dialect.PhysicalIdentityValueEquals(reader.GetValue(index), item.Value));
+        if (!matches.All(match => match))
             throw new PhysicalIdentityHashCollisionException(table, identity.Select(item => item.Column).ToArray());
     }
 
@@ -1309,6 +1315,13 @@ public abstract class RelationalServerPhysicalSchemaDialect
     public abstract string UpsertLinkedSql(string table, IReadOnlyList<string> columns, IReadOnlyList<string> keyColumns, IReadOnlyList<string> updateColumns);
     public abstract string SelectCanonicalBatchSql(ExecutableStorageRoute route, int batchSize, bool hasCursor);
     public abstract object? ConvertStorageValue(object? value, ProjectedColumnDefinition definition);
+    public virtual object ConvertDocumentIdentityOriginal(string value) => value;
+    public virtual object ConvertDocumentIdentityComparison(string value) => value;
+    public virtual object ConvertDocumentIdentityLookup(string value) => value;
+    public virtual string ReadDocumentIdentityComparison(DbDataReader reader, int ordinal) =>
+        reader.GetString(ordinal);
+    public virtual bool PhysicalIdentityValueEquals(object retained, object expected) =>
+        Equals(retained, expected);
     public abstract void Validate(ProjectedColumnDefinition definition);
     public abstract Task AcquireApplicationLockAsync(DbConnection connection, string resource, CancellationToken cancellationToken);
     public abstract Task ReleaseApplicationLockAsync(DbConnection connection, string resource, CancellationToken cancellationToken);

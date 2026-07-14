@@ -12,6 +12,7 @@ using Groundwork.SqlServer.Documents;
 using Groundwork.SqlServer.PhysicalStorage;
 using Groundwork.TestInfrastructure;
 using Microsoft.Data.SqlClient;
+using System.Text;
 using Testcontainers.MsSql;
 using Xunit;
 
@@ -671,13 +672,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var linkedLookupExpression = Q(linkedLookup);
         var collisionLookups = new[] { "zz-collision-a", "zz-collision-b" }
             .Select(id => route.LinkedRelationship.Identity.Project(id).LookupKey)
-            .Select(value => $"N'{value.Replace("'", "''", StringComparison.Ordinal)}'")
+            .Select(value => $"0x{value}")
             .ToArray();
         var hash = new SqlServerPhysicalIdentityHash(value =>
             string.Equals(value, linkedLookupExpression, StringComparison.Ordinal) ||
             string.Equals(value, "@collisionLookup", StringComparison.Ordinal) ||
             string.Equals(value, "@v4", StringComparison.Ordinal)
-                ? $"CASE WHEN {string.Join(" OR ", collisionLookups.Select(lookup => $"CONVERT(nvarchar(max), {value}) = {lookup}"))} " +
+                ? $"CASE WHEN {string.Join(" OR ", collisionLookups.Select(lookup => $"{value} = {lookup}"))} " +
                   "THEN CONVERT(binary(32), 0x0000000000000000000000000000000000000000000000000000000000000000) " +
                   $"ELSE CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {value}))) END"
                 : $"CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(varbinary(max), {value})))");
@@ -925,45 +926,15 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         var table = category.Target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.PrimaryStorage.Name.Identifier
             : route.LinkedIndexStorage!.Name.Identifier;
-        var id = category.Target == ExecutableStorageObjectRole.PrimaryStorage
-            ? route.Envelope.Id.Identifier
-            : route.LinkedRelationship!.DocumentId.Identifier;
         var identity = category.Target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.Envelope.Identity
             : route.LinkedRelationship!.Identity;
-        var identityColumns = new HashSet<string>(StringComparer.Ordinal)
-        {
-            id,
-            identity.ComparisonKey.Identifier,
-            identity.LookupKey.Identifier
-        };
-        await using var connection = new SqlConnection(container.GetConnectionString());
-        await connection.OpenAsync();
-        var columns = new List<string>();
-        await using (var metadata = connection.CreateCommand())
-        {
-            metadata.CommandText = "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(@table) AND is_computed = 0 ORDER BY column_id;";
-            metadata.Parameters.AddWithValue("@table", table);
-            await using var reader = await metadata.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-                columns.Add(reader.GetString(0));
-        }
-        await using var seed = connection.CreateCommand();
-        seed.CommandText = $"""
-            WITH source AS (
-                SELECT TOP (1) * FROM {Q(table)} WHERE {Q(category.Column.Identifier)} = @category
-            ), numbers AS (
-                SELECT TOP (4096) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-                FROM sys.all_objects a CROSS JOIN sys.all_objects b
-            )
-            INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))})
-            SELECT {string.Join(", ", columns.Select(column => identityColumns.Contains(column)
-                ? $"CONCAT(s.{Q(column)}, N'-noise-', n.n)"
-                : column == category.Column.Identifier ? "N'noise'" : $"s.{Q(column)}"))}
-            FROM source s CROSS JOIN numbers n;
-            """;
-        seed.Parameters.AddWithValue("@category", "tools");
-        await seed.ExecuteNonQueryAsync();
+        await SqlServerDocumentIdentityNoiseSeeder.SeedAsync(
+            container.GetConnectionString(),
+            identity,
+            table,
+            (category.Column.Identifier, "tools"),
+            new Dictionary<string, object?> { [category.Column.Identifier] = "noise" });
     }
 
     private async Task CorruptPrimaryLookupAsync(ExecutableStorageRoute route, string lookupKey)
@@ -974,7 +945,7 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         command.CommandText =
             $"UPDATE {Q(route.PrimaryStorage.Name.Identifier)} SET " +
             $"{Q(route.Envelope.Identity.LookupKey.Identifier)} = @lookupKey;";
-        command.Parameters.AddWithValue("@lookupKey", lookupKey);
+        command.Parameters.AddWithValue("@lookupKey", SqlServerDocumentIdentityEncoding.Lookup(lookupKey));
         await command.ExecuteNonQueryAsync();
     }
 
@@ -991,7 +962,7 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             $"{Q(route.LinkedRelationship!.DocumentId.Identifier)} = @retainedId, " +
             $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey;";
         command.Parameters.AddWithValue("@retainedId", retainedId);
-        command.Parameters.AddWithValue("@comparisonKey", comparisonKey);
+        command.Parameters.AddWithValue("@comparisonKey", EncodeInjectedComparisonEvidence(comparisonKey));
         await command.ExecuteNonQueryAsync();
     }
 
@@ -1010,10 +981,15 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = @comparisonKey " +
             $"WHERE {Q(route.LinkedRelationship.Identity.LookupKey.Identifier)} = @lookupKey;";
         command.Parameters.AddWithValue("@retainedId", retainedId);
-        command.Parameters.AddWithValue("@comparisonKey", comparisonKey);
-        command.Parameters.AddWithValue("@lookupKey", lookupKey);
+        command.Parameters.AddWithValue("@comparisonKey", EncodeInjectedComparisonEvidence(comparisonKey));
+        command.Parameters.AddWithValue("@lookupKey", SqlServerDocumentIdentityEncoding.Lookup(lookupKey));
         Assert.Equal(1, await command.ExecuteNonQueryAsync());
     }
+
+    private static byte[] EncodeInjectedComparisonEvidence(string value)
+        => value.Length % 2 == 0 && value.All(Uri.IsHexDigit)
+            ? SqlServerDocumentIdentityEncoding.Comparison(value)
+            : Encoding.UTF8.GetBytes(value);
 
     private async Task<IReadOnlyList<int?>> ReadNullableInt32Async(
         string table,

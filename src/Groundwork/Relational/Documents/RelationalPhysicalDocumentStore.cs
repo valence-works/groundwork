@@ -25,6 +25,8 @@ public sealed record RelationalPhysicalIdentityJoinPart(
     string RightColumnIdentifier,
     string? RightAlias);
 
+public sealed record RelationalPhysicalIdentityPrefixRange(object Lower, object? Upper);
+
 internal enum RelationalPhysicalWriteExecutionPoint
 {
     BeforePrimaryLock,
@@ -133,6 +135,25 @@ public abstract class RelationalPhysicalDocumentDialect
         Groundwork.Core.Indexing.IndexValueKind valueKind,
         ProjectedColumnDefinition definition) =>
         RelationalPhysicalProjectionValues.ConvertScalar(value, valueKind, definition);
+    public virtual object ConvertDocumentIdentityOriginal(string value) => value;
+    public virtual object ConvertDocumentIdentityComparison(string value) => value;
+    public virtual object ConvertDocumentIdentityLookup(string value) => value;
+    public virtual RelationalPhysicalIdentityPrefixRange ConvertDocumentIdentityPrefix(string comparisonKey)
+    {
+        ArgumentNullException.ThrowIfNull(comparisonKey);
+        var upper = comparisonKey.Length == 0
+            ? null
+            : comparisonKey[..^1] + (char)(comparisonKey[^1] + 1);
+        return new RelationalPhysicalIdentityPrefixRange(
+            ConvertDocumentIdentityComparison(comparisonKey),
+            upper is null ? null : ConvertDocumentIdentityComparison(upper));
+    }
+    public virtual string ReadDocumentIdentityComparison(DbDataReader reader, int ordinal) =>
+        reader.GetString(ordinal);
+    public virtual string ReadDocumentIdentityLookup(DbDataReader reader, int ordinal) =>
+        reader.GetString(ordinal);
+    public virtual bool PhysicalIdentityValueEquals(object retained, object expected) =>
+        Equals(retained, expected);
     public abstract string Contains(string fieldExpression, string parameterExpression);
     public abstract string StartsWith(string fieldExpression, string parameterExpression);
     public abstract string ApplyOffsetPage(string selectSql, string takeParameter, string skipParameter);
@@ -307,8 +328,11 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     public DocumentStoreAccess Access { get; }
     public TransactionBoundary TransactionBoundary => TransactionBoundary.CrossUnitAtomic;
 
-    public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default) =>
-        await ExecuteAsync(async (current, ct) =>
+    public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ValidateDocumentIdentity(request.Id);
+        return await ExecuteAsync(async (current, ct) =>
         {
             await using var transaction = await current.BeginTransactionAsync(ct);
             var result = await SaveCoreAsync(request, transaction, ct);
@@ -316,12 +340,19 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 await transaction.CommitAsync(ct);
             return result;
         }, cancellationToken);
+    }
 
-    public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default) =>
-        await ExecuteAsync((current, ct) => LoadCoreAsync(current, documentKind, id, null, ct), cancellationToken);
+    public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
+    {
+        ValidateDocumentIdentity(id);
+        return await ExecuteAsync((current, ct) => LoadCoreAsync(current, documentKind, id, null, ct), cancellationToken);
+    }
 
-    public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default) =>
-        await ExecuteAsync(async (current, ct) =>
+    public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ValidateDocumentIdentity(request.Id);
+        return await ExecuteAsync(async (current, ct) =>
         {
             await using var transaction = await current.BeginTransactionAsync(ct);
             var result = await DeleteCoreAsync(request, transaction, ct);
@@ -329,6 +360,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 await transaction.CommitAsync(ct);
             return result;
         }, cancellationToken);
+    }
 
     public async Task<IDocumentUnitOfWork> BeginAsync(DocumentCommitScope scope, CancellationToken cancellationToken = default)
     {
@@ -520,6 +552,29 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         Groundwork.Core.Indexing.IndexValueKind valueKind,
         ProjectedColumnDefinition definition) =>
         dialect.ConvertQueryValue(value, valueKind, definition);
+    internal void ValidateDocumentIdentity(string value) =>
+        _ = dialect.ConvertDocumentIdentityOriginal(value);
+    internal object ConvertDocumentIdentityComparison(string value) =>
+        dialect.ConvertDocumentIdentityComparison(value);
+    internal object ConvertDocumentIdentityLookup(string value) =>
+        dialect.ConvertDocumentIdentityLookup(value);
+    internal object ConvertDocumentIdentityQueryValue(PhysicalQueryField field, string value) =>
+        field.Path switch
+        {
+            PhysicalDocumentIdentityFieldPaths.Original => dialect.ConvertDocumentIdentityOriginal(value),
+            PhysicalDocumentIdentityFieldPaths.Comparison => dialect.ConvertDocumentIdentityComparison(value),
+            PhysicalDocumentIdentityFieldPaths.Lookup => dialect.ConvertDocumentIdentityLookup(value),
+            _ => throw new InvalidOperationException(
+                $"Document identity field '{field.Path}' does not identify retained physical evidence.")
+        };
+    internal RelationalPhysicalIdentityPrefixRange ConvertDocumentIdentityPrefix(string comparisonKey) =>
+        dialect.ConvertDocumentIdentityPrefix(comparisonKey);
+    internal string ReadDocumentIdentityComparison(DbDataReader reader, int ordinal) =>
+        dialect.ReadDocumentIdentityComparison(reader, ordinal);
+    internal string ReadDocumentIdentityLookup(DbDataReader reader, int ordinal) =>
+        dialect.ReadDocumentIdentityLookup(reader, ordinal);
+    internal RelationalPhysicalEnvelopeRow ReadPhysicalEnvelope(DbDataReader reader) =>
+        RelationalPhysicalEnvelopeRowLayout.Read(reader, dialect);
     internal string P(string name) => dialect.Parameter(name);
     internal int MaxPhysicalParameters => dialect.MaxParameters;
     internal string Contains(string field, string parameter) => dialect.Contains(field, parameter);
@@ -803,9 +858,9 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             {
                 route.Discriminator.Value,
                 scope.StorageKey!,
-                identity.OriginalValue,
-                identity.ComparisonKey,
-                identity.LookupKey
+                dialect.ConvertDocumentIdentityOriginal(identity.OriginalValue),
+                dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey),
+                dialect.ConvertDocumentIdentityLookup(identity.LookupKey)
             }
             .Concat(ProjectedValues(projectedValues, projections));
         await using var command = CreatePhysicalCommand(
@@ -852,8 +907,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             transaction);
         AddPhysicalParameter(command, "kind", route.Discriminator.Value);
         AddPhysicalParameter(command, "scope", scope.StorageKey!);
-        AddPhysicalParameter(command, "idLookup", identity.LookupKey);
-        AddPhysicalParameter(command, "idComparison", identity.ComparisonKey);
+        AddPhysicalParameter(command, "idLookup", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
+        AddPhysicalParameter(command, "idComparison", dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey));
         await command.ExecuteNonQueryAsync(ct);
     }
 
@@ -878,12 +933,15 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             transaction);
         AddPhysicalParameter(command, "kind", route.Discriminator.Value);
         AddPhysicalParameter(command, "scope", scope.StorageKey!);
-        AddPhysicalParameter(command, "idLookup", identity.LookupKey);
+        AddPhysicalParameter(command, "idLookup", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return;
         var retainedId = reader.GetString(0);
-        if (!string.Equals(reader.GetString(1), identity.ComparisonKey, StringComparison.Ordinal))
+        if (!string.Equals(
+                dialect.ReadDocumentIdentityComparison(reader, 1),
+                identity.ComparisonKey,
+                StringComparison.Ordinal))
         {
             throw new DocumentIdentityLookupCollisionException(
                 route.Discriminator.Value,
@@ -924,7 +982,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         if (!await reader.ReadAsync(ct))
             return null;
         var identity = route.Envelope.Identity.Project(id);
-        var row = RelationalPhysicalEnvelopeRowLayout.Read(reader);
+        var row = ReadPhysicalEnvelope(reader);
         if (!string.Equals(row.ComparisonKey, identity.ComparisonKey, StringComparison.Ordinal))
         {
             throw new DocumentIdentityLookupCollisionException(
@@ -975,11 +1033,11 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         var identity = route.Envelope.Identity.Project(id);
         AddPhysicalParameter(command, "kind", route.Discriminator.Value);
         AddPhysicalParameter(command, "scope", scope.StorageKey!);
-        AddPhysicalParameter(command, "idLookup", identity.LookupKey);
-        AddPhysicalParameter(command, "idComparison", identity.ComparisonKey);
+        AddPhysicalParameter(command, "idLookup", dialect.ConvertDocumentIdentityLookup(identity.LookupKey));
+        AddPhysicalParameter(command, "idComparison", dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey));
     }
 
-    private static object?[] EnvelopeValues(
+    private object?[] EnvelopeValues(
         ExecutableStorageRoute route,
         SaveDocumentRequest request,
         DocumentScopeSelection scope,
@@ -990,9 +1048,9 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         [
             route.Discriminator.Value,
             scope.StorageKey!,
-            identity.OriginalValue,
-            identity.ComparisonKey,
-            identity.LookupKey,
+            dialect.ConvertDocumentIdentityOriginal(identity.OriginalValue),
+            dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey),
+            dialect.ConvertDocumentIdentityLookup(identity.LookupKey),
             request.SchemaVersion,
             version,
             request.ContentJson
@@ -1036,12 +1094,13 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return;
-        var retained = Enumerable.Range(0, identity.Count).Select(reader.GetString).ToArray();
-        if (!retained.SequenceEqual(identity.Select(item => item.Value), StringComparer.Ordinal))
+        var matches = identity.Select((item, index) =>
+            dialect.PhysicalIdentityValueEquals(reader.GetValue(index), item.Value));
+        if (!matches.All(match => match))
             throw new PhysicalIdentityHashCollisionException(table, identity.Select(item => item.Column).ToArray());
     }
 
-    private static IdentityValue[] PrimaryIdentity(
+    private IdentityValue[] PrimaryIdentity(
         ExecutableStorageRoute route,
         string id,
         DocumentScopeSelection scope)
@@ -1055,11 +1114,11 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 : column.Identifier == route.ScopeKey.Column.Identifier
                     ? scope.StorageKey!
                     : column.Identifier == route.Envelope.Identity.LookupKey.Identifier
-                        ? identity.LookupKey
+                        ? dialect.ConvertDocumentIdentityLookup(identity.LookupKey)
                         : throw new InvalidOperationException($"Unsupported primary identity column '{column.Identifier}'."))).ToArray();
     }
 
-    private static IdentityValue[] LinkedIdentity(
+    private IdentityValue[] LinkedIdentity(
         ExecutableStorageRoute route,
         string id,
         DocumentScopeSelection scope)
@@ -1074,7 +1133,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 : column.Identifier == relationship.StorageScope.Identifier
                     ? scope.StorageKey!
                     : column.Identifier == relationship.Identity.LookupKey.Identifier
-                        ? identity.LookupKey
+                        ? dialect.ConvertDocumentIdentityLookup(identity.LookupKey)
                         : throw new InvalidOperationException($"Unsupported linked identity column '{column.Identifier}'."))).ToArray();
     }
 
@@ -1142,6 +1201,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         public async Task<DocumentStoreWriteResult> SaveAsync(SaveDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            ArgumentNullException.ThrowIfNull(request);
+            store.ValidateDocumentIdentity(request.Id);
             scope.EnsureIncludes(request.DocumentKind);
             try
             {
@@ -1161,6 +1222,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         public async Task<DocumentStoreWriteResult> DeleteAsync(DeleteDocumentRequest request, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            ArgumentNullException.ThrowIfNull(request);
+            store.ValidateDocumentIdentity(request.Id);
             scope.EnsureIncludes(request.DocumentKind);
             try
             {
@@ -1180,6 +1243,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         public async Task<DocumentEnvelope?> LoadAsync(string documentKind, string id, CancellationToken cancellationToken = default)
         {
             EnsureActive();
+            store.ValidateDocumentIdentity(id);
             scope.EnsureIncludes(documentKind);
             return await ExecuteAsync(
                 (currentTransaction, ct) => store.LoadCoreAsync(
@@ -1255,5 +1319,5 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         }
     }
 
-    private sealed record IdentityValue(string Column, string Parameter, string Value);
+    private sealed record IdentityValue(string Column, string Parameter, object Value);
 }

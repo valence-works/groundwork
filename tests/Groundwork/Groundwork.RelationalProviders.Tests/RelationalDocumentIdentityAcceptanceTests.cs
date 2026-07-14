@@ -280,38 +280,10 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
 
     private async Task SeedPlanNoiseAsync(ExecutableStorageRoute route)
     {
-        await using var connection = new SqlConnection(fixture.Container.GetConnectionString());
-        await connection.OpenAsync();
-        var table = route.PrimaryStorage.Name.Identifier;
-        var columns = new List<string>();
-        await using (var metadata = connection.CreateCommand())
-        {
-            metadata.CommandText = "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(@table) AND is_computed = 0 ORDER BY column_id;";
-            metadata.Parameters.AddWithValue("@table", table);
-            await using var reader = await metadata.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-                columns.Add(reader.GetString(0));
-        }
-        var identity = route.Envelope.Identity;
-        var identityColumns = new HashSet<string>(StringComparer.Ordinal)
-        {
-            route.Envelope.Id.Identifier,
-            identity.LookupKey.Identifier,
-            identity.ComparisonKey.Identifier
-        };
-        await using var seed = connection.CreateCommand();
-        seed.CommandText = $"""
-            WITH source AS (SELECT TOP (1) * FROM {Quote(table)}),
-                 numbers AS (
-                     SELECT TOP (4096) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-                     FROM sys.all_objects a CROSS JOIN sys.all_objects b)
-            INSERT INTO {Quote(table)} ({string.Join(", ", columns.Select(Quote))})
-            SELECT {string.Join(", ", columns.Select(column => identityColumns.Contains(column)
-                ? $"CONCAT(s.{Quote(column)}, N'-noise-', n.n)"
-                : $"s.{Quote(column)}"))}
-            FROM source s CROSS JOIN numbers n;
-            """;
-        await seed.ExecuteNonQueryAsync();
+        await SqlServerDocumentIdentityNoiseSeeder.SeedAsync(
+            fixture.Container.GetConnectionString(),
+            route.Envelope.Identity,
+            route.PrimaryStorage.Name.Identifier);
     }
 
     private static string Quote(string identifier) => $"[{identifier.Replace("]", "]]")}]";

@@ -127,6 +127,29 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         ProjectedColumnDefinition definition) =>
         ConvertProjectionValue(base.ConvertQueryValue(value, valueKind, definition), definition)!;
 
+    public override object ConvertDocumentIdentityOriginal(string value) =>
+        SqlServerDocumentIdentityEncoding.Original(value);
+
+    public override object ConvertDocumentIdentityComparison(string value) =>
+        SqlServerDocumentIdentityEncoding.Comparison(value);
+
+    public override object ConvertDocumentIdentityLookup(string value) =>
+        SqlServerDocumentIdentityEncoding.Lookup(value);
+
+    public override RelationalPhysicalIdentityPrefixRange ConvertDocumentIdentityPrefix(string comparisonKey) =>
+        new(
+            SqlServerDocumentIdentityEncoding.Comparison(comparisonKey),
+            SqlServerDocumentIdentityEncoding.ComparisonPrefixUpperBound(comparisonKey));
+
+    public override string ReadDocumentIdentityComparison(DbDataReader reader, int ordinal) =>
+        SqlServerDocumentIdentityEncoding.ReadComparison(reader.GetValue(ordinal));
+
+    public override string ReadDocumentIdentityLookup(DbDataReader reader, int ordinal) =>
+        SqlServerDocumentIdentityEncoding.ReadLookup(reader.GetValue(ordinal));
+
+    public override bool PhysicalIdentityValueEquals(object retained, object expected) =>
+        SqlServerDocumentIdentityEncoding.ValueEquals(retained, expected);
+
     public override string JsonValue(string canonicalJsonExpression, string stablePath) =>
         $"JSON_VALUE({canonicalJsonExpression}, {SqlLiteral(JsonPath(stablePath))})";
 
@@ -192,8 +215,8 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
                $"{QuoteIdentifier(documentKindColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(storageScopeColumn)} nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentIdColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
-               $"{QuoteIdentifier(documentIdComparisonColumn)} nvarchar(max) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
-               $"{QuoteIdentifier(documentIdLookupColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentIdComparisonColumn)} varbinary(1350) NOT NULL, " +
+               $"{QuoteIdentifier(documentIdLookupColumn)} binary(32) NOT NULL, " +
                $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
                $"{QuoteIdentifier(documentIncarnationColumn)} nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(kindKey)} AS {hash.Expression(QuoteIdentifier(documentKindColumn))} PERSISTED NOT NULL, " +

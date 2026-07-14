@@ -103,6 +103,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         PhysicalMutationPlan plan,
         CancellationToken cancellationToken)
     {
+        predicateBuilder.ValidateDocumentIdentityValues(mutation.Clauses);
         var scope = store.ResolveMutationScope(mutation.DocumentKind);
         if (scope.AcrossScopes || scope.StorageKey is null)
             throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
@@ -423,7 +424,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             route.Discriminator.Value,
             reader.GetString(0),
             reader.GetString(1),
-            reader.GetString(2));
+            store.ReadDocumentIdentityLookup(reader, 2));
     }
 
     private async Task LockRowsAsync(

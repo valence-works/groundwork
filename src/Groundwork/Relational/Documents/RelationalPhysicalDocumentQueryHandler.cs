@@ -39,8 +39,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public bool SupportsFirst => true;
     public bool SupportsLatestPerKey => false;
 
-    public Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+    public Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        ValidateDocumentIdentityValues(query.Clauses);
+        return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
             await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
@@ -55,17 +57,21 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             var documents = new List<DocumentEnvelope>();
             await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
-                documents.Add(RelationalPhysicalEnvelopeRowLayout.Read(reader).Envelope);
+                documents.Add(store.ReadPhysicalEnvelope(reader).Envelope);
             return new DocumentQueryResult(documents, total);
         }, cancellationToken);
+    }
 
-    public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+    public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        ValidateDocumentIdentityValues(query.Clauses);
+        return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
             await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
             return await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
         }, cancellationToken);
+    }
 
     internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
         RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false));
@@ -97,8 +103,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             parameters);
     }
 
-    public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+    public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        ValidateDocumentIdentityValues(query.Clauses);
+        return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
             await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
@@ -107,11 +115,14 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"));
             AddParameters(command, built.Parameters);
             await using var reader = await command.ExecuteReaderAsync(ct);
-            return await reader.ReadAsync(ct) ? RelationalPhysicalEnvelopeRowLayout.Read(reader).Envelope : null;
+            return await reader.ReadAsync(ct) ? store.ReadPhysicalEnvelope(reader).Envelope : null;
         }, cancellationToken);
+    }
 
-    public Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+    public Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
+    {
+        ValidateDocumentIdentityValues(query.Clauses);
+        return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
             await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
@@ -122,6 +133,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             AddParameters(command, built.Parameters);
             return await command.ExecuteScalarAsync(ct) is not null;
         }, cancellationToken);
+    }
 
     public static PhysicalQueryHandlerCertification Certify(PhysicalQueryPlan plan)
     {
@@ -286,7 +298,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             route.Discriminator.Value,
             reader.GetString(0),
             reader.GetString(1),
-            reader.GetString(2));
+            store.ReadDocumentIdentityLookup(reader, 2));
     }
 
     private static IEnumerable<PhysicalQueryField> PredicateFields(PhysicalQueryPlan plan) =>
@@ -418,13 +430,21 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     {
         if (value is null)
             return operation == QueryComparisonOperator.NotEqual ? $"{field} IS NOT NULL" : $"{field} IS NULL";
+        if (IsDocumentIdentityField(queryField) &&
+            operation == QueryComparisonOperator.StartsWith)
+        {
+            return IdentityPrefixRange(queryField, field, (string)value, parameters, ref parameterIndex);
+        }
         var name = $"q{parameterIndex++}";
-        parameters.Add((name, operation switch
+        object parameterValue = operation switch
         {
             QueryComparisonOperator.Contains => ContainsPattern.Build((string)value),
             QueryComparisonOperator.StartsWith => ContainsPattern.BuildStartsWith((string)value),
             _ => value
-        }));
+        };
+        if (IsDocumentIdentityField(queryField))
+            parameterValue = store.ConvertDocumentIdentityQueryValue(queryField, (string)parameterValue);
+        parameters.Add((name, parameterValue));
         var parameter = store.NormalizeQueryExpression(store.P(name), queryField.Source, queryField.ValueKind);
         return operation switch
         {
@@ -440,6 +460,38 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         };
     }
 
+    private string IdentityPrefixRange(
+        PhysicalQueryField queryField,
+        string field,
+        string comparisonKey,
+        List<(string Name, object? Value)> parameters,
+        ref int parameterIndex)
+    {
+        var range = store.ConvertDocumentIdentityPrefix(comparisonKey);
+        var lowerName = $"q{parameterIndex++}";
+        parameters.Add((lowerName, range.Lower));
+        var lower = store.NormalizeQueryExpression(store.P(lowerName), queryField.Source, queryField.ValueKind);
+        if (range.Upper is null)
+            return $"{field} >= {lower}";
+        var upperName = $"q{parameterIndex++}";
+        parameters.Add((upperName, range.Upper));
+        var upper = store.NormalizeQueryExpression(store.P(upperName), queryField.Source, queryField.ValueKind);
+        return $"({field} >= {lower} AND {field} < {upper})";
+    }
+
+    internal void ValidateDocumentIdentityValues(IEnumerable<DocumentQueryClause> clauses)
+    {
+        ArgumentNullException.ThrowIfNull(clauses);
+        foreach (var value in clauses
+                     .SelectMany(clause => clause.Comparisons)
+                     .Where(comparison => comparison.Path == PhysicalDocumentFieldPaths.Id)
+                     .SelectMany(comparison => comparison.Values)
+                     .Where(value => value is not null))
+        {
+            store.ValidateDocumentIdentity(value!);
+        }
+    }
+
     private string Field(PhysicalQueryField field)
     {
         var alias = Alias(field);
@@ -452,6 +504,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private static string Alias(PhysicalQueryField field) =>
         field.Target == ExecutableStorageObjectRole.LinkedIndexStorage ? "l" : "p";
+
+    private static bool IsDocumentIdentityField(PhysicalQueryField field) =>
+        field.Path is PhysicalDocumentIdentityFieldPaths.Original or
+            PhysicalDocumentIdentityFieldPaths.Comparison or
+            PhysicalDocumentIdentityFieldPaths.Lookup;
 
     private string OrderBy(PhysicalQueryPlan plan) =>
         plan.Order.Count == 0

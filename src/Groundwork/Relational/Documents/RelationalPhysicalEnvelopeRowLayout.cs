@@ -44,8 +44,12 @@ internal static class RelationalPhysicalEnvelopeRowLayout
             ])
             .ToArray();
 
-    public static RelationalPhysicalEnvelopeRow Read(DbDataReader reader)
+    public static RelationalPhysicalEnvelopeRow Read(
+        DbDataReader reader,
+        RelationalPhysicalDocumentDialect dialect)
     {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentNullException.ThrowIfNull(dialect);
         var envelope = new DocumentEnvelope(
             reader.GetString(DocumentKind),
             reader.GetString(OriginalId),
@@ -59,7 +63,7 @@ internal static class RelationalPhysicalEnvelopeRowLayout
         };
         return new RelationalPhysicalEnvelopeRow(
             envelope,
-            reader.GetString(ComparisonKey),
-            reader.GetString(LookupKey));
+            dialect.ReadDocumentIdentityComparison(reader, ComparisonKey),
+            dialect.ReadDocumentIdentityLookup(reader, LookupKey));
     }
 }
