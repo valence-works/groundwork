@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Xml.Linq;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
@@ -18,15 +20,170 @@ using Xunit;
 
 namespace Groundwork.RelationalProviders.Tests;
 
+internal sealed record RelationalIdentityNativeExplain(
+    string Plan,
+    IReadOnlyList<DocumentIdentityAccessPath> AccessPaths,
+    IReadOnlyList<DocumentIdentityMaterializedIndex> MaterializedIndexes);
+
+internal static class RelationalIdentityPlanInspector
+{
+    public static IReadOnlyList<DocumentIdentityAccessPath> PostgreSql(string explain)
+    {
+        using var document = JsonDocument.Parse(explain);
+        var plan = document.RootElement[0].GetProperty("Plan");
+        var paths = new List<DocumentIdentityAccessPath>();
+        VisitPostgreSql(plan, paths);
+        return paths;
+    }
+
+    public static IReadOnlyList<DocumentIdentityAccessPath> SqlServer(string explain)
+    {
+        var document = XDocument.Parse(explain);
+        return document.Descendants()
+            .Where(element => element.Name.LocalName == "RelOp")
+            .Select(element =>
+            {
+                var operation = element.Attribute("PhysicalOp")?.Value;
+                var isFullScan = operation is "Table Scan" or "Index Scan" or "Clustered Index Scan";
+                var isIndexAccess = operation is "Index Seek" or "Clustered Index Seek";
+                if (!isFullScan && !isIndexAccess)
+                    return null;
+                var index = element.Descendants()
+                    .FirstOrDefault(candidate => candidate.Name.LocalName == "Object")?
+                    .Attribute("Index")?.Value;
+                return new DocumentIdentityAccessPath(
+                    isIndexAccess || operation is "Index Scan" or "Clustered Index Scan"
+                        ? UnquoteSqlServerIdentifier(index)
+                        : null,
+                    isFullScan);
+            })
+            .Where(path => path is not null)
+            .Cast<DocumentIdentityAccessPath>()
+            .ToArray();
+    }
+
+    private static void VisitPostgreSql(
+        JsonElement plan,
+        ICollection<DocumentIdentityAccessPath> paths)
+    {
+        var nodeType = plan.GetProperty("Node Type").GetString();
+        if (nodeType == "Seq Scan")
+        {
+            paths.Add(new DocumentIdentityAccessPath(null, true));
+        }
+        else if (nodeType is "Index Scan" or "Index Only Scan" or "Bitmap Index Scan")
+        {
+            paths.Add(new DocumentIdentityAccessPath(
+                plan.TryGetProperty("Index Name", out var index) ? index.GetString() : null,
+                false));
+        }
+        if (!plan.TryGetProperty("Plans", out var children))
+            return;
+        foreach (var child in children.EnumerateArray())
+            VisitPostgreSql(child, paths);
+    }
+
+    private static string? UnquoteSqlServerIdentifier(string? identifier)
+    {
+        if (identifier is null || identifier.Length < 2 || identifier[0] != '[' || identifier[^1] != ']')
+            return identifier;
+        return identifier[1..^1].Replace("]]", "]", StringComparison.Ordinal);
+    }
+}
+
+public sealed class RelationalDocumentIdentityAcceptanceEvidenceTests
+{
+    [Fact]
+    public void Same_name_index_with_wrong_catalog_shape_does_not_cover_the_selector()
+    {
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            [new DocumentIdentityMaterializedIndex(
+                "ix_identity",
+                ["storage_scope", "id_comparison_key", "id_lookup_key"],
+                IsValid: true,
+                IsReady: true,
+                IsUnfiltered: true)],
+            ["id_lookup_key", "id_comparison_key"],
+            "same name, wrong ordered key shape");
+
+        Assert.True(evidence.UsesExpectedIndex);
+        Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    [Theory]
+    [InlineData(false, true, true, true, false)]
+    [InlineData(true, false, true, true, false)]
+    [InlineData(true, true, false, true, false)]
+    [InlineData(true, true, true, false, false)]
+    [InlineData(true, true, true, true, true)]
+    public void Unusable_catalog_index_does_not_cover_the_selector(
+        bool isValid,
+        bool isReady,
+        bool isUnfiltered,
+        bool isEnabled,
+        bool isHypothetical)
+    {
+        var evidence = DocumentIdentityNativePlanEvidence.Create(
+            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            [new DocumentIdentityAccessPath("ix_identity", false)],
+            [new DocumentIdentityMaterializedIndex(
+                "ix_identity",
+                ["storage_scope", "id_lookup_key", "id_comparison_key"],
+                isValid,
+                isReady,
+                isUnfiltered,
+                isEnabled,
+                isHypothetical)],
+            ["id_lookup_key", "id_comparison_key"],
+            "unusable catalog index");
+
+        Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    [Fact]
+    public void Postgre_sql_plan_text_cannot_impersonate_a_winning_index_access_path()
+    {
+        const string explain =
+            "[{\"Plan\":{\"Node Type\":\"Seq Scan\",\"Relation Name\":\"documents\",\"Filter\":\"ix_identity = id_lookup_key\"}}]";
+
+        var paths = RelationalIdentityPlanInspector.PostgreSql(explain);
+
+        Assert.Single(paths);
+        Assert.True(paths[0].IsFullScan);
+        Assert.Null(paths[0].IndexName);
+    }
+
+    [Fact]
+    public void Sql_server_statement_text_cannot_impersonate_a_winning_index_access_path()
+    {
+        const string explain = """
+            <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+              <BatchSequence><Batch><Statements><StmtSimple StatementText="SELECT ix_identity">
+                <QueryPlan><RelOp PhysicalOp="Table Scan"><TableScan><Object Table="[documents]" /></TableScan></RelOp></QueryPlan>
+              </StmtSimple></Statements></Batch></BatchSequence>
+            </ShowPlanXML>
+            """;
+
+        var paths = RelationalIdentityPlanInspector.SqlServer(explain);
+
+        Assert.Single(paths);
+        Assert.True(paths[0].IsFullScan);
+        Assert.Null(paths[0].IndexName);
+    }
+}
+
 public abstract class RelationalDocumentIdentityAcceptanceConformance : DocumentIdentityAcceptanceConformance
 {
     protected abstract ProviderIdentity Provider { get; }
     protected abstract IProviderPhysicalNameNormalizer PhysicalNames { get; }
     protected abstract string DialectName { get; }
     protected abstract IPhysicalSchemaExecutor CreateSchemaExecutor();
-    internal abstract Task<string> ExplainNativeAsync(
+    internal abstract Task<RelationalIdentityNativeExplain> ExplainNativeAsync(
         RelationalPhysicalQueryCommand command,
-        ExecutableStorageRoute route);
+        ExecutableStorageRoute route,
+        DocumentIdentityExpectedIndex expectedIndex);
     protected abstract DocumentIdentityAcceptanceFixture CreateFixture(
         StorageManifest manifest,
         PhysicalSchemaTarget target,
@@ -90,23 +247,17 @@ public abstract class RelationalDocumentIdentityAcceptanceConformance : Document
         ExecutableStorageRoute route,
         RelationalPhysicalQueryCommand command)
     {
-        var plan = await ExplainNativeAsync(command, route);
-        var index = route.Indexes.Single(candidate => candidate.Identity.StartsWith(
-            DocumentIdentityAcceptanceModel.ExactIndexIdentity,
-            StringComparison.Ordinal));
-        var lookup = route.Envelope.Identity.LookupKey.Identifier;
-        var comparison = route.Envelope.Identity.ComparisonKey.Identifier;
-        return new DocumentIdentityNativePlanEvidence(
-            plan.Contains(index.Name.Identifier, StringComparison.Ordinal),
-            plan.Contains("Seq Scan", StringComparison.Ordinal) ||
-            plan.Contains("Table Scan", StringComparison.Ordinal) ||
-            DialectName == "sqlserver" && plan.Contains("Index Scan", StringComparison.Ordinal) ||
-            plan.Contains("COLLSCAN", StringComparison.Ordinal),
-            command.CommandText.Contains(lookup, StringComparison.Ordinal),
-            command.CommandText.Contains(comparison, StringComparison.Ordinal),
-            index.Columns.Any(column => column.Column.Identifier == lookup) &&
-            index.Columns.Any(column => column.Column.Identifier == comparison),
-            $"SQL:{Environment.NewLine}{command.CommandText}{Environment.NewLine}PLAN:{Environment.NewLine}{plan}");
+        var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
+        var native = await ExplainNativeAsync(command, route, expectedIndex);
+        var selectorFields = expectedIndex.SelectorFields
+            .Where(field => command.CommandText.Contains(field, StringComparison.Ordinal))
+            .ToArray();
+        return DocumentIdentityNativePlanEvidence.Create(
+            expectedIndex,
+            native.AccessPaths,
+            native.MaterializedIndexes,
+            selectorFields,
+            $"SQL:{Environment.NewLine}{command.CommandText}{Environment.NewLine}PLAN:{Environment.NewLine}{native.Plan}");
     }
 }
 
@@ -142,9 +293,10 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
             mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
     }
 
-    internal override async Task<string> ExplainNativeAsync(
+    internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(
         RelationalPhysicalQueryCommand command,
-        ExecutableStorageRoute route)
+        ExecutableStorageRoute route,
+        DocumentIdentityExpectedIndex expectedIndex)
     {
         await SeedPlanNoiseAsync(route);
         await using var connection = new NpgsqlConnection(fixture.Container.GetConnectionString());
@@ -159,10 +311,69 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
         foreach (var (name, value) in command.Parameters)
             explain.Parameters.AddWithValue(name, value ?? DBNull.Value);
         var lines = new List<string>();
-        await using var reader = await explain.ExecuteReaderAsync();
+        await using (var reader = await explain.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                lines.Add(reader.GetString(0));
+        }
+        var plan = string.Join(Environment.NewLine, lines);
+        var materializedIndexes = await ReadIndexAsync(connection, route, expectedIndex.Name);
+        return new RelationalIdentityNativeExplain(
+            plan,
+            RelationalIdentityPlanInspector.PostgreSql(plan),
+            materializedIndexes);
+    }
+
+    private static async Task<IReadOnlyList<DocumentIdentityMaterializedIndex>> ReadIndexAsync(
+        NpgsqlConnection connection,
+        ExecutableStorageRoute route,
+        string indexName)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT i.indisvalid,
+                   i.indisready,
+                   i.indpred IS NULL AS is_unfiltered,
+                   keys.ordinality,
+                   attributes.attname
+            FROM pg_catalog.pg_index AS i
+            INNER JOIN pg_catalog.pg_class AS indexes ON indexes.oid = i.indexrelid
+            INNER JOIN pg_catalog.pg_class AS tables ON tables.oid = i.indrelid
+            INNER JOIN pg_catalog.pg_namespace AS schemas ON schemas.oid = tables.relnamespace
+            INNER JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY AS keys(attnum, ordinality)
+                ON keys.ordinality <= i.indnkeyatts
+            LEFT JOIN pg_catalog.pg_attribute AS attributes
+                ON attributes.attrelid = tables.oid AND attributes.attnum = keys.attnum
+            WHERE schemas.nspname = current_schema()
+              AND tables.relname = @table
+              AND indexes.relname = @index
+            ORDER BY keys.ordinality;
+            """;
+        command.Parameters.AddWithValue("table", route.PrimaryStorage.Name.Identifier);
+        command.Parameters.AddWithValue("index", indexName);
+        var fields = new List<string>();
+        bool? isValid = null;
+        bool? isReady = null;
+        bool? isUnfiltered = null;
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
-            lines.Add(reader.GetString(0));
-        return string.Join(Environment.NewLine, lines);
+        {
+            isValid ??= reader.GetBoolean(0);
+            isReady ??= reader.GetBoolean(1);
+            isUnfiltered ??= reader.GetBoolean(2);
+            fields.Add(reader.IsDBNull(4) ? "<expression>" : reader.GetString(4));
+        }
+        return isValid is null
+            ? []
+            :
+            [
+                new DocumentIdentityMaterializedIndex(
+                    indexName,
+                    fields,
+                    isValid.Value,
+                    isReady!.Value,
+                    isUnfiltered!.Value)
+            ];
     }
 
     private async Task SeedPlanNoiseAsync(ExecutableStorageRoute route)
@@ -238,9 +449,10 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
             mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
     }
 
-    internal override async Task<string> ExplainNativeAsync(
+    internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(
         RelationalPhysicalQueryCommand command,
-        ExecutableStorageRoute route)
+        ExecutableStorageRoute route,
+        DocumentIdentityExpectedIndex expectedIndex)
     {
         await SeedPlanNoiseAsync(route);
         await using var connection = new SqlConnection(fixture.Container.GetConnectionString());
@@ -250,6 +462,7 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
             statistics.CommandText = $"UPDATE STATISTICS {Quote(route.PrimaryStorage.Name.Identifier)};";
             await statistics.ExecuteNonQueryAsync();
         }
+        var materializedIndexes = await ReadIndexAsync(connection, route, expectedIndex.Name);
         await using (var enable = connection.CreateCommand())
         {
             enable.CommandText = "SET STATISTICS XML ON;";
@@ -275,7 +488,62 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
                 }
             }
         } while (await reader.NextResultAsync());
-        return Assert.Single(plans);
+        var plan = Assert.Single(plans);
+        return new RelationalIdentityNativeExplain(
+            plan,
+            RelationalIdentityPlanInspector.SqlServer(plan),
+            materializedIndexes);
+    }
+
+    private static async Task<IReadOnlyList<DocumentIdentityMaterializedIndex>> ReadIndexAsync(
+        SqlConnection connection,
+        ExecutableStorageRoute route,
+        string indexName)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT indexes.is_disabled,
+                   indexes.has_filter,
+                   indexes.is_hypothetical,
+                   index_columns.key_ordinal,
+                   columns.name
+            FROM sys.indexes AS indexes
+            INNER JOIN sys.index_columns AS index_columns
+                ON index_columns.object_id = indexes.object_id
+               AND index_columns.index_id = indexes.index_id
+               AND index_columns.key_ordinal > 0
+            INNER JOIN sys.columns AS columns
+                ON columns.object_id = index_columns.object_id
+               AND columns.column_id = index_columns.column_id
+            WHERE indexes.object_id = OBJECT_ID(@table)
+              AND indexes.name = @index
+            ORDER BY index_columns.key_ordinal;
+            """;
+        command.Parameters.AddWithValue("@table", route.PrimaryStorage.Name.Identifier);
+        command.Parameters.AddWithValue("@index", indexName);
+        var fields = new List<string>();
+        bool? isDisabled = null;
+        bool? hasFilter = null;
+        bool? isHypothetical = null;
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            isDisabled ??= reader.GetBoolean(0);
+            hasFilter ??= reader.GetBoolean(1);
+            isHypothetical ??= reader.GetBoolean(2);
+            fields.Add(reader.GetString(4));
+        }
+        return isDisabled is null
+            ? []
+            :
+            [
+                new DocumentIdentityMaterializedIndex(
+                    indexName,
+                    fields,
+                    IsUnfiltered: !hasFilter!.Value,
+                    IsEnabled: !isDisabled.Value,
+                    IsHypothetical: isHypothetical!.Value)
+            ];
     }
 
     private async Task SeedPlanNoiseAsync(ExecutableStorageRoute route)

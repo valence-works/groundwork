@@ -12,6 +12,46 @@ using Xunit;
 
 namespace Groundwork.Sqlite.Tests;
 
+internal static class SqliteIdentityPlanInspector
+{
+    public static IReadOnlyList<DocumentIdentityAccessPath> Parse(IReadOnlyList<string> details) => details
+        .Select(detail =>
+        {
+            var indexName = IndexName(detail, "USING COVERING INDEX ") ??
+                IndexName(detail, "USING INDEX ");
+            var fullScan = detail.StartsWith("SCAN ", StringComparison.OrdinalIgnoreCase);
+            return indexName is null && !fullScan
+                ? null
+                : new DocumentIdentityAccessPath(indexName, fullScan);
+        })
+        .Where(path => path is not null)
+        .Cast<DocumentIdentityAccessPath>()
+        .ToArray();
+
+    private static string? IndexName(string detail, string marker)
+    {
+        var start = detail.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+            return null;
+        start += marker.Length;
+        var end = detail.IndexOfAny([' ', '('], start);
+        return end < 0 ? detail[start..] : detail[start..end];
+    }
+}
+
+public sealed class SqliteDocumentIdentityAcceptanceEvidenceTests
+{
+    [Fact]
+    public void Plan_detail_text_cannot_impersonate_a_structured_index_access_path()
+    {
+        var paths = SqliteIdentityPlanInspector.Parse(["SCAN documents /* ix_identity */"]);
+
+        Assert.Single(paths);
+        Assert.True(paths[0].IsFullScan);
+        Assert.Null(paths[0].IndexName);
+    }
+}
+
 public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcceptanceConformance
 {
     protected override async Task<DocumentIdentityAcceptanceFixture> CreateIdentityFixtureAsync(
@@ -120,22 +160,46 @@ public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcce
         foreach (var (name, value) in command.Parameters)
             explain.Parameters.AddWithValue($"@{name}", value ?? DBNull.Value);
         var details = new List<string>();
-        await using var reader = await explain.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-            details.Add(reader.GetString(3));
+        await using (var reader = await explain.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                details.Add(reader.GetString(3));
+        }
         var plan = string.Join(Environment.NewLine, details);
-        var index = route.Indexes.Single(candidate => candidate.Identity.StartsWith(
-            DocumentIdentityAcceptanceModel.ExactIndexIdentity,
-            StringComparison.Ordinal));
-        var lookup = route.Envelope.Identity.LookupKey.Identifier;
-        var comparison = route.Envelope.Identity.ComparisonKey.Identifier;
-        return new DocumentIdentityNativePlanEvidence(
-            plan.Contains(index.Name.Identifier, StringComparison.Ordinal),
-            plan.Contains("SCAN", StringComparison.OrdinalIgnoreCase),
-            command.CommandText.Contains(lookup, StringComparison.Ordinal),
-            command.CommandText.Contains(comparison, StringComparison.Ordinal),
-            index.Columns.Any(column => column.Column.Identifier == lookup) &&
-            index.Columns.Any(column => column.Column.Identifier == comparison),
+        var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
+        var materializedIndexes = await ReadIndexAsync(connection, expectedIndex.Name);
+        var selectorFields = expectedIndex.SelectorFields
+            .Where(field => command.CommandText.Contains(field, StringComparison.Ordinal))
+            .ToArray();
+        return DocumentIdentityNativePlanEvidence.Create(
+            expectedIndex,
+            SqliteIdentityPlanInspector.Parse(details),
+            materializedIndexes,
+            selectorFields,
             $"SQL:{Environment.NewLine}{command.CommandText}{Environment.NewLine}PLAN:{Environment.NewLine}{plan}");
+    }
+
+    private static async Task<IReadOnlyList<DocumentIdentityMaterializedIndex>> ReadIndexAsync(
+        SqliteConnection connection,
+        string indexName)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA index_xinfo(\"{indexName.Replace("\"", "\"\"")}\");";
+        var fields = new List<(long Ordinal, string Name)>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            if (reader.GetInt64(5) != 1 || reader.IsDBNull(2))
+                continue;
+            fields.Add((reader.GetInt64(0), reader.GetString(2)));
+        }
+        return fields.Count == 0
+            ? []
+            :
+            [
+                new DocumentIdentityMaterializedIndex(
+                    indexName,
+                    fields.OrderBy(field => field.Ordinal).Select(field => field.Name).ToArray())
+            ];
     }
 }

@@ -11,6 +11,133 @@ using Xunit;
 
 namespace Groundwork.MongoDb.Tests;
 
+internal static class MongoDbDocumentIdentityAcceptanceEvidence
+{
+    public static DocumentIdentityNativePlanEvidence Create(
+        DocumentIdentityExpectedIndex expectedIndex,
+        BsonDocument winningPlan,
+        BsonDocument materializedIndex)
+    {
+        var observation = MongoDbWinningPlanInspector.Inspect(winningPlan);
+        var accessPaths = observation.IndexScans
+            .Select(scan => new DocumentIdentityAccessPath(scan.IndexName, false))
+            .Concat(observation.HasCollectionScan
+                ? [new DocumentIdentityAccessPath(null, true)]
+                : [])
+            .ToArray();
+        var indexName = materializedIndex["name"].AsString;
+        var keyFields = materializedIndex["key"].AsBsonDocument.Names.ToArray();
+        var selectorFields = observation.IndexScans
+            .Where(scan => scan.IndexName.Equals(expectedIndex.Name, StringComparison.Ordinal))
+            .SelectMany(scan => scan.BoundFields)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        return DocumentIdentityNativePlanEvidence.Create(
+            expectedIndex,
+            accessPaths,
+            [new DocumentIdentityMaterializedIndex(indexName, keyFields)],
+            selectorFields,
+            $"INDEX:{Environment.NewLine}{materializedIndex.ToJson()}{Environment.NewLine}" +
+            $"WINNING PLAN:{Environment.NewLine}{winningPlan.ToJson()}");
+    }
+
+    public static DocumentIdentityNativePlanEvidence CreateMutation(
+        DocumentIdentityExpectedIndex expectedIndex,
+        BsonDocument primaryEvidence,
+        BsonDocument materializedIndex) =>
+        Create(expectedIndex, primaryEvidence["winningPlan"].AsBsonDocument, materializedIndex);
+}
+
+public sealed class MongoDbDocumentIdentityAcceptanceEvidenceTests
+{
+    [Fact]
+    public void Rejected_plan_index_cannot_hide_a_winning_collection_scan()
+    {
+        var explanation = new BsonDocument("queryPlanner", new BsonDocument
+        {
+            ["winningPlan"] = new BsonDocument("stage", "COLLSCAN"),
+            ["rejectedPlans"] = new BsonArray
+            {
+                new BsonDocument
+                {
+                    ["stage"] = "IXSCAN",
+                    ["indexName"] = "ix_identity",
+                    ["indexBounds"] = new BsonDocument
+                    {
+                        ["id_lookup_key"] = new BsonArray(),
+                        ["id_comparison_key"] = new BsonArray()
+                    }
+                }
+            }
+        });
+        var winningPlan = MongoDbWinningPlanInspector.ExactWinningPlan(explanation);
+
+        var evidence = MongoDbDocumentIdentityAcceptanceEvidence.Create(
+            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            winningPlan,
+            Index("ix_identity", "storage_scope", "id_lookup_key", "id_comparison_key"));
+
+        Assert.False(evidence.UsesExpectedIndex);
+        Assert.True(evidence.HasFullScan);
+    }
+
+    [Fact]
+    public void Same_name_index_with_wrong_list_indexes_shape_does_not_cover_the_selector()
+    {
+        var winningPlan = new BsonDocument
+        {
+            ["stage"] = "IXSCAN",
+            ["indexName"] = "ix_identity",
+            ["indexBounds"] = new BsonDocument
+            {
+                ["id_lookup_key"] = new BsonArray(),
+                ["id_comparison_key"] = new BsonArray()
+            }
+        };
+
+        var evidence = MongoDbDocumentIdentityAcceptanceEvidence.Create(
+            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            winningPlan,
+            Index("ix_identity", "storage_scope", "id_comparison_key", "id_lookup_key"));
+
+        Assert.True(evidence.UsesExpectedIndex);
+        Assert.False(evidence.IndexCoversSelectorFields);
+    }
+
+    [Fact]
+    public void Mutation_evidence_uses_the_independent_expectation_not_the_reported_index_name()
+    {
+        var primary = new BsonDocument
+        {
+            ["indexName"] = "production-reported-decoy",
+            ["winningPlan"] = new BsonDocument
+            {
+                ["stage"] = "IXSCAN",
+                ["indexName"] = "ix_identity",
+                ["indexBounds"] = new BsonDocument
+                {
+                    ["id_lookup_key"] = new BsonArray(),
+                    ["id_comparison_key"] = new BsonArray()
+                }
+            }
+        };
+
+        var evidence = MongoDbDocumentIdentityAcceptanceEvidence.CreateMutation(
+            new DocumentIdentityExpectedIndex("ix_identity", ["id_lookup_key", "id_comparison_key"]),
+            primary,
+            Index("ix_identity", "storage_scope", "id_lookup_key", "id_comparison_key"));
+
+        Assert.True(evidence.UsesExpectedIndex);
+        Assert.True(evidence.IndexCoversSelectorFields);
+    }
+
+    private static BsonDocument Index(string name, params string[] fields) => new()
+    {
+        ["name"] = name,
+        ["key"] = new BsonDocument(fields.Select(field => new BsonElement(field, 1)))
+    };
+}
+
 public sealed class MongoDbDocumentIdentityAcceptanceContainer : IAsyncLifetime
 {
     public MongoDbContainer Container { get; } = new MongoDbBuilder("mongo:7.0.24")
@@ -61,15 +188,13 @@ public sealed class MongoDbDocumentIdentityAcceptanceTests(MongoDbDocumentIdenti
         Groundwork.Documents.Store.DocumentQuery query)
     {
         var explanation = await documents.ExplainAsync(query);
-        var expectedIndex = route.Indexes.Single(candidate => candidate.Identity.StartsWith(
-            DocumentIdentityAcceptanceModel.ExactIndexIdentity,
-            StringComparison.Ordinal));
-        var filter = explanation.ToJson();
+        var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
+        var winningPlan = MongoDbWinningPlanInspector.ExactWinningPlan(explanation);
         var index = await ReadIndexAsync(
             documents.Database,
             route.PrimaryStorage.Name.Identifier,
-            expectedIndex.Name.Identifier);
-        return Evidence(route, filter, expectedIndex.Name.Identifier, index);
+            expectedIndex.Name);
+        return MongoDbDocumentIdentityAcceptanceEvidence.Create(expectedIndex, winningPlan, index);
     }
 
     private static async Task<DocumentIdentityNativePlanEvidence> ExplainMutationAsync(
@@ -85,31 +210,23 @@ public sealed class MongoDbDocumentIdentityAcceptanceTests(MongoDbDocumentIdenti
             model.Provider,
             mutation);
         var primary = explanation["primary"].AsBsonDocument;
-        var expectedIndex = primary["indexName"].AsString;
+        var exactIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
+        var storage = model.StorageByStorageUnit[route.StorageUnit.Value];
+        var declaration = storage.BoundedMutations.Single(candidate =>
+            candidate.Identity == mutation.MutationIdentity);
+        var predicate = storage.BoundedQueries.Single(candidate =>
+            candidate.Identity == declaration.PredicateQueryIdentity);
+        var expectedIndex = new DocumentIdentityExpectedIndex(
+            MongoDbPhysicalMutationStorage.IndexName(
+                route,
+                predicate,
+                ExecutableStorageObjectRole.PrimaryStorage),
+            exactIndex.SelectorFields);
         var index = await ReadIndexAsync(
             documents.Database,
             route.PrimaryStorage.Name.Identifier,
-            expectedIndex);
-        return Evidence(route, primary.ToJson(), expectedIndex, index);
-    }
-
-    private static DocumentIdentityNativePlanEvidence Evidence(
-        ExecutableStorageRoute route,
-        string plan,
-        string expectedIndex,
-        BsonDocument index)
-    {
-        var lookup = route.Envelope.Identity.LookupKey.Identifier;
-        var comparison = route.Envelope.Identity.ComparisonKey.Identifier;
-        var keys = index["key"].AsBsonDocument.Names.ToHashSet(StringComparer.Ordinal);
-        return new DocumentIdentityNativePlanEvidence(
-            plan.Contains(expectedIndex, StringComparison.Ordinal) &&
-            plan.Contains("IXSCAN", StringComparison.Ordinal),
-            plan.Contains("COLLSCAN", StringComparison.Ordinal),
-            plan.Contains(lookup, StringComparison.Ordinal),
-            plan.Contains(comparison, StringComparison.Ordinal),
-            keys.Contains(lookup) && keys.Contains(comparison),
-            $"INDEX:{Environment.NewLine}{index.ToJson()}{Environment.NewLine}PLAN:{Environment.NewLine}{plan}");
+            expectedIndex.Name);
+        return MongoDbDocumentIdentityAcceptanceEvidence.CreateMutation(expectedIndex, primary, index);
     }
 
     private static async Task<BsonDocument> ReadIndexAsync(

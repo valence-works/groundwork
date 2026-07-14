@@ -135,6 +135,24 @@ public abstract class DocumentIdentityAcceptanceConformance
         Assert.Equal(authoritative[1..3], prefix.Documents.Select(document => document.Id));
     }
 
+    [Fact]
+    public async Task Empty_identity_starts_with_matches_every_identity_and_returns_originals()
+    {
+        await using var fixture = await CreateIdentityFixtureAsync(surface: DocumentIdentityAcceptanceSurface.StartsWith);
+        string[] authoritative = ["", "alpha", "Prefix-𐐨-one", "zulu"];
+        foreach (var id in authoritative)
+        {
+            Assert.Equal(
+                DocumentStoreWriteStatus.Saved,
+                (await fixture.Documents.SaveAsync(DocumentIdentityAcceptanceModel.Save(id, "pending"))).Status);
+        }
+
+        var prefix = await fixture.Queries.QueryAsync(DocumentIdentityAcceptanceModel.PrefixQuery(
+            DocumentQueryComparison.StartsWith(PhysicalDocumentFieldPaths.Id, string.Empty)));
+
+        Assert.Equal(authoritative, prefix.Documents.Select(document => document.Id));
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
@@ -152,17 +170,6 @@ public abstract class DocumentIdentityAcceptanceConformance
 
         Assert.Equal(authoritative, Assert.Single(result.Documents).Id);
         Assert.NotNull(fixture.Route.LinkedIndexStorage);
-    }
-
-    [Fact]
-    public async Task Identity_contains_is_rejected_before_a_query_runtime_is_published()
-    {
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            CreateIdentityFixtureAsync(surface: DocumentIdentityAcceptanceSurface.Contains));
-
-        Assert.Contains("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("Contains", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("identity", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -285,7 +292,6 @@ public enum DocumentIdentityAcceptanceSurface
     Exact,
     OrderedRange,
     StartsWith,
-    Contains,
     Mutation
 }
 
@@ -315,7 +321,78 @@ public sealed record DocumentIdentityNativePlanEvidence(
     bool SelectorUsesLookupKey,
     bool SelectorUsesComparisonKey,
     bool IndexCoversSelectorFields,
-    string Details);
+    string Details)
+{
+    public static DocumentIdentityNativePlanEvidence Create(
+        DocumentIdentityExpectedIndex expected,
+        IReadOnlyList<DocumentIdentityAccessPath> accessPaths,
+        IReadOnlyList<DocumentIdentityMaterializedIndex> materializedIndexes,
+        IReadOnlyList<string> selectorFields,
+        string details)
+    {
+        var materialized = materializedIndexes
+            .Where(index => index.Name.Equals(expected.Name, StringComparison.Ordinal))
+            .ToArray();
+        var indexCoversSelector = materialized.Length == 1 &&
+            materialized[0].IsUsable &&
+            ContainsOrderedSequence(materialized[0].KeyFields, expected.SelectorFields);
+        var structuredDetails = $"""
+            EXPECTED INDEX: {expected.Name} ({string.Join(", ", expected.SelectorFields)})
+            ACCESS PATHS: {string.Join("; ", accessPaths.Select(path => path.ToString()))}
+            MATERIALIZED INDEXES: {string.Join("; ", materializedIndexes.Select(index => index.ToString()))}
+            {details}
+            """;
+        return new DocumentIdentityNativePlanEvidence(
+            accessPaths.Any(path => !path.IsFullScan && path.IndexName == expected.Name),
+            accessPaths.Any(path => path.IsFullScan),
+            selectorFields.Contains(expected.SelectorFields[0], StringComparer.Ordinal),
+            selectorFields.Contains(expected.SelectorFields[1], StringComparer.Ordinal),
+            indexCoversSelector,
+            structuredDetails);
+    }
+
+    private static bool ContainsOrderedSequence(
+        IReadOnlyList<string> actual,
+        IReadOnlyList<string> required)
+    {
+        if (required.Count == 0)
+            return true;
+        for (var start = 0; start <= actual.Count - required.Count; start++)
+        {
+            if (required.Select((field, offset) => (field, offset)).All(item =>
+                    actual[start + item.offset].Equals(item.field, StringComparison.Ordinal)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+public sealed record DocumentIdentityExpectedIndex(
+    string Name,
+    IReadOnlyList<string> SelectorFields);
+
+public sealed record DocumentIdentityAccessPath(string? IndexName, bool IsFullScan)
+{
+    public override string ToString() => IsFullScan ? "FULL SCAN" : $"INDEX {IndexName ?? "<unknown>"}";
+}
+
+public sealed record DocumentIdentityMaterializedIndex(
+    string Name,
+    IReadOnlyList<string> KeyFields,
+    bool IsValid = true,
+    bool IsReady = true,
+    bool IsUnfiltered = true,
+    bool IsEnabled = true,
+    bool IsHypothetical = false)
+{
+    public bool IsUsable => IsValid && IsReady && IsUnfiltered && IsEnabled && !IsHypothetical;
+
+    public override string ToString() =>
+        $"{Name} ({string.Join(", ", KeyFields)}); " +
+        $"valid={IsValid}; ready={IsReady}; unfiltered={IsUnfiltered}; enabled={IsEnabled}; hypothetical={IsHypothetical}";
+}
 
 public static class DocumentIdentityAcceptanceModel
 {
@@ -324,12 +401,24 @@ public static class DocumentIdentityAcceptanceModel
     public const string ExactIndexIdentity = "by-identity-exact";
     public const string RangeQueryIdentity = "identity-range";
     public const string PrefixQueryIdentity = "identity-prefix";
-    public const string ContainsQueryIdentity = "identity-contains";
     public const string OrderedIndexIdentity = "by-identity-ordered";
     public const string StatusQueryIdentity = "identity-status";
     public const string StatusIndexIdentity = "by-identity-status";
     public const string DeleteMutationIdentity = "delete-by-identity";
     public const string TransitionMutationIdentity = "transition-pending";
+
+    public static DocumentIdentityExpectedIndex ExactIndex(ExecutableStorageRoute route)
+    {
+        var index = route.Indexes.Single(candidate => candidate.Identity.StartsWith(
+            ExactIndexIdentity,
+            StringComparison.Ordinal));
+        return new DocumentIdentityExpectedIndex(
+            index.Name.Identifier,
+            [
+                route.Envelope.Identity.LookupKey.Identifier,
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ]);
+    }
 
     public static StorageManifest Manifest(
         PhysicalStorageForm form = PhysicalStorageForm.PhysicalEntityTable,
@@ -438,13 +527,6 @@ public static class DocumentIdentityAcceptanceModel
             QueryPagingSupport.Offset,
             BoundedQueryExecutionClass.ScaleBearing,
             supportsTotalCount: true);
-        var containsQuery = new BoundedQueryDeclaration(
-            ContainsQueryIdentity,
-            orderedIndexIdentity,
-            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
-            QuerySortSupport.None,
-            QueryPagingSupport.None,
-            BoundedQueryExecutionClass.ScaleBearing);
         var statusLogicalIndex = new LogicalIndexDeclaration(
             statusIndexIdentity,
             [new IndexField("status")],
@@ -469,7 +551,6 @@ public static class DocumentIdentityAcceptanceModel
             DocumentIdentityAcceptanceSurface.Exact => [exactQuery],
             DocumentIdentityAcceptanceSurface.OrderedRange => [rangeQuery],
             DocumentIdentityAcceptanceSurface.StartsWith => [prefixQuery],
-            DocumentIdentityAcceptanceSurface.Contains => [containsQuery],
             DocumentIdentityAcceptanceSurface.Mutation => [exactQuery, statusQuery],
             _ => throw new ArgumentOutOfRangeException(nameof(surface), surface, null)
         };

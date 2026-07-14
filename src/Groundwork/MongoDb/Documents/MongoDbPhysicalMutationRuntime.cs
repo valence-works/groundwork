@@ -196,17 +196,13 @@ public static class MongoDbPhysicalMutationRuntime
                 ["verbosity"] = "queryPlanner"
             },
             cancellationToken: cancellationToken);
-        var winningPlan = ExactWinningPlan(explanation);
-        var stages = Descendants(winningPlan)
-            .Where(document => document.TryGetValue("stage", out _))
-            .Select(document => document["stage"].AsString)
-            .ToArray();
-        var indexes = Descendants(winningPlan)
-            .Where(document => document.TryGetValue("indexName", out _))
-            .Select(document => document["indexName"].AsString)
+        var winningPlan = MongoDbWinningPlanInspector.ExactWinningPlan(explanation);
+        var observation = MongoDbWinningPlanInspector.Inspect(winningPlan);
+        var indexes = observation.IndexScans
+            .Select(scan => scan.IndexName)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
-        if (stages.Contains("COLLSCAN", StringComparer.Ordinal) ||
+        if (observation.HasCollectionScan ||
             indexes.Length != 1 ||
             indexes[0] != selector.Index.Identifier)
         {
@@ -221,38 +217,6 @@ public static class MongoDbPhysicalMutationRuntime
             ["winningPlanIndex"] = indexes[0],
             ["winningPlan"] = winningPlan
         };
-    }
-
-    private static BsonDocument ExactWinningPlan(BsonDocument explanation)
-    {
-        var planners = Descendants(explanation)
-            .Where(document => document.TryGetValue("queryPlanner", out var value) && value.IsBsonDocument)
-            .Select(document => document["queryPlanner"].AsBsonDocument)
-            .ToArray();
-        if (planners.Length != 1 ||
-            !planners[0].TryGetValue("winningPlan", out var winningPlan) ||
-            !winningPlan.IsBsonDocument)
-        {
-            throw new InvalidOperationException(
-                "MongoDB bounded-mutation explain must contain exactly one queryPlanner.winningPlan.");
-        }
-        return winningPlan.AsBsonDocument;
-    }
-
-    private static IEnumerable<BsonDocument> Descendants(BsonValue value)
-    {
-        if (value.IsBsonDocument)
-        {
-            var document = value.AsBsonDocument;
-            yield return document;
-            foreach (var child in document.Elements.SelectMany(element => Descendants(element.Value)))
-                yield return child;
-            yield break;
-        }
-        if (!value.IsBsonArray)
-            yield break;
-        foreach (var child in value.AsBsonArray.SelectMany(Descendants))
-            yield return child;
     }
 
     private sealed record RuntimeBinding(
