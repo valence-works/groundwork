@@ -188,26 +188,10 @@ public static class MongoDbDocumentStoreFactory
             var snapshot = applied.Snapshot.Routes.SingleOrDefault(candidate =>
                 candidate.StorageUnit == route.StorageUnit);
             var identity = snapshot?.IdentitySchemaState;
-            var primary = route.Envelope.Identity;
-            var expectedPrimary = new DocumentIdentityColumnMapping(
-                primary.OriginalId,
-                primary.ComparisonKey,
-                primary.LookupKey);
-            var linked = route.LinkedRelationship?.Identity;
-            var expectedLinked = linked is null
-                ? null
-                : new DocumentIdentityColumnMapping(
-                    linked.OriginalId,
-                    linked.ComparisonKey,
-                    linked.LookupKey);
             if (snapshot is null ||
                 !string.Equals(snapshot.RouteFingerprint, route.Fingerprint, StringComparison.Ordinal) ||
                 identity is null ||
-                identity.StringCasePolicy != primary.StringCasePolicy ||
-                !string.Equals(identity.ComparisonAlgorithmId, primary.ComparisonAlgorithmId, StringComparison.Ordinal) ||
-                !string.Equals(identity.LookupAlgorithmId, primary.LookupAlgorithmId, StringComparison.Ordinal) ||
-                identity.Primary != expectedPrimary ||
-                identity.Linked != expectedLinked)
+                !identity.Matches(route))
             {
                 throw new InvalidOperationException(
                     $"MongoDB physical document store admission has mismatched typed identity state for '{route.StorageUnit.Value}'.");

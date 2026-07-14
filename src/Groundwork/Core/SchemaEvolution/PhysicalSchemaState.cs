@@ -119,6 +119,12 @@ public sealed record DocumentIdentitySchemaState(
     DocumentIdentityColumnMapping Primary,
     DocumentIdentityColumnMapping? Linked)
 {
+    public bool Matches(ExecutableStorageRoute route)
+    {
+        ArgumentNullException.ThrowIfNull(route);
+        return this == Capture(route);
+    }
+
     internal static DocumentIdentitySchemaState Capture(ExecutableStorageRoute route)
     {
         ArgumentNullException.ThrowIfNull(route);

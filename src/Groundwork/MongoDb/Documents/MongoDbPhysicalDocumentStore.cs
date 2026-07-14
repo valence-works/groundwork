@@ -604,7 +604,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         }
         else
         {
-            var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
+            var filter = MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, request.Id, scope.StorageKey!);
             if (request.ExpectedVersion is not null)
                 filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
             var result = await primary.ReplaceOneAsync(session, filter, document, cancellationToken: cancellationToken);
@@ -628,7 +628,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         IClientSessionHandle session,
         CancellationToken cancellationToken)
     {
-        var filter = IdentityFilter(route, request.Id, scope.StorageKey!);
+        var filter = MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, request.Id, scope.StorageKey!);
         if (request.ExpectedVersion is not null)
             filter &= Builders<BsonDocument>.Filter.Eq(route.Envelope.Version.Identifier, request.ExpectedVersion.Value);
         var deleted = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
@@ -780,9 +780,6 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             new ReplaceOptions { IsUpsert = true },
             cancellationToken);
     }
-
-    private static FilterDefinition<BsonDocument> IdentityFilter(ExecutableStorageRoute route, string id, string scope) =>
-        MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, id, scope);
 
     internal static DocumentEnvelope ReadEnvelope(ExecutableStorageRoute route, BsonDocument document) =>
         new(
