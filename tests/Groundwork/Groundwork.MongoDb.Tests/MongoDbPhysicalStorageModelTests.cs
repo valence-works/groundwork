@@ -444,6 +444,78 @@ public sealed class MongoDbPhysicalStorageModelTests
         traffic.AssertNone();
     }
 
+    [Theory]
+    [InlineData("missing-required-clause", false, "requires exactly one clause")]
+    [InlineData("missing-required-clause", true, "requires exactly one clause")]
+    [InlineData("wrong-document-kind", false, "not bound to storage unit")]
+    [InlineData("wrong-document-kind", true, "not bound to storage unit")]
+    [InlineData("illegal-operator", false, "not bound to mutation")]
+    [InlineData("illegal-operator", true, "not bound to mutation")]
+    [InlineData("caller-transition-path", false, "is not caller supplied")]
+    [InlineData("caller-transition-path", true, "is not caller supplied")]
+    public async Task Mutation_execute_and_explain_admit_the_same_closed_shape_before_provider_traffic(
+        string shape,
+        bool explain,
+        string expectedMessage)
+    {
+        var model = shape == "caller-transition-path"
+            ? MongoDbBoundedMutationTests.Model(PhysicalStorageForm.PhysicalEntityTable)
+            : MutationModel(PortablePhysicalType.String, IndexValueKind.Keyword, "status");
+        var (store, traffic) = TrafficObservedStore(
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            model);
+        var mutation = shape switch
+        {
+            "missing-required-clause" => new DocumentMutation(
+                "workItem",
+                "prune-by-status",
+                $"{shape}-{explain}"),
+            "wrong-document-kind" => new DocumentMutation(
+                "other",
+                "prune-by-status",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "stale"))]),
+            "illegal-operator" => new DocumentMutation(
+                "workItem",
+                "prune-by-status",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.GreaterThan("status", "stale"))]),
+            "caller-transition-path" => new DocumentMutation(
+                "workItem",
+                "revoke-pending",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "pending"))]),
+            _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, null)
+        };
+        var route = Assert.Single(model.Routes);
+
+        async Task InvokeAsync()
+        {
+            if (explain)
+            {
+                await MongoDbPhysicalMutationRuntime.ExplainAsync(
+                    store,
+                    model.Manifest,
+                    route,
+                    model.Provider,
+                    mutation);
+                return;
+            }
+
+            await MongoDbPhysicalMutationRuntime.Create(
+                    store,
+                    model.Manifest,
+                    route,
+                    model.Provider)
+                .ExecuteAsync(mutation);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(InvokeAsync);
+
+        Assert.Contains(expectedMessage, exception.Message, StringComparison.Ordinal);
+        traffic.AssertNone();
+    }
+
     [Fact]
     public async Task Unit_of_work_disposes_an_owned_session_when_transaction_startup_fails()
     {

@@ -418,6 +418,16 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
         DocumentMutation mutation,
         CancellationToken cancellationToken = default)
     {
+        var plan = Admit(mutation);
+        return handlers[plan.HandlerIdentity].ExecuteAsync(mutation, plan, cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves and validates one complete closed mutation request without invoking a provider.
+    /// Execution and provider-native explain paths use this same admission boundary.
+    /// </summary>
+    public PhysicalMutationPlan Admit(DocumentMutation mutation)
+    {
         ArgumentNullException.ThrowIfNull(mutation);
         if (!plans.TryGetValue(mutation.MutationIdentity, out var plan) ||
             plan.Predicate.StorageUnit.Value != mutation.DocumentKind)
@@ -427,7 +437,7 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
         }
 
         ValidateRuntimeShape(mutation, plan);
-        return handlers[plan.HandlerIdentity].ExecuteAsync(mutation, plan, cancellationToken);
+        return plan;
     }
 
     private static bool SupportsProfile(

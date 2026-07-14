@@ -25,17 +25,26 @@ public static class MongoDbPhysicalMutationRuntime
         ProviderIdentity provider,
         Func<MongoDbPhysicalMutationExecutionPoint, ValueTask>? intercept)
     {
+        return CreateRuntime(store, manifest, route, provider, intercept).Mutations;
+    }
+
+    private static BoundRuntime CreateRuntime(
+        MongoDbPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        Func<MongoDbPhysicalMutationExecutionPoint, ValueTask>? intercept)
+    {
         var binding = Resolve(store, manifest, route, provider);
         route = binding.Route;
         var storage = binding.Storage;
         var capabilities = binding.Capabilities;
-        var compilation = binding.Compilation;
         var handlers = capabilities.HandlerIdentities.Select(registration =>
         {
             var executableBindings = binding.Bindings
                 .Where(candidate => candidate.Plan.HandlerIdentity == registration.Value)
                 .ToArray();
-            return (IPhysicalDocumentMutationHandler)new MongoDbPhysicalDocumentMutationHandler(
+            return new MongoDbPhysicalDocumentMutationHandler(
                 registration.Value,
                 registration.Key,
                 store,
@@ -44,7 +53,15 @@ public static class MongoDbPhysicalMutationRuntime
                 capabilities.NativeFieldIdentifiers,
                 intercept);
         }).ToArray();
-        return new PhysicalMutationDocumentStore(route, storage, capabilities, handlers);
+        var mutations = new PhysicalMutationDocumentStore(
+            route,
+            storage,
+            capabilities,
+            handlers.Cast<IPhysicalDocumentMutationHandler>().ToArray());
+        return new BoundRuntime(
+            binding,
+            mutations,
+            handlers.ToDictionary(handler => handler.Identity, StringComparer.Ordinal));
     }
 
     /// <summary>Returns MongoDB query-planner evidence for the exact primary mutation selector.</summary>
@@ -57,20 +74,10 @@ public static class MongoDbPhysicalMutationRuntime
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(mutation);
-        var binding = Resolve(store, manifest, route, provider);
-        var executable = binding.Bindings.Single(candidate =>
-            candidate.Plan.MutationIdentity == mutation.MutationIdentity);
-        var plan = executable.Plan;
-        var registration = binding.Capabilities.HandlerIdentities.Single(candidate =>
-            candidate.Value == plan.HandlerIdentity);
-        var handler = new MongoDbPhysicalDocumentMutationHandler(
-            registration.Value,
-            registration.Key,
-            store,
-            binding.Route,
-            [executable],
-            binding.Capabilities.NativeFieldIdentifiers,
-            null);
+        var runtime = CreateRuntime(store, manifest, route, provider, intercept: null);
+        var plan = runtime.Mutations.Admit(mutation);
+        var executable = runtime.Binding.Bindings.Single(candidate => candidate.Plan.Equals(plan));
+        var handler = runtime.Handlers[plan.HandlerIdentity];
         var invocation = handler.BindInvocation(mutation, plan);
         await store.EnsureMutationSupportedAsync(mutation.DocumentKind, cancellationToken);
         var evidence = new BsonDocument
@@ -164,7 +171,7 @@ public static class MongoDbPhysicalMutationRuntime
                 $"MongoDB mutation bindings for storage unit '{route.StorageUnit.Value}' do not match the compiled mutation plans.");
         }
 
-        return new RuntimeBinding(route, storage, capabilities, compilation, bindings);
+        return new RuntimeBinding(route, storage, capabilities, bindings);
     }
 
     private static async Task<BsonDocument> ExplainSelectorAsync(
@@ -252,6 +259,10 @@ public static class MongoDbPhysicalMutationRuntime
         ExecutableStorageRoute Route,
         StorageUnitPhysicalStorage Storage,
         PhysicalQueryPlannerCapabilities Capabilities,
-        PhysicalMutationPlanCompilationResult Compilation,
         IReadOnlyList<MongoDbPhysicalMutationBinding> Bindings);
+
+    private sealed record BoundRuntime(
+        RuntimeBinding Binding,
+        PhysicalMutationDocumentStore Mutations,
+        IReadOnlyDictionary<string, MongoDbPhysicalDocumentMutationHandler> Handlers);
 }
