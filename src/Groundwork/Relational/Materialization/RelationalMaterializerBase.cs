@@ -193,6 +193,7 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
 
                 var originalId = reader.GetString(2);
                 var policy = PortableStringComparison.ForIdentityPolicy(admission.RequiredState.StringCasePolicy);
+                PortableStringComparison.ValidateIdentity(originalId);
                 var projection = PortableStringComparison.ProjectIdentity(originalId, policy);
                 rows.Add(new(
                     unit,

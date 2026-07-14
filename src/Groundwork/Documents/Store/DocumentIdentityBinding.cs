@@ -35,8 +35,11 @@ public sealed class DocumentIdentityBinding
             StringComparer.Ordinal);
     }
 
-    public PortableStringIdentityProjection Project(string originalId) =>
-        PortableStringComparison.ProjectIdentity(originalId, comparisonPolicy);
+    public PortableStringIdentityProjection Project(string originalId)
+    {
+        PortableStringComparison.ValidateIdentity(originalId);
+        return PortableStringComparison.ProjectIdentity(originalId, comparisonPolicy);
+    }
 
     public void EnsureLookupIntegrity(
         string documentKind,

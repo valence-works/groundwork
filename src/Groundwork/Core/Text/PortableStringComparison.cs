@@ -116,7 +116,6 @@ public static class PortableStringComparison
         string value,
         PortableStringComparisonPolicy policy)
     {
-        ValidateIdentity(value);
         var comparisonKey = Create(value, policy);
         return new(
             value,

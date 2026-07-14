@@ -89,6 +89,7 @@ public sealed record ExecutableDocumentIdentityRoute(
         string originalId)
     {
         EnsureSupportedAlgorithms(stringCasePolicy, comparisonAlgorithmId, lookupAlgorithmId);
+        PortableStringComparison.ValidateIdentity(originalId);
         return PortableStringComparison.ProjectIdentity(
             originalId,
             ToPortableComparisonPolicy(stringCasePolicy));

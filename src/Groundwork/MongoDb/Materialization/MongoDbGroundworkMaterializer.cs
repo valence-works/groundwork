@@ -362,6 +362,7 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
                     $"Document Store Storage Unit '{admission.StorageUnit.Value}' contains an invalid storage scope identity.");
             }
 
+            PortableStringComparison.ValidateIdentity(originalId);
             var projection = PortableStringComparison.ProjectIdentity(
                 originalId,
                 PortableStringComparison.ForIdentityPolicy(admission.RequiredState.StringCasePolicy));
