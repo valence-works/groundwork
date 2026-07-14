@@ -93,6 +93,71 @@ public sealed class SqlitePhysicalQueryRuntimeTests
     }
 
     [Fact]
+    public async Task LinkedQueryHydratesPrimaryThroughUnicodeEquivalentIdentityEvidence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true,
+            stringCasePolicy: Groundwork.Core.Manifests.StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("Configuration-One", "tools"));
+        await using (var changeOriginalSpelling = connection.CreateCommand())
+        {
+            changeOriginalSpelling.CommandText =
+                $"UPDATE \"{route.LinkedIndexStorage!.Name.Identifier}\" " +
+                $"SET \"{route.LinkedRelationship!.DocumentId.Identifier}\" = 'configuration-one';";
+            await changeOriginalSpelling.ExecuteNonQueryAsync();
+        }
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+
+        var result = await queries.QueryAsync(new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))]));
+
+        Assert.Equal(1, result.TotalCount);
+        Assert.Equal("Configuration-One", Assert.Single(result.Documents).Id);
+    }
+
+    [Fact]
+    public async Task LinkedQueryRejectsLookupCollisionEvidence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("Primary-Id", "tools"));
+        await using (var corruptEvidence = connection.CreateCommand())
+        {
+            corruptEvidence.CommandText =
+                $"UPDATE \"{route.LinkedIndexStorage!.Name.Identifier}\" SET " +
+                $"\"{route.LinkedRelationship!.DocumentId.Identifier}\" = 'Collision-Id', " +
+                $"\"{route.LinkedRelationship.Identity.ComparisonKey.Identifier}\" = 'different-comparison';";
+            await corruptEvidence.ExecuteNonQueryAsync();
+        }
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() => queries.QueryAsync(
+            new DocumentQuery(
+                "configurationDocument",
+                "list-by-category",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))])));
+
+        Assert.Equal("configurationDocument", exception.DocumentKind);
+        Assert.Equal("Collision-Id", exception.RequestedId);
+        Assert.Equal("Primary-Id", exception.RetainedId);
+        Assert.Equal(route.Envelope.Identity.Project("Primary-Id").LookupKey, exception.LookupKey);
+    }
+
+    [Fact]
     public async Task SubstringOperationsTreatLikeWildcardsAsLiteralInput()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

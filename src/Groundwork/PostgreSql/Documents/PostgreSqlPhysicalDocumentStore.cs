@@ -98,15 +98,19 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
         string documentKindColumn,
         string storageScopeColumn,
         string documentIdColumn,
+        string documentIdComparisonColumn,
+        string documentIdLookupColumn,
         string documentVersionColumn,
         string documentIncarnationColumn) =>
         $"CREATE TEMP TABLE {tableExpression} (" +
         $"{QuoteIdentifier(documentKindColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"{QuoteIdentifier(storageScopeColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"{QuoteIdentifier(documentIdColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(documentIdComparisonColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
+        $"{QuoteIdentifier(documentIdLookupColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
         $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
         $"{QuoteIdentifier(documentIncarnationColumn)} text COLLATE pg_catalog.\"C\" NOT NULL, " +
-        $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdColumn)})) " +
+        $"PRIMARY KEY ({QuoteIdentifier(documentKindColumn)}, {QuoteIdentifier(storageScopeColumn)}, {QuoteIdentifier(documentIdLookupColumn)})) " +
         "ON COMMIT DROP;";
 
     public override async Task AcquireMutationOperationLockAsync(

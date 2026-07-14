@@ -746,6 +746,58 @@ public sealed class SqlitePhysicalSchemaExecutorTests
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    public async Task LinkedBackfillRejectsLookupCollisionEvidenceAndRollsBackProjectedRows(
+        PhysicalStorageForm form)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var initial = CreateModel(form, includePriority: false);
+        var additive = CreateModel(form, includePriority: true);
+        var executor = new SqlitePhysicalSchemaExecutor(connection);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, executor);
+        var store = new SqlitePhysicalDocumentStore(
+            connection,
+            initial.Manifest,
+            initial.Target.Routes,
+            DocumentStoreAccess.Global);
+        await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "a-valid", "1", """{"category":"tools","priority":1}""", 0));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "z-collision", "1", """{"category":"tools","priority":2}""", 0));
+        var route = initial.Target.Routes.Single();
+        await using (var corruptEvidence = connection.CreateCommand())
+        {
+            corruptEvidence.CommandText =
+                $"UPDATE {Q(route.LinkedIndexStorage!.Name.Identifier)} SET " +
+                $"{Q(route.LinkedRelationship!.DocumentId.Identifier)} = 'Retained-Collision-Id', " +
+                $"{Q(route.LinkedRelationship.Identity.ComparisonKey.Identifier)} = 'different-comparison' " +
+                $"WHERE {Q(route.LinkedRelationship.DocumentId.Identifier)} = 'z-collision';";
+            await corruptEvidence.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(additive.Target, executor));
+
+        Assert.Equal("configurationDocument", exception.DocumentKind);
+        Assert.Equal("z-collision", exception.RequestedId);
+        Assert.Equal("Retained-Collision-Id", exception.RetainedId);
+        Assert.Equal(route.LinkedRelationship.Identity.Project("z-collision").LookupKey, exception.LookupKey);
+        var priority = additive.Target.Routes.Single().ProjectedColumns
+            .Single(column => column.Definition.LogicalName == "priority");
+        await using var readProjection = connection.CreateCommand();
+        readProjection.CommandText =
+            $"SELECT {Q(priority.Column.Identifier)} FROM {Q(route.LinkedIndexStorage.Name.Identifier)} " +
+            $"ORDER BY {Q(route.LinkedRelationship.DocumentId.Identifier)};";
+        await using var reader = await readProjection.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.IsDBNull(0));
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.IsDBNull(0));
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
     public async Task DecimalLiveAndBackfilledValuesUseTheSameExactScaledInteger(PhysicalStorageForm form)
     {
@@ -870,6 +922,9 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             resultOperation: BoundedQueryResultOperation.Count));
         Assert.Equal(1, trueCount);
     }
+
+    private static string Q(string identifier) =>
+        $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
     internal static (StorageManifest Manifest, PhysicalSchemaTarget Target) CreateModel(
         PhysicalStorageForm form,

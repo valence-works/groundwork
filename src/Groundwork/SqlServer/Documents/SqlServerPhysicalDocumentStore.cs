@@ -165,21 +165,25 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
         string documentKindColumn,
         string storageScopeColumn,
         string documentIdColumn,
+        string documentIdComparisonColumn,
+        string documentIdLookupColumn,
         string documentVersionColumn,
         string documentIncarnationColumn)
     {
         var kindKey = SqlServerPhysicalIdentity.HiddenColumn(documentKindColumn);
         var scopeKey = SqlServerPhysicalIdentity.HiddenColumn(storageScopeColumn);
-        var idKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdColumn);
+        var idKey = SqlServerPhysicalIdentity.HiddenColumn(documentIdLookupColumn);
         return $"CREATE TABLE {tableExpression} (" +
                $"{QuoteIdentifier(documentKindColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(storageScopeColumn)} nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentIdColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentIdComparisonColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
+               $"{QuoteIdentifier(documentIdLookupColumn)} nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(documentVersionColumn)} bigint NOT NULL, " +
                $"{QuoteIdentifier(documentIncarnationColumn)} nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, " +
                $"{QuoteIdentifier(kindKey)} AS {hash.Expression(QuoteIdentifier(documentKindColumn))} PERSISTED NOT NULL, " +
                $"{QuoteIdentifier(scopeKey)} AS {hash.Expression(QuoteIdentifier(storageScopeColumn))} PERSISTED NOT NULL, " +
-               $"{QuoteIdentifier(idKey)} AS {hash.Expression(QuoteIdentifier(documentIdColumn))} PERSISTED NOT NULL, " +
+               $"{QuoteIdentifier(idKey)} AS {hash.Expression(QuoteIdentifier(documentIdLookupColumn))} PERSISTED NOT NULL, " +
                $"PRIMARY KEY NONCLUSTERED ({QuoteIdentifier(kindKey)}, {QuoteIdentifier(scopeKey)}, {QuoteIdentifier(idKey)}));";
     }
 

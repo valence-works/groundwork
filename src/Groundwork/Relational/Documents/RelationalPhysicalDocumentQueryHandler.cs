@@ -43,6 +43,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
             var total = await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult([], total);
@@ -54,13 +55,17 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             var documents = new List<DocumentEnvelope>();
             await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
-                documents.Add(ReadEnvelope(reader));
+                documents.Add(RelationalPhysicalEnvelopeRowLayout.Read(reader).Envelope);
             return new DocumentQueryResult(documents, total);
         }, cancellationToken);
 
     public Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
-        store.ExecutePhysicalQueryAsync((connection, ct) =>
-            CountCoreAsync(connection, Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false), ct), cancellationToken);
+        store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+        {
+            var route = store.GetRoute(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
+            return await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
+        }, cancellationToken);
 
     internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
         RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false));
@@ -96,18 +101,21 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
             var built = Build(query, plan, route, requiresPrimaryLookup: true);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, store.ApplyFirst(
                 $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"));
             AddParameters(command, built.Parameters);
             await using var reader = await command.ExecuteReaderAsync(ct);
-            return await reader.ReadAsync(ct) ? ReadEnvelope(reader) : null;
+            return await reader.ReadAsync(ct) ? RelationalPhysicalEnvelopeRowLayout.Read(reader).Envelope : null;
         }, cancellationToken);
 
     public Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken) =>
         store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            var built = Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: true);
+            var route = store.GetRoute(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
+            var built = Build(query, plan, route, requiresPrimaryLookup: true);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
                 connection,
                 store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"));
@@ -166,7 +174,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
         bool requiresPrimaryLookup,
-        DocumentScopeSelection? fixedScope = null)
+        DocumentScopeSelection? fixedScope = null,
+        bool detectIdentityCollision = false)
     {
         if (query.Continuation is not null)
             throw new NotSupportedException("This relational handler profile does not certify keyset continuations.");
@@ -174,17 +183,12 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             throw new NotSupportedException("This relational handler profile does not certify latest-per-key selection.");
 
         var linked = plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary;
-        var needsPrimaryJoin = linked && (requiresPrimaryLookup || PredicateFields(plan)
+        var needsPrimaryJoin = linked && (detectIdentityCollision || requiresPrimaryLookup || PredicateFields(plan)
             .Any(field => field.Target == ExecutableStorageObjectRole.PrimaryStorage));
         var from = linked && needsPrimaryJoin
             ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)} " +
               $"JOIN {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", null)} ON " +
-              store.ExactPhysicalIdentityJoin(
-              [
-                  new(route.Envelope.DocumentKind.Identifier, "p", route.LinkedRelationship!.DocumentKind.Identifier, "l"),
-                  new(route.Envelope.StorageScope.Identifier, "p", route.LinkedRelationship.StorageScope.Identifier, "l"),
-                  new(route.Envelope.Id.Identifier, "p", route.LinkedRelationship.DocumentId.Identifier, "l")
-              ])
+              store.ExactPhysicalIdentityJoin(LinkedPrimaryJoin(route, detectIdentityCollision))
             : linked
                 ? $"FROM {store.PhysicalQuerySource(route.LinkedIndexStorage!.Name.Identifier, "l", plan.IndexName?.Identifier)}"
                 : $"FROM {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", plan.IndexName?.Identifier)}";
@@ -200,6 +204,13 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         predicates.Add(store.ExactPhysicalIdentityPredicate(
             [new(plan.Discriminator.Identifier, Alias(plan.Discriminator), store.P("kind"))]));
         parameters.Add(("kind", route.Discriminator.Value));
+
+        if (detectIdentityCollision)
+        {
+            predicates.Add(
+                $"p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)} <> " +
+                $"l.{store.Q(route.LinkedRelationship!.Identity.ComparisonKey.Identifier)}");
+        }
 
         var parameterIndex = 0;
         foreach (var clause in query.Clauses)
@@ -222,6 +233,62 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return new RelationalPhysicalQueryPredicate(
             fromAndWhere,
             parameters);
+    }
+
+    private static IReadOnlyList<RelationalPhysicalIdentityJoinPart> LinkedPrimaryJoin(
+        ExecutableStorageRoute route,
+        bool lookupOnly)
+    {
+        var relationship = route.LinkedRelationship!;
+        var identityJoin = new List<RelationalPhysicalIdentityJoinPart>
+        {
+            new(route.Envelope.DocumentKind.Identifier, "p", relationship.DocumentKind.Identifier, "l"),
+            new(route.Envelope.StorageScope.Identifier, "p", relationship.StorageScope.Identifier, "l"),
+            new(route.Envelope.Identity.LookupKey.Identifier, "p", relationship.Identity.LookupKey.Identifier, "l")
+        };
+        if (!lookupOnly)
+        {
+            identityJoin.Add(new(
+                route.Envelope.Identity.ComparisonKey.Identifier,
+                "p",
+                relationship.Identity.ComparisonKey.Identifier,
+                "l"));
+        }
+        return identityJoin;
+    }
+
+    private async Task ThrowIfLinkedIdentityCollisionAsync(
+        DbConnection connection,
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        CancellationToken ct)
+    {
+        if (plan.AccessKind != PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+            return;
+
+        var built = Build(
+            query,
+            plan,
+            route,
+            requiresPrimaryLookup: true,
+            detectIdentityCollision: true);
+        var relationship = route.LinkedRelationship!;
+        var sql = store.ApplyFirst(
+            $"SELECT l.{store.Q(relationship.DocumentId.Identifier)}, " +
+            $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
+            $"l.{store.Q(relationship.Identity.LookupKey.Identifier)} {built.FromAndWhere}");
+        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, sql);
+        AddParameters(command, built.Parameters);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return;
+
+        throw new DocumentIdentityLookupCollisionException(
+            route.Discriminator.Value,
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2));
     }
 
     private static IEnumerable<PhysicalQueryField> PredicateFields(PhysicalQueryPlan plan) =>
@@ -310,28 +377,15 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             : "ORDER BY " + string.Join(", ", plan.Order.Select(order =>
                 $"{Field(order.Field)} {(order.Direction == PhysicalSortDirection.Descending ? "DESC" : "ASC")}"));
 
-    private string EnvelopeSelection(ExecutableStorageRoute route) => string.Join(", ", new[]
-    {
-        route.Envelope.DocumentKind.Identifier,
-        route.Envelope.StorageScope.Identifier,
-        route.Envelope.Id.Identifier,
-        route.Envelope.SchemaVersion.Identifier,
-        route.Envelope.Version.Identifier,
-        route.Envelope.CanonicalJson.Identifier,
-        RelationalPhysicalStorageColumns.CreatedUtc,
-        RelationalPhysicalStorageColumns.UpdatedUtc
-    }.Select(column => $"p.{store.Q(column)}"));
+    private string EnvelopeSelection(ExecutableStorageRoute route) => string.Join(", ",
+        RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route)
+            .Select(column => $"p.{store.Q(column)}"));
 
     private void AddParameters(DbCommand command, IEnumerable<(string Name, object? Value)> parameters)
     {
         foreach (var (name, value) in parameters)
             store.AddPhysicalParameter(command, name, value);
     }
-
-    private static DocumentEnvelope ReadEnvelope(DbDataReader reader) =>
-        new(reader.GetString(0), reader.GetString(2), reader.GetString(3), reader.GetInt64(4), reader.GetString(5),
-            DateTimeOffset.Parse(reader.GetString(6)), DateTimeOffset.Parse(reader.GetString(7)))
-        { Scope = DocumentStoreScopeResolver.ReadScope(reader.GetString(1)) };
 
 }
 

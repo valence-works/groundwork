@@ -139,6 +139,8 @@ public abstract class RelationalPhysicalDocumentDialect
         string documentKindColumn,
         string storageScopeColumn,
         string documentIdColumn,
+        string documentIdComparisonColumn,
+        string documentIdLookupColumn,
         string documentVersionColumn,
         string documentIncarnationColumn) =>
         throw new NotSupportedException("This relational provider does not support bounded mutation identity selection.");
@@ -528,6 +530,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         string kindColumn,
         string scopeColumn,
         string idColumn,
+        string idComparisonColumn,
+        string idLookupColumn,
         string versionColumn,
         string incarnationColumn) =>
         dialect.CreateMutationSelectionTable(
@@ -535,6 +539,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             kindColumn,
             scopeColumn,
             idColumn,
+            idComparisonColumn,
+            idLookupColumn,
             versionColumn,
             incarnationColumn);
     internal string DropMutationSelectionTable(string table) =>
@@ -670,7 +676,10 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         CancellationToken ct)
     {
         var projections = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage).ToArray();
-        var columns = EnvelopeColumns(route).Concat([RelationalPhysicalStorageColumns.CreatedUtc, RelationalPhysicalStorageColumns.UpdatedUtc]).Concat(projections.Select(column => column.Column.Identifier)).ToArray();
+        var columns = RelationalPhysicalEnvelopeRowLayout.PersistedColumns(route)
+            .Concat([RelationalPhysicalStorageColumns.CreatedUtc, RelationalPhysicalStorageColumns.UpdatedUtc])
+            .Concat(projections.Select(column => column.Column.Identifier))
+            .ToArray();
         var parameters = columns.Select((_, index) => P($"v{index}")).ToArray();
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
@@ -855,7 +864,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 indexIdentifier: null)
             : Q(route.PrimaryStorage.Name.Identifier);
         var sql =
-            $"SELECT {string.Join(", ", EnvelopeColumns(route).Select(Q))}, {Q(RelationalPhysicalStorageColumns.CreatedUtc)}, {Q(RelationalPhysicalStorageColumns.UpdatedUtc)} " +
+            $"SELECT {string.Join(", ", RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route).Select(Q))} " +
             $"FROM {source} WHERE {IdentityLookupPredicate(route)}";
         if (lockForWrite)
             sql = dialect.CompleteMutationSelection(sql, includesLinkedStorage: false);
@@ -868,20 +877,16 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         if (!await reader.ReadAsync(ct))
             return null;
         var identity = route.Envelope.Identity.Project(id);
-        var retainedId = reader.GetString(2);
-        var retainedComparison = reader.GetString(3);
-        if (!string.Equals(retainedComparison, identity.ComparisonKey, StringComparison.Ordinal))
+        var row = RelationalPhysicalEnvelopeRowLayout.Read(reader);
+        if (!string.Equals(row.ComparisonKey, identity.ComparisonKey, StringComparison.Ordinal))
         {
             throw new DocumentIdentityLookupCollisionException(
                 documentKind,
                 id,
-                retainedId,
+                row.Envelope.Id,
                 identity.LookupKey);
         }
-        return new DocumentEnvelope(
-            reader.GetString(0), retainedId, reader.GetString(5), reader.GetInt64(6), reader.GetString(7),
-            DateTimeOffset.Parse(reader.GetString(8)), DateTimeOffset.Parse(reader.GetString(9)))
-        { Scope = DocumentStoreScopeResolver.ReadScope(reader.GetString(1)) };
+        return row.Envelope;
     }
 
     private async Task<DocumentEnvelope?> LoadForWriteAsync(
@@ -926,18 +931,6 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         AddPhysicalParameter(command, "idLookup", identity.LookupKey);
         AddPhysicalParameter(command, "idComparison", identity.ComparisonKey);
     }
-
-    private static string[] EnvelopeColumns(ExecutableStorageRoute route) =>
-    [
-        route.Envelope.DocumentKind.Identifier,
-        route.Envelope.StorageScope.Identifier,
-        route.Envelope.Id.Identifier,
-        route.Envelope.Identity.ComparisonKey.Identifier,
-        route.Envelope.Identity.LookupKey.Identifier,
-        route.Envelope.SchemaVersion.Identifier,
-        route.Envelope.Version.Identifier,
-        route.Envelope.CanonicalJson.Identifier
-    ];
 
     private static object?[] EnvelopeValues(
         ExecutableStorageRoute route,

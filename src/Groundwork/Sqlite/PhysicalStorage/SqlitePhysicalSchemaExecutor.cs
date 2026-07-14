@@ -6,6 +6,8 @@ using System.Security.Cryptography;
 using System.Text;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Text;
+using Groundwork.Documents.Store;
 using Groundwork.Relational.Documents;
 using Groundwork.Relational.Physicalization;
 using Microsoft.Data.Sqlite;
@@ -443,6 +445,13 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         await ForEachCanonicalDocumentBatchAsync(route, transaction, ct, async document =>
         {
             var values = RelationalPhysicalProjectionValues.Read(document.CanonicalJson, selected);
+            var identity = relationship.Identity.Project(document.Id);
+            await ThrowIfLinkedIdentityCollisionAsync(
+                route,
+                document.Scope,
+                identity,
+                transaction,
+                ct);
             await using var command = connection.CreateCommand();
             command.Transaction = (SqliteTransaction)transaction;
             command.CommandText =
@@ -451,7 +460,6 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 $"ON CONFLICT ({string.Join(", ", route.AuxiliaryKey!.Columns.Select(column => Q(column.Identifier)))}) {updates};";
             command.Parameters.AddWithValue("@v0", route.Discriminator.Value);
             command.Parameters.AddWithValue("@v1", document.Scope);
-            var identity = relationship.Identity.Project(document.Id);
             command.Parameters.AddWithValue("@v2", identity.OriginalValue);
             command.Parameters.AddWithValue("@v3", identity.ComparisonKey);
             command.Parameters.AddWithValue("@v4", identity.LookupKey);
@@ -463,6 +471,40 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                         selected[index].Definition) ?? DBNull.Value);
             await command.ExecuteNonQueryAsync(ct);
         });
+    }
+
+    private async Task ThrowIfLinkedIdentityCollisionAsync(
+        ExecutableStorageRoute route,
+        string scope,
+        PortableStringIdentityProjection identity,
+        DbTransaction transaction,
+        CancellationToken ct)
+    {
+        var relationship = route.LinkedRelationship!;
+        await using var command = connection.CreateCommand();
+        command.Transaction = (SqliteTransaction)transaction;
+        command.CommandText =
+            $"SELECT {Q(relationship.DocumentId.Identifier)}, " +
+            $"{Q(relationship.Identity.ComparisonKey.Identifier)} " +
+            $"FROM {Q(route.LinkedIndexStorage!.Name.Identifier)} WHERE " +
+            $"{Q(relationship.DocumentKind.Identifier)} = @kind AND " +
+            $"{Q(relationship.StorageScope.Identifier)} = @scope AND " +
+            $"{Q(relationship.Identity.LookupKey.Identifier)} = @lookup;";
+        command.Parameters.AddWithValue("@kind", route.Discriminator.Value);
+        command.Parameters.AddWithValue("@scope", scope);
+        command.Parameters.AddWithValue("@lookup", identity.LookupKey);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return;
+        var retainedId = reader.GetString(0);
+        if (!string.Equals(reader.GetString(1), identity.ComparisonKey, StringComparison.Ordinal))
+        {
+            throw new DocumentIdentityLookupCollisionException(
+                route.Discriminator.Value,
+                identity.OriginalValue,
+                retainedId,
+                identity.LookupKey);
+        }
     }
 
     private async Task BackfillPrimaryAsync(
