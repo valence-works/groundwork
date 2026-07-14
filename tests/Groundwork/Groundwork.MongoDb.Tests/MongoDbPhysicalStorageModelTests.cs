@@ -126,6 +126,30 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Compound_identity_contains_surfaces_the_core_diagnostic_for_queries_and_mutations(
+        bool includeMutation)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+        {
+            var model = CompoundIdentityContainsModel(includeMutation);
+            if (!includeMutation)
+            {
+                _ = new MongoDbPhysicalDocumentStore(
+                    new MongoClient("mongodb://localhost").GetDatabase("groundwork_identity_diagnostic"),
+                    model,
+                    DocumentStoreAccess.Global);
+            }
+        });
+
+        Assert.Contains("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Contains", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-003", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("regular-expression semantics", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
     [InlineData(PortableQueryOperation.GreaterThan)]
     [InlineData(PortableQueryOperation.StartsWith)]
     public void Ordered_identity_filter_binds_equivalent_unicode_spelling_to_the_same_comparison_key(
@@ -164,6 +188,41 @@ public sealed class MongoDbPhysicalStorageModelTests
             Assert.Contains("$gte", lower.ToJson(), StringComparison.Ordinal);
             Assert.Contains("$lt", lower.ToJson(), StringComparison.Ordinal);
             Assert.DoesNotContain("$regularExpression", lower.ToJson(), StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Empty_identity_prefix_uses_a_lower_only_indexed_range_for_queries_and_mutations()
+    {
+        var model = IdentityModel(PortableQueryOperation.StartsWith, includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var storage = Assert.Single(model.Manifest.StorageUnits).PhysicalStorage!;
+        var capabilities = MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
+            model.Provider,
+            MongoDbPhysicalQueryHandler.Operations);
+        var queryPlan = Assert.Single(PhysicalQueryPlanCompiler.Compile(route, storage, capabilities).Plans);
+        var comparison = Assert.Single(Assert.Single(
+            IdentityQuery(string.Empty, PortableQueryOperation.StartsWith).Clauses).Comparisons);
+
+        var queryFilter = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            IdentityQuery(string.Empty, PortableQueryOperation.StartsWith),
+            queryPlan,
+            DocumentScopeSelection.Global,
+            storage,
+            route));
+        var mutationFilter = Render(MongoDbPhysicalDocumentMutationHandler.BuildIdentityMutationFilter(
+            comparison,
+            Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings)).Plan));
+
+        foreach (var filter in new[] { queryFilter, mutationFilter })
+        {
+            var json = filter.ToJson();
+            Assert.Contains("id_comparison_key", json, StringComparison.Ordinal);
+            Assert.Contains("$gte", json, StringComparison.Ordinal);
+            Assert.DoesNotContain("$lt", json, StringComparison.Ordinal);
+            Assert.DoesNotContain("$regularExpression", json, StringComparison.Ordinal);
         }
     }
 
@@ -291,6 +350,26 @@ public sealed class MongoDbPhysicalStorageModelTests
 
         Assert.Contains(reserved, exception.Message, StringComparison.Ordinal);
         Assert.Contains("reserved", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.Contains)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Query_compilation_preserves_provider_diagnostics_for_case_insensitive_regex_operations(
+        PortableQueryOperation operation)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            operations: new HashSet<PortableQueryOperation> { operation });
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new MongoDbPhysicalDocumentStore(
+            new MongoClient("mongodb://localhost").GetDatabase("groundwork_provider_diagnostic"),
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Contains(operation.ToString(), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("regular-expression semantics", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -1107,6 +1186,69 @@ public sealed class MongoDbPhysicalStorageModelTests
         };
         return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
             new StorageManifestIdentity("mongo.identity-query"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
+
+    private static MongoDbPhysicalStorageModel CompoundIdentityContainsModel(bool includeMutation)
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-status-id",
+            [new IndexField("status"), new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-status-id",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Contains,
+                PortableQueryOperation.StartsWith
+            },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "status",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.StartsWith }),
+                new BoundedQueryPredicateField(
+                    PhysicalDocumentFieldPaths.Id,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains })
+            ]);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "compound_identity_entities",
+            [new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("status", 0),
+                        new PhysicalIndexColumnDefinition("id_comparison_key", 1)
+                    ])
+            ]);
+        var unit = Unit("configurationDocument", definition) with
+        {
+            IdentityPolicy = IdentityPolicy.StringId(
+                stringCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase),
+            Tenancy = TenancyPolicy.Global,
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query],
+                boundedMutations: includeMutation
+                    ? [new BoundedMutationDeclaration("delete-by-status-id", query.Identity, BoundedMutationAction.Delete())]
+                    : [])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.compound-identity-diagnostic"),
             new StorageManifestOwner("tests"),
             new StorageManifestVersion("1"),
             [unit],

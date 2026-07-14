@@ -245,13 +245,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private PhysicalQueryDocumentStore CreateQueryStore(ExecutableStorageRoute route)
     {
         var storage = model.StorageByStorageUnit[route.StorageUnit.Value];
-        ValidateScaleBearingOperations(storage);
-        ValidateTypedPaths(route, storage);
         var capabilities = Capabilities(route, storage);
         var plans = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
         if (!plans.IsValid)
             throw new InvalidOperationException(string.Join(Environment.NewLine, plans.Diagnostics.Select(x => $"{x.Code}: {x.Message}")));
 
+        ValidateScaleBearingOperations(storage);
+        ValidateTypedPaths(route, storage);
         var linkedPlans = plans.Plans.Where(plan => plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary).ToArray();
         var nativePlans = plans.Plans.Where(plan => plan.AccessKind != PhysicalQueryAccessKind.LinkedIndexThenPrimary).ToArray();
         var handlers = new IPhysicalDocumentQueryHandler[]

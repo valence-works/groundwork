@@ -67,9 +67,11 @@ internal static class MongoDbPhysicalIdentityQuery
         var builder = Builders<BsonDocument>.Filter;
         return operation switch
         {
-            QueryComparisonOperator.StartsWith => builder.And(
-                builder.Gte(field, comparisonKey),
-                builder.Lt(field, PrefixUpperBound(comparisonKey))),
+            QueryComparisonOperator.StartsWith => comparisonKey.Length == 0
+                ? builder.Gte(field, comparisonKey)
+                : builder.And(
+                    builder.Gte(field, comparisonKey),
+                    builder.Lt(field, PrefixUpperBound(comparisonKey))),
             QueryComparisonOperator.GreaterThan => builder.Gt(field, comparisonKey),
             QueryComparisonOperator.GreaterThanOrEqual => builder.Gte(field, comparisonKey),
             QueryComparisonOperator.LessThan => builder.Lt(field, comparisonKey),
@@ -80,8 +82,6 @@ internal static class MongoDbPhysicalIdentityQuery
 
     private static string PrefixUpperBound(string prefix)
     {
-        if (prefix.Length == 0)
-            throw new InvalidOperationException("Document identity prefix evidence cannot be empty.");
         var upper = prefix.ToCharArray();
         upper[^1]++;
         return new string(upper);

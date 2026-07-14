@@ -52,7 +52,6 @@ internal sealed class MongoDbPhysicalMutationBinding
         StorageUnitPhysicalStorage storage,
         ProviderIdentity provider)
     {
-        MongoDbPhysicalMutationModelValidation.Validate(route, storage);
         var capabilities = MongoDbPhysicalMutationCapabilities.Create(route, storage, provider);
         var compilation = PhysicalMutationPlanCompiler.Compile(route, storage, capabilities);
         if (!compilation.IsValid)
@@ -62,6 +61,7 @@ internal sealed class MongoDbPhysicalMutationBinding
                 compilation.Diagnostics.Select(item => $"{item.Code}: {item.Message}")));
         }
 
+        MongoDbPhysicalMutationModelValidation.Validate(route, storage);
         return compilation.Plans
             .OrderBy(plan => plan.MutationIdentity, StringComparer.Ordinal)
             .Select(plan => new MongoDbPhysicalMutationBinding(
@@ -480,13 +480,13 @@ internal sealed class MongoDbPhysicalMutationSelector
         var identity = target == ExecutableStorageObjectRole.PrimaryStorage
             ? route.Envelope.Identity
             : route.LinkedRelationship!.Identity;
-        var operations = query.Predicates.Single(predicate =>
-            predicate.Path == PhysicalDocumentFieldPaths.Id).Operations;
+        var operations = query.Predicates.SingleOrDefault(predicate =>
+            predicate.Path == PhysicalDocumentFieldPaths.Id)?.Operations;
         var fields = new List<MongoDbPhysicalMutationMirrorField>();
-        if (operations.Any(operation => operation is
+        if (operations?.Any(operation => operation is
                 PortableQueryOperation.Equal or
                 PortableQueryOperation.In or
-                PortableQueryOperation.NotEqual))
+                PortableQueryOperation.NotEqual) == true)
         {
             fields.Add(new MongoDbPhysicalMutationMirrorField(
                 PhysicalDocumentIdentityFieldPaths.Lookup,

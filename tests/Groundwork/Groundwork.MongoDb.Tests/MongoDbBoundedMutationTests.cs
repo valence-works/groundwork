@@ -972,6 +972,37 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Compound_mutation_selector_certifies_a_non_predicate_identity_tail_for_primary_and_linked_storage()
+    {
+        var model = IdentityMutationModel(includeStatusPrefix: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                MongoDbPhysicalMutationStorage.PrimaryField(route, "status"),
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            [
+                route.LinkedRelationship!.DocumentKind.Identifier,
+                route.LinkedRelationship.StorageScope.Identifier,
+                MongoDbPhysicalMutationStorage.LinkedField(route, "status"),
+                route.LinkedRelationship.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Linked!.IndexKeys.Names);
+        Assert.DoesNotContain(
+            PhysicalDocumentIdentityFieldPaths.Lookup,
+            binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(
+            PhysicalDocumentIdentityFieldPaths.Lookup,
+            binding.Certification.Linked!.FieldIdentifiers.Keys);
+    }
+
+    [Fact]
     public async Task Identity_prefix_mutation_uses_indexed_comparison_ranges_for_primary_and_linked_storage()
     {
         var database = new MongoClient(container.GetConnectionString())
@@ -1427,12 +1458,19 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     }
 
     private static MongoDbPhysicalStorageModel IdentityMutationModel(
-        PortableQueryOperation operation = PortableQueryOperation.Equal)
+        PortableQueryOperation operation = PortableQueryOperation.Equal,
+        bool includeStatusPrefix = false)
     {
         var binding = new SharedStorageBinding("runtime");
         var logicalIndex = new LogicalIndexDeclaration(
             "by-id",
-            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            includeStatusPrefix
+                ?
+                [
+                    new IndexField("status"),
+                    new IndexField(PhysicalDocumentFieldPaths.Id)
+                ]
+                : [new IndexField(PhysicalDocumentFieldPaths.Id)],
             IndexValueKind.Keyword,
             false,
             MissingValueBehavior.Excluded);
@@ -1440,16 +1478,22 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             logicalIndex.Identity,
             [
                 new PhysicalIndexColumnDefinition("storage_scope", 0),
-                ..(operation == PortableQueryOperation.Equal
+                ..(includeStatusPrefix
+                    ? new[] { new PhysicalIndexColumnDefinition("status", 1) }
+                    : []),
+                ..(operation == PortableQueryOperation.Equal && !includeStatusPrefix
                     ? new[]
                     {
                         new PhysicalIndexColumnDefinition("id_lookup_key", 1),
                         new PhysicalIndexColumnDefinition("id_comparison_key", 2)
                     }
-                    : [new PhysicalIndexColumnDefinition("id_comparison_key", 1)])
+                    : [new PhysicalIndexColumnDefinition("id_comparison_key", includeStatusPrefix ? 2 : 1)])
             ]);
         var definition = PhysicalTableDefinition.SharedDocuments(
             binding,
+            linkedProjectedColumns: includeStatusPrefix
+                ? [new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false)]
+                : null,
             linkedIndexes: [physicalIndex],
             linkedProjectionLogicalName: "work_items_lookup");
         var query = new BoundedQueryDeclaration(
@@ -1459,7 +1503,15 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
             QuerySortSupport.None,
             QueryPagingSupport.None,
             BoundedQueryExecutionClass.ScaleBearing,
-            supportsTotalCount: true);
+            supportsTotalCount: true,
+            predicateFields: includeStatusPrefix
+                ?
+                [
+                    new BoundedQueryPredicateField(
+                        "status",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ]
+                : null);
         var unit = new StorageUnit(
             new StorageUnitIdentity(DocumentKind),
             "Work item",
