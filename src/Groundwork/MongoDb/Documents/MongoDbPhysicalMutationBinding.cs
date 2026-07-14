@@ -145,7 +145,7 @@ internal static class MongoDbPhysicalMutationModelValidation
             if (unsupported.Length != 0)
             {
                 throw new InvalidOperationException(
-                    $"MongoDB cannot certify scale-bearing bounded mutation query '{query.Identity}' operations " +
+                    $"GW-QUERY-003: MongoDB cannot certify scale-bearing bounded mutation query '{query.Identity}' operations " +
                     $"{string.Join(", ", unsupported)} as indexed: case-insensitive regular-expression semantics " +
                     "cannot be served by the declared ordinary MongoDB B-tree index.");
             }

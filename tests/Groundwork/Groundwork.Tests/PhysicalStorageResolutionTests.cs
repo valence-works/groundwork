@@ -1263,6 +1263,54 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
+    public void ExplicitScaleBearingExactIdentityDemandAcceptsLookupLeadingComparisonEvidence()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal],
+            ["id_lookup_key", "id_comparison_key"]);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Single(result.Definitions);
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingOrderedIdentityDemandAcceptsComparisonEvidenceOnly()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.GreaterThan, PortableQueryOperation.StartsWith],
+            ["id_comparison_key"]);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Single(result.Definitions);
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingIdentityDemandRejectsRawOriginalIdentityEvidence()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal],
+            ["id"]);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-025");
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingMixedIdentityDemandReportsUnsupportedEvidenceShape()
+    {
+        var result = ResolveExplicitIdentityIndex(
+            [PortableQueryOperation.Equal, PortableQueryOperation.GreaterThan],
+            ["id_lookup_key", "id_comparison_key"]);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        var diagnostic = Assert.Single(result.Diagnostics, item => item.Code == "GW-PHYSICAL-035");
+        Assert.Contains("mixed exact and ordered document-identity demand", diagnostic.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(result.Diagnostics, item => item.Code == "GW-PHYSICAL-025");
+    }
+
+    [Fact]
     public void ExplicitScaleBearingDemandRejectsMismatchedPhysicalIndexDirections()
     {
         var logicalIndex = new LogicalIndexDeclaration(
@@ -1529,6 +1577,49 @@ public sealed class PhysicalStorageResolutionTests
         {
             StorageUnits = [manifest.StorageUnits.Single() with { PhysicalStorage = physicalStorage }]
         };
+
+    private static PhysicalStorageResolutionResult ResolveExplicitIdentityIndex(
+        IReadOnlyList<PortableQueryOperation> operations,
+        IReadOnlyList<string> physicalColumns)
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-id",
+            [new IndexField(PhysicalDocumentFieldPaths.Id)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "find-by-id",
+            logicalIndex.Identity,
+            operations.ToHashSet(),
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "configurationDocument",
+            [new ProjectedColumnDefinition("unused", "unused", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    new[] { "storage_scope" }
+                        .Concat(physicalColumns)
+                        .Select((column, order) => new PhysicalIndexColumnDefinition(column, order))
+                        .ToArray())
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query]));
+
+        return PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+    }
 
     private static StorageManifest DedicatedWithLinkedStorage()
     {

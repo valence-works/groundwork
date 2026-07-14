@@ -789,18 +789,24 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             return;
         await DeleteLinkedAsync(route, request.Id, scope, transaction, ct);
         var relationship = route.LinkedRelationship!;
+        var identity = relationship.Identity.Project(request.Id);
         var projections = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage).ToArray();
         var columns = new[]
         {
             relationship.DocumentKind.Identifier,
             relationship.StorageScope.Identifier,
-            relationship.DocumentId.Identifier,
+            relationship.Identity.OriginalId.Identifier,
             relationship.Identity.ComparisonKey.Identifier,
             relationship.Identity.LookupKey.Identifier
         }.Concat(projections.Select(column => column.Column.Identifier)).ToArray();
-        var identity = relationship.Identity.Project(request.Id);
         var values = new object?[]
-            { route.Discriminator.Value, scope.StorageKey!, identity.OriginalValue, identity.ComparisonKey, identity.LookupKey }
+            {
+                route.Discriminator.Value,
+                scope.StorageKey!,
+                identity.OriginalValue,
+                identity.ComparisonKey,
+                identity.LookupKey
+            }
             .Concat(ProjectedValues(projectedValues, projections));
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
@@ -1038,8 +1044,10 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     private static IdentityValue[] PrimaryIdentity(
         ExecutableStorageRoute route,
         string id,
-        DocumentScopeSelection scope) =>
-        route.PrimaryKey.Columns.Select((column, index) => new IdentityValue(
+        DocumentScopeSelection scope)
+    {
+        var identity = route.Envelope.Identity.Project(id);
+        return route.PrimaryKey.Columns.Select((column, index) => new IdentityValue(
             column.Identifier,
             $"identity{index}",
             column.Identifier == route.Discriminator.Column.Identifier
@@ -1047,8 +1055,9 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 : column.Identifier == route.ScopeKey.Column.Identifier
                     ? scope.StorageKey!
                     : column.Identifier == route.Envelope.Identity.LookupKey.Identifier
-                        ? route.Envelope.Identity.Project(id).LookupKey
+                        ? identity.LookupKey
                         : throw new InvalidOperationException($"Unsupported primary identity column '{column.Identifier}'."))).ToArray();
+    }
 
     private static IdentityValue[] LinkedIdentity(
         ExecutableStorageRoute route,
@@ -1056,6 +1065,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         DocumentScopeSelection scope)
     {
         var relationship = route.LinkedRelationship!;
+        var identity = relationship.Identity.Project(id);
         return route.AuxiliaryKey!.Columns.Select((column, index) => new IdentityValue(
             column.Identifier,
             $"identity{index}",
@@ -1064,7 +1074,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 : column.Identifier == relationship.StorageScope.Identifier
                     ? scope.StorageKey!
                     : column.Identifier == relationship.Identity.LookupKey.Identifier
-                        ? relationship.Identity.Project(id).LookupKey
+                        ? identity.LookupKey
                         : throw new InvalidOperationException($"Unsupported linked identity column '{column.Identifier}'."))).ToArray();
     }
 

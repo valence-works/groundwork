@@ -354,7 +354,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         {
             dialect.EnvelopeColumn(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             dialect.EnvelopeColumn(envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-            dialect.EnvelopeColumn(envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id),
+            dialect.EnvelopeColumn(envelope.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
             dialect.EnvelopeColumn(envelope.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
             dialect.EnvelopeColumn(envelope.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup),
             dialect.EnvelopeColumn(envelope.SchemaVersion.Identifier, RelationalEnvelopeColumnKind.SchemaVersion),
@@ -385,7 +385,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         {
             dialect.EnvelopeColumn(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             dialect.EnvelopeColumn(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-            dialect.EnvelopeColumn(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id),
+            dialect.EnvelopeColumn(relationship.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
             dialect.EnvelopeColumn(relationship.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
             dialect.EnvelopeColumn(relationship.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup)
         }.Concat(identity.ProviderColumns.Select(column => column.Definition)).ToArray();
@@ -470,6 +470,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 if (selected.Length == 0)
                     return;
                 var values = RelationalPhysicalProjectionValues.Read(document.CanonicalJson, selected);
+                var identity = route.Envelope.Identity.Project(document.Id);
                 var assignments = string.Join(", ", selected.Select((column, index) => $"{dialect.Q(column.Column.Identifier)} = @v{index}"));
                 await using var command = Command(connection, transaction,
                     $"UPDATE {dialect.Q(route.PrimaryStorage.Name.Identifier)} SET {assignments} WHERE " +
@@ -477,13 +478,15 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                     [
                         new(route.Discriminator.Column.Identifier, null, "@kind"),
                         new(route.ScopeKey.Column.Identifier, null, "@scope"),
-                        new(route.Envelope.Id.Identifier, null, "@id")
+                        new(route.Envelope.Identity.LookupKey.Identifier, null, "@idLookup"),
+                        new(route.Envelope.Identity.ComparisonKey.Identifier, null, "@idComparison")
                     ]) + ";");
                 for (var index = 0; index < selected.Length; index++)
                     Add(command, $"v{index}", dialect.ConvertStorageValue(values[selected[index].Definition.LogicalName], selected[index].Definition));
                 Add(command, "kind", route.Discriminator.Value);
                 Add(command, "scope", document.Scope);
-                Add(command, "id", document.Id);
+                Add(command, "idLookup", identity.LookupKey);
+                Add(command, "idComparison", identity.ComparisonKey);
                 if (await command.ExecuteNonQueryAsync(ct) != 1)
                     throw new InvalidOperationException($"Canonical backfill lost document '{document.Id}' in scope '{document.Scope}'.");
             });
@@ -507,7 +510,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
             {
                 relationship.DocumentKind.Identifier,
                 relationship.StorageScope.Identifier,
-                relationship.DocumentId.Identifier,
+                relationship.Identity.OriginalId.Identifier,
                 relationship.Identity.ComparisonKey.Identifier,
                 relationship.Identity.LookupKey.Identifier
             };
@@ -519,7 +522,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
                 linked.Select(column => column.Column.Identifier).ToArray()));
             Add(command, "v0", route.Discriminator.Value);
             Add(command, "v1", document.Scope);
-            Add(command, "v2", document.Id);
+            Add(command, "v2", identity.OriginalValue);
             Add(command, "v3", identity.ComparisonKey);
             Add(command, "v4", identity.LookupKey);
             for (var index = 0; index < linked.Length; index++)
@@ -680,7 +683,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         [
             Envelope(envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             Envelope(envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-            Envelope(envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id),
+            Envelope(envelope.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
             Envelope(envelope.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
             Envelope(envelope.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup),
             Envelope(envelope.SchemaVersion.Identifier, RelationalEnvelopeColumnKind.SchemaVersion),
@@ -715,7 +718,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
         [
             Envelope(relationship.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
             Envelope(relationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-            Envelope(relationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id),
+            Envelope(relationship.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
             Envelope(relationship.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
             Envelope(relationship.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup),
             .. identity.ProviderColumns.Select(ProviderColumn)
@@ -924,7 +927,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
     [
         new(route.Envelope.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
         new(route.Envelope.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-        new(route.Envelope.Id.Identifier, RelationalEnvelopeColumnKind.Id),
+        new(route.Envelope.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
         new(route.Envelope.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
         new(route.Envelope.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup)
     ];
@@ -933,7 +936,7 @@ public class RelationalServerPhysicalSchemaExecutor : IPhysicalSchemaExecutor, I
     [
         new(route.LinkedRelationship!.DocumentKind.Identifier, RelationalEnvelopeColumnKind.DocumentKind),
         new(route.LinkedRelationship.StorageScope.Identifier, RelationalEnvelopeColumnKind.StorageScope),
-        new(route.LinkedRelationship.DocumentId.Identifier, RelationalEnvelopeColumnKind.Id),
+        new(route.LinkedRelationship.Identity.OriginalId.Identifier, RelationalEnvelopeColumnKind.Id),
         new(route.LinkedRelationship.Identity.ComparisonKey.Identifier, RelationalEnvelopeColumnKind.IdentityComparison),
         new(route.LinkedRelationship.Identity.LookupKey.Identifier, RelationalEnvelopeColumnKind.IdentityLookup)
     ];

@@ -142,6 +142,7 @@ public static class MongoDbDocumentStoreFactory
         return new MongoDbPhysicalDocumentStoreHandle(
             client,
             model,
+            application,
             new MongoDbPhysicalDocumentStore(
                 database,
                 model,
@@ -203,9 +204,12 @@ public static class MongoDbDocumentStoreFactory
 public sealed class MongoDbPhysicalDocumentStoreHandle(
     IDisposable? client,
     MongoDbPhysicalStorageModel model,
+    PhysicalSchemaApplicationResult schemaApplication,
     MongoDbPhysicalDocumentStore store) : IAsyncDisposable
 {
     public MongoDbPhysicalStorageModel Model { get; } = model;
+
+    public PhysicalSchemaApplicationResult SchemaApplication { get; } = schemaApplication;
 
     public MongoDbPhysicalDocumentStore Store { get; } = store;
 

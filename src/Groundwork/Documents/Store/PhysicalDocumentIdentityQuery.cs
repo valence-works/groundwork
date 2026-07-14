@@ -41,14 +41,18 @@ public static class PhysicalDocumentIdentityQuery
         }
 
         var operation = DocumentQueryOperations.ToPortable(comparison.Operator);
+        if (comparison.Values.Any(value => value is null))
+            throw new ArgumentException("Document identity query values cannot be null.", nameof(comparison));
         IEnumerable<PhysicalQueryIdentityValue> values = comparison.Values
-            .Select(value => plan.DocumentIdentity.Bind(operation, value));
+            .Select(value => plan.DocumentIdentity.Bind(operation, value!));
         if (comparison.Operator == QueryComparisonOperator.In)
         {
             values = values
                 .Distinct()
                 .OrderBy(value => value.ComparisonKey, StringComparer.Ordinal)
-                .ThenBy(value => value.LookupKey, StringComparer.Ordinal);
+                .ThenBy(
+                    value => value is PhysicalQueryIdentityValue.Exact exact ? exact.LookupKey : null,
+                    StringComparer.Ordinal);
         }
         return new PhysicalDocumentIdentityComparison(
             plan.DocumentIdentity,

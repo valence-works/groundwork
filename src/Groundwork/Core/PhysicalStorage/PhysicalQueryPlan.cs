@@ -203,16 +203,34 @@ public static class PhysicalDocumentIdentityFieldPaths
     public const string Lookup = "id.lookup";
 }
 
-public enum PhysicalQueryIdentityBindingKind
+public abstract record PhysicalQueryIdentityValue
 {
-    Exact,
-    Ordered
-}
+    private PhysicalQueryIdentityValue(string comparisonKey)
+    {
+        ComparisonKey = comparisonKey ?? throw new ArgumentNullException(nameof(comparisonKey));
+    }
 
-public sealed record PhysicalQueryIdentityValue(
-    PhysicalQueryIdentityBindingKind Kind,
-    string? ComparisonKey,
-    string? LookupKey);
+    public string ComparisonKey { get; }
+
+    public sealed record Exact : PhysicalQueryIdentityValue
+    {
+        public Exact(string comparisonKey, string lookupKey)
+            : base(comparisonKey)
+        {
+            LookupKey = lookupKey ?? throw new ArgumentNullException(nameof(lookupKey));
+        }
+
+        public string LookupKey { get; }
+    }
+
+    public sealed record Ordered : PhysicalQueryIdentityValue
+    {
+        public Ordered(string comparisonKey)
+            : base(comparisonKey)
+        {
+        }
+    }
+}
 
 /// <summary>
 /// Owns provider-neutral document-identity projection and the exact physical evidence selected by
@@ -234,30 +252,27 @@ public sealed record PhysicalQueryDocumentIdentityBinding(
             LookupAlgorithmId,
             originalId);
 
-    public PhysicalQueryIdentityValue Bind(PortableQueryOperation operation, string? originalId)
+    public PhysicalQueryIdentityValue Bind(PortableQueryOperation operation, string originalId)
     {
-        var kind = operation switch
+        ArgumentNullException.ThrowIfNull(originalId);
+        var projection = Project(originalId);
+        return operation switch
         {
             PortableQueryOperation.Equal or
                 PortableQueryOperation.In or
-                PortableQueryOperation.NotEqual => PhysicalQueryIdentityBindingKind.Exact,
+                PortableQueryOperation.NotEqual => new PhysicalQueryIdentityValue.Exact(
+                    projection.ComparisonKey,
+                    projection.LookupKey),
             PortableQueryOperation.StartsWith or
                 PortableQueryOperation.GreaterThan or
                 PortableQueryOperation.GreaterThanOrEqual or
                 PortableQueryOperation.LessThan or
-                PortableQueryOperation.LessThanOrEqual => PhysicalQueryIdentityBindingKind.Ordered,
+                PortableQueryOperation.LessThanOrEqual => new PhysicalQueryIdentityValue.Ordered(
+                    projection.ComparisonKey),
             PortableQueryOperation.Contains => throw new NotSupportedException(
                 "Document identity does not support Contains because no bounded identity projection preserves substring semantics."),
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
         };
-        if (originalId is null)
-            return new PhysicalQueryIdentityValue(kind, ComparisonKey: null, LookupKey: null);
-
-        var projection = Project(originalId);
-        return new PhysicalQueryIdentityValue(
-            kind,
-            projection.ComparisonKey,
-            kind == PhysicalQueryIdentityBindingKind.Exact ? projection.LookupKey : null);
     }
 }
 

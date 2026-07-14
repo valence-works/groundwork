@@ -1239,6 +1239,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
                 Comparison(
                     comparison,
+                    plan,
                     plan.Predicates.Single(predicate => predicate.Path == comparison.Path).Field,
                     route))));
         }
@@ -1294,9 +1295,13 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
 
     private static FilterDefinition<BsonDocument> Comparison(
         DocumentQueryComparison comparison,
+        PhysicalQueryPlan plan,
         PhysicalQueryField queryField,
         ExecutableStorageRoute route)
     {
+        if (comparison.Path == PhysicalDocumentFieldPaths.Id)
+            return MongoDbPhysicalIdentityQuery.Build(comparison, plan);
+
         var field = queryField.Identifier;
         var projection = route.ProjectedColumns.SingleOrDefault(candidate =>
             candidate.Target == queryField.Target &&

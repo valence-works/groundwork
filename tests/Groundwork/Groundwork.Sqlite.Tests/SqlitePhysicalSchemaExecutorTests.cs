@@ -560,7 +560,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                 CREATE TABLE "{route.PrimaryStorage.Name.Identifier}" (
                     "{envelope.DocumentKind.Identifier}" TEXT NOT NULL,
                     "{envelope.StorageScope.Identifier}" TEXT NOT NULL,
-                    "{envelope.Id.Identifier}" TEXT NOT NULL,
+                    "{envelope.Identity.OriginalId.Identifier}" TEXT NOT NULL,
                     "{envelope.Identity.ComparisonKey.Identifier}" TEXT NOT NULL,
                     "{envelope.Identity.LookupKey.Identifier}" TEXT NOT NULL,
                     "{envelope.SchemaVersion.Identifier}" TEXT NOT NULL,
@@ -1080,7 +1080,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             CREATE TABLE {QuoteTable(route.PrimaryStorage.Name.Identifier, quoting)} (
               {QuoteTable(envelope.DocumentKind.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.StorageScope.Identifier, quoting)} TEXT NOT NULL,
-              {QuoteTable(envelope.Id.Identifier, quoting)} TEXT NOT NULL,
+              {QuoteTable(envelope.Identity.OriginalId.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.Identity.ComparisonKey.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.Identity.LookupKey.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.SchemaVersion.Identifier, quoting)} TEXT NOT NULL,

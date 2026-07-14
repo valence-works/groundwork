@@ -203,11 +203,19 @@ public static class BoundedMutationRequestFingerprint
     }
 
     private static string CanonicalIdentityValue(PhysicalQueryIdentityValue value) =>
-        string.Join(
-            "\u0012",
-            ((int)value.Kind).ToString(System.Globalization.CultureInfo.InvariantCulture),
-            Encode(value.ComparisonKey),
-            Encode(value.LookupKey));
+        value switch
+        {
+            PhysicalQueryIdentityValue.Exact exact => string.Join(
+                "\u0012",
+                "exact",
+                Encode(exact.LookupKey),
+                Encode(exact.ComparisonKey)),
+            PhysicalQueryIdentityValue.Ordered ordered => string.Join(
+                "\u0012",
+                "ordered",
+                Encode(ordered.ComparisonKey)),
+            _ => throw new ArgumentOutOfRangeException(nameof(value), value, null)
+        };
 
     private static string Encode(string? value) => value is null ? "-" : $"{value.Length}:{value}";
 }

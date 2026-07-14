@@ -300,6 +300,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         List<(string Name, object? Value)> parameters,
         ref int parameterIndex)
     {
+        if (comparison.Path == PhysicalDocumentFieldPaths.Id)
+            return IdentityComparison(plan, comparison, parameters, ref parameterIndex);
+
         var predicate = plan.Predicates.Single(item => item.Path == comparison.Path);
         var field = Field(predicate.Field);
         var projection = predicate.Field.Source == PhysicalQueryFieldSource.ProjectedColumn
@@ -323,6 +326,87 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         }
         return ScalarComparison(predicate.Field, field, comparison.Operator, Convert(comparison.Values[0]), parameters, ref parameterIndex);
     }
+
+    private string IdentityComparison(
+        PhysicalQueryPlan plan,
+        DocumentQueryComparison comparison,
+        List<(string Name, object? Value)> parameters,
+        ref int parameterIndex)
+    {
+        var bound = PhysicalDocumentIdentityQuery.Bind(plan, comparison);
+        if (comparison.Operator == QueryComparisonOperator.In)
+        {
+            if (bound.Values.Count == 0)
+                return "0 = 1";
+            var alternatives = new List<string>();
+            foreach (var value in bound.Values)
+            {
+                alternatives.Add(ExactIdentityComparison(
+                    plan.DocumentIdentity,
+                    RequireExact(value),
+                    QueryComparisonOperator.Equal,
+                    parameters,
+                    ref parameterIndex));
+            }
+            return $"({string.Join(" OR ", alternatives)})";
+        }
+
+        var evidence = bound.Values.Single();
+        return evidence switch
+        {
+            PhysicalQueryIdentityValue.Exact exact => ExactIdentityComparison(
+                plan.DocumentIdentity,
+                exact,
+                comparison.Operator,
+                parameters,
+                ref parameterIndex),
+            PhysicalQueryIdentityValue.Ordered ordered => ScalarComparison(
+                plan.DocumentIdentity.Comparison,
+                Field(plan.DocumentIdentity.Comparison),
+                comparison.Operator,
+                ordered.ComparisonKey,
+                parameters,
+                ref parameterIndex),
+            _ => throw new ArgumentOutOfRangeException(nameof(evidence), evidence, null)
+        };
+    }
+
+    private string ExactIdentityComparison(
+        PhysicalQueryDocumentIdentityBinding identity,
+        PhysicalQueryIdentityValue.Exact evidence,
+        QueryComparisonOperator operation,
+        List<(string Name, object? Value)> parameters,
+        ref int parameterIndex)
+    {
+        var comparison = operation == QueryComparisonOperator.NotEqual
+            ? QueryComparisonOperator.NotEqual
+            : QueryComparisonOperator.Equal;
+        var lookupPredicate = ScalarComparison(
+            identity.Lookup,
+            Field(identity.Lookup),
+            comparison,
+            evidence.LookupKey,
+            parameters,
+            ref parameterIndex);
+        var comparisonPredicate = ScalarComparison(
+            identity.Comparison,
+            Field(identity.Comparison),
+            comparison,
+            evidence.ComparisonKey,
+            parameters,
+            ref parameterIndex);
+        var conjunction = operation == QueryComparisonOperator.NotEqual ? " OR " : " AND ";
+        return $"({lookupPredicate}{conjunction}{comparisonPredicate})";
+    }
+
+    private static PhysicalQueryIdentityValue.Exact RequireExact(PhysicalQueryIdentityValue value) =>
+        value switch
+        {
+            PhysicalQueryIdentityValue.Exact exact => exact,
+            PhysicalQueryIdentityValue.Ordered => throw new InvalidOperationException(
+                "Identity membership requires exact lookup and comparison evidence."),
+            _ => throw new ArgumentOutOfRangeException(nameof(value), value, null)
+        };
 
     private string ScalarComparison(
         PhysicalQueryField queryField,

@@ -293,12 +293,19 @@ internal sealed class MongoDbPhysicalDocumentMutationHandler : IPhysicalDocument
         {
             filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
             {
+                if (comparison.Path == PhysicalDocumentFieldPaths.Id)
+                    return BuildIdentityMutationFilter(comparison, plan);
                 var mirror = selector.FieldByPath[comparison.Path];
                 return Comparison(comparison, mirror.Identifier, mirror.ValueKind);
             })));
         }
         return Builders<BsonDocument>.Filter.And(filters);
     }
+
+    internal static FilterDefinition<BsonDocument> BuildIdentityMutationFilter(
+        DocumentQueryComparison comparison,
+        PhysicalMutationPlan plan) =>
+        MongoDbPhysicalIdentityQuery.Build(comparison, plan.Predicate);
 
     private MongoDbPhysicalMutationBinding Binding(PhysicalMutationPlan plan)
     {

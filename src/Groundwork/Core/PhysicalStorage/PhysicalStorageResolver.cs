@@ -887,6 +887,17 @@ public static class PhysicalStorageResolver
         {
             var indexIdentity = query.IndexIdentity;
             var logicalIndex = unit.PhysicalStorage.LogicalIndexes.Single(x => x.Identity == indexIdentity);
+            if (PhysicalQueryIdentityDemand.Resolve(logicalIndex, query) ==
+                PhysicalQueryIdentityEvidenceDemand.Mixed)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-035",
+                    $"Scale-bearing query '{query.Identity}' has mixed exact and ordered document-identity demand; " +
+                    "no single explicit physical index order can certify both evidence shapes.",
+                    $"{target}.indexes"));
+                valid = false;
+                continue;
+            }
             var expectedColumns = ResolveExpectedIndexColumns(
                 unit,
                 logicalIndex,
@@ -1393,8 +1404,27 @@ public static class PhysicalStorageResolver
             result.Add(new PhysicalIndexColumnDefinition(envelope.StorageScopeColumn, result.Count));
 
         var sortDirections = ResolveSortDirections(query, logicalIndex);
+        var identityDemand = PhysicalQueryIdentityDemand.Resolve(logicalIndex, query);
         foreach (var (field, fieldOrder) in logicalIndex.Fields.Select((field, order) => (field, order)))
         {
+            if (field.Path == PhysicalDocumentFieldPaths.Id)
+            {
+                IReadOnlyList<string> identityColumns = identityDemand switch
+                {
+                    PhysicalQueryIdentityEvidenceDemand.Exact =>
+                    [envelope.IdLookupKeyColumn, envelope.IdComparisonKeyColumn],
+                    PhysicalQueryIdentityEvidenceDemand.Ordered => [envelope.IdComparisonKeyColumn],
+                    PhysicalQueryIdentityEvidenceDemand.None => [envelope.IdComparisonKeyColumn],
+                    PhysicalQueryIdentityEvidenceDemand.Mixed => [],
+                    _ => throw new ArgumentOutOfRangeException(nameof(identityDemand), identityDemand, null)
+                };
+                result.AddRange(identityColumns.Select(logicalName => new PhysicalIndexColumnDefinition(
+                    logicalName,
+                    result.Count,
+                    sortDirections[fieldOrder])));
+                continue;
+            }
+
             string logicalName;
             if (PhysicalDocumentFieldPaths.IsEnvelope(field.Path))
             {

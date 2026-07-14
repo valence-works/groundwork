@@ -41,6 +41,11 @@ transactional diagnostic-record provider.
   page, and linked-primary hydration share one snapshot attempt; transient failures retry the whole
   attempt on a fresh session within the same attempt and elapsed-time budgets.
 - Exposes native `explain` evidence for the resolved collection and selected physical index.
+- Admits physical document stores only through `MongoDbDocumentStoreFactory.CreatePhysicalAsync`.
+  The factory compiles the model, proves replica-set or sharded transaction support, applies or
+  validates the durable physical-schema state, and only then returns a store handle. The handle's
+  `SchemaApplication` result reports whether admission applied work or followed the restart-safe
+  `NoChanges` path against matching durable state; physical store constructors remain internal.
 - Executes named bounded transitions and deletes through set-based `UpdateMany`/`DeleteMany`
   operations. Provider-owned, route-scoped typed mutation mirrors and deterministic indexes exist
   on both primary and linked collections. Additive per-mutation fence definitions and deduplicated
@@ -87,7 +92,8 @@ defaults.
 
 - The compatibility materializer/store retain their pre-route one-field API. New three-form work
   uses `MongoDbPhysicalStorageModel`, the physical materializer overload, and
-  `MongoDbPhysicalDocumentStore` (or `CreatePhysicalAsync`).
+  `MongoDbDocumentStoreFactory.CreatePhysicalAsync`; direct physical-store construction is not a
+  public admission path.
 - Physical bounded handlers currently certify offset paging, not keyset continuation or
   latest-per-key selection; declarations requiring either fail during store construction.
 - Canonical JSON formatting is normalized when BSON is serialized back to standard JSON; semantic
@@ -98,10 +104,8 @@ defaults.
   diagnostic-record contract; use a replica set or sharded cluster. `CreatePhysicalAsync` probes
   this requirement before compiling or materializing the physical model, so rejection creates no
   database state. The direct physical materializer performs the same probe before schema
-  application. A directly constructed physical store uses one cached asynchronous capability gate:
-  it reports a conservative transaction boundary until support is proven and rejects transactional
-  writes, units of work, and snapshot queries before sessions or collection traffic on unsupported
-  deployments.
+  application. Public runtime admission is factory-only so a caller cannot receive a physical store
+  before this capability and durable-schema validation succeeds.
 - Resolved physical namespaces must be writable ordinary collections with simple binary collation.
   Views, time-series collections, and capped collections are rejected during creation validation,
   final route validation, and durable restart validation; capped collections cannot participate in
