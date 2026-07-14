@@ -37,73 +37,27 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
 
     [Fact]
     public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
-        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            PostgreSqlPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            PostgreSqlPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_distinct_transitions_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Direct_connection_mutations_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            () => new NpgsqlConnection(container.GetConnectionString()),
-            () => new PostgreSqlPhysicalDocumentDialect(),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_distinct_deletes_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Ordinary_save_and_delete_serialize_with_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Linked_ordinary_crud_interleavings_serialize_in_pooled_and_direct_sessions() =>
@@ -115,72 +69,27 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
 
     [Fact]
     public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
-        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            PostgreSqlPhysicalMutationRuntime.Create,
-            PostgreSqlPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
-        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            PostgreSqlPhysicalMutationRuntime.Create,
-            PostgreSqlPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
-        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            PostgreSqlPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
-        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            PostgreSqlPhysicalMutationRuntime.Create,
-            PostgreSqlPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
-        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            PostgreSqlPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
-        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(
-            PostgreSqlGroundworkCapabilities.Provider,
-            "postgresql",
-            PostgreSqlGroundworkCapabilities.PhysicalNames,
-            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            PostgreSqlPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
 
     [Fact]
     public async Task Bounded_mutation_ledger_supports_unbounded_operation_identity()
@@ -189,9 +98,8 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PhysicalStorageForm.PhysicalEntityTable,
             PostgreSqlGroundworkCapabilities.Provider,
             includePriority: true,
-            includeCategoryTransition: true,
-            includeRangeDelete: true,
-            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true, IncludeRangeDelete: true));
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -230,8 +138,8 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PhysicalStorageForm.PhysicalEntityTable,
             PostgreSqlGroundworkCapabilities.Provider,
             includePriority: false,
-            includeCategoryTransition: true,
-            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -244,13 +152,15 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
             "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
         await SeedPlanNoiseAsync(route);
         await AnalyzeRouteAsync(route);
-        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
             store,
             model.Manifest,
             route,
             model.Target.Provider,
             PostgreSqlGroundworkCapabilities.Provider.Name,
-            "postgresql",
+            "postgresql");
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            mutationContext,
             new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
 
         var plan = await ExplainAsync(selection);
@@ -979,8 +889,10 @@ public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
         "postgresql",
         PostgreSqlGroundworkCapabilities.PhysicalNames,
         () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
-        (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
-            container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+        (manifest, routes, access) => new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), manifest, routes, access),
+        PostgreSqlPhysicalMutationRuntime.Create,
+        PostgreSqlPhysicalQueryRuntime.Create,
         () => new NpgsqlConnection(container.GetConnectionString()),
         () => new PostgreSqlPhysicalDocumentDialect(),
         LockContention());

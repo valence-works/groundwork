@@ -47,14 +47,15 @@ public static class SqlitePhysicalMutationRuntime
     {
         ArgumentNullException.ThrowIfNull(connection);
         var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
-            store,
-            manifest,
-            route,
-            provider,
-            SqliteGroundworkCapabilities.Provider.Name,
-            "sqlite",
-            mutation,
-            CanonicalJsonValueKinds(provider));
+            new RelationalPhysicalMutationRuntimeContext(
+                store,
+                manifest,
+                route,
+                provider,
+                SqliteGroundworkCapabilities.Provider.Name,
+                "sqlite",
+                CanonicalJsonValueKinds(provider)),
+            mutation);
         if (connection.State != ConnectionState.Open)
             await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();

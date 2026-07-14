@@ -12,6 +12,12 @@ internal sealed record RelationalTypedTransitionTestOptions(
     string PriorityTarget = "2",
     IReadOnlyDictionary<string, (string Source, string Target)>? FieldValues = null);
 
+internal sealed record RelationalMutationScenarioOptions(
+    bool IncludeCategoryTransition = false,
+    bool IncludeRangeDelete = false,
+    bool IncludeTypedTransitions = false,
+    RelationalTypedTransitionTestOptions? TypedTransitions = null);
+
 internal static class RelationalPhysicalStorageTestModels
 {
     public static (StorageManifest Manifest, PhysicalSchemaTarget Target) Create(
@@ -27,14 +33,12 @@ internal static class RelationalPhysicalStorageTestModels
         IProviderPhysicalNameNormalizer? normalizer = null,
         bool categoryUnique = false,
         bool categoryNullable = false,
-        bool includeCategoryTransition = false,
-        bool includeRangeDelete = false,
         string documentKind = "configurationDocument",
         Func<PhysicalNameContext, string>? namePolicy = null,
-        bool includeTypedTransitions = false,
-        RelationalTypedTransitionTestOptions? typedTransitions = null)
+        RelationalMutationScenarioOptions? mutationOptions = null)
     {
-        typedTransitions ??= new RelationalTypedTransitionTestOptions();
+        mutationOptions ??= new RelationalMutationScenarioOptions();
+        var typedTransitions = mutationOptions.TypedTransitions ?? new RelationalTypedTransitionTestOptions();
         var template = RelationalTestManifests.MetadataManifest();
         instance ??= Guid.NewGuid().ToString("N")[..8];
         var columns = new List<ProjectedColumnDefinition>
@@ -69,7 +73,7 @@ internal static class RelationalPhysicalStorageTestModels
             compoundColumns.Add(new PhysicalIndexColumnDefinition("priority", compoundColumns.Count));
             indexes.Add(new PhysicalIndexDefinition("by-category-priority", compoundColumns));
         }
-        if (includeTypedTransitions)
+        if (mutationOptions.IncludeTypedTransitions)
         {
             foreach (var field in TypedTransitionFields())
             {
@@ -113,7 +117,7 @@ internal static class RelationalPhysicalStorageTestModels
                 false,
                 MissingValueBehavior.Excluded);
             logicalIndexes.Add(compound);
-            var priorityOperations = includeRangeDelete
+            var priorityOperations = mutationOptions.IncludeRangeDelete
                 ? new HashSet<PortableQueryOperation>
                 {
                     PortableQueryOperation.Equal,
@@ -133,7 +137,7 @@ internal static class RelationalPhysicalStorageTestModels
                     new BoundedQueryPredicateField("category", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
                     new BoundedQueryPredicateField(
                         "priority",
-                        includeRangeDelete
+                        mutationOptions.IncludeRangeDelete
                             ? new HashSet<PortableQueryOperation> { PortableQueryOperation.LessThan }
                             : new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
                 ],
@@ -143,7 +147,7 @@ internal static class RelationalPhysicalStorageTestModels
                     BoundedQueryResultOperation.Count
                 }));
         }
-        if (includeTypedTransitions)
+        if (mutationOptions.IncludeTypedTransitions)
         {
             var priorityIndex = new LogicalIndexDeclaration(
                 "by-priority",
@@ -190,21 +194,21 @@ internal static class RelationalPhysicalStorageTestModels
             }
         }
         var boundedMutations = new List<BoundedMutationDeclaration>();
-        if (includeCategoryTransition)
+        if (mutationOptions.IncludeCategoryTransition)
         {
             boundedMutations.Add(new BoundedMutationDeclaration(
                 "revoke-pending",
                 "list-by-category",
                 BoundedMutationAction.Transition("category", ["pending"], "revoked")));
         }
-        if (includeRangeDelete)
+        if (mutationOptions.IncludeRangeDelete)
         {
             boundedMutations.Add(new BoundedMutationDeclaration(
                 "prune-by-category-cutoff",
                 "find-by-category-priority",
                 BoundedMutationAction.Delete()));
         }
-        if (includeTypedTransitions)
+        if (mutationOptions.IncludeTypedTransitions)
         {
             boundedMutations.Add(new BoundedMutationDeclaration(
                 "raise-priority",

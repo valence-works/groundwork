@@ -14,11 +14,11 @@ public static class SqlServerPhysicalMutationRuntime
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        RelationalPhysicalMutationRuntime.Create(
+        RelationalPhysicalMutationRuntime.Create(new RelationalPhysicalMutationRuntimeContext(
             store,
             manifest,
             route,
             provider,
             SqlServerGroundworkCapabilities.Provider.Name,
-            "sqlserver");
+            "sqlserver"));
 }

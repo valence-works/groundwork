@@ -33,73 +33,27 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
 
     [Fact]
     public Task Bounded_transition_updates_the_exact_indexed_identity_set() =>
-        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            SqlServerPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.TransitionUpdatesExactIndexedIdentitySetAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_bounded_retry_completes_once_and_replays_the_exact_count() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            SqlServerPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.ConcurrentRetryReplaysExactResultAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_distinct_transitions_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctTransitionsSerializeSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Direct_connection_mutations_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            () => new SqlConnection(container.GetConnectionString()),
-            () => new SqlServerPhysicalDocumentDialect(),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.DirectConnectionDistinctTransitionSerializesSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Concurrent_distinct_deletes_serialize_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.ConcurrentDistinctDeletesSerializeSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Ordinary_save_and_delete_serialize_with_the_selected_set() =>
-        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            LockContention());
+        RelationalBoundedMutationServerAssertions.OrdinaryCrudSerializesWithSelectedSetAsync(MutationHarness());
 
     [Fact]
     public Task Linked_ordinary_crud_interleavings_serialize_in_pooled_and_direct_sessions() =>
@@ -111,72 +65,27 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
 
     [Fact]
     public Task Bounded_transition_and_range_delete_cover_all_relational_storage_forms() =>
-        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(),
-                manifest,
-                routes,
-                DocumentStoreAccess.Global),
-            SqlServerPhysicalMutationRuntime.Create,
-            SqlServerPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.PhysicalFormsExecuteTransitionAndRangeDeleteAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_typed_transitions_preserve_canonical_and_projected_values() =>
-        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
-            SqlServerPhysicalMutationRuntime.Create,
-            SqlServerPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.TypedTransitionsPreserveCanonicalAndProjectedValuesAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_scope_is_inherited_from_the_store_session() =>
-        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            SqlServerPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.MutationScopeIsInheritedFromStoreSessionAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_failure_before_commit_rolls_back_and_can_retry() =>
-        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            SqlServerPhysicalMutationRuntime.Create,
-            SqlServerPhysicalQueryRuntime.Create);
+        RelationalBoundedMutationServerAssertions.FailureBeforeCommitRollsBackAndRetryCompletesAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_cancellation_rolls_back_and_preserves_the_token() =>
-        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            SqlServerPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.CancellationBeforeCommitRollsBackAndPreservesTokenAsync(MutationHarness());
 
     [Fact]
     public Task Bounded_mutation_acknowledgement_loss_restarts_and_replays_across_provider_upgrade() =>
-        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(
-            SqlServerGroundworkCapabilities.Provider,
-            "sqlserver",
-            SqlServerGroundworkCapabilities.PhysicalNames,
-            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-            (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
-                container.GetConnectionString(), manifest, routes, access),
-            SqlServerPhysicalMutationRuntime.Create);
+        RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
 
     [Fact]
     public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
@@ -185,8 +94,8 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             PhysicalStorageForm.PhysicalEntityTable,
             SqlServerGroundworkCapabilities.Provider,
             includePriority: false,
-            includeCategoryTransition: true,
-            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -198,13 +107,15 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument", "plan-noise", "1", "{\"category\":\"tools\"}"))).Status);
         await SeedPlanNoiseAsync(route);
-        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
             store,
             model.Manifest,
             route,
             model.Target.Provider,
             SqlServerGroundworkCapabilities.Provider.Name,
-            "sqlserver",
+            "sqlserver");
+        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+            mutationContext,
             new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
 
         var plan = await ExplainAsync(selection, route);
@@ -221,8 +132,8 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             PhysicalStorageForm.PhysicalEntityTable,
             SqlServerGroundworkCapabilities.Provider,
             includePriority: false,
-            includeCategoryTransition: true,
-            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            mutationOptions: new(IncludeCategoryTransition: true));
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -240,14 +151,14 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             await SqlServerPhysicalMutationRuntime.Create(store, model.Manifest, route, model.Target.Provider)
                 .ExecuteAsync(request));
         await SeedMutationLedgerPlanNoiseAsync(request.OperationId);
-        var lookup = RelationalPhysicalMutationRuntime.BuildOperationReadCommand(
+        var mutationContext = new RelationalPhysicalMutationRuntimeContext(
             store,
             model.Manifest,
             route,
             model.Target.Provider,
             SqlServerGroundworkCapabilities.Provider.Name,
-            "sqlserver",
-            request);
+            "sqlserver");
+        var lookup = RelationalPhysicalMutationRuntime.BuildOperationReadCommand(mutationContext, request);
         Assert.All(
             new[] { "manifest_key", "provider_key", "storage_unit_key", "storage_scope_key", "operation_key" },
             key => Assert.Contains(key, lookup.CommandText, StringComparison.Ordinal));
@@ -1180,8 +1091,10 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         "sqlserver",
         SqlServerGroundworkCapabilities.PhysicalNames,
         () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
-        (manifest, routes) => new SqlServerPhysicalDocumentStore(
-            container.GetConnectionString(), manifest, routes, DocumentStoreAccess.Global),
+        (manifest, routes, access) => new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), manifest, routes, access),
+        SqlServerPhysicalMutationRuntime.Create,
+        SqlServerPhysicalQueryRuntime.Create,
         () => new SqlConnection(container.GetConnectionString()),
         () => new SqlServerPhysicalDocumentDialect(),
         LockContention());

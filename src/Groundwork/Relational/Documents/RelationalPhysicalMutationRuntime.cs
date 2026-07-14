@@ -25,23 +25,6 @@ internal static class RelationalPhysicalMutationRuntime
     private static readonly JsonSerializerOptions ManifestFingerprintOptions = CreateManifestFingerprintOptions();
 
     internal static IBoundedDocumentMutationStore Create(
-        RelationalPhysicalDocumentStore store,
-        StorageManifest manifest,
-        ExecutableStorageRoute route,
-        ProviderIdentity provider,
-        string expectedProviderName,
-        string handlerPrefix,
-        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null) =>
-        Create(new RelationalPhysicalMutationRuntimeContext(
-            store,
-            manifest,
-            route,
-            provider,
-            expectedProviderName,
-            handlerPrefix,
-            canonicalJsonValueKinds));
-
-    internal static IBoundedDocumentMutationStore Create(
         RelationalPhysicalMutationRuntimeContext context,
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null) =>
         CreateCore(
@@ -60,14 +43,7 @@ internal static class RelationalPhysicalMutationRuntime
         RelationalPhysicalMutationInterceptor? intercept)
     {
         ArgumentNullException.ThrowIfNull(context);
-        var runtime = BuildRuntime(
-            context.Store,
-            context.Manifest,
-            context.Route,
-            context.Provider,
-            context.ExpectedProviderName,
-            context.HandlerPrefix,
-            context.CanonicalJsonValueKinds);
+        var runtime = BuildRuntime(context);
         var handlers = runtime.Capabilities.HandlerIdentities.Select(registration =>
         {
             var certifications = runtime.Compilation.Plans
@@ -89,55 +65,31 @@ internal static class RelationalPhysicalMutationRuntime
     }
 
     internal static RelationalPhysicalQueryCommand BuildSelectionCommand(
-        RelationalPhysicalDocumentStore store,
-        StorageManifest manifest,
-        ExecutableStorageRoute route,
-        ProviderIdentity provider,
-        string expectedProviderName,
-        string handlerPrefix,
-        DocumentMutation mutation,
-        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+        RelationalPhysicalMutationRuntimeContext context,
+        DocumentMutation mutation)
     {
+        ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(mutation);
-        var runtime = BuildRuntime(
-            store,
-            manifest,
-            route,
-            provider,
-            expectedProviderName,
-            handlerPrefix,
-            canonicalJsonValueKinds);
-        var (handler, plan) = ResolveCommandHandler(store, runtime, mutation);
+        var runtime = BuildRuntime(context);
+        var (handler, plan) = ResolveCommandHandler(context.Store, runtime, mutation);
         return handler.BuildSelectionCommand(
             mutation,
             plan,
-            store.ResolveMutationScope(mutation.DocumentKind));
+            context.Store.ResolveMutationScope(mutation.DocumentKind));
     }
 
     internal static RelationalPhysicalQueryCommand BuildOperationReadCommand(
-        RelationalPhysicalDocumentStore store,
-        StorageManifest manifest,
-        ExecutableStorageRoute route,
-        ProviderIdentity provider,
-        string expectedProviderName,
-        string handlerPrefix,
-        DocumentMutation mutation,
-        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+        RelationalPhysicalMutationRuntimeContext context,
+        DocumentMutation mutation)
     {
+        ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(mutation);
-        var runtime = BuildRuntime(
-            store,
-            manifest,
-            route,
-            provider,
-            expectedProviderName,
-            handlerPrefix,
-            canonicalJsonValueKinds);
-        var (handler, plan) = ResolveCommandHandler(store, runtime, mutation);
+        var runtime = BuildRuntime(context);
+        var (handler, plan) = ResolveCommandHandler(context.Store, runtime, mutation);
         return handler.BuildOperationReadCommand(
             mutation,
             plan,
-            store.ResolveMutationScope(mutation.DocumentKind));
+            context.Store.ResolveMutationScope(mutation.DocumentKind));
     }
 
     private static (RelationalPhysicalDocumentMutationHandler Handler, PhysicalMutationPlan Plan) ResolveCommandHandler(
@@ -158,57 +110,51 @@ internal static class RelationalPhysicalMutationRuntime
             plan);
     }
 
-    private static RuntimeComponents BuildRuntime(
-        RelationalPhysicalDocumentStore store,
-        StorageManifest manifest,
-        ExecutableStorageRoute route,
-        ProviderIdentity provider,
-        string expectedProviderName,
-        string handlerPrefix,
-        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds)
+    private static RuntimeComponents BuildRuntime(RelationalPhysicalMutationRuntimeContext context)
     {
-        ArgumentNullException.ThrowIfNull(store);
-        ArgumentNullException.ThrowIfNull(manifest);
-        ArgumentNullException.ThrowIfNull(route);
-        ArgumentNullException.ThrowIfNull(provider);
-        ArgumentException.ThrowIfNullOrWhiteSpace(expectedProviderName);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerPrefix);
-        if (!string.Equals(provider.Name, expectedProviderName, StringComparison.Ordinal))
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(context.Store);
+        ArgumentNullException.ThrowIfNull(context.Manifest);
+        ArgumentNullException.ThrowIfNull(context.Route);
+        ArgumentNullException.ThrowIfNull(context.Provider);
+        ArgumentException.ThrowIfNullOrWhiteSpace(context.ExpectedProviderName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(context.HandlerPrefix);
+        if (!string.Equals(context.Provider.Name, context.ExpectedProviderName, StringComparison.Ordinal))
         {
             throw new ArgumentException(
-                $"Provider '{provider.Name}' cannot use the '{expectedProviderName}' bounded-mutation runtime.",
-                nameof(provider));
+                $"Provider '{context.Provider.Name}' cannot use the '{context.ExpectedProviderName}' bounded-mutation runtime.",
+                nameof(context));
         }
         if (!CryptographicOperations.FixedTimeEquals(
-                ManifestFingerprint(manifest),
-                ManifestFingerprint(store.BoundManifest)))
+                ManifestFingerprint(context.Manifest),
+                ManifestFingerprint(context.Store.BoundManifest)))
         {
             throw new ArgumentException(
                 "The mutation runtime manifest content must exactly match the document store manifest.",
-                nameof(manifest));
+                nameof(context));
         }
-        if (!store.IsBoundRoute(route))
+        if (!context.Store.IsBoundRoute(context.Route))
         {
             throw new ArgumentException(
                 "The mutation runtime route fingerprint must match the document store route.",
-                nameof(route));
+                nameof(context));
         }
-        var storage = store.BoundManifest.StorageUnits
-            .Single(candidate => candidate.Identity == route.StorageUnit).PhysicalStorage
+        var storage = context.Store.BoundManifest.StorageUnits
+            .Single(candidate => candidate.Identity == context.Route.StorageUnit).PhysicalStorage
             ?? throw new InvalidOperationException(
-                $"Storage unit '{route.StorageUnit.Value}' has no physical mutation declarations.");
+                $"Storage unit '{context.Route.StorageUnit.Value}' has no physical mutation declarations.");
         var capabilities = RelationalPhysicalQueryRuntime.Capabilities(
-            provider,
-            handlerPrefix,
-            canonicalJsonValueKinds);
-        var compilation = PhysicalMutationPlanCompiler.Compile(route, storage, capabilities);
+            context.Provider,
+            context.HandlerPrefix,
+            context.CanonicalJsonValueKinds);
+        var compilation = PhysicalMutationPlanCompiler.Compile(context.Route, storage, capabilities);
         if (!compilation.IsValid)
         {
             throw new InvalidOperationException(string.Join(
                 Environment.NewLine,
                 compilation.Diagnostics.Select(item => $"{item.Code}: {item.Message}")));
         }
-        CertifyTransitionValues(store, route, compilation.Plans);
+        CertifyTransitionValues(context.Store, context.Route, compilation.Plans);
         return new RuntimeComponents(storage, capabilities, compilation);
     }
 

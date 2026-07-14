@@ -14,11 +14,11 @@ public static class PostgreSqlPhysicalMutationRuntime
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        RelationalPhysicalMutationRuntime.Create(
+        RelationalPhysicalMutationRuntime.Create(new RelationalPhysicalMutationRuntimeContext(
             store,
             manifest,
             route,
             provider,
             PostgreSqlGroundworkCapabilities.Provider.Name,
-            "postgresql");
+            "postgresql"));
 }

@@ -149,24 +149,25 @@ public sealed class RelationalPhysicalMutationRuntimeBindingTests
             priorityType: PortablePhysicalType.Decimal,
             priorityPrecision: 3,
             priorityScale: 1,
-            includeCategoryTransition: transitionField is null,
             normalizer: normalizer,
-            includeTypedTransitions: transitionField is not null,
-            typedTransitions: new RelationalTypedTransitionTestOptions(
-                priorityTransitionSource ?? "1",
-                priorityTransitionTarget ?? "2",
-                transitionField is null or "priority"
-                    ? null
-                    : new Dictionary<string, (string Source, string Target)>
-                    {
-                        [transitionField] = (priorityTransitionSource!, priorityTransitionTarget!)
-                    }));
+            mutationOptions: new(
+                IncludeCategoryTransition: transitionField is null,
+                IncludeTypedTransitions: transitionField is not null,
+                TypedTransitions: new RelationalTypedTransitionTestOptions(
+                    priorityTransitionSource ?? "1",
+                    priorityTransitionTarget ?? "2",
+                    transitionField is null or "priority"
+                        ? null
+                        : new Dictionary<string, (string Source, string Target)>
+                        {
+                            [transitionField] = (priorityTransitionSource!, priorityTransitionTarget!)
+                        })));
         var other = RelationalPhysicalStorageTestModels.Create(
             PhysicalStorageForm.DedicatedDocumentTable,
             identity,
             includePriority: false,
-            includeCategoryTransition: true,
-            normalizer: normalizer);
+            normalizer: normalizer,
+            mutationOptions: new(IncludeCategoryTransition: true));
         var connectionFactoryCalls = 0;
         var sessions = RelationalSessionFactory.Concurrent(() =>
         {
