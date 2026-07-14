@@ -42,8 +42,8 @@ public static class PortableStringComparison
         CreateUnicodeOrdinalIgnoreCaseState);
 
     /// <summary>
-    /// Identifies both the key format and the exact Unicode simple-uppercase table supplied by the
-    /// current runtime, making runtime Unicode-data drift visible to persisted schema state.
+    /// Identifies the key format and exact runtime-compatible Unicode casing table. Unicode 16
+    /// supplementary candidates close platform data gaps before the table is fingerprinted.
     /// </summary>
     public static string UnicodeOrdinalIgnoreCaseAlgorithmId => UnicodeOrdinalIgnoreCase.Value.AlgorithmId;
 
@@ -192,18 +192,35 @@ public static class PortableStringComparison
     private static UnicodeOrdinalIgnoreCaseState CreateUnicodeOrdinalIgnoreCaseState()
     {
         var mappings = new Dictionary<int, int>();
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        Span<byte> pair = stackalloc byte[8];
         for (var scalar = 0; scalar <= 0x10FFFF; scalar++)
         {
             if (!Rune.IsValid(scalar))
                 continue;
-            var mapped = Rune.ToUpperInvariant(new Rune(scalar)).Value;
+            var sourceRune = new Rune(scalar);
+            var mapped = Rune.ToUpperInvariant(sourceRune).Value;
             if (mapped == scalar)
+                continue;
+            if (!StringComparer.OrdinalIgnoreCase.Equals(sourceRune.ToString(), new Rune(mapped).ToString()))
+                continue;
+            mappings.Add(scalar, mapped);
+        }
+
+        var supplementaryMappings = UnicodeOrdinalCasingData.SupplementarySimpleUppercaseMappings;
+        for (var index = 0; index < supplementaryMappings.Length; index += 2)
+        {
+            var scalar = supplementaryMappings[index];
+            var mapped = supplementaryMappings[index + 1];
+            if (mappings.ContainsKey(scalar))
                 continue;
             if (!StringComparer.OrdinalIgnoreCase.Equals(new Rune(scalar).ToString(), new Rune(mapped).ToString()))
                 continue;
             mappings.Add(scalar, mapped);
+        }
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Span<byte> pair = stackalloc byte[8];
+        foreach (var (scalar, mapped) in mappings.OrderBy(mapping => mapping.Key))
+        {
             System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(pair, scalar);
             System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(pair[4..], mapped);
             hash.AppendData(pair);
