@@ -1,5 +1,11 @@
 # Agent Instructions
 
+## Workroom execution
+
+- Root agent: use Sol 5.6 High. If unavailable, use the closest available Sol/Terra model at high reasoning, then the closest available frontier model. Report the exact fallback used.
+- Delegates: use Luna Extra High. If unavailable, use Luna High, then the closest available model at high reasoning. Report the exact fallback used.
+- Treat delegation timeouts or failures separately from model unavailability. After a bounded wait, the root agent continues, owns integration and QA, and reports when no delegated result was available for review.
+
 ## Agent skills
 
 ### Issue tracker
