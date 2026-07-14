@@ -36,7 +36,8 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         {
             switch (operation)
             {
-                case CreateStorageUnitOperation:
+                case CreateStorageUnitOperation storageUnit:
+                    await AdmitIdentityPolicyAsync(storageUnit.StorageUnit, transaction, cancellationToken);
                     break;
                 case CreateIndexOperation:
                     break;
@@ -55,6 +56,61 @@ public abstract class RelationalMaterializerBase(DbConnection connection)
         }
 
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private async Task AdmitIdentityPolicyAsync(
+        MaterializedStorageUnit storageUnit,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        var policy = storageUnit.StringIdentityCasePolicy.ToString();
+        string? retainedPolicy = null;
+        string? retainedComparisonAlgorithm = null;
+        string? retainedLookupAlgorithm = null;
+        await using (var command = CreateCommand(
+                         $"""
+                         SELECT string_case_policy, comparison_algorithm, lookup_algorithm
+                         FROM groundwork_document_identity_schema
+                         WHERE {ExactEqualityPredicate("document_kind", $"{ParameterPrefix}kind")};
+                         """,
+                         transaction))
+        {
+            AddParameter(command, "kind", storageUnit.Identity);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                retainedPolicy = reader.GetString(0);
+                retainedComparisonAlgorithm = reader.GetString(1);
+                retainedLookupAlgorithm = reader.GetString(2);
+            }
+        }
+
+        if (retainedPolicy is null)
+        {
+            await using var command = CreateCommand(
+                $"""
+                INSERT INTO groundwork_document_identity_schema
+                (document_kind, string_case_policy, comparison_algorithm, lookup_algorithm)
+                VALUES ({ParameterPrefix}kind, {ParameterPrefix}policy, {ParameterPrefix}comparisonAlgorithm, {ParameterPrefix}lookupAlgorithm);
+                """,
+                transaction);
+            AddParameter(command, "kind", storageUnit.Identity);
+            AddParameter(command, "policy", policy);
+            AddParameter(command, "comparisonAlgorithm", storageUnit.ComparisonAlgorithmId);
+            AddParameter(command, "lookupAlgorithm", storageUnit.LookupAlgorithmId);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            return;
+        }
+
+        if (string.Equals(retainedPolicy, policy, StringComparison.Ordinal) &&
+            string.Equals(retainedComparisonAlgorithm, storageUnit.ComparisonAlgorithmId, StringComparison.Ordinal) &&
+            string.Equals(retainedLookupAlgorithm, storageUnit.LookupAlgorithmId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Conventional document kind '{storageUnit.Identity}' identity policy or algorithm state does not match the materialization target. Drop and recreate the schema; automatic re-keying is not supported.");
     }
 
     private static MaterializedIndex ToLegacyMaterializedIndex(BackfillCanonicalJsonOperation backfill)

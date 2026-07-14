@@ -17,6 +17,10 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
+    public void ConventionalStoreConstructionRequiresFactoryAdmission() =>
+        Assert.Empty(typeof(SqlServerDocumentStore).GetConstructors());
+
+    [Fact]
     public async Task FactoryRejectsInvalidManifestBeforeCreatingAnyConnection()
     {
         var materializationConnections = 0;
@@ -140,11 +144,11 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
             blocker);
     }
 
-    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync()
+    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync(Groundwork.Core.Manifests.StorageManifest? manifest = null)
     {
         var connectionString = container.GetConnectionString();
         var connection = new SqlConnection(connectionString);
-        var manifest = RelationalTestManifests.MetadataManifest();
+        manifest ??= RelationalTestManifests.MetadataManifest();
         var store = await SqlServerDocumentStoreFactory.CreateAsync(
             connectionString,
             manifest,
@@ -201,6 +205,9 @@ public sealed class SqlServerProviderTests : RelationalProviderContractTests, IA
 
         public async Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_documents", primaryKey: true);
+
+        public async Task<IReadOnlyList<string>> ReadIdentityLookupUniqueIndexColumnsAsync()
+            => await ReadIndexColumnsAsync("groundwork_documents", indexName: "ux_groundwork_documents_identity_lookup");
 
         public async Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_document_indexes", indexName: "ux_groundwork_document_indexes_unique");

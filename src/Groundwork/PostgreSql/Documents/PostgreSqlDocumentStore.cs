@@ -8,7 +8,7 @@ namespace Groundwork.PostgreSql.Documents;
 
 public sealed class PostgreSqlDocumentStore : RelationalDocumentStore
 {
-    public PostgreSqlDocumentStore(NpgsqlConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal PostgreSqlDocumentStore(NpgsqlConnection connection, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(connection, manifest, new PostgreSqlDocumentStoreDialect(), access, scopeObserver)
     {
     }
@@ -18,7 +18,7 @@ public sealed class PostgreSqlDocumentStore : RelationalDocumentStore
     {
     }
 
-    public PostgreSqlDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
+    internal PostgreSqlDocumentStore(string connectionString, StorageManifest manifest, DocumentStoreAccess access, IStorageScopeObserver? scopeObserver = null)
         : base(
             RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
             manifest,

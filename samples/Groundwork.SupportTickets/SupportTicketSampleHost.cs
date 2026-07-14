@@ -2,7 +2,6 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.Validation;
 using Groundwork.Documents.Store;
-using Groundwork.Materialization;
 using Groundwork.MongoDb.Documents;
 using Groundwork.Modules.Inbox;
 using Groundwork.Modules.Inbox.Sqlite;
@@ -11,7 +10,6 @@ using Groundwork.SqlServer.Documents;
 using Groundwork.Operational;
 using Groundwork.Sqlite;
 using Groundwork.Sqlite.Documents;
-using Groundwork.Sqlite.Materialization;
 using Groundwork.Sqlite.Operational;
 using Groundwork.SupportTickets.ExternalModules;
 using Groundwork.SupportTickets.Operations;
@@ -101,17 +99,14 @@ public sealed class SupportTicketSampleHost : IAsyncDisposable
                         var connection = new SqliteConnection(options.ConnectionString);
                         try
                         {
-                            var provider = Provider("groundwork-sqlite");
-                            var plan = new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
-                                .Plan(
-                                    manifest,
-                                    SqliteGroundworkCapabilities.Runtime(provider),
-                                    SqliteGroundworkCapabilities.Materialization(provider));
-                            await new SqliteGroundworkMaterializer(connection).MaterializeAsync(
-                                plan,
-                                cancellationToken);
+                            var memoryStore = await SqliteDocumentStoreFactory.CreateAsync(
+                                connection,
+                                manifest,
+                                Provider("groundwork-sqlite"),
+                                Groundwork.Documents.Scoping.DocumentStoreAccess.Global,
+                                cancellationToken: cancellationToken);
                             disposables.Add(connection);
-                            return (new SqliteDocumentStore(connection, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global), disposables);
+                            return (memoryStore, disposables);
                         }
                         catch
                         {

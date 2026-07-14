@@ -11,6 +11,24 @@ namespace Groundwork.Sqlite.Documents;
 
 public static class SqliteDocumentStoreFactory
 {
+    public static async Task<SqliteDocumentStore> CreateAsync(
+        SqliteConnection connection,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
+
+        var plan = CreateMaterializationPlan(manifest, provider).RequirePlannable();
+        await new SqliteGroundworkMaterializer(connection).MaterializeAsync(plan, cancellationToken);
+        return new SqliteDocumentStore(connection, manifest, access, scopeObserver);
+    }
+
     public static Task<SqliteDocumentStore> CreateAsync(
         string connectionString,
         StorageManifest manifest,

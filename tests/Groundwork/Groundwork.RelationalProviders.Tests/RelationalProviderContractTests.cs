@@ -13,6 +13,52 @@ namespace Groundwork.RelationalProviders.Tests;
 public abstract class RelationalProviderContractTests
 {
     [Fact]
+    public async Task UnicodeIdentityConflictPreservesAuthoritativeOriginal()
+    {
+        await using var harness = await CreateHarnessAsync(RelationalTestManifests.UnicodeIdentityManifest());
+        var store = harness.Store;
+
+        var saved = await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+        var conflict = await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "straße-σΣ",
+            "1.0.0",
+            """{"key":"replacement","category":"system"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal("Straße-Σς", conflict.AuthoritativeId);
+        Assert.Contains("alpha", (await store.LoadAsync("configurationDocument", "Straße-Σς"))!.ContentJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnicodeIdentityLoadAndDeleteReturnAuthoritativeOriginal()
+    {
+        await using var harness = await CreateHarnessAsync(RelationalTestManifests.UnicodeIdentityManifest());
+        var store = harness.Store;
+        await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        var loaded = await store.LoadAsync("configurationDocument", "straße-σΣ");
+        var deleted = await store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "STRAßE-Σσ",
+            ExpectedVersion: 1));
+
+        Assert.Equal("Straße-Σς", loaded!.Id);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("Straße-Σς", deleted.AuthoritativeId);
+        Assert.Null(await store.LoadAsync("configurationDocument", "Straße-Σς"));
+    }
+
+    [Fact]
     public async Task SatisfiesSharedStorageScopeBlackBoxContract()
     {
         await using var harness = await CreateHarnessAsync();
@@ -40,8 +86,13 @@ public abstract class RelationalProviderContractTests
         Assert.Equal(
             sqlServer
                 ? ["document_kind_key", "storage_scope_key", "id_key"]
-                : ["document_kind", "storage_scope", "id"],
+                : ["document_kind", "storage_scope", "id_lookup_key"],
             await harness.ReadDocumentPrimaryKeyColumnsAsync());
+        Assert.Equal(
+            sqlServer
+                ? ["document_kind_key", "storage_scope_key", "id_lookup_key"]
+                : ["document_kind", "storage_scope", "id_lookup_key"],
+            await harness.ReadIdentityLookupUniqueIndexColumnsAsync());
         Assert.Equal(
             sqlServer
                 ? ["document_kind_key", "storage_scope_key", "index_name_key", "index_value_key"]
@@ -113,6 +164,18 @@ public abstract class RelationalProviderContractTests
         await harness.MaterializeAsync();
 
         Assert.Equal(1, await harness.CountSchemaHistoryRowsAsync());
+    }
+
+    [Fact]
+    public async Task MaterializationRejectsDocumentIdentityPolicyDrift()
+    {
+        await using var harness = await CreateHarnessAsync();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.ApplyManifestAsync(RelationalTestManifests.UnicodeIdentityManifest()));
+
+        Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("identity policy", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -355,7 +418,7 @@ public abstract class RelationalProviderContractTests
         Assert.Null(await harness.Store.LoadAsync("configurationDocument", rolledBack));
     }
 
-    protected abstract Task<IRelationalProviderHarness> CreateHarnessAsync();
+    protected abstract Task<IRelationalProviderHarness> CreateHarnessAsync(StorageManifest? manifest = null);
 
     [Fact]
     public async Task AddedIndexBackfillsPreexistingDocuments()
@@ -493,6 +556,7 @@ public interface IRelationalProviderHarness : IAsyncDisposable
     Task<IDocumentStore> ApplyManifestAsync(StorageManifest manifest);
     Task<IDocumentStore> CreateStoreAsync(StorageManifest manifest, DocumentStoreAccess access);
     Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync();
+    Task<IReadOnlyList<string>> ReadIdentityLookupUniqueIndexColumnsAsync();
     Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync();
     Task<IReadOnlyList<string>> ReadOptimizedPrimaryKeyColumnsAsync();
     Task<IReadOnlyList<string>> ReadOptimizedUniqueIndexColumnsAsync();

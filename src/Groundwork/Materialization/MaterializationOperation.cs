@@ -1,6 +1,8 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.Materialization;
 using Groundwork.Core.Physicalization;
+using Groundwork.Core.Text;
 
 namespace Groundwork.Materialization;
 
@@ -39,7 +41,16 @@ public sealed record MaterializedStorageUnit(
     string IdentityField,
     string? ConcurrencyField,
     string? StorageScopeField,
-    string? SchemaField);
+    string? SchemaField,
+    IdentityPolicy IdentityPolicy)
+{
+    public StringIdentityCasePolicy StringIdentityCasePolicy => IdentityPolicy.StringCasePolicy;
+
+    public string ComparisonAlgorithmId => PortableStringComparison.GetAlgorithmId(
+        PortableStringComparison.ForIdentityPolicy(StringIdentityCasePolicy));
+
+    public string LookupAlgorithmId => PortableStringComparison.LookupHashAlgorithmId;
+}
 
 public sealed record MaterializedIndex(
     string UnitIdentity,

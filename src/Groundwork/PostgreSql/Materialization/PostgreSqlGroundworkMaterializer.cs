@@ -8,7 +8,7 @@ namespace Groundwork.PostgreSql.Materialization;
 
 public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection) : RelationalMaterializerBase(connection)
 {
-    protected override IReadOnlyList<string> SchemaStatements { get; } = [DocumentTableSql, IndexTableSql, SchemaHistorySql];
+    protected override IReadOnlyList<string> SchemaStatements { get; } = [DocumentTableSql, IndexTableSql, IdentitySchemaSql, SchemaHistorySql];
 
     protected override string InsertSchemaHistorySql => """
         INSERT INTO groundwork_schema_history
@@ -58,12 +58,24 @@ public sealed class PostgreSqlGroundworkMaterializer(NpgsqlConnection connection
             document_kind TEXT NOT NULL,
             storage_scope TEXT NOT NULL,
             id TEXT NOT NULL,
+            id_comparison_key TEXT NOT NULL,
+            id_lookup_key TEXT NOT NULL,
             schema_version TEXT NOT NULL,
             version BIGINT NOT NULL,
             content_json TEXT NOT NULL,
             created_utc TEXT NOT NULL,
             updated_utc TEXT NOT NULL,
-            PRIMARY KEY (document_kind, storage_scope, id)
+            PRIMARY KEY (document_kind, storage_scope, id_lookup_key),
+            UNIQUE (document_kind, storage_scope, id)
+        );
+        """;
+
+    private const string IdentitySchemaSql = """
+        CREATE TABLE IF NOT EXISTS groundwork_document_identity_schema (
+            document_kind TEXT NOT NULL PRIMARY KEY,
+            string_case_policy TEXT NOT NULL,
+            comparison_algorithm TEXT NOT NULL,
+            lookup_algorithm TEXT NOT NULL
         );
         """;
 

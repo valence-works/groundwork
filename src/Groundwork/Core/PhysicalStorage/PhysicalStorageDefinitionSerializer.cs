@@ -211,7 +211,7 @@ public static class PhysicalStorageDefinitionSerializer
 
     private static void WriteIdentityPolicy(Utf8JsonWriter writer, IdentityPolicy policy)
     {
-        var portablePolicy = ExecutableDocumentIdentityRoute.ToPortableComparisonPolicy(policy.StringCasePolicy);
+        var portablePolicy = PortableStringComparison.ForIdentityPolicy(policy.StringCasePolicy);
         writer.WritePropertyName("identityPolicy");
         writer.WriteStartObject();
         writer.WriteString("kind", policy.Kind.ToString());

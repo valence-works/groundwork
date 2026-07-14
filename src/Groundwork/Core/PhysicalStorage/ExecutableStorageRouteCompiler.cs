@@ -395,7 +395,7 @@ public static class ExecutableStorageRouteCompiler
         ExecutableColumnRoute comparisonKey,
         ExecutableColumnRoute lookupKey)
     {
-        var portablePolicy = ExecutableDocumentIdentityRoute.ToPortableComparisonPolicy(policy.StringCasePolicy);
+        var portablePolicy = PortableStringComparison.ForIdentityPolicy(policy.StringCasePolicy);
         return new ExecutableDocumentIdentityRoute(
             policy.StringCasePolicy,
             PortableStringComparison.GetAlgorithmId(portablePolicy),

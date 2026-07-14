@@ -60,6 +60,9 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
             {
                 case CreateStorageUnitOperation storageUnit:
                     await EnsureCollectionAsync(collections, MongoDbGroundworkNames.CollectionName(storageUnit.StorageUnit.Identity), cancellationToken);
+                    await EnsureIdentityLookupIndexAsync(storageUnit.StorageUnit, cancellationToken);
+                    await EnsureCollectionAsync(collections, MongoDbGroundworkNames.IdentitySchemaCollection, cancellationToken);
+                    await AdmitIdentityPolicyAsync(storageUnit.StorageUnit, cancellationToken);
                     break;
                 case CreateIndexOperation index:
                     await EnsureIndexAsync(index.Index, physicalizedFields, cancellationToken);
@@ -158,6 +161,75 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
         await CreateIndexWithAdvisoryAsync(collection, model, model.Options.Name, cancellationToken);
     }
 
+    private async Task EnsureIdentityLookupIndexAsync(
+        MaterializedStorageUnit storageUnit,
+        CancellationToken cancellationToken)
+    {
+        var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.CollectionName(storageUnit.Identity));
+        var keys = Builders<BsonDocument>.IndexKeys
+            .Ascending("storage_scope")
+            .Ascending("id_lookup_key");
+        var options = new CreateIndexOptions<BsonDocument>
+        {
+            Name = "ux_groundwork_document_identity_lookup",
+            Unique = true
+        };
+        try
+        {
+            await collection.Indexes.CreateOneAsync(
+                new CreateIndexModel<BsonDocument>(keys, options),
+                cancellationToken: cancellationToken);
+        }
+        catch (MongoCommandException exception) when (IsIndexConflictException(exception))
+        {
+            throw new InvalidOperationException(
+                $"MongoDB identity lookup index on collection '{collection.CollectionNamespace.CollectionName}' conflicts with the required unique conventional-store identity schema.",
+                exception);
+        }
+    }
+
+    private async Task AdmitIdentityPolicyAsync(
+        MaterializedStorageUnit storageUnit,
+        CancellationToken cancellationToken)
+    {
+        var collection = database.GetCollection<BsonDocument>(MongoDbGroundworkNames.IdentitySchemaCollection);
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", storageUnit.Identity);
+        var retained = await collection.Find(filter).SingleOrDefaultAsync(cancellationToken);
+        if (retained is null)
+        {
+            try
+            {
+                await collection.InsertOneAsync(
+                    CreateIdentitySchemaDocument(storageUnit),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+            catch (MongoWriteException exception) when (IsDuplicateKey(exception))
+            {
+                retained = await collection.Find(filter).SingleAsync(cancellationToken);
+            }
+        }
+
+        if (retained["string_case_policy"].AsString == storageUnit.StringIdentityCasePolicy.ToString() &&
+            retained["comparison_algorithm"].AsString == storageUnit.ComparisonAlgorithmId &&
+            retained["lookup_algorithm"].AsString == storageUnit.LookupAlgorithmId)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Conventional document kind '{storageUnit.Identity}' identity policy or algorithm state does not match the materialization target. Drop and recreate the schema; automatic re-keying is not supported.");
+    }
+
+    private static BsonDocument CreateIdentitySchemaDocument(MaterializedStorageUnit storageUnit) =>
+        new()
+        {
+            ["_id"] = storageUnit.Identity,
+            ["string_case_policy"] = storageUnit.StringIdentityCasePolicy.ToString(),
+            ["comparison_algorithm"] = storageUnit.ComparisonAlgorithmId,
+            ["lookup_algorithm"] = storageUnit.LookupAlgorithmId
+        };
+
     private async Task EnsureIndexAsync(
         MaterializedIndex index,
         IReadOnlyDictionary<(string UnitIdentity, string FieldName), PhysicalizedFieldPlan> physicalizedFields,
@@ -201,6 +273,9 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
 
     private static bool IsIndexConflictException(MongoCommandException exception) =>
         exception.Code is IndexOptionsConflictErrorCode or IndexKeySpecsConflictErrorCode;
+
+    private static bool IsDuplicateKey(MongoWriteException exception) =>
+        exception.WriteError?.Code == 11000;
 
     private async Task RecordSchemaHistoryAsync(SchemaHistoryEntry history, CancellationToken cancellationToken)
     {

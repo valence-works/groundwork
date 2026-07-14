@@ -8,7 +8,7 @@ namespace Groundwork.SqlServer.Materialization;
 
 public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : RelationalMaterializerBase(connection)
 {
-    protected override IReadOnlyList<string> SchemaStatements { get; } = [DocumentTableSql, IndexTableSql, SchemaHistorySql];
+    protected override IReadOnlyList<string> SchemaStatements { get; } = [DocumentTableSql, IndexTableSql, IdentitySchemaSql, SchemaHistorySql];
 
     protected override string InsertSchemaHistorySql => $$"""
         IF NOT EXISTS (
@@ -85,6 +85,8 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
                 document_kind NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
                 storage_scope NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
                 id NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                id_comparison_key VARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                id_lookup_key VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
                 {RequiredHashKey("document_kind")},
                 {RequiredHashKey("storage_scope", 256)},
                 {RequiredHashKey("id")},
@@ -95,6 +97,9 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
                 updated_utc NVARCHAR(64) NOT NULL,
                 CONSTRAINT pk_groundwork_documents PRIMARY KEY (document_kind_key, storage_scope_key, id_key)
             );
+
+            CREATE UNIQUE INDEX ux_groundwork_documents_identity_lookup
+            ON groundwork_documents(document_kind_key, storage_scope_key, id_lookup_key);
         END;
         """;
 
@@ -125,6 +130,20 @@ public sealed class SqlServerGroundworkMaterializer(SqlConnection connection) : 
             CREATE UNIQUE INDEX ux_groundwork_document_indexes_unique
             ON groundwork_document_indexes(document_kind_key, storage_scope_key, index_name_key, index_value_key)
             WHERE is_unique = 1;
+        END;
+        """;
+
+    private static readonly string IdentitySchemaSql = $"""
+        IF OBJECT_ID(N'groundwork_document_identity_schema', N'U') IS NULL
+        BEGIN
+            CREATE TABLE groundwork_document_identity_schema (
+                document_kind NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                {RequiredHashKey("document_kind")},
+                string_case_policy NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                comparison_algorithm NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                lookup_algorithm NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                CONSTRAINT pk_groundwork_document_identity_schema PRIMARY KEY (document_kind_key)
+            );
         END;
         """;
 

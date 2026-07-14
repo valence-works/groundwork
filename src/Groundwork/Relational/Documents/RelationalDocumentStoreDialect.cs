@@ -40,8 +40,8 @@ public class RelationalDocumentStoreDialect
 
     public virtual string InsertDocumentSql => $$"""
         INSERT INTO groundwork_documents
-        (document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc)
-        VALUES ({{Parameter("kind")}}, {{Parameter("scope")}}, {{Parameter("id")}}, {{Parameter("schemaVersion")}}, {{Parameter("version")}}, {{Parameter("content")}}, {{Parameter("createdUtc")}}, {{Parameter("updatedUtc")}});
+        (document_kind, storage_scope, id, id_comparison_key, id_lookup_key, schema_version, version, content_json, created_utc, updated_utc)
+        VALUES ({{Parameter("kind")}}, {{Parameter("scope")}}, {{Parameter("id")}}, {{Parameter("idComparisonKey")}}, {{Parameter("idLookupKey")}}, {{Parameter("schemaVersion")}}, {{Parameter("version")}}, {{Parameter("content")}}, {{Parameter("createdUtc")}}, {{Parameter("updatedUtc")}});
         """;
 
     public virtual string UpdateDocumentSql => $$"""
@@ -50,7 +50,9 @@ public class RelationalDocumentStoreDialect
             version = {{Parameter("version")}},
             content_json = {{Parameter("content")}},
             updated_utc = {{Parameter("updatedUtc")}}
-        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}} AND id = {{Parameter("id")}};
+        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}}
+          AND id_lookup_key = {{Parameter("idLookupKey")}} AND id_comparison_key = {{Parameter("idComparisonKey")}}
+          AND id = {{Parameter("authoritativeId")}};
         """;
 
     public virtual string UpdateDocumentCommandSql(bool checkVersion) =>
@@ -61,26 +63,34 @@ public class RelationalDocumentStoreDialect
                   version = {{Parameter("version")}},
                   content_json = {{Parameter("content")}},
                   updated_utc = {{Parameter("updatedUtc")}}
-              WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}} AND id = {{Parameter("id")}} AND version = {{Parameter("expectedVersion")}};
+              WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}}
+                AND id_lookup_key = {{Parameter("idLookupKey")}} AND id_comparison_key = {{Parameter("idComparisonKey")}}
+                AND id = {{Parameter("authoritativeId")}} AND version = {{Parameter("expectedVersion")}};
               """
             : UpdateDocumentSql;
 
     public virtual string LoadDocumentSql => $$"""
-        SELECT document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc
+        SELECT document_kind, storage_scope, id, schema_version, version, content_json, created_utc, updated_utc,
+               id_comparison_key, id_lookup_key
         FROM groundwork_documents
-        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}} AND id = {{Parameter("id")}};
+        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}}
+          AND id_lookup_key = {{Parameter("idLookupKey")}};
         """;
 
     public virtual string DeleteDocumentSql => $$"""
         DELETE FROM groundwork_documents
-        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}} AND id = {{Parameter("id")}};
+        WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}}
+          AND id_lookup_key = {{Parameter("idLookupKey")}} AND id_comparison_key = {{Parameter("idComparisonKey")}}
+          AND id = {{Parameter("authoritativeId")}};
         """;
 
     public virtual string DeleteDocumentCommandSql(bool checkVersion) =>
         checkVersion
             ? $$"""
               DELETE FROM groundwork_documents
-              WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}} AND id = {{Parameter("id")}} AND version = {{Parameter("expectedVersion")}};
+              WHERE document_kind = {{Parameter("kind")}} AND storage_scope = {{Parameter("scope")}}
+                AND id_lookup_key = {{Parameter("idLookupKey")}} AND id_comparison_key = {{Parameter("idComparisonKey")}}
+                AND id = {{Parameter("authoritativeId")}} AND version = {{Parameter("expectedVersion")}};
               """
             : DeleteDocumentSql;
 

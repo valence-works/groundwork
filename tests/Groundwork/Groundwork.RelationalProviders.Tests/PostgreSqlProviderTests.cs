@@ -20,6 +20,10 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
+    public void ConventionalStoreConstructionRequiresFactoryAdmission() =>
+        Assert.Empty(typeof(PostgreSqlDocumentStore).GetConstructors());
+
+    [Fact]
     public async Task FactoryRejectsInvalidManifestBeforeCreatingAnyConnection()
     {
         var materializationConnections = 0;
@@ -79,11 +83,11 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
             blocker);
     }
 
-    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync()
+    protected override async Task<IRelationalProviderHarness> CreateHarnessAsync(Groundwork.Core.Manifests.StorageManifest? manifest = null)
     {
         var connectionString = container.GetConnectionString();
         var connection = new NpgsqlConnection(connectionString);
-        var manifest = RelationalTestManifests.MetadataManifest();
+        manifest ??= RelationalTestManifests.MetadataManifest();
         var store = await PostgreSqlDocumentStoreFactory.CreateAsync(
             connectionString,
             manifest,
@@ -140,6 +144,9 @@ public sealed class PostgreSqlProviderTests : RelationalProviderContractTests, I
 
         public async Task<IReadOnlyList<string>> ReadDocumentPrimaryKeyColumnsAsync()
             => await ReadConstraintColumnsAsync("groundwork_documents", "PRIMARY KEY");
+
+        public async Task<IReadOnlyList<string>> ReadIdentityLookupUniqueIndexColumnsAsync()
+            => await ReadIndexColumnsAsync("groundwork_documents", "groundwork_documents_pkey");
 
         public async Task<IReadOnlyList<string>> ReadPortableUniqueIndexColumnsAsync()
             => await ReadIndexColumnsAsync("groundwork_document_indexes", "ux_groundwork_document_indexes_unique");

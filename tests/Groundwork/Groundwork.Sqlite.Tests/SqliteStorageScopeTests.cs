@@ -71,7 +71,7 @@ public sealed class SqliteStorageScopeTests
         var manifest = ScopedManifest();
         await new SqliteGroundworkMaterializer(connection).MaterializeAsync(manifest, SqliteTestManifests.Provider);
         Assert.Equal(
-            new[] { "document_kind", "storage_scope", "id" },
+            new[] { "document_kind", "storage_scope", "id_lookup_key" },
             await ReadKeyColumns(connection, "PRAGMA table_info(groundwork_documents);", nameOrdinal: 1, keyOrdinal: 5));
         Assert.Equal(
             new[] { "document_kind", "storage_scope", "index_name", "index_value" },

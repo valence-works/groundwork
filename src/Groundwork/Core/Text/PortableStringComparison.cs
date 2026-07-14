@@ -2,6 +2,7 @@ using System.Collections.Frozen;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using Groundwork.Core.Manifests;
 
 namespace Groundwork.Core.Text;
 
@@ -125,6 +126,13 @@ public static class PortableStringComparison
         PortableStringComparisonPolicy.Ordinal => OrdinalAlgorithmId,
         PortableStringComparisonPolicy.AsciiIgnoreCase => AsciiIgnoreCaseAlgorithmId,
         PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase => UnicodeOrdinalIgnoreCaseAlgorithmId,
+        _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+    };
+
+    public static PortableStringComparisonPolicy ForIdentityPolicy(StringIdentityCasePolicy policy) => policy switch
+    {
+        StringIdentityCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+        StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
         _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
     };
 

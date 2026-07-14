@@ -23,6 +23,108 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
     public async Task DisposeAsync() => await container.DisposeAsync();
 
     [Fact]
+    public void ConventionalStoreConstructionRequiresFactoryAdmission() =>
+        Assert.Empty(typeof(MongoDbDocumentStore).GetConstructors());
+
+    [Fact]
+    public async Task UnicodeIdentitySpellingConflictPreservesAuthoritativeDocument()
+    {
+        await using var harness = await MongoDbDocumentStoreHarness.Create(
+            container.GetConnectionString(),
+            MongoDbTestManifests.UnicodeIdentityManifest());
+
+        var saved = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+        var conflict = await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "straße-σΣ",
+            "1.0.0",
+            """{"key":"replacement","category":"system"}"""));
+
+        Assert.Equal(DocumentStoreWriteStatus.Saved, saved.Status);
+        Assert.Equal(DocumentStoreWriteStatus.IdentityConflict, conflict.Status);
+        Assert.Equal("Straße-Σς", conflict.AuthoritativeId);
+        Assert.Contains("alpha", (await harness.Store.LoadAsync("configurationDocument", "Straße-Σς"))!.ContentJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnicodeIdentityLoadAndDeleteReturnAuthoritativeOriginal()
+    {
+        await using var harness = await MongoDbDocumentStoreHarness.Create(
+            container.GetConnectionString(),
+            MongoDbTestManifests.UnicodeIdentityManifest());
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument",
+            "Straße-Σς",
+            "1.0.0",
+            """{"key":"alpha","category":"system"}"""));
+
+        var loaded = await harness.Store.LoadAsync("configurationDocument", "straße-σΣ");
+        var deleted = await harness.Store.DeleteAsync(new DeleteDocumentRequest(
+            "configurationDocument",
+            "STRAßE-Σσ",
+            ExpectedVersion: 1));
+
+        Assert.Equal("Straße-Σς", loaded!.Id);
+        Assert.Equal(DocumentStoreWriteStatus.Deleted, deleted.Status);
+        Assert.Equal("Straße-Σς", deleted.AuthoritativeId);
+        Assert.Null(await harness.Store.LoadAsync("configurationDocument", "Straße-Σς"));
+    }
+
+    [Fact]
+    public async Task LookupHashCollisionThrowsDedicatedIntegrityException()
+    {
+        var manifest = MongoDbTestManifests.UnicodeIdentityManifest();
+        await using var harness = await MongoDbDocumentStoreHarness.Create(container.GetConnectionString(), manifest);
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "retained", "1.0.0", """{"key":"retained"}"""));
+        await harness.Store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "requested", "1.0.0", """{"key":"requested"}"""));
+        var collection = harness.Database.GetCollection<BsonDocument>(
+            Groundwork.MongoDb.MongoDbGroundworkNames.CollectionName(manifest.StorageUnits.Single()));
+        var requested = await collection.Find(Builders<BsonDocument>.Filter.Eq("id_original", "requested")).SingleAsync();
+        await harness.Store.DeleteAsync(new DeleteDocumentRequest("configurationDocument", "requested"));
+        await collection.UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Eq("id_original", "retained"),
+            Builders<BsonDocument>.Update.Set("id_lookup_key", requested["id_lookup_key"].AsString));
+
+        var exception = await Assert.ThrowsAsync<DocumentIdentityLookupCollisionException>(() =>
+            harness.Store.LoadAsync("configurationDocument", "requested"));
+
+        Assert.Equal("requested", exception.RequestedId);
+        Assert.Equal("retained", exception.RetainedId);
+    }
+
+    [Fact]
+    public async Task MaterializationRejectsDocumentIdentityPolicyDrift()
+    {
+        var client = new MongoClient(container.GetConnectionString());
+        var database = client.GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var materializer = new MongoDbGroundworkMaterializer(database);
+        try
+        {
+            await materializer.MaterializeAsync(
+                MongoDbTestManifests.MetadataManifest(),
+                MongoDbTestManifests.Provider);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                materializer.MaterializeAsync(
+                    MongoDbTestManifests.UnicodeIdentityManifest(),
+                    MongoDbTestManifests.Provider));
+
+            Assert.Contains("configurationDocument", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("identity policy", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await client.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
     public async Task MaterializationRejectsPreexistingNonBinaryCollectionCollation()
     {
         var client = new MongoClient(container.GetConnectionString());
@@ -43,6 +145,34 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
 
             Assert.Contains(collectionName, exception.Message, StringComparison.Ordinal);
             Assert.Contains("simple", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await client.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task MaterializationRejectsConflictingIdentityLookupIndex()
+    {
+        var client = new MongoClient(container.GetConnectionString());
+        var database = client.GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var manifest = MongoDbTestManifests.MetadataManifest();
+        var collectionName = Groundwork.MongoDb.MongoDbGroundworkNames.CollectionName(manifest.StorageUnits.Single());
+        try
+        {
+            await database.CreateCollectionAsync(
+                collectionName,
+                new CreateCollectionOptions { Collation = new Collation("simple") });
+            var collection = database.GetCollection<BsonDocument>(collectionName);
+            await collection.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+                Builders<BsonDocument>.IndexKeys.Ascending("storage_scope").Ascending("id_lookup_key"),
+                new CreateIndexOptions { Name = "ux_groundwork_document_identity_lookup", Unique = false }));
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, MongoDbTestManifests.Provider));
+
+            Assert.Contains("identity lookup", exception.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -475,14 +605,16 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
         }
 
         private IMongoClient Client { get; }
-        private IMongoDatabase Database { get; }
+        public IMongoDatabase Database { get; }
         public MongoDbDocumentStore Store { get; }
 
-        public static async Task<MongoDbDocumentStoreHarness> Create(string connectionString)
+        public static async Task<MongoDbDocumentStoreHarness> Create(
+            string connectionString,
+            Groundwork.Core.Manifests.StorageManifest? manifest = null)
         {
             var client = new MongoClient(connectionString);
             var database = client.GetDatabase($"groundwork_{Guid.NewGuid():N}");
-            var manifest = MongoDbTestManifests.MetadataManifest();
+            manifest ??= MongoDbTestManifests.MetadataManifest();
             await new MongoDbGroundworkMaterializer(database).MaterializeAsync(manifest, MongoDbTestManifests.Provider);
             return new MongoDbDocumentStoreHarness(client, database, new MongoDbDocumentStore(database, manifest, Groundwork.Documents.Scoping.DocumentStoreAccess.Global));
         }
