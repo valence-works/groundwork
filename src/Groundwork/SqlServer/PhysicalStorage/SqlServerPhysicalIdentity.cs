@@ -129,7 +129,7 @@ internal sealed class SqlServerPhysicalIdentity
         IReadOnlyList<string> identityColumns,
         IEnumerable<string> visibleColumns)
     {
-        var hidden = identityColumns.Select(HiddenColumn).ToHashSet(StringComparer.Ordinal);
+        var hidden = identityColumns.Select(HiddenColumn).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var collision = visibleColumns.FirstOrDefault(hidden.Contains);
         if (collision is not null)
         {

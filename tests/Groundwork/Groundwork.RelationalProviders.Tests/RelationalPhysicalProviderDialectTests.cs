@@ -154,6 +154,43 @@ public sealed class RelationalPhysicalProviderDialectTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public void Sql_server_rejects_case_only_visible_columns_that_collide_with_hidden_identity_keys(
+        bool linked)
+    {
+        var instance = linked ? "linked_case_visible_collision" : "primary_case_visible_collision";
+        var original = linked
+            ? $"gw_{instance}_document_id"
+            : $"gw_{instance}_id";
+        var hidden = $"{original}_key";
+        var projectedKind = linked
+            ? PhysicalObjectKind.LinkedProjectedField
+            : PhysicalObjectKind.ProjectedField;
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.ObjectKind == projectedKind &&
+                       context.LogicalName.EndsWith("_category", StringComparison.Ordinal)
+                ? hidden.ToUpperInvariant()
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            linked ? PhysicalStorageForm.SharedDocuments : PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains(hidden, exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public void Sql_server_rejects_retained_identity_columns_that_collide_with_hidden_identity_keys(
         bool linked)
     {
@@ -181,6 +218,38 @@ public sealed class RelationalPhysicalProviderDialectTests
             DocumentStoreAccess.Global));
 
         Assert.Contains(SqlServerPhysicalIdentity.HiddenColumn(original), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sql_server_rejects_case_only_provider_owned_identity_column_collisions(bool linked)
+    {
+        var instance = linked ? "linked_case_hidden_collision" : "primary_case_hidden_collision";
+        var original = linked
+            ? $"gw_{instance}_document_id"
+            : $"gw_{instance}_id";
+        var comparisonSuffix = linked ? "_document_id_comparison_key" : "_id_comparison_key";
+        var normalizer = new DelegateProviderPhysicalNameNormalizer(
+            context => context.LogicalName.EndsWith(comparisonSuffix, StringComparison.Ordinal)
+                ? original.ToUpperInvariant()
+                : SqlServerGroundworkCapabilities.PhysicalNames.Normalize(context),
+            context => SqlServerGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+        var model = RelationalPhysicalStorageTestModels.Create(
+            linked ? PhysicalStorageForm.SharedDocuments : PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: normalizer);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new SqlServerPhysicalDocumentStore(
+            "Server=localhost;Database=unused;Integrated Security=true;TrustServerCertificate=true",
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global));
+
+        Assert.Contains("duplicate", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("provider-owned", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
