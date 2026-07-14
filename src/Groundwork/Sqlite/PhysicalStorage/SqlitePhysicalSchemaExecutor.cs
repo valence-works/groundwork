@@ -259,6 +259,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             $"{Q(envelope.DocumentKind.Identifier)} TEXT NOT NULL",
             $"{Q(envelope.StorageScope.Identifier)} TEXT NOT NULL",
             $"{Q(envelope.Id.Identifier)} TEXT NOT NULL",
+            $"{Q(envelope.Identity.ComparisonKey.Identifier)} TEXT NOT NULL",
+            $"{Q(envelope.Identity.LookupKey.Identifier)} TEXT NOT NULL",
             $"{Q(envelope.SchemaVersion.Identifier)} TEXT NOT NULL",
             $"{Q(envelope.Version.Identifier)} INTEGER NOT NULL",
             $"{Q(envelope.CanonicalJson.Identifier)} TEXT NOT NULL",
@@ -282,6 +284,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             $"{Q(relationship.DocumentKind.Identifier)} TEXT NOT NULL",
             $"{Q(relationship.StorageScope.Identifier)} TEXT NOT NULL",
             $"{Q(relationship.DocumentId.Identifier)} TEXT NOT NULL",
+            $"{Q(relationship.Identity.ComparisonKey.Identifier)} TEXT NOT NULL",
+            $"{Q(relationship.Identity.LookupKey.Identifier)} TEXT NOT NULL",
             $"PRIMARY KEY ({string.Join(", ", key.Columns.Select(column => Q(column.Identifier)))})"
         };
         await ExecuteAsync(
@@ -427,7 +431,9 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         {
             relationship.DocumentKind.Identifier,
             relationship.StorageScope.Identifier,
-            relationship.DocumentId.Identifier
+            relationship.DocumentId.Identifier,
+            relationship.Identity.ComparisonKey.Identifier,
+            relationship.Identity.LookupKey.Identifier
         };
         var insertColumns = relationColumns.Concat(selected.Select(column => column.Column.Identifier)).ToArray();
         var updates = selected.Length == 0
@@ -445,10 +451,13 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 $"ON CONFLICT ({string.Join(", ", route.AuxiliaryKey!.Columns.Select(column => Q(column.Identifier)))}) {updates};";
             command.Parameters.AddWithValue("@v0", route.Discriminator.Value);
             command.Parameters.AddWithValue("@v1", document.Scope);
-            command.Parameters.AddWithValue("@v2", document.Id);
+            var identity = relationship.Identity.Project(document.Id);
+            command.Parameters.AddWithValue("@v2", identity.OriginalValue);
+            command.Parameters.AddWithValue("@v3", identity.ComparisonKey);
+            command.Parameters.AddWithValue("@v4", identity.LookupKey);
             for (var index = 0; index < selected.Length; index++)
                 command.Parameters.AddWithValue(
-                    $"@v{index + 3}",
+                    $"@v{index + relationColumns.Length}",
                     SqlitePhysicalValueConverter.ToStorage(
                         values[selected[index].Definition.LogicalName],
                         selected[index].Definition) ?? DBNull.Value);
@@ -588,6 +597,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             RequiredText(envelope.DocumentKind.Identifier, keyOrder),
             RequiredText(envelope.StorageScope.Identifier, keyOrder),
             RequiredText(envelope.Id.Identifier, keyOrder),
+            RequiredText(envelope.Identity.ComparisonKey.Identifier, keyOrder),
+            RequiredText(envelope.Identity.LookupKey.Identifier, keyOrder),
             RequiredText(envelope.SchemaVersion.Identifier, keyOrder),
             new ExpectedColumn(envelope.Version.Identifier, "INTEGER", true, null, keyOrder.GetValueOrDefault(envelope.Version.Identifier)),
             RequiredText(envelope.CanonicalJson.Identifier, keyOrder),
@@ -611,7 +622,9 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         {
             RequiredText(relationship.DocumentKind.Identifier, keyOrder),
             RequiredText(relationship.StorageScope.Identifier, keyOrder),
-            RequiredText(relationship.DocumentId.Identifier, keyOrder)
+            RequiredText(relationship.DocumentId.Identifier, keyOrder),
+            RequiredText(relationship.Identity.ComparisonKey.Identifier, keyOrder),
+            RequiredText(relationship.Identity.LookupKey.Identifier, keyOrder)
         };
         await ValidateTableColumnsAsync(route.LinkedIndexStorage!.Name.Identifier, expected, key.Columns, transaction, ct);
     }

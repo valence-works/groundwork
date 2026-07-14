@@ -561,6 +561,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                     "{envelope.DocumentKind.Identifier}" TEXT NOT NULL,
                     "{envelope.StorageScope.Identifier}" TEXT NOT NULL,
                     "{envelope.Id.Identifier}" TEXT NOT NULL,
+                    "{envelope.Identity.ComparisonKey.Identifier}" TEXT NOT NULL,
+                    "{envelope.Identity.LookupKey.Identifier}" TEXT NOT NULL,
                     "{envelope.SchemaVersion.Identifier}" TEXT NOT NULL,
                     "{envelope.Version.Identifier}" INTEGER NOT NULL,
                     "{envelope.CanonicalJson.Identifier}" TEXT NOT NULL,
@@ -882,7 +884,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         string? priorityDefault = null,
         IProviderPhysicalNameNormalizer? normalizer = null,
         string? priorityCollation = null,
-        bool categoryNullable = false)
+        bool categoryNullable = false,
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
     {
         var template = SqliteTestManifests.MetadataManifest();
         var columns = new List<ProjectedColumnDefinition>
@@ -990,6 +993,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             [
                 template.StorageUnits.Single() with
                 {
+                    IdentityPolicy = IdentityPolicy.StringId(stringCasePolicy: stringCasePolicy),
                     Tenancy = scoped ? TenancyPolicy.Scoped : TenancyPolicy.Global,
                     PhysicalStorage = new StorageUnitPhysicalStorage(
                         StorageUnitProvisioningMode.Declared,
@@ -1022,6 +1026,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
               {QuoteTable(envelope.DocumentKind.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.StorageScope.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.Id.Identifier, quoting)} TEXT NOT NULL,
+              {QuoteTable(envelope.Identity.ComparisonKey.Identifier, quoting)} TEXT NOT NULL,
+              {QuoteTable(envelope.Identity.LookupKey.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.SchemaVersion.Identifier, quoting)} TEXT NOT NULL,
               {QuoteTable(envelope.Version.Identifier, quoting)} INTEGER NOT NULL,
               {QuoteTable(envelope.CanonicalJson.Identifier, quoting)} TEXT NOT NULL,
