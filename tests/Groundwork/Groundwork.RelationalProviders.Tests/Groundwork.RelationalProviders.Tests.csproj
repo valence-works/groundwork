@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <Compile Include="..\TestInfrastructure\BackfillAcknowledgementLosingExecutor.cs" Link="TestInfrastructure\BackfillAcknowledgementLosingExecutor.cs" />
+    <Compile Include="..\TestInfrastructure\DocumentIdentityAcceptanceConformance.cs" Link="TestInfrastructure\DocumentIdentityAcceptanceConformance.cs" />
     <Compile Include="..\TestInfrastructure\RepositoryRootLocator.cs" Link="TestInfrastructure\RepositoryRootLocator.cs" />
     <Compile Include="..\TestInfrastructure\StorageScopeDocumentStoreConformance.cs" Link="TestInfrastructure\StorageScopeDocumentStoreConformance.cs" />
     <Compile Include="..\TestInfrastructure\RelationalPhysicalStorageConformance.cs" Link="TestInfrastructure\RelationalPhysicalStorageConformance.cs" />
