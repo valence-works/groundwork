@@ -21,19 +21,19 @@ internal sealed class RelationalDiagnosticQueryBuilder(
         {
             if (StringComparer.Ordinal.Equals(orderField.Name, DiagnosticRecordFieldNames.OccurredAt))
             {
-                select += ", NULL AS order_value, r.occurred_at_ticks AS order_key";
+                select += ", NULL AS order_value, NULL AS order_prefix, r.occurred_at_ticks AS order_key";
             }
             else
             {
                 AddNamed("orderField", orderField.Name);
                 AddNamed("orderFieldType", (int)orderField.Type);
                 joins.Add($"JOIN {dialect.TableReference(RelationalDiagnosticRecordSchema.FieldsTable, "ofield")} ON {FieldJoin("ofield", "r")} AND ofield.field_name = {dialect.Parameter("orderField")} AND ofield.field_type = {dialect.Parameter("orderFieldType")} AND ofield.value_ordinal = 0");
-                select += ", ofield.canonical_value AS order_value, ofield.comparison_key AS order_key";
+                select += ", ofield.canonical_value AS order_value, ofield.comparison_key_prefix AS order_prefix, ofield.comparison_key AS order_key";
             }
         }
         else
         {
-            select += ", NULL AS order_value, NULL AS order_key";
+            select += ", NULL AS order_value, NULL AS order_prefix, NULL AS order_key";
         }
 
         if (latestField is not null)
@@ -67,7 +67,7 @@ internal sealed class RelationalDiagnosticQueryBuilder(
             ? null
             : $"""
               latest_winners AS (
-                  SELECT lfield.comparison_key, MAX(lfield.cursor) AS cursor
+                  SELECT lfield.comparison_key_hash, lfield.comparison_key, MAX(lfield.cursor) AS cursor
                   FROM {dialect.TableReference(RelationalDiagnosticRecordSchema.FieldsTable, "lfield")}
                   {(query.Predicate is null ? "" : $"JOIN {dialect.TableReference(RelationalDiagnosticRecordSchema.RecordsTable, "lr")} ON {FieldJoin("lfield", "lr")}")}
                   WHERE lfield.tenant_id = {dialect.Parameter("tenant")}
@@ -78,7 +78,7 @@ internal sealed class RelationalDiagnosticQueryBuilder(
                     AND lfield.value_ordinal = 0
                     AND lfield.cursor <= {dialect.Parameter("snapshot")}
                     {(query.Predicate is null ? "" : $"AND {BuildPredicate(query.Predicate, "lr")}")}
-                  GROUP BY lfield.comparison_key
+                  GROUP BY lfield.comparison_key_hash, lfield.comparison_key
               ),
               """;
 
@@ -93,7 +93,7 @@ internal sealed class RelationalDiagnosticQueryBuilder(
         var direction = order.Direction == DiagnosticSortDirection.Ascending ? "ASC" : "DESC";
         var orderBy = orderField is null
             ? $"cursor {direction}"
-            : $"order_key {direction}, cursor {direction}";
+            : $"order_prefix {direction}, order_key {direction}, cursor {direction}";
         var pageSql = $"SELECT * FROM selected{(continuation is null ? "" : $" WHERE {continuation}")} ORDER BY {orderBy}";
         pageSql = dialect.ApplyLimit(pageSql, "take");
         return new(
@@ -123,16 +123,29 @@ internal sealed class RelationalDiagnosticQueryBuilder(
 
         var fieldParameter = Add("field", field.Name);
         var fieldTypeParameter = Add("fieldType", (int)field.Type);
-        var usesCanonicalContains = comparison.Operator == DiagnosticPredicateOperator.Contains &&
-                                    field.CasePolicy == DiagnosticStringCasePolicy.Ordinal;
-        var valueExpression = BuildValueExpression(
-            usesCanonicalContains ? "f.canonical_value" : "f.comparison_key",
-            comparison,
-            usesCanonicalContains ? "canonicalValue" : "value",
-            usesCanonicalContains
-                ? value => value.CanonicalValue
-                : value => DiagnosticComparisonKeys.Create(value, field.CasePolicy));
+        var valueExpression = field.Type == DiagnosticFieldType.String &&
+                              comparison.Operator is DiagnosticPredicateOperator.Equal or DiagnosticPredicateOperator.In
+            ? BuildStringIdentityExpression(comparison, field)
+            : BuildValueExpression(
+                comparison.Operator == DiagnosticPredicateOperator.Contains ? "f.search_key" : "f.comparison_key",
+                comparison,
+                comparison.Operator == DiagnosticPredicateOperator.Contains ? "search" : "value",
+                comparison.Operator == DiagnosticPredicateOperator.Contains
+                    ? value => DiagnosticStringComparisonKey.CreateSearchKey(value.CanonicalValue, field.CasePolicy)
+                    : value => DiagnosticComparisonKeys.Create(value, field.CasePolicy));
         return $"EXISTS (SELECT 1 FROM {dialect.TableReference(RelationalDiagnosticRecordSchema.FieldsTable, "f")} WHERE {FieldJoin("f", recordAlias)} AND f.field_name = {fieldParameter} AND f.field_type = {fieldTypeParameter} AND {valueExpression})";
+    }
+
+    private string BuildStringIdentityExpression(
+        DiagnosticRecordPredicate.Comparison comparison,
+        DiagnosticFieldDefinition field)
+    {
+        var identities = comparison.Values.Select(value =>
+        {
+            var projection = DiagnosticStringComparisonKey.Project(value.CanonicalValue, field.CasePolicy);
+            return $"(f.comparison_key_hash = {Add("hash", projection.ComparisonKeyHash)} AND f.comparison_key = {Add("value", projection.ComparisonKey)})";
+        }).ToArray();
+        return identities.Length == 1 ? identities[0] : $"({string.Join(" OR ", identities)})";
     }
 
     private string BuildValueExpression(
@@ -141,6 +154,9 @@ internal sealed class RelationalDiagnosticQueryBuilder(
         string parameterPrefix,
         Func<DiagnosticFieldValue, object> convert)
     {
+        if (comparison is { Operator: DiagnosticPredicateOperator.Contains, Values.Count: > 0 } &&
+            comparison.Values[0].CanonicalValue.Length == 0)
+            return "1 = 1";
         var values = comparison.Values.Select(value => Add(parameterPrefix, convert(value))).ToArray();
         return comparison.Operator switch
         {
@@ -163,12 +179,15 @@ internal sealed class RelationalDiagnosticQueryBuilder(
         var comparison = order.Direction == DiagnosticSortDirection.Ascending ? ">" : "<";
         if (orderField is null)
             return $"cursor {comparison} {lastCursor}";
-        var lastOrder = Add(
-            "lastOrder",
-            StringComparer.Ordinal.Equals(orderField.Name, DiagnosticRecordFieldNames.OccurredAt)
-                ? DateTimeOffset.Parse(continuation.LastOrderValue!.Value.CanonicalValue).UtcTicks
-                : DiagnosticComparisonKeys.Create(continuation.LastOrderValue!.Value, orderField.CasePolicy));
-        return $"(order_key {comparison} {lastOrder} OR (order_key = {lastOrder} AND cursor {comparison} {lastCursor}))";
+        var isOccurredAt = StringComparer.Ordinal.Equals(orderField.Name, DiagnosticRecordFieldNames.OccurredAt);
+        var lastOrderKey = isOccurredAt
+            ? (object)DateTimeOffset.Parse(continuation.LastOrderValue!.Value.CanonicalValue).UtcTicks
+            : DiagnosticComparisonKeys.Create(continuation.LastOrderValue!.Value, orderField.CasePolicy);
+        var lastOrder = Add("lastOrder", lastOrderKey);
+        if (isOccurredAt)
+            return $"(order_key {comparison} {lastOrder} OR (order_key = {lastOrder} AND cursor {comparison} {lastCursor}))";
+        var lastPrefix = Add("lastOrderPrefix", DiagnosticStringComparisonKey.CreateBoundedPrefix((string)lastOrderKey));
+        return $"(order_prefix {comparison} {lastPrefix} OR (order_prefix = {lastPrefix} AND (order_key {comparison} {lastOrder} OR (order_key = {lastOrder} AND cursor {comparison} {lastCursor}))))";
     }
 
     private void AddScope(DiagnosticStorageScope scope, DiagnosticStreamId stream)

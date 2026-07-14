@@ -16,8 +16,12 @@ public static class SqlServerDiagnosticRecordStoreFactory
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(definition);
         SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
-        return new(connectionString, definition);
+        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
+            definition,
+            null,
+            null);
     }
 
     internal static async Task<SqlServerDiagnosticRecordStore> CreateAsync(
@@ -32,7 +36,7 @@ public static class SqlServerDiagnosticRecordStoreFactory
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentNullException.ThrowIfNull(timeProvider);
         SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
+        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
         var sessions = RelationalSessionFactory.Concurrent(createOperationConnection ?? (() => new SqlConnection(connectionString)));
         return new(sessions, definition, timeProvider, interceptAsync);
     }

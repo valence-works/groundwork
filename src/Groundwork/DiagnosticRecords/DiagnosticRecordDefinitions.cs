@@ -20,7 +20,12 @@ public enum DiagnosticFieldCardinality
 public enum DiagnosticStringCasePolicy
 {
     Ordinal,
-    AsciiIgnoreCase
+    AsciiIgnoreCase,
+    /// <summary>
+    /// Uses Groundwork's versioned, provider-neutral Unicode simple case mapping with ordinal
+    /// scalar comparison semantics. The mapping identity is persisted with the stream schema.
+    /// </summary>
+    UnicodeOrdinalIgnoreCase
 }
 
 public enum DiagnosticMissingValueBehavior
@@ -157,6 +162,8 @@ public static class DiagnosticRecordStreamDefinitionValidator
                 errors.Add(new("definition.field.contains.invalid", $"Non-string field '{field.Name}' cannot declare Contains.", $"fields.{field.Name}.supportedPredicates"));
             if (field.Type != DiagnosticFieldType.String && field.CasePolicy != DiagnosticStringCasePolicy.Ordinal)
                 errors.Add(new("definition.field.case_policy.invalid", $"Non-string field '{field.Name}' must use ordinal case policy.", $"fields.{field.Name}.casePolicy"));
+            if (!Enum.IsDefined(field.CasePolicy))
+                errors.Add(new("definition.field.case_policy.unknown", $"Field '{field.Name}' declares an unknown string case policy.", $"fields.{field.Name}.casePolicy"));
             if (field.Cardinality == DiagnosticFieldCardinality.Multiple && field.IsOrderable)
                 errors.Add(new("definition.field.multi_order.invalid", $"Multi-value field '{field.Name}' cannot define a single field order.", $"fields.{field.Name}.isOrderable"));
             if (field.Cardinality == DiagnosticFieldCardinality.Multiple && field.SupportsLatestPerKey)
@@ -169,6 +176,8 @@ public static class DiagnosticRecordStreamDefinitionValidator
             if (field is null || field.Cardinality != DiagnosticFieldCardinality.Scalar || field.Type != DiagnosticFieldType.Int64)
                 errors.Add(new("definition.high_water.invalid", "The logical high-water field must be a declared scalar Int64 field.", "logicalHighWaterField"));
         }
+
+        DiagnosticStringProjectionBudget.AddDefinitionErrors(definition, errors);
 
         if (errors.Count > 0)
             throw new DiagnosticRecordValidationException(errors);

@@ -25,13 +25,14 @@ public sealed class RelationalDiagnosticRecordStore :
     private readonly RelationalDiagnosticRecordDialect dialect;
     private readonly TimeProvider timeProvider;
     private readonly Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask> interceptAsync;
+    private readonly RelationalDiagnosticRecordAdmission? admission;
 
-    public RelationalDiagnosticRecordStore(
+    internal RelationalDiagnosticRecordStore(
         RelationalSessionFactory sessions,
         DiagnosticRecordStreamDefinition definition,
         RelationalDiagnosticRecordDialect dialect,
         TimeProvider? timeProvider = null)
-        : this(sessions, sessions, definition, dialect, timeProvider, null)
+        : this(sessions, sessions, definition, dialect, timeProvider, null, null)
     {
     }
 
@@ -41,7 +42,8 @@ public sealed class RelationalDiagnosticRecordStore :
         DiagnosticRecordStreamDefinition definition,
         RelationalDiagnosticRecordDialect dialect,
         TimeProvider? timeProvider,
-        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync)
+        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync,
+        Func<CancellationToken, Task>? admitAsync)
     {
         ArgumentNullException.ThrowIfNull(readSessions);
         ArgumentNullException.ThrowIfNull(writeSessions);
@@ -54,6 +56,7 @@ public sealed class RelationalDiagnosticRecordStore :
         this.dialect = dialect;
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.interceptAsync = interceptAsync ?? ((_, _) => ValueTask.CompletedTask);
+        admission = admitAsync is null ? null : new(admitAsync);
         Handlers = new(this, this, this, this);
     }
 
@@ -74,6 +77,7 @@ public sealed class RelationalDiagnosticRecordStore :
         cancellationToken.ThrowIfCancellationRequested();
         batch = DiagnosticRecordRequestSnapshot.Capture(batch);
         DiagnosticRecordRequestValidator.Validate(batch, definition);
+        await EnsureAdmissionAsync(cancellationToken);
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendBeforeCommit, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.AppendBeforeStreamLock, cancellationToken);
@@ -126,8 +130,9 @@ public sealed class RelationalDiagnosticRecordStore :
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        query = DiagnosticRecordQuerySnapshot.Capture(query);
+        query = DiagnosticRecordQuerySnapshot.Capture(query, definition.Limits.MaxPredicateNodes);
         DiagnosticRecordQueryValidator.Validate(query, definition, this);
+        await EnsureAdmissionAsync(cancellationToken);
         return await readSessions.AutonomousExecutor.ExecuteAsync(
             async (connection, transaction, ct) =>
             {
@@ -168,15 +173,16 @@ public sealed class RelationalDiagnosticRecordStore :
             cancellationToken);
     }
 
-    public ValueTask<DiagnosticStreamStatistics> InspectAsync(
+    public async ValueTask<DiagnosticStreamStatistics> InspectAsync(
         DiagnosticStreamInspectionRequest request,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         DiagnosticRecordRequestValidator.Validate(request, definition);
-        return new(readSessions.AutonomousExecutor.ExecuteAsync(
+        await EnsureAdmissionAsync(cancellationToken);
+        return await readSessions.AutonomousExecutor.ExecuteAsync(
             (connection, transaction, ct) => ReadStatisticsAsync(connection, transaction, request.Scope, request.Stream, ct),
-            cancellationToken));
+            cancellationToken);
     }
 
     public async ValueTask<DiagnosticTrimResult> TrimAsync(
@@ -185,6 +191,7 @@ public sealed class RelationalDiagnosticRecordStore :
     {
         cancellationToken.ThrowIfCancellationRequested();
         DiagnosticRecordRequestValidator.Validate(request, definition);
+        await EnsureAdmissionAsync(cancellationToken);
         await interceptAsync(RelationalDiagnosticRecordExecutionPoint.TrimBeforeCommit, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -235,6 +242,9 @@ public sealed class RelationalDiagnosticRecordStore :
         var command = new RelationalDiagnosticQueryBuilder(definition, dialect).Build(query, snapshotHighWater);
         return command with { CommandText = dialect.PrepareCommandText(command.CommandText) };
     }
+
+    private ValueTask EnsureAdmissionAsync(CancellationToken cancellationToken) =>
+        admission?.EnsureAsync(cancellationToken) ?? ValueTask.CompletedTask;
 
     internal RelationalDiagnosticCommand BuildTrimSelectionCommand(DiagnosticTrimRequest request)
     {
@@ -701,15 +711,19 @@ public sealed class RelationalDiagnosticRecordStore :
             for (var ordinal = 0; ordinal < field.Value.Count; ordinal++)
             {
                 var value = field.Value[ordinal];
+                var stored = DiagnosticStoredFieldKeys.Create(value, fieldDefinition);
                 var fieldParameters = ScopeParameters(scope, stream);
                 fieldParameters.Add("cursor", cursor);
                 fieldParameters.Add("field", field.Key);
                 fieldParameters.Add("ordinal", ordinal);
                 fieldParameters.Add("type", (int)value.Type);
-                fieldParameters.Add("canonical", value.CanonicalValue);
-                fieldParameters.Add("comparison", DiagnosticComparisonKeys.Create(value, fieldDefinition.CasePolicy));
+                fieldParameters.Add("canonical", stored.CanonicalValue);
+                fieldParameters.Add("comparison", stored.ComparisonKey);
+                fieldParameters.Add("comparisonPrefix", stored.ComparisonKeyPrefix);
+                fieldParameters.Add("comparisonHash", stored.ComparisonKeyHash);
+                fieldParameters.Add("search", stored.SearchKey);
                 await ExecuteNonQueryAsync(connection, transaction,
-                    new($"INSERT INTO {RelationalDiagnosticRecordSchema.FieldsTable} (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key) VALUES ({dialect.Parameter("tenant")}, {dialect.Parameter("scope")}, {dialect.Parameter("stream")}, {dialect.Parameter("cursor")}, {dialect.Parameter("field")}, {dialect.Parameter("ordinal")}, {dialect.Parameter("type")}, {dialect.Parameter("canonical")}, {dialect.Parameter("comparison")});", fieldParameters),
+                    new($"INSERT INTO {RelationalDiagnosticRecordSchema.FieldsTable} (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key, comparison_key_prefix, comparison_key_hash, search_key) VALUES ({dialect.Parameter("tenant")}, {dialect.Parameter("scope")}, {dialect.Parameter("stream")}, {dialect.Parameter("cursor")}, {dialect.Parameter("field")}, {dialect.Parameter("ordinal")}, {dialect.Parameter("type")}, {dialect.Parameter("canonical")}, {dialect.Parameter("comparison")}, {dialect.Parameter("comparisonPrefix")}, {dialect.Parameter("comparisonHash")}, {dialect.Parameter("search")});", fieldParameters),
                     cancellationToken);
             }
         }
@@ -821,7 +835,10 @@ public sealed class RelationalDiagnosticRecordStore :
                 var cursor = reader.GetInt64(0);
                 var field = reader.GetString(1);
                 var ordinal = checked((int)reader.GetInt64(2));
-                var value = new DiagnosticFieldValue((DiagnosticFieldType)reader.GetInt64(3), reader.GetString(4));
+                var fieldType = (DiagnosticFieldType)reader.GetInt64(3);
+                var value = new DiagnosticFieldValue(
+                    fieldType,
+                    DiagnosticStoredFieldKeys.DecodeCanonical(fieldType, reader.GetString(4)));
                 if (!fieldsByCursor.TryGetValue(cursor, out var byName))
                     fieldsByCursor[cursor] = byName = new(StringComparer.Ordinal);
                 if (!byName.TryGetValue(field, out var values))
@@ -853,7 +870,7 @@ public sealed class RelationalDiagnosticRecordStore :
     private DiagnosticFieldValue ParseFieldValue(string fieldName, string canonicalValue)
     {
         var field = DiagnosticRecordFieldResolver.Resolve(definition, fieldName)!;
-        return new(field.Type, canonicalValue);
+        return new(field.Type, DiagnosticStoredFieldKeys.DecodeCanonical(field.Type, canonicalValue));
     }
 
     private static long ParseCursor(DiagnosticCursor cursor) => long.Parse(cursor.Value, CultureInfo.InvariantCulture);

@@ -18,7 +18,11 @@ public sealed class SqliteDiagnosticRecordStore : IDiagnosticRecordStore
             SqliteRelationalSessions.CreateSerializedImmediate(connectionString),
             definition,
             timeProvider,
-            null)
+            null,
+            (snapshot, cancellationToken) => SqliteDiagnosticRecordMaterializer.AdmitAsync(
+                connectionString,
+                snapshot,
+                cancellationToken))
     {
     }
 
@@ -27,9 +31,19 @@ public sealed class SqliteDiagnosticRecordStore : IDiagnosticRecordStore
         RelationalSessionFactory writeSessions,
         DiagnosticRecordStreamDefinition definition,
         TimeProvider? timeProvider,
-        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync)
+        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync,
+        Func<DiagnosticRecordStreamDefinition, CancellationToken, Task>? materializeAsync = null)
     {
-        inner = new(readSessions, writeSessions, definition, new SqliteDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        var snapshot = DiagnosticRecordStreamDefinitionSnapshot.Capture(definition);
+        SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(snapshot);
+        inner = new(
+            readSessions,
+            writeSessions,
+            snapshot,
+            new SqliteDiagnosticRecordDialect(),
+            timeProvider,
+            interceptAsync,
+            materializeAsync is null ? null : cancellationToken => materializeAsync(snapshot, cancellationToken));
         instrumented = new(inner, new("sqlite", "diagnostic-records"));
     }
 
@@ -60,6 +74,11 @@ public sealed class SqliteDiagnosticRecordStore : IDiagnosticRecordStore
 
 internal sealed class SqliteDiagnosticRecordDialect : RelationalDiagnosticRecordDialect
 {
+    public override string TableReference(string table, string alias) =>
+        table == RelationalDiagnosticRecordSchema.FieldsTable && alias == "lfield"
+            ? $"{table} AS {alias} INDEXED BY ix_groundwork_diagnostic_fields_scope_latest"
+            : base.TableReference(table, alias);
+
     public override string ApplyLimit(string selectSql, string parameterName) =>
         $"{selectSql} LIMIT {Parameter(parameterName)}";
 

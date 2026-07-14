@@ -21,7 +21,7 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
     public async Task InitializeAsync()
     {
         fixtureConnectionString = await container.CreateDatabaseAsync();
-        fixture = await SqlServerDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString);
+        fixture = await SqlServerDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString, TestDefinition);
     }
 
     public async Task DisposeAsync()
@@ -53,6 +53,7 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
         Assert.Equal(
             [
                 "groundwork_diagnostic_append_operations",
+                "groundwork_diagnostic_definitions",
                 "groundwork_diagnostic_fields",
                 "groundwork_diagnostic_provider_state",
                 "groundwork_diagnostic_records",
@@ -61,6 +62,22 @@ public sealed class SqlServerDiagnosticRecordStoreTests(SqlServerDiagnosticConta
             ],
             names);
         Assert.Equal("Latin1_General_100_BIN2_UTF8", await collation.ExecuteScalarAsync());
+        await using var state = connection.CreateCommand();
+        state.CommandText = $"SELECT algorithm_manifest FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
+        state.Parameters.AddWithValue("@stream", TestDefinition.Stream.Value);
+        Assert.Contains(
+            DiagnosticStringComparisonKey.UnicodeOrdinalIgnoreCaseAlgorithmId,
+            Assert.IsType<string>(await state.ExecuteScalarAsync()),
+            StringComparison.Ordinal);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => SqlServerDiagnosticRecordMaterializer.MaterializeAsync(
+            fixture.ConnectionString,
+            TestDefinition with { SchemaVersion = TestDefinition.SchemaVersion + 1 }));
+
+        var direct = new SqlServerDiagnosticRecordStore(
+            fixture.ConnectionString,
+            TestDefinition with { SchemaVersion = TestDefinition.SchemaVersion + 1 });
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await direct.InspectAsync(new(new("tenant-a", "shell-a"), TestDefinition.Stream)));
 
     }
 
@@ -162,15 +179,18 @@ internal sealed class SqlServerDiagnosticRecordStoreFixture : IServerDiagnosticR
 
     public static async Task<SqlServerDiagnosticRecordStoreFixture> CreateAsync(
         string connectionString,
+        DiagnosticRecordStreamDefinition definition,
         CancellationToken cancellationToken = default)
     {
         await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(
             connectionString,
+            definition,
             cancellationToken: cancellationToken);
         return new(connectionString);
     }
 
     public string ConnectionString { get; }
+    public string FieldsPrimaryAccessPath => "pk_groundwork_diagnostic_fields";
 
     public IDiagnosticRecordStore OpenStore(DiagnosticRecordStreamDefinition definition) =>
         new SqlServerDiagnosticRecordStore(sessions, definition, timeProvider, InterceptAsync);
@@ -401,8 +421,8 @@ internal sealed class SqlServerDiagnosticRecordStoreFixture : IServerDiagnosticR
             await using var command = connection.CreateCommand();
             command.CommandText = $"""
                 INSERT INTO {RelationalDiagnosticRecordSchema.FieldsTable}
-                    (tenant_id, scope_id, stream_id, [cursor], field_name, value_ordinal, field_type, canonical_value, comparison_key)
-                SELECT 'noise-tenant', CONCAT('noise-scope-', n % 100), 'logs', n, 'service', 0, 0, 'noise', 'noise'
+                    (tenant_id, scope_id, stream_id, [cursor], field_name, value_ordinal, field_type, canonical_value, comparison_key, comparison_key_prefix, comparison_key_hash, search_key)
+                SELECT 'noise-tenant', CONCAT('noise-scope-', n % 100), 'logs', n, 'service', 0, 0, 'bm9pc2U=', 'noise', 'noise', REPLICATE('0', 64), '|006E|006F|0069|0073|0065'
                 FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) a(digit)
                 CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) b(digit)
                 CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) c(digit)

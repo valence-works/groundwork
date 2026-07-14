@@ -96,20 +96,74 @@ public sealed class MongoDbDiagnosticRecordStoreConformanceTests(MongoDbReplicaS
     }
 
     [Fact]
-    public async Task Native_field_explain_uses_the_scoped_field_index()
+    public async Task Native_long_unicode_equality_explain_uses_the_bounded_hash_field_index()
+    {
+        var fixture = (MongoDbDiagnosticRecordStoreFixture)CreateFixture();
+        var store = (MongoDbDiagnosticRecordStore)fixture.OpenStore(TestDefinition);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        var value = new string('Å', 32_766) + "😀";
+        Assert.Equal(65_536, System.Text.Encoding.UTF8.GetByteCount(value));
+        var record = new DiagnosticRecordInput("record-1", fixture.GetUtcNow(), "{}",
+            new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>> { ["unicode"] = [DiagnosticFieldValue.String(value)] });
+        await store.AppendAsync(DiagnosticRecordBatch.Create(scope, TestDefinition.Stream,
+            new(fixture.GetUtcNow(), "explain-field"), [record]));
+
+        var explain = await store.ExplainQueryAsync(new(scope, TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.Equal("unicode", DiagnosticFieldValue.String(value.ToLowerInvariant()))));
+
+        Assert.Contains("ix_groundwork_diagnostic_records_scope_fields", WinningIndexNames(explain));
+    }
+
+    [Fact]
+    public async Task Native_contains_explain_uses_the_scope_and_stream_bounded_field_index()
     {
         var fixture = (MongoDbDiagnosticRecordStoreFixture)CreateFixture();
         var store = (MongoDbDiagnosticRecordStore)fixture.OpenStore(TestDefinition);
         var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
         var record = new DiagnosticRecordInput("record-1", fixture.GetUtcNow(), "{}",
-            new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>> { ["service"] = [DiagnosticFieldValue.String("API")] });
+            new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>>
+            {
+                ["unicode"] = [DiagnosticFieldValue.String("before-Å😀-after")]
+            });
         await store.AppendAsync(DiagnosticRecordBatch.Create(scope, TestDefinition.Stream,
-            new(fixture.GetUtcNow(), "explain-field"), [record]));
+            new(fixture.GetUtcNow(), "explain-contains"), [record]));
 
-        var explain = await store.ExplainQueryAsync(new(scope, TestDefinition.Stream, 10,
-            Predicate: DiagnosticRecordPredicate.Equal("service", DiagnosticFieldValue.String("api"))));
+        var explain = await store.ExplainQueryAsync(new(
+            scope,
+            TestDefinition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.Contains("unicode", "å😀")));
 
         Assert.Contains("ix_groundwork_diagnostic_records_scope_fields", WinningIndexNames(explain));
+        Assert.DoesNotContain("COLLSCAN", explain.ToJson(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Persisted_long_unicode_keys_keep_only_bounded_values_in_native_indexes()
+    {
+        var fixture = (MongoDbDiagnosticRecordStoreFixture)CreateFixture();
+        var store = (MongoDbDiagnosticRecordStore)fixture.OpenStore(TestDefinition);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+        var value = new string('Å', 32_766) + "😀";
+        await store.AppendAsync(DiagnosticRecordBatch.Create(scope, TestDefinition.Stream,
+            new(fixture.GetUtcNow(), "unicode-bounded-keys"),
+            [new("record-1", fixture.GetUtcNow(), "{}", new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>>
+            {
+                ["unicode"] = [DiagnosticFieldValue.String(value)]
+            })]));
+
+        var document = await fixture.Database
+            .GetCollection<BsonDocument>(MongoDbDiagnosticRecordNames.Records)
+            .Find(FilterDefinition<BsonDocument>.Empty)
+            .SingleAsync();
+        var queryValue = document["query_values"].AsBsonArray.Single().AsBsonDocument;
+        var prefix = document[MongoDbDiagnosticRecordStore.SortPrefixPath("unicode").Split('.')[0]]
+            .AsBsonDocument[MongoDbDiagnosticRecordStore.SortPrefixKey("unicode")].AsString;
+
+        Assert.True(queryValue["comparison_key"].AsString.Length > DiagnosticStringComparisonKey.BoundedPrefixLength);
+        Assert.Equal(DiagnosticStringComparisonKey.BoundedPrefixLength, queryValue["comparison_key_prefix"].AsString.Length);
+        Assert.Equal(64, queryValue["comparison_key_hash"].AsString.Length);
+        Assert.Equal(DiagnosticStringComparisonKey.BoundedPrefixLength, prefix.Length);
     }
 
     [Fact]
@@ -259,6 +313,26 @@ public sealed class MongoDbDiagnosticRecordStoreConformanceTests(MongoDbReplicaS
         Assert.Contains(MongoDbDiagnosticRecordNames.StreamDefinitions, collections);
         Assert.Contains(indexes, index => index["name"] == "ux_groundwork_diagnostic_records_scope_record" && index["unique"].ToBoolean());
         Assert.Contains(indexes, index => index["name"] == "ix_groundwork_diagnostic_records_scope_fields");
+        var orderedFieldNames = TestDefinition.Fields
+            .Where(field => field.IsOrderable || field.SupportsLatestPerKey)
+            .Select(field => field.Name)
+            .Append(DiagnosticRecordFieldNames.OccurredAt)
+            .ToArray();
+        var fullSortPaths = orderedFieldNames
+            .Select(MongoDbDiagnosticRecordStore.SortPath)
+            .ToHashSet(StringComparer.Ordinal);
+        var prefixSortPaths = orderedFieldNames
+            .Select(MongoDbDiagnosticRecordStore.SortPrefixPath)
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.All(indexes, index =>
+        {
+            var keys = index["key"].AsBsonDocument.Names;
+            Assert.DoesNotContain("query_values.comparison_key", keys);
+            Assert.DoesNotContain("query_values.search_key", keys);
+            Assert.DoesNotContain(keys, fullSortPaths.Contains);
+        });
+        Assert.Contains(indexes, index => index["key"].AsBsonDocument.Names.Contains("query_values.comparison_key_hash"));
+        Assert.Contains(indexes, index => index["key"].AsBsonDocument.Names.Any(prefixSortPaths.Contains));
         using var collectionMetadata = await fixture.Database.ListCollectionsAsync();
         var metadata = await collectionMetadata.ToListAsync();
         Assert.All(metadata.Where(item => item["name"].AsString.StartsWith("groundwork_diagnostic_", StringComparison.Ordinal)), item =>
@@ -417,6 +491,59 @@ public sealed class MongoDbDiagnosticRecordStoreConformanceTests(MongoDbReplicaS
         await Assert.ThrowsAsync<DiagnosticRecordValidationException>(() =>
             MongoDbDiagnosticRecordMaterializer.MaterializeAsync(fixture.Database, invalid));
 
+        Assert.Empty(await (await fixture.Database.ListCollectionNamesAsync()).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Provider_string_and_document_bounds_are_rejected_before_mongodb_io()
+    {
+        var fixture = new MongoDbDiagnosticRecordStoreFixture(replicaSet.PrimaryClient, replicaSet.SecondaryClient);
+        var oversized = TestDefinition with
+        {
+            LogicalHighWaterField = null,
+            Fields =
+            [
+                new("message", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Contains },
+                    CasePolicy: DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+                    MaxStringBytes: 65_537)
+            ]
+        };
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordValidationException>(() =>
+            MongoDbDiagnosticRecordMaterializer.MaterializeAsync(fixture.Database, oversized));
+
+        Assert.Contains(exception.Errors, error => error.Code == "provider.mongodb.string_bound.too_large");
+        Assert.Empty(await (await fixture.Database.ListCollectionNamesAsync()).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Aggregate_record_document_budget_is_rejected_before_mongodb_io()
+    {
+        var fixture = new MongoDbDiagnosticRecordStoreFixture(replicaSet.PrimaryClient, replicaSet.SecondaryClient);
+        DiagnosticFieldDefinition Field(string name) => new(
+            name,
+            DiagnosticFieldType.String,
+            DiagnosticFieldCardinality.Scalar,
+            new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.Contains },
+            CasePolicy: DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+            MaxStringBytes: 65_536);
+        var oversized = TestDefinition with
+        {
+            LogicalHighWaterField = null,
+            Fields = Enumerable.Range(0, 10).Select(index => Field($"message-{index}")).ToArray(),
+            Limits = TestDefinition.Limits with
+            {
+                MaxPayloadBytes = 1_000_000,
+                MaxFieldsPerRecord = 10,
+                MaxPredicateValues = 1
+            }
+        };
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordValidationException>(() =>
+            MongoDbDiagnosticRecordMaterializer.MaterializeAsync(fixture.Database, oversized));
+
+        Assert.Contains(exception.Errors, error => error.Code == "provider.mongodb.record_document_budget.exceeded");
         Assert.Empty(await (await fixture.Database.ListCollectionNamesAsync()).ToListAsync());
     }
 

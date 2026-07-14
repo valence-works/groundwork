@@ -16,8 +16,12 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(definition);
         PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
-        return new(connectionString, definition);
+        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
+            definition,
+            null,
+            null);
     }
 
     internal static async Task<PostgreSqlDiagnosticRecordStore> CreateAsync(
@@ -32,7 +36,7 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentNullException.ThrowIfNull(timeProvider);
         PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
+        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
         var sessions = RelationalSessionFactory.Concurrent(createOperationConnection ?? (() => new NpgsqlConnection(connectionString)));
         return new(sessions, definition, timeProvider, interceptAsync);
     }

@@ -20,7 +20,11 @@ public sealed class SqlServerDiagnosticRecordStore : IDiagnosticRecordStore
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             definition,
             timeProvider,
-            null)
+            null,
+            (snapshot, cancellationToken) => SqlServerDiagnosticRecordMaterializer.AdmitAsync(
+                connectionString,
+                snapshot,
+                cancellationToken))
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
@@ -29,10 +33,19 @@ public sealed class SqlServerDiagnosticRecordStore : IDiagnosticRecordStore
         RelationalSessionFactory sessions,
         DiagnosticRecordStreamDefinition definition,
         TimeProvider? timeProvider,
-        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync)
+        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync,
+        Func<DiagnosticRecordStreamDefinition, CancellationToken, Task>? materializeAsync = null)
     {
-        SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        inner = new(sessions, sessions, definition, new SqlServerDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        var snapshot = DiagnosticRecordStreamDefinitionSnapshot.Capture(definition);
+        SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(snapshot);
+        inner = new(
+            sessions,
+            sessions,
+            snapshot,
+            new SqlServerDiagnosticRecordDialect(),
+            timeProvider,
+            interceptAsync,
+            materializeAsync is null ? null : cancellationToken => materializeAsync(snapshot, cancellationToken));
         var core = new CoreHandlers(inner);
         instrumented = new(
             new DiagnosticRecordStoreHandlers(core, core, core, core),

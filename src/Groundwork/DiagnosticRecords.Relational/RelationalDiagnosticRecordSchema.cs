@@ -32,6 +32,7 @@ public sealed record RelationalDiagnosticRecordSchema(
     IReadOnlyList<RelationalDiagnosticIndexDefinition> Indexes)
 {
     public const string ProviderStateTable = "groundwork_diagnostic_provider_state";
+    public const string DefinitionsTable = "groundwork_diagnostic_definitions";
     public const string StreamsTable = "groundwork_diagnostic_streams";
     public const string RecordsTable = "groundwork_diagnostic_records";
     public const string FieldsTable = "groundwork_diagnostic_fields";
@@ -52,6 +53,13 @@ public sealed record RelationalDiagnosticRecordSchema(
         return new(
             [
                 new(ProviderStateTable, [Int64("id"), Int64("clock_high_water_ticks")], ["id"]),
+                new(DefinitionsTable,
+                    [
+                        Text("stream_id"), Int64("schema_version"), Text("definition_fingerprint"),
+                        Text("algorithm_manifest"), Text("algorithm_manifest_fingerprint"),
+                        Text("canonical_definition")
+                    ],
+                    ["stream_id"]),
                 new(StreamsTable,
                     scope.Concat([
                         Int64("next_cursor"), Int64("logical_high_water_type", true),
@@ -66,7 +74,8 @@ public sealed record RelationalDiagnosticRecordSchema(
                 new(FieldsTable,
                     scope.Concat([
                         Int64("cursor"), Text("field_name"), Int64("value_ordinal"), Int64("field_type"),
-                        Text("canonical_value"), Text("comparison_key")
+                        Text("canonical_value"), Text("comparison_key"), Text("comparison_key_prefix"),
+                        Text("comparison_key_hash"), Text("search_key")
                     ]).ToArray(),
                     ["tenant_id", "scope_id", "stream_id", "cursor", "field_name", "value_ordinal"]),
                 new(AppendOperationsTable,
@@ -88,9 +97,11 @@ public sealed record RelationalDiagnosticRecordSchema(
                 new("ix_groundwork_diagnostic_records_scope_cursor", RecordsTable,
                     ["tenant_id", "scope_id", "stream_id", "cursor"]),
                 new("ix_groundwork_diagnostic_fields_scope_value", FieldsTable,
-                    ["tenant_id", "scope_id", "stream_id", "field_name", "comparison_key", "field_type", "cursor"]),
+                    ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key_hash", "cursor"]),
+                new("ix_groundwork_diagnostic_fields_scope_order", FieldsTable,
+                    ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal", "comparison_key_prefix", "cursor"]),
                 new("ix_groundwork_diagnostic_fields_scope_latest", FieldsTable,
-                    ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal", "comparison_key", "cursor"]),
+                    ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal", "cursor", "comparison_key_hash"]),
                 new("ix_groundwork_diagnostic_append_tombstone", AppendOperationsTable, ["tombstone_until_ticks"]),
                 new("ix_groundwork_diagnostic_trim_tombstone", TrimOperationsTable, ["tombstone_until_ticks"])
             ]);

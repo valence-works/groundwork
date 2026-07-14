@@ -46,13 +46,13 @@ public sealed class DiagnosticRecordProviderApiTests
                     SupportsLatestPerKey: true,
                     MaxStringBytes: 1)
             ],
-            Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 2_087)
+            Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 1_043)
         };
         var exactStore = new SqlServerDiagnosticRecordStore(
             "Server=localhost;Database=groundwork;User ID=sa;Password=NotARealPassword1!;TrustServerCertificate=True",
             exactBudget);
         Assert.NotNull(exactStore.Handlers);
-        var values = Enumerable.Repeat(DiagnosticFieldValue.String("a"), 2_087).ToArray();
+        var values = Enumerable.Repeat(DiagnosticFieldValue.String("a"), 1_043).ToArray();
         var query = new DiagnosticRecordQuery(
             new("tenant-a", "scope-a"),
             exactBudget.Stream,
@@ -66,7 +66,7 @@ public sealed class DiagnosticRecordProviderApiTests
             DiagnosticRequestFingerprint.ForQuery(query, exactBudget),
             DiagnosticFieldValue.String("a"));
         Assert.Equal(2_100, exactStore.Inner.BuildQueryCommand(query with { Continuation = continuation }, 1).Parameters.Count);
-        var overBudget = exactBudget with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 2_088) };
+        var overBudget = exactBudget with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 1_044) };
         var exception = Assert.Throws<DiagnosticRecordValidationException>(() => new SqlServerDiagnosticRecordStore(
             "Server=localhost;Database=groundwork;User ID=sa;Password=NotARealPassword1!;TrustServerCertificate=True",
             overBudget));
@@ -81,15 +81,41 @@ public sealed class DiagnosticRecordProviderApiTests
             Definition);
 
         Assert.NotNull(store.Handlers);
-        var exactBudget = Definition with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 65_522) };
+        var exactBudget = Definition with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 32_760) };
         Assert.NotNull(new PostgreSqlDiagnosticRecordStore(
             "Host=localhost;Database=groundwork;Username=groundwork;Password=not-real",
             exactBudget).Handlers);
-        var overBudget = exactBudget with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 65_523) };
+        var overBudget = exactBudget with { Limits = new(MaxRecordIdBytes: 128, MaxPredicateNodes: 1, MaxPredicateValues: 32_761) };
         var exception = Assert.Throws<DiagnosticRecordValidationException>(() => new PostgreSqlDiagnosticRecordStore(
             "Host=localhost;Database=groundwork;Username=groundwork;Password=not-real",
             overBudget));
         Assert.Contains(exception.Errors, error => error.Code == "provider.postgresql.parameter_budget.exceeded");
+    }
+
+    [Fact]
+    public void Relational_providers_reject_declared_string_bounds_beyond_adapter_capabilities_before_io()
+    {
+        var oversized = Definition with
+        {
+            Fields =
+            [
+                new("message", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Contains },
+                    MaxStringBytes: 65_537)
+            ]
+        };
+
+        var sqlServer = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            new SqlServerDiagnosticRecordStore(
+                "Server=unreachable;Database=groundwork;User ID=sa;Password=not-used",
+                oversized));
+        var postgreSql = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            new PostgreSqlDiagnosticRecordStore(
+                "Host=unreachable;Database=groundwork;Username=groundwork;Password=not-used",
+                oversized));
+
+        Assert.Contains(sqlServer.Errors, error => error.Code == "provider.sql_server.string_bound.too_large");
+        Assert.Contains(postgreSql.Errors, error => error.Code == "provider.postgresql.string_bound.too_large");
     }
 
     [Fact]

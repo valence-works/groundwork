@@ -48,7 +48,7 @@ public sealed class MongoDbDiagnosticRecordStore :
     {
         ArgumentNullException.ThrowIfNull(database);
         _definition = DiagnosticRecordStreamDefinitionSnapshot.Capture(definition);
-        DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(_definition);
+        MongoDbDiagnosticRecordValidator.ValidateDefinitionAndThrow(_definition);
         _database = database;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _interceptAsync = interceptor ?? ((_, _) => ValueTask.CompletedTask);
@@ -213,7 +213,7 @@ public sealed class MongoDbDiagnosticRecordStore :
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        query = DiagnosticRecordQuerySnapshot.Capture(query);
+        query = DiagnosticRecordQuerySnapshot.Capture(query, _definition.Limits.MaxPredicateNodes);
         DiagnosticRecordQueryValidator.Validate(query, _definition, this);
         using var session = await _database.Client.StartSessionAsync(cancellationToken: cancellationToken);
         return await ExecuteSnapshotReadAsync(session, async (transaction, token) =>
@@ -223,7 +223,7 @@ public sealed class MongoDbDiagnosticRecordStore :
             var snapshot = query.Continuation?.SnapshotHighWater ?? new((stream?.GetValue("next_cursor", 0).ToInt64() ?? 0).ToString(CultureInfo.InvariantCulture));
             await _interceptAsync(MongoDbDiagnosticRecordExecutionPoint.QueryAfterHighWaterRead, token);
             var pipeline = BuildQueryPipeline(query, ParseCursor(snapshot));
-            var facet = await AggregateSingleAsync(transaction, pipeline, token);
+            var facet = await AggregateSingleAsync(transaction, pipeline, token, QueryIndexHint(query));
             var documents = facet["page"].AsBsonArray.Select(item => item.AsBsonDocument).ToList();
             var hasMore = documents.Count > query.Limit;
             if (hasMore)
@@ -252,7 +252,7 @@ public sealed class MongoDbDiagnosticRecordStore :
         DiagnosticRecordQuery query,
         CancellationToken cancellationToken = default)
     {
-        query = DiagnosticRecordQuerySnapshot.Capture(query);
+        query = DiagnosticRecordQuerySnapshot.Capture(query, _definition.Limits.MaxPredicateNodes);
         DiagnosticRecordQueryValidator.Validate(query, _definition, this);
         var stream = await Streams.Find(Builders<BsonDocument>.Filter.Eq("_id", StreamKey(query.Scope, query.Stream)))
             .FirstOrDefaultAsync(cancellationToken);
@@ -264,6 +264,8 @@ public sealed class MongoDbDiagnosticRecordStore :
             { "cursor", new BsonDocument() },
             { "collation", new BsonDocument("locale", "simple") }
         };
+        if (QueryIndexHint(query) is { } hint)
+            aggregate.Add("hint", hint);
         return await _database.RunCommandAsync<BsonDocument>(
             new BsonDocument { { "explain", aggregate }, { "verbosity", "queryPlanner" } },
             cancellationToken: cancellationToken);
@@ -615,7 +617,10 @@ public sealed class MongoDbDiagnosticRecordStore :
         var pipeline = new List<BsonDocument> { new("$match", Render(filter)) };
         if (query.LatestPerKeyField is { } latest)
         {
-            pipeline.Add(new("$sort", new BsonDocument { { SortPath(latest), 1 }, { "cursor", -1 } }));
+            pipeline.Add(new("$sort", new BsonDocument
+            {
+                { SortPrefixPath(latest), 1 }, { SortPath(latest), 1 }, { "cursor", -1 }
+            }));
             pipeline.Add(new("$group", new BsonDocument
             {
                 { "_id", $"${SortPath(latest)}" },
@@ -650,20 +655,62 @@ public sealed class MongoDbDiagnosticRecordStore :
         var field = DiagnosticRecordFieldResolver.Resolve(_definition, comparison.Field)!;
         if (StringComparer.Ordinal.Equals(comparison.Field, DiagnosticRecordFieldNames.OccurredAt))
             return ScalarComparison("occurred_at_ticks", field, comparison);
+        if (field.Type == DiagnosticFieldType.String)
+            return StringComparisonFilter(field, comparison);
         var element = new BsonDocument { { "name", comparison.Field }, { "type", (int)field.Type } };
-        var path = field.Type == DiagnosticFieldType.String ? "comparison_key" : "native";
         var values = comparison.Values.Select(value => QueryValue(value, field)).ToArray();
-        element[path] = comparison.Operator switch
+        element["native"] = comparison.Operator switch
         {
             DiagnosticPredicateOperator.Equal => values[0],
             DiagnosticPredicateOperator.In => new BsonDocument("$in", new BsonArray(values)),
             DiagnosticPredicateOperator.RangeInclusive => new BsonDocument { { "$gte", values[0] }, { "$lte", values[1] } },
-            DiagnosticPredicateOperator.Contains => field.CasePolicy == DiagnosticStringCasePolicy.Ordinal
-                ? new BsonRegularExpression($"^(?:[0-9A-F]{{4}})*{Regex.Escape(values[0].AsString)}", "")
-                : new BsonRegularExpression(Regex.Escape(values[0].AsString), ""),
             _ => throw new ArgumentOutOfRangeException()
         };
         return new BsonDocument("query_values", new BsonDocument("$elemMatch", element));
+    }
+
+    private static FilterDefinition<BsonDocument> StringComparisonFilter(
+        DiagnosticFieldDefinition field,
+        DiagnosticRecordPredicate.Comparison comparison)
+    {
+        BsonDocument Element(string keyName, BsonValue condition, string? hash = null)
+        {
+            var element = new BsonDocument
+            {
+                { "name", comparison.Field },
+                { "type", (int)field.Type },
+                { keyName, condition }
+            };
+            if (hash is not null)
+                element.InsertAt(2, new("comparison_key_hash", hash));
+            return new("query_values", new BsonDocument("$elemMatch", element));
+        }
+
+        var projections = comparison.Values
+            .Select(value => DiagnosticStringComparisonKey.Project(value.CanonicalValue, field.CasePolicy))
+            .ToArray();
+        return comparison.Operator switch
+        {
+            DiagnosticPredicateOperator.Equal => Element(
+                "comparison_key",
+                projections[0].ComparisonKey,
+                projections[0].ComparisonKeyHash),
+            DiagnosticPredicateOperator.In => new BsonDocument(
+                "$or",
+                new BsonArray(projections.Select(projection => Element(
+                    "comparison_key",
+                    projection.ComparisonKey,
+                    projection.ComparisonKeyHash)))),
+            DiagnosticPredicateOperator.RangeInclusive => Element(
+                "comparison_key",
+                new BsonDocument { { "$gte", projections[0].ComparisonKey }, { "$lte", projections[1].ComparisonKey } }),
+            DiagnosticPredicateOperator.Contains => Element(
+                "search_key",
+                new BsonRegularExpression(
+                    Regex.Escape(projections[0].SearchKey),
+                    "")),
+            _ => throw new ArgumentOutOfRangeException()
+        };
     }
 
     private static FilterDefinition<BsonDocument> ScalarComparison(
@@ -689,13 +736,32 @@ public sealed class MongoDbDiagnosticRecordStore :
                 ? Builders<BsonDocument>.Filter.Gt("cursor", cursor)
                 : Builders<BsonDocument>.Filter.Lt("cursor", cursor);
         var field = DiagnosticRecordFieldResolver.Resolve(_definition, order.Field)!;
-        var value = QueryValue(continuation.LastOrderValue!.Value, field);
         var path = SortPath(order.Field);
+        var prefixPath = SortPrefixPath(order.Field);
+        BsonValue value;
+        BsonValue prefix;
+        if (field.Type == DiagnosticFieldType.String)
+        {
+            var projection = DiagnosticStringComparisonKey.Project(
+                continuation.LastOrderValue!.Value.CanonicalValue,
+                field.CasePolicy);
+            value = projection.ComparisonKey;
+            prefix = projection.ComparisonKeyPrefix;
+        }
+        else
+        {
+            value = NativeValue(continuation.LastOrderValue!.Value, field);
+            prefix = value;
+        }
         return order.Direction == DiagnosticSortDirection.Ascending
-            ? Builders<BsonDocument>.Filter.Gt(path, value) |
-              (Builders<BsonDocument>.Filter.Eq(path, value) & Builders<BsonDocument>.Filter.Gt("cursor", cursor))
-            : Builders<BsonDocument>.Filter.Lt(path, value) |
-              (Builders<BsonDocument>.Filter.Eq(path, value) & Builders<BsonDocument>.Filter.Lt("cursor", cursor));
+            ? Builders<BsonDocument>.Filter.Gt(prefixPath, prefix) |
+              (Builders<BsonDocument>.Filter.Eq(prefixPath, prefix) &
+               (Builders<BsonDocument>.Filter.Gt(path, value) |
+                (Builders<BsonDocument>.Filter.Eq(path, value) & Builders<BsonDocument>.Filter.Gt("cursor", cursor))))
+            : Builders<BsonDocument>.Filter.Lt(prefixPath, prefix) |
+              (Builders<BsonDocument>.Filter.Eq(prefixPath, prefix) &
+               (Builders<BsonDocument>.Filter.Lt(path, value) |
+                (Builders<BsonDocument>.Filter.Eq(path, value) & Builders<BsonDocument>.Filter.Lt("cursor", cursor))));
     }
 
     private BsonDocument Render(FilterDefinition<BsonDocument> filter) =>
@@ -704,23 +770,50 @@ public sealed class MongoDbDiagnosticRecordStore :
     private async Task<BsonDocument> AggregateSingleAsync(
         IClientSessionHandle session,
         IReadOnlyList<BsonDocument> stages,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? hint = null)
     {
         PipelineDefinition<BsonDocument, BsonDocument> pipeline = stages.ToArray();
         using var cursor = await Records.AggregateAsync(
             session,
             pipeline,
-            new AggregateOptions { Collation = Collation.Simple },
+            new AggregateOptions { Collation = Collation.Simple, Hint = hint },
             cancellationToken);
         return await cursor.SingleAsync(cancellationToken);
     }
+
+    private static string? QueryIndexHint(DiagnosticRecordQuery query)
+    {
+        if (query.Predicate is not null && ContainsSubstringPredicate(query.Predicate))
+            return "ix_groundwork_diagnostic_records_scope_fields";
+        if (query.Predicate is not null)
+            return null;
+        if (query.LatestPerKeyField is { } latest)
+            return $"ix_groundwork_diagnostic_records_latest_{SortKey(latest)}";
+        return query.Order?.Field is { } order
+            ? $"ix_groundwork_diagnostic_records_order_{SortKey(order)}"
+            : null;
+    }
+
+    private static bool ContainsSubstringPredicate(DiagnosticRecordPredicate predicate) => predicate switch
+    {
+        DiagnosticRecordPredicate.Comparison { Operator: DiagnosticPredicateOperator.Contains } => true,
+        DiagnosticRecordPredicate.All all => all.Predicates.Any(ContainsSubstringPredicate),
+        DiagnosticRecordPredicate.Any any => any.Predicates.Any(ContainsSubstringPredicate),
+        _ => false
+    };
 
     private static BsonDocument SortDocument(DiagnosticRecordOrder order)
     {
         var direction = order.Direction == DiagnosticSortDirection.Ascending ? 1 : -1;
         return order.Field is null
             ? new("cursor", direction)
-            : new() { { SortPath(order.Field), direction }, { "cursor", direction } };
+            : new()
+            {
+                { SortPrefixPath(order.Field), direction },
+                { SortPath(order.Field), direction },
+                { "cursor", direction }
+            };
     }
 
     private static FilterDefinition<BsonDocument> ScopeFilter(DiagnosticStorageScope scope, DiagnosticStreamId stream) =>
@@ -737,22 +830,55 @@ public sealed class MongoDbDiagnosticRecordStore :
         foreach (var (name, values) in fields)
         {
             var definition = DiagnosticRecordFieldResolver.Resolve(_definition, name)!;
+            var projections = definition.Type == DiagnosticFieldType.String
+                ? values.Select(value => DiagnosticStringComparisonKey.Project(
+                    value.CanonicalValue,
+                    definition.CasePolicy)).ToArray()
+                : null;
             storedFields.Add(new BsonDocument
             {
                 { "name", name },
                 { "values", new BsonArray(values.Select(FieldValueDocument)) }
             });
-            foreach (var value in values)
+            for (var ordinal = 0; ordinal < values.Count; ordinal++)
+            {
+                var value = values[ordinal];
+                var projection = projections is null ? default : projections[ordinal];
+                var comparisonKey = projections is null
+                    ? ComparisonKey(value, definition)
+                    : projection.ComparisonKey;
                 queryValues.Add(new BsonDocument
                 {
                     { "name", name }, { "type", (int)value.Type },
-                    { "comparison_key", ComparisonKey(value, definition) },
+                    { "comparison_key", comparisonKey },
+                    { "comparison_key_prefix", projections is null
+                        ? DiagnosticStringComparisonKey.CreateBoundedPrefix(comparisonKey)
+                        : projection.ComparisonKeyPrefix },
+                    { "comparison_key_hash", projections is null
+                        ? DiagnosticStringComparisonKey.CreateHash(comparisonKey)
+                        : projection.ComparisonKeyHash },
+                    { "search_key", projections is null ? comparisonKey : projection.SearchKey },
                     { "native", NativeValue(value, definition) }
                 });
+            }
             if (definition.Cardinality == DiagnosticFieldCardinality.Scalar && values.Count > 0)
-                sortKeys[SortKey(name)] = QueryValue(values[0], definition);
+            {
+                if (projections is not null)
+                {
+                    var projection = projections[0];
+                    sortKeys[SortKey(name)] = projection.ComparisonKey;
+                    sortKeys[SortPrefixKey(name)] = projection.ComparisonKeyPrefix;
+                }
+                else
+                {
+                    var native = NativeValue(values[0], definition);
+                    sortKeys[SortKey(name)] = native;
+                    sortKeys[SortPrefixKey(name)] = native;
+                }
+            }
         }
         sortKeys[SortKey(DiagnosticRecordFieldNames.OccurredAt)] = record.OccurredAt.UtcTicks;
+        sortKeys[SortPrefixKey(DiagnosticRecordFieldNames.OccurredAt)] = record.OccurredAt.UtcTicks;
         return new()
         {
             { "tenant_id", scope.TenantId }, { "scope_id", scope.ScopeId }, { "stream_id", stream.Value },
@@ -801,9 +927,7 @@ public sealed class MongoDbDiagnosticRecordStore :
     };
 
     private static string ComparisonKey(DiagnosticFieldValue value, DiagnosticFieldDefinition definition) =>
-        definition.CasePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase
-            ? DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value.CanonicalValue)
-            : DiagnosticStringComparisonKey.CreateOrdinal(value.CanonicalValue);
+        DiagnosticStringComparisonKey.Create(value.CanonicalValue, definition.CasePolicy);
 
     private DiagnosticFieldValue? MaxLogicalHighWater(DiagnosticFieldValue? current, IEnumerable<DiagnosticRecord> records)
     {
@@ -943,7 +1067,11 @@ public sealed class MongoDbDiagnosticRecordStore :
 
     internal static string SortPath(string field) => $"sort.{SortKey(field)}";
 
+    internal static string SortPrefixPath(string field) => $"sort.{SortPrefixKey(field)}";
+
     internal static string SortKey(string field) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(field)))[..24];
+
+    internal static string SortPrefixKey(string field) => $"p{SortKey(field)}";
 
     private static long ParseCursor(DiagnosticCursor cursor) => long.Parse(cursor.Value, CultureInfo.InvariantCulture);
 }
