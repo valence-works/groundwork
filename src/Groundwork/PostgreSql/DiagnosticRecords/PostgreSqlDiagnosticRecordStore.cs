@@ -18,7 +18,11 @@ public sealed class PostgreSqlDiagnosticRecordStore : IDiagnosticRecordStore
             RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
             definition,
             timeProvider,
-            null)
+            null,
+            (snapshot, cancellationToken) => PostgreSqlDiagnosticRecordMaterializer.AdmitAsync(
+                connectionString,
+                snapshot,
+                cancellationToken))
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
     }
@@ -27,10 +31,19 @@ public sealed class PostgreSqlDiagnosticRecordStore : IDiagnosticRecordStore
         RelationalSessionFactory sessions,
         DiagnosticRecordStreamDefinition definition,
         TimeProvider? timeProvider,
-        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync)
+        Func<RelationalDiagnosticRecordExecutionPoint, CancellationToken, ValueTask>? interceptAsync,
+        Func<DiagnosticRecordStreamDefinition, CancellationToken, Task>? materializeAsync = null)
     {
-        PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
-        inner = new(sessions, sessions, definition, new PostgreSqlDiagnosticRecordDialect(), timeProvider, interceptAsync);
+        var snapshot = DiagnosticRecordStreamDefinitionSnapshot.Capture(definition);
+        PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(snapshot);
+        inner = new(
+            sessions,
+            sessions,
+            snapshot,
+            new PostgreSqlDiagnosticRecordDialect(),
+            timeProvider,
+            interceptAsync,
+            materializeAsync is null ? null : cancellationToken => materializeAsync(snapshot, cancellationToken));
         instrumented = new(inner, new("postgresql", "diagnostic-records"));
     }
 

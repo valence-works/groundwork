@@ -12,9 +12,14 @@ public static class SqliteDiagnosticRecordStoreFactory
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(definition);
-        DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(definition);
-        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
-        return new(connectionString, definition);
+        SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            SqliteRelationalSessions.CreateSerializedDeferred(connectionString),
+            SqliteRelationalSessions.CreateSerializedImmediate(connectionString),
+            definition,
+            null,
+            null);
     }
 
     internal static async Task<SqliteDiagnosticRecordStore> CreateAsync(
@@ -25,7 +30,8 @@ public static class SqliteDiagnosticRecordStoreFactory
         SqliteImmediateTransactionObserver? transactionObserver = null,
         CancellationToken cancellationToken = default)
     {
-        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
+        SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
         return new(
             SqliteRelationalSessions.CreateSerializedDeferred(connectionString),
             SqliteRelationalSessions.CreateSerializedImmediate(connectionString, transactionObserver),

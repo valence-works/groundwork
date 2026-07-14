@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace Groundwork.DiagnosticRecords;
 
 public abstract record DiagnosticRecordPredicate
@@ -29,37 +31,138 @@ public abstract record DiagnosticRecordPredicate
 
 public static class DiagnosticRecordQuerySnapshot
 {
-    public static DiagnosticRecordQuery Capture(DiagnosticRecordQuery query)
+    public static DiagnosticRecordQuery Capture(
+        DiagnosticRecordQuery query,
+        int maximumPredicateNodes)
     {
         ArgumentNullException.ThrowIfNull(query);
-        return query with { Predicate = Capture(query.Predicate) };
+        return query with { Predicate = Capture(query.Predicate, maximumPredicateNodes) };
     }
 
-    private static DiagnosticRecordPredicate? Capture(DiagnosticRecordPredicate? predicate) => predicate switch
+    private static DiagnosticRecordPredicate? Capture(
+        DiagnosticRecordPredicate? predicate,
+        int maximumPredicateNodes)
     {
-        null => null,
-        DiagnosticRecordPredicate.All all => all with
-        {
-            Predicates = Capture(all.Predicates)
-        },
-        DiagnosticRecordPredicate.Any any => any with
-        {
-            Predicates = Capture(any.Predicates)
-        },
-        DiagnosticRecordPredicate.Comparison comparison => comparison with
-        {
-            Values = comparison.Values is null
-                ? null!
-                : Array.AsReadOnly(comparison.Values.ToArray())
-        },
-        _ => throw new ArgumentOutOfRangeException(nameof(predicate))
-    };
+        if (predicate is null)
+            return null;
+        if (!DiagnosticRecordPredicateTraversal.TryCollect(predicate, maximumPredicateNodes, out _))
+            throw new DiagnosticRecordValidationException([
+                new("query.predicate.too_complex", "The predicate exceeds the declared node bound.", "predicate")
+            ]);
 
-    private static IReadOnlyList<DiagnosticRecordPredicate> Capture(
-        IReadOnlyList<DiagnosticRecordPredicate> predicates) =>
-        predicates is null
-            ? null!
-            : Array.AsReadOnly(predicates.Select(x => x is null ? null! : Capture(x)!).ToArray());
+        var frames = new Stack<SnapshotFrame>();
+        frames.Push(new(predicate));
+        DiagnosticRecordPredicate? result = null;
+        while (frames.Count > 0)
+        {
+            var frame = frames.Peek();
+            if (frame.Source is DiagnosticRecordPredicate.Comparison comparison)
+            {
+                Attach(comparison with
+                {
+                    Values = comparison.Values is null
+                        ? null!
+                        : Array.AsReadOnly(comparison.Values.ToArray())
+                });
+                continue;
+            }
+
+            var children = frame.Source switch
+            {
+                DiagnosticRecordPredicate.All all => all.Predicates,
+                DiagnosticRecordPredicate.Any any => any.Predicates,
+                _ => throw new ArgumentOutOfRangeException(nameof(predicate))
+            };
+            if (children is not null && frame.NextChild < children.Count)
+            {
+                var child = children[frame.NextChild++];
+                if (child is null)
+                    frame.Children.Add(null!);
+                else
+                    frames.Push(new(child));
+                continue;
+            }
+
+            DiagnosticRecordPredicate snapshot = frame.Source switch
+            {
+                DiagnosticRecordPredicate.All all => all with
+                {
+                    Predicates = children is null ? null! : Array.AsReadOnly(frame.Children.ToArray())
+                },
+                DiagnosticRecordPredicate.Any any => any with
+                {
+                    Predicates = children is null ? null! : Array.AsReadOnly(frame.Children.ToArray())
+                },
+                _ => throw new ArgumentOutOfRangeException(nameof(predicate))
+            };
+            Attach(snapshot);
+        }
+
+        return result!;
+
+        void Attach(DiagnosticRecordPredicate snapshot)
+        {
+            frames.Pop();
+            if (frames.TryPeek(out var parent))
+                parent.Children.Add(snapshot);
+            else
+                result = snapshot;
+        }
+    }
+
+    private sealed class SnapshotFrame(DiagnosticRecordPredicate source)
+    {
+        public DiagnosticRecordPredicate Source { get; } = source;
+        public List<DiagnosticRecordPredicate> Children { get; } = [];
+        public int NextChild { get; set; }
+    }
+}
+
+internal static class DiagnosticRecordPredicateTraversal
+{
+    public static bool TryCollect(
+        DiagnosticRecordPredicate predicate,
+        int maximumPredicateNodes,
+        out IReadOnlyList<DiagnosticRecordPredicate> nodes)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumPredicateNodes);
+        var collected = new List<DiagnosticRecordPredicate>(Math.Min(maximumPredicateNodes, 256));
+        var pending = new Stack<DiagnosticRecordPredicate>();
+        pending.Push(predicate);
+        while (pending.Count > 0)
+        {
+            if (collected.Count >= maximumPredicateNodes)
+            {
+                nodes = collected;
+                return false;
+            }
+
+            var current = pending.Pop();
+            collected.Add(current);
+            var children = current switch
+            {
+                DiagnosticRecordPredicate.All all => all.Predicates,
+                DiagnosticRecordPredicate.Any any => any.Predicates,
+                _ => null
+            };
+            if (children is null)
+                continue;
+            if (children.Count > maximumPredicateNodes - collected.Count - pending.Count)
+            {
+                nodes = collected;
+                return false;
+            }
+            for (var index = children.Count - 1; index >= 0; index--)
+            {
+                if (children[index] is { } child)
+                    pending.Push(child);
+            }
+        }
+
+        nodes = collected;
+        return true;
+    }
 }
 
 public static class DiagnosticRecordQueryValidator
@@ -105,8 +208,15 @@ public static class DiagnosticRecordQueryValidator
             if (order.Field is { } continuationOrderField)
             {
                 var field = DiagnosticRecordFieldResolver.Resolve(definition, continuationOrderField);
-                if (continuation.LastOrderValue is null || field is not null && continuation.LastOrderValue.Value.Type != field.Type)
+                if (continuation.LastOrderValue is null ||
+                    !continuation.LastOrderValue.Value.IsInitialized ||
+                    field is not null && continuation.LastOrderValue.Value.Type != field.Type)
                     errors.Add(new("query.continuation.order_value.invalid", "Field-ordered continuation must carry a matching last order value.", "continuation.lastOrderValue"));
+                else if (field is not null && ExceedsStringByteBound(continuation.LastOrderValue.Value, field))
+                    errors.Add(new(
+                        "query.continuation.string_too_large",
+                        $"Field-ordered continuation value for '{continuationOrderField}' exceeds its declared byte bound.",
+                        "continuation.lastOrderValue"));
                 else if (field is { Type: DiagnosticFieldType.String, CasePolicy: DiagnosticStringCasePolicy.AsciiIgnoreCase } &&
                          !DiagnosticStringComparisonKey.IsAsciiIgnoreCaseValue(continuation.LastOrderValue.Value.CanonicalValue))
                     errors.Add(new(
@@ -126,10 +236,27 @@ public static class DiagnosticRecordQueryValidator
                 errors.Add(new("query.latest_per_key.unsupported", "The bound query handler cannot execute latest-per-key selection.", "latestPerKeyField"));
         }
 
+        IReadOnlyList<DiagnosticRecordPredicate> predicateNodes = [];
+        var predicateTooComplex = query.Predicate is not null &&
+                                  !DiagnosticRecordPredicateTraversal.TryCollect(
+                                      query.Predicate,
+                                      definition.Limits.MaxPredicateNodes,
+                                      out predicateNodes);
+        if (predicateTooComplex)
+            errors.Add(new("query.predicate.too_complex", "The predicate exceeds the declared node bound.", "predicate"));
+        var projectionBudgetExceeded = DiagnosticStringProjectionBudget.AddQueryError(query, predicateNodes, errors);
         if (query.Predicate is not null)
         {
             var valueCount = 0;
-            ValidatePredicate(query.Predicate, definition, capabilities, errors, 1, ref valueCount);
+            if (!predicateTooComplex)
+                foreach (var predicate in predicateNodes)
+                    ValidatePredicate(
+                        predicate,
+                        definition,
+                        capabilities,
+                        errors,
+                        projectionBudgetExceeded,
+                        ref valueCount);
         }
 
         if (errors.Count == 0 && query.Continuation is { } validContinuation &&
@@ -140,20 +267,14 @@ public static class DiagnosticRecordQueryValidator
             throw new DiagnosticRecordValidationException(errors);
     }
 
-    private static int ValidatePredicate(
+    private static void ValidatePredicate(
         DiagnosticRecordPredicate predicate,
         DiagnosticRecordStreamDefinition definition,
         DiagnosticQueryHandlerCapabilities capabilities,
         List<DiagnosticValidationError> errors,
-        int count,
+        bool projectionBudgetExceeded,
         ref int valueCount)
     {
-        if (count > definition.Limits.MaxPredicateNodes)
-        {
-            errors.Add(new("query.predicate.too_complex", "The predicate exceeds the declared node bound.", "predicate"));
-            return count;
-        }
-
         switch (predicate)
         {
             case DiagnosticRecordPredicate.All all:
@@ -166,8 +287,6 @@ public static class DiagnosticRecordQueryValidator
                 {
                     if (child is null)
                         errors.Add(new("query.predicate.child_null", "Predicate children cannot be null.", "predicate"));
-                    else
-                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1, ref valueCount);
                 }
                 break;
             case DiagnosticRecordPredicate.Any any:
@@ -180,8 +299,6 @@ public static class DiagnosticRecordQueryValidator
                 {
                     if (child is null)
                         errors.Add(new("query.predicate.child_null", "Predicate children cannot be null.", "predicate"));
-                    else
-                        count = ValidatePredicate(child, definition, capabilities, errors, count + 1, ref valueCount);
                 }
                 break;
             case DiagnosticRecordPredicate.Comparison comparison:
@@ -224,6 +341,11 @@ public static class DiagnosticRecordQueryValidator
                     errors.Add(new("query.predicate.value_invalid", $"Predicate values for '{comparison.Field}' must be initialized portable values.", "predicate.values"));
                 else if (comparison.Values.Any(x => x.Type != field.Type))
                     errors.Add(new("query.predicate.value_type", $"Predicate values for '{comparison.Field}' must be {field.Type}.", "predicate.values"));
+                else if (comparison.Values.Any(value => ExceedsStringByteBound(value, field)))
+                    errors.Add(new(
+                        "query.predicate.string_too_large",
+                        $"Predicate values for '{comparison.Field}' exceed its declared byte bound.",
+                        "predicate.values"));
                 else if (field.Type == DiagnosticFieldType.String &&
                          field.CasePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase &&
                          comparison.Values.Any(x => !DiagnosticStringComparisonKey.IsAsciiIgnoreCaseValue(x.CanonicalValue)))
@@ -231,7 +353,8 @@ public static class DiagnosticRecordQueryValidator
                         "query.predicate.case_domain",
                         $"Predicate values for '{comparison.Field}' use {DiagnosticStringComparisonKey.AsciiIgnoreCaseAlgorithmId} and accept only U+0020 through U+007E.",
                         "predicate.values"));
-                else if (comparison.Operator == DiagnosticPredicateOperator.RangeInclusive &&
+                else if (!projectionBudgetExceeded &&
+                         comparison.Operator == DiagnosticPredicateOperator.RangeInclusive &&
                          comparison.Values.Count == 2 &&
                          comparison.Values[0].CompareTo(comparison.Values[1], field.CasePolicy) > 0)
                     errors.Add(new("query.predicate.range_reversed", "Inclusive range lower bound cannot exceed its upper bound.", "predicate.values"));
@@ -239,7 +362,12 @@ public static class DiagnosticRecordQueryValidator
                     errors.Add(new("query.predicate.contains_type", "Contains is only valid for string fields.", "predicate.operator"));
                 break;
         }
-
-        return count;
     }
+
+    private static bool ExceedsStringByteBound(
+        DiagnosticFieldValue value,
+        DiagnosticFieldDefinition field) =>
+        field is { Type: DiagnosticFieldType.String, MaxStringBytes: { } maximumBytes } &&
+        value is { IsInitialized: true, Type: DiagnosticFieldType.String } &&
+        Encoding.UTF8.GetByteCount(value.CanonicalValue) > maximumBytes;
 }

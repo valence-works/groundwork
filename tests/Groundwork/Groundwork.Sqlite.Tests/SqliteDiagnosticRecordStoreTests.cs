@@ -25,6 +25,73 @@ public sealed class SqliteDiagnosticRecordStoreTests : RelationalDiagnosticRecor
 public sealed class SqliteDiagnosticRecordMaterializerTests
 {
     [Fact]
+    public async Task Concurrent_admission_runs_once()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var admission = new RelationalDiagnosticRecordAdmission(async cancellationToken =>
+        {
+            Interlocked.Increment(ref calls);
+            entered.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+        });
+
+        var callers = Enumerable.Range(0, 8)
+            .Select(_ => admission.EnsureAsync(CancellationToken.None).AsTask())
+            .ToArray();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, Volatile.Read(ref calls));
+        release.TrySetResult();
+
+        await Task.WhenAll(callers);
+        await admission.EnsureAsync(CancellationToken.None);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task Failed_admission_is_retryable()
+    {
+        var calls = 0;
+        var admission = new RelationalDiagnosticRecordAdmission(_ =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+                throw new InvalidOperationException("transient");
+            return Task.CompletedTask;
+        });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            admission.EnsureAsync(CancellationToken.None).AsTask());
+        await admission.EnsureAsync(CancellationToken.None);
+
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
+    public async Task Canceled_admission_is_retryable_by_another_caller()
+    {
+        var calls = 0;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var admission = new RelationalDiagnosticRecordAdmission(async cancellationToken =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                entered.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+        });
+        using var canceled = new CancellationTokenSource();
+        var first = admission.EnsureAsync(canceled.Token).AsTask();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await canceled.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+        await admission.EnsureAsync(CancellationToken.None);
+
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
     public async Task Store_uses_the_shared_diagnostic_record_instrumentation()
     {
         var store = new SqliteDiagnosticRecordStore(
@@ -60,7 +127,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
     }
 
     [Fact]
-    public void Latest_per_key_sql_avoids_a_redundant_record_join_and_keeps_the_snapshot_sargable()
+    public void Latest_per_key_sql_uses_the_bounded_latest_index_and_keeps_the_snapshot_sargable()
     {
         var store = new SqliteDiagnosticRecordStore(
             new SqliteConnectionStringBuilder { DataSource = Path.Combine(Path.GetTempPath(), $"groundwork-sql-{Guid.NewGuid():N}.db") }.ToString(),
@@ -74,7 +141,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
         var sql = store.Inner.BuildQueryCommand(query, 10).CommandText;
 
         Assert.DoesNotContain("CROSS JOIN", sql, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("INDEXED BY", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("INDEXED BY ix_groundwork_diagnostic_fields_scope_latest", sql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("cursor + 0", sql, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("lfield.cursor <= @snapshot", sql, StringComparison.Ordinal);
         Assert.DoesNotContain("groundwork_diagnostic_records lr", sql, StringComparison.Ordinal);
@@ -236,6 +303,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
             Assert.Equal(
                 [
                     "groundwork_diagnostic_append_operations",
+                    "groundwork_diagnostic_definitions",
                     "groundwork_diagnostic_fields",
                     "groundwork_diagnostic_provider_state",
                     "groundwork_diagnostic_records",
@@ -266,11 +334,139 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
             var ddl = Assert.IsType<string>(await command.ExecuteScalarAsync());
 
             Assert.Contains("comparison_key TEXT COLLATE BINARY NOT NULL", ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("comparison_key_prefix TEXT COLLATE BINARY NOT NULL", ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("comparison_key_hash TEXT COLLATE BINARY NOT NULL", ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("search_key TEXT COLLATE BINARY NOT NULL", ddl, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
             File.Delete(path);
         }
+    }
+
+    [Fact]
+    public void Portable_schema_indexes_only_bounded_string_comparison_keys()
+    {
+        var fieldIndexes = RelationalDiagnosticRecordSchema.Standard.Indexes
+            .Where(index => index.Table == RelationalDiagnosticRecordSchema.FieldsTable)
+            .ToArray();
+
+        Assert.NotEmpty(fieldIndexes);
+        Assert.All(fieldIndexes, index =>
+        {
+            Assert.DoesNotContain("comparison_key", index.Columns);
+            Assert.DoesNotContain("search_key", index.Columns);
+        });
+        Assert.Contains(fieldIndexes, index => index.Columns.Contains("comparison_key_prefix"));
+        Assert.Contains(fieldIndexes, index => index.Columns.Contains("comparison_key_hash"));
+    }
+
+    [Fact]
+    public async Task Factory_persists_definition_and_algorithm_state_and_rejects_drift()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-diagnostics-{Guid.NewGuid():N}.db");
+        var connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+        try
+        {
+            var definition = SqliteDiagnosticRecordStoreFixture.Definition with
+            {
+                Fields =
+                [
+                    SqliteDiagnosticRecordStoreFixture.Definition.Fields[0] with
+                    {
+                        CasePolicy = DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+                        MaxStringBytes = 8_192
+                    }
+                ],
+                Limits = SqliteDiagnosticRecordStoreFixture.Definition.Limits with { MaxPredicateValues = 16 }
+            };
+            await SqliteDiagnosticRecordStoreFactory.CreateAsync(connectionString, definition);
+            await using var connection = new SqliteConnection(connectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"SELECT definition_fingerprint, algorithm_manifest, algorithm_manifest_fingerprint FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
+            command.Parameters.AddWithValue("@stream", definition.Stream.Value);
+            await using var reader = await command.ExecuteReaderAsync();
+
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(64, reader.GetString(0).Length);
+            Assert.Contains(DiagnosticStringComparisonKey.UnicodeOrdinalIgnoreCaseAlgorithmId, reader.GetString(1), StringComparison.Ordinal);
+            Assert.Equal(64, reader.GetString(2).Length);
+            await reader.DisposeAsync();
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                SqliteDiagnosticRecordStoreFactory.CreateAsync(connectionString, definition with { SchemaVersion = definition.SchemaVersion + 1 }));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Every_direct_public_store_operation_rejects_incompatible_persisted_state()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-diagnostics-{Guid.NewGuid():N}.db");
+        var connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+        try
+        {
+            var persisted = SqliteDiagnosticRecordStoreFixture.Definition;
+            await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, persisted);
+            var incompatible = persisted with { SchemaVersion = persisted.SchemaVersion + 1 };
+            var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+            var now = TimeProvider.System.GetUtcNow();
+            var append = DiagnosticRecordBatch.Create(
+                scope,
+                incompatible.Stream,
+                new(now, "drift-append"),
+                [new("record-1", now, "{}")]);
+            var trim = DiagnosticTrimRequest.Create(
+                scope,
+                incompatible.Stream,
+                new(now, "drift-trim"),
+                0);
+            Func<SqliteDiagnosticRecordStore, Task>[] operations =
+            [
+                async store => _ = await store.AppendAsync(append),
+                async store => _ = await store.QueryAsync(new(scope, incompatible.Stream, 10)),
+                async store => _ = await store.InspectAsync(new(scope, incompatible.Stream)),
+                async store => _ = await store.TrimAsync(trim)
+            ];
+
+            foreach (var operation in operations)
+            {
+                var store = new SqliteDiagnosticRecordStore(connectionString, incompatible);
+                await Assert.ThrowsAsync<InvalidOperationException>(() => operation(store));
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Provider_string_bound_is_rejected_before_sqlite_file_io()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-diagnostics-{Guid.NewGuid():N}.db");
+        var oversized = SqliteDiagnosticRecordStoreFixture.Definition with
+        {
+            Fields =
+            [
+                SqliteDiagnosticRecordStoreFixture.Definition.Fields[0] with
+                {
+                    MaxStringBytes = 65_537
+                }
+            ]
+        };
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordValidationException>(() =>
+            SqliteDiagnosticRecordMaterializer.MaterializeAsync(
+                new SqliteConnectionStringBuilder { DataSource = path }.ToString(),
+                oversized));
+
+        Assert.Contains(exception.Errors, error => error.Code == "provider.sqlite.string_bound.too_large");
+        Assert.False(File.Exists(path));
     }
 
     [Theory]
@@ -374,11 +570,16 @@ internal sealed class SqliteDiagnosticRecordStoreFixture : IRelationalDiagnostic
         SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString).GetAwaiter().GetResult();
     }
 
-    public IDiagnosticRecordStore OpenStore(DiagnosticRecordStreamDefinition definition) =>
-        new SqliteDiagnosticRecordStore(readSessions, writeSessions, definition, timeProvider, InterceptAsync);
+    public IDiagnosticRecordStore OpenStore(DiagnosticRecordStreamDefinition definition)
+    {
+        SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition).GetAwaiter().GetResult();
+        return new SqliteDiagnosticRecordStore(readSessions, writeSessions, definition, timeProvider, InterceptAsync);
+    }
 
-    public IDiagnosticRecordStore OpenIndependentStore(DiagnosticRecordStreamDefinition definition) =>
-        new SqliteDiagnosticRecordStore(connectionString, definition, timeProvider);
+    public IDiagnosticRecordStore OpenIndependentStore(DiagnosticRecordStreamDefinition definition)
+        => new SqliteDiagnosticRecordStore(connectionString, definition, timeProvider);
+
+    public string FieldsPrimaryAccessPath => "sqlite_autoindex_groundwork_diagnostic_fields_1";
 
     public void InterceptNext(DiagnosticExecutionPoint point, Func<CancellationToken, ValueTask> interceptor)
     {

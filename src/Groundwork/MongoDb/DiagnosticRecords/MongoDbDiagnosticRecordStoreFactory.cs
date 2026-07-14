@@ -14,6 +14,7 @@ public static class MongoDbDiagnosticRecordStoreFactory
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
+        MongoDbDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         var client = new MongoClient(connectionString);
         try
         {

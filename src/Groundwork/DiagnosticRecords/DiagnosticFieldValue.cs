@@ -1,70 +1,98 @@
 using System.Globalization;
+using Groundwork.Core.Text;
 
 namespace Groundwork.DiagnosticRecords;
 
+public readonly record struct DiagnosticStringComparisonProjection(
+    string ComparisonKey,
+    string ComparisonKeyPrefix,
+    string ComparisonKeyHash,
+    string SearchKey);
+
 public static class DiagnosticStringComparisonKey
 {
-    public const string OrdinalAlgorithmId = "groundwork-utf16-hex-v1";
-    public const string AsciiIgnoreCaseAlgorithmId = "groundwork-ascii-lower-v1";
+    public const string OrdinalAlgorithmId = PortableStringComparison.OrdinalAlgorithmId;
+    public const string AsciiIgnoreCaseAlgorithmId = PortableStringComparison.AsciiIgnoreCaseAlgorithmId;
+    public const string LookupHashAlgorithmId = PortableStringComparison.LookupHashAlgorithmId;
+    public const string SearchKeyAlgorithmId = "groundwork-boundary-delimited-search-key-v1";
+    public const int BoundedPrefixLength = 256;
 
-    public static bool IsPortableOrdinalValue(string value)
+    public static string UnicodeOrdinalIgnoreCaseAlgorithmId => PortableStringComparison.UnicodeOrdinalIgnoreCaseAlgorithmId;
+    public static bool IsPortableOrdinalValue(string value) => PortableStringComparison.IsWellFormedUnicode(value);
+    public static string CreateOrdinal(string value) => PortableStringComparison.CreateOrdinal(value);
+    public static string CreateUnicodeOrdinalIgnoreCase(string value) => PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(value);
+    public static string CreateAsciiIgnoreCase(string value) => PortableStringComparison.CreateAsciiIgnoreCase(value);
+    public static bool IsAsciiIgnoreCaseValue(string value) => PortableStringComparison.IsAsciiIgnoreCaseValue(value);
+    public static string CreateBoundedPrefix(string comparisonKey) =>
+        PortableStringComparison.CreateBoundedPrefix(comparisonKey, BoundedPrefixLength);
+    public static string CreateHash(string comparisonKey) => PortableStringComparison.CreateHash(comparisonKey);
+    public static string Create(string value, DiagnosticStringCasePolicy casePolicy) =>
+        PortableStringComparison.Create(value, Map(casePolicy));
+    public static string CreateSearchKey(string value, DiagnosticStringCasePolicy casePolicy)
     {
-        ArgumentNullException.ThrowIfNull(value);
-        for (var index = 0; index < value.Length; index++)
+        var policy = Map(casePolicy);
+        return CreateSearchKeyFromComparison(PortableStringComparison.Create(value, policy), casePolicy);
+    }
+    public static DiagnosticStringComparisonProjection Project(
+        string value,
+        DiagnosticStringCasePolicy casePolicy)
+    {
+        var policy = Map(casePolicy);
+        var identity = PortableStringComparison.ProjectIdentity(value, policy);
+        return new(
+            identity.ComparisonKey,
+            PortableStringComparison.CreateBoundedPrefix(identity.ComparisonKey, BoundedPrefixLength),
+            identity.ComparisonKeyHash,
+            CreateSearchKeyFromComparison(identity.ComparisonKey, casePolicy));
+    }
+
+    private static string CreateSearchKeyFromComparison(
+        string comparisonKey,
+        DiagnosticStringCasePolicy casePolicy)
+    {
+        if (casePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase)
         {
-            var character = value[index];
-            if (character == '\0' || char.IsLowSurrogate(character))
-                return false;
-            if (!char.IsHighSurrogate(character))
-                continue;
-            if (++index >= value.Length || !char.IsLowSurrogate(value[index]))
-                return false;
+            return string.Create(comparisonKey.Length * 5, comparisonKey, static (buffer, source) =>
+            {
+                const string hex = "0123456789ABCDEF";
+                for (var index = 0; index < source.Length; index++)
+                {
+                    var character = source[index];
+                    var offset = index * 5;
+                    buffer[offset] = '|';
+                    buffer[offset + 1] = hex[(character >> 12) & 0xF];
+                    buffer[offset + 2] = hex[(character >> 8) & 0xF];
+                    buffer[offset + 3] = hex[(character >> 4) & 0xF];
+                    buffer[offset + 4] = hex[character & 0xF];
+                }
+            });
         }
-        return true;
-    }
 
-    public static string CreateOrdinal(string value)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-        if (!IsPortableOrdinalValue(value))
-            throw new ArgumentException("Ordinal strings must be well-formed UTF-16 and cannot contain U+0000.", nameof(value));
-        return string.Create(value.Length * 4, value, static (buffer, source) =>
-        {
-            const string hex = "0123456789ABCDEF";
-            for (var index = 0; index < source.Length; index++)
+        var unitLength = casePolicy == DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase ? 6 : 4;
+        var unitCount = (comparisonKey.Length + unitLength - 1) / unitLength;
+        return string.Create(
+            comparisonKey.Length + unitCount,
+            (comparisonKey, unitLength),
+            static (buffer, state) =>
             {
-                var character = source[index];
-                var offset = index * 4;
-                buffer[offset] = hex[(character >> 12) & 0xF];
-                buffer[offset + 1] = hex[(character >> 8) & 0xF];
-                buffer[offset + 2] = hex[(character >> 4) & 0xF];
-                buffer[offset + 3] = hex[character & 0xF];
-            }
-        });
+                var target = 0;
+                for (var source = 0; source < state.comparisonKey.Length; source += state.unitLength)
+                {
+                    buffer[target++] = '|';
+                    var length = Math.Min(state.unitLength, state.comparisonKey.Length - source);
+                    state.comparisonKey.AsSpan(source, length).CopyTo(buffer[target..]);
+                    target += length;
+                }
+            });
     }
 
-    public static bool IsAsciiIgnoreCaseValue(string value)
+    private static PortableStringComparisonPolicy Map(DiagnosticStringCasePolicy casePolicy) => casePolicy switch
     {
-        ArgumentNullException.ThrowIfNull(value);
-        return value.All(character => character is >= ' ' and <= '~');
-    }
-
-    public static string CreateAsciiIgnoreCase(string value)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-        if (!IsAsciiIgnoreCaseValue(value))
-            throw new ArgumentException(
-                "ASCII-ignore-case values may contain only U+0020 through U+007E.",
-                nameof(value));
-        return string.Create(value.Length, value, static (buffer, source) =>
-        {
-            for (var index = 0; index < source.Length; index++)
-            {
-                var character = source[index];
-                buffer[index] = character is >= 'A' and <= 'Z' ? (char)(character + ('a' - 'A')) : character;
-            }
-        });
-    }
+        DiagnosticStringCasePolicy.Ordinal => PortableStringComparisonPolicy.Ordinal,
+        DiagnosticStringCasePolicy.AsciiIgnoreCase => PortableStringComparisonPolicy.AsciiIgnoreCase,
+        DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase => PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase,
+        _ => throw new ArgumentOutOfRangeException(nameof(casePolicy), casePolicy, null)
+    };
 }
 
 public readonly record struct DiagnosticFieldValue
@@ -111,6 +139,9 @@ public readonly record struct DiagnosticFieldValue
                 DiagnosticStringCasePolicy.AsciiIgnoreCase => StringComparer.Ordinal.Compare(
                     DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(CanonicalValue),
                     DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(other.CanonicalValue)),
+                DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase => StringComparer.Ordinal.Compare(
+                    DiagnosticStringComparisonKey.CreateUnicodeOrdinalIgnoreCase(CanonicalValue),
+                    DiagnosticStringComparisonKey.CreateUnicodeOrdinalIgnoreCase(other.CanonicalValue)),
                 _ => throw new ArgumentOutOfRangeException(nameof(casePolicy))
             },
             DiagnosticFieldType.Int64 => long.Parse(CanonicalValue, CultureInfo.InvariantCulture)

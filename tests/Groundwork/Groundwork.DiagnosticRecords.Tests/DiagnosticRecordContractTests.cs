@@ -1,3 +1,4 @@
+using Groundwork.Core.Text;
 using Groundwork.DiagnosticRecords;
 using Xunit;
 
@@ -64,29 +65,87 @@ public abstract class DiagnosticRecordContractTests
         Assert.True(supplementary.CompareTo(bmp, DiagnosticStringCasePolicy.Ordinal) < 0);
         Assert.Equal("D800DC00", DiagnosticStringComparisonKey.CreateOrdinal(supplementary.CanonicalValue));
         Assert.Throws<ArgumentException>(() => DiagnosticFieldValue.String("\uD800"));
-        Assert.Throws<ArgumentException>(() => DiagnosticFieldValue.String("contains\0nul"));
+        Assert.Equal("contains\0nul", DiagnosticFieldValue.String("contains\0nul").CanonicalValue);
     }
 
     [Theory]
-    [InlineData("API-Z9", "api-z9")]
-    [InlineData("already lower", "already lower")]
-    [InlineData("[]_@", "[]_@")]
-    public void Ascii_ignore_case_uses_a_versioned_culture_independent_comparison_key(string value, string expected)
+    [InlineData(DiagnosticStringCasePolicy.Ordinal, PortableStringComparisonPolicy.Ordinal)]
+    [InlineData(DiagnosticStringCasePolicy.AsciiIgnoreCase, PortableStringComparisonPolicy.AsciiIgnoreCase)]
+    [InlineData(DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase, PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase)]
+    public void Diagnostic_case_policy_is_a_thin_mapping_to_the_core_algorithm(
+        DiagnosticStringCasePolicy diagnosticPolicy,
+        PortableStringComparisonPolicy corePolicy)
     {
-        Assert.Equal("groundwork-ascii-lower-v1", DiagnosticStringComparisonKey.AsciiIgnoreCaseAlgorithmId);
-        Assert.Equal(expected, DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value));
+        const string value = "Groundwork";
+
+        Assert.Equal(
+            PortableStringComparison.Create(value, corePolicy),
+            DiagnosticStringComparisonKey.Create(value, diagnosticPolicy));
+        Assert.Equal(
+            PortableStringComparison.ProjectIdentity(value, corePolicy).ComparisonKeyHash,
+            DiagnosticStringComparisonKey.Project(value, diagnosticPolicy).ComparisonKeyHash);
     }
 
-    [Theory]
-    [InlineData("Å")]
-    [InlineData("İ")]
-    [InlineData("ß")]
-    [InlineData("é")]
-    [InlineData("line\nbreak")]
-    public void Ascii_ignore_case_rejects_non_portable_unicode_and_control_values(string value)
+    [Fact]
+    public void Diagnostic_search_key_preserves_unicode_scalar_boundaries()
     {
-        Assert.False(DiagnosticStringComparisonKey.IsAsciiIgnoreCaseValue(value));
-        Assert.Throws<ArgumentException>(() => DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value));
+        var search = DiagnosticStringComparisonKey.CreateSearchKey(
+            "xÅ😀y",
+            DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        Assert.Equal("groundwork-boundary-delimited-search-key-v1", DiagnosticStringComparisonKey.SearchKeyAlgorithmId);
+        Assert.Contains("|0000C5|01F600", search, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Maximum_diagnostic_unicode_projection_stays_within_the_declared_allocation_factor()
+    {
+        var value = new string('a', DiagnosticStringProjectionLimits.MaxInputUtf8Bytes);
+        _ = DiagnosticStringComparisonKey.Project("warmup", DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+
+        var projection = DiagnosticStringComparisonKey.Project(
+            value,
+            DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase);
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(DiagnosticStringComparisonKey.CreateUnicodeOrdinalIgnoreCase(value), projection.ComparisonKey);
+        Assert.Equal(
+            DiagnosticStringComparisonKey.CreateSearchKey(value, DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase),
+            projection.SearchKey);
+        Assert.True(
+            allocated <= (long)DiagnosticStringProjectionLimits.MaxInputUtf8Bytes * 48,
+            $"Maximum projection allocated {allocated} bytes.");
+    }
+
+    [Fact]
+    public void Physical_schema_state_is_deterministic_and_exposes_comparison_algorithm_drift()
+    {
+        var definition = Definition() with
+        {
+            Fields =
+            [
+                new("message", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal },
+                    CasePolicy: DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+                    MaxStringBytes: 8_192)
+            ],
+            Limits = Definition().Limits with { MaxPredicateValues = 16 }
+        };
+        var first = DiagnosticRecordPhysicalSchemaState.Capture(definition);
+        var reorderedPredicates = definition with
+        {
+            Fields = [definition.Fields[0] with { SupportedPredicates = new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal } }]
+        };
+        var second = DiagnosticRecordPhysicalSchemaState.Capture(reorderedPredicates);
+
+        Assert.Equal(first, second);
+        Assert.Contains(DiagnosticStringComparisonKey.UnicodeOrdinalIgnoreCaseAlgorithmId, first.ComparisonAlgorithmManifest, StringComparison.Ordinal);
+        Assert.Contains(DiagnosticStringComparisonKey.LookupHashAlgorithmId, first.ComparisonAlgorithmManifest, StringComparison.Ordinal);
+        Assert.Contains(DiagnosticStringComparisonKey.SearchKeyAlgorithmId, first.ComparisonAlgorithmManifest, StringComparison.Ordinal);
+        Assert.Contains("\"comparisonAlgorithms\"", first.CanonicalDefinition, StringComparison.Ordinal);
+        Assert.Equal(64, first.DefinitionFingerprint.Length);
+        Assert.Equal(64, first.ComparisonAlgorithmManifestFingerprint.Length);
     }
 
     [Fact]
@@ -244,13 +303,47 @@ public abstract class DiagnosticRecordContractTests
             10,
             Predicate: new DiagnosticRecordPredicate.All(children));
 
-        var snapshot = DiagnosticRecordQuerySnapshot.Capture(query);
+        var snapshot = DiagnosticRecordQuerySnapshot.Capture(query, Definition().Limits.MaxPredicateNodes);
         values[0] = DiagnosticFieldValue.String("mutated");
         children.Clear();
 
         var all = Assert.IsType<DiagnosticRecordPredicate.All>(snapshot.Predicate);
         var comparison = Assert.IsType<DiagnosticRecordPredicate.Comparison>(Assert.Single(all.Predicates));
         Assert.Equal(DiagnosticFieldValue.String("original"), Assert.Single(comparison.Values));
+    }
+
+    [Fact]
+    public void Deep_and_wide_over_limit_predicates_are_rejected_before_recursive_work()
+    {
+        var definition = Definition();
+        var handler = QueryHandler(DiagnosticPredicateOperator.Equal);
+        DiagnosticRecordPredicate deep = DiagnosticRecordPredicate.Equal(
+            "message",
+            DiagnosticFieldValue.String("value"));
+        for (var index = 0; index < 10_000; index++)
+            deep = new DiagnosticRecordPredicate.All([deep]);
+        var wide = new DiagnosticRecordPredicate.All(
+            Enumerable.Range(0, definition.Limits.MaxPredicateNodes + 1)
+                .Select(_ => DiagnosticRecordPredicate.Equal(
+                    "message",
+                    DiagnosticFieldValue.String("value")))
+                .ToArray());
+        DiagnosticRecordQuery Query(DiagnosticRecordPredicate predicate) => new(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Predicate: predicate);
+
+        foreach (var query in new[] { Query(deep), Query(wide) })
+        {
+            var validationException = Assert.Throws<DiagnosticRecordValidationException>(() =>
+                DiagnosticRecordQueryValidator.Validate(query, definition, handler));
+            var snapshotException = Assert.Throws<DiagnosticRecordValidationException>(() =>
+                DiagnosticRecordQuerySnapshot.Capture(query, definition.Limits.MaxPredicateNodes));
+
+            Assert.Contains(validationException.Errors, error => error.Code == "query.predicate.too_complex");
+            Assert.Contains(snapshotException.Errors, error => error.Code == "query.predicate.too_complex");
+        }
     }
 
     [Fact]
@@ -263,6 +356,219 @@ public abstract class DiagnosticRecordContractTests
 
         await Assert.ThrowsAsync<TimeoutException>(async () =>
             await store.QueryAsync(new(new("tenant-a", "shell-a"), new("logs"), 1)));
+    }
+
+    [Fact]
+    public void Definition_projection_budgets_accept_the_boundary_and_reject_cap_plus_one_and_overflow()
+    {
+        var boundary = Definition() with
+        {
+            Fields =
+            [
+                Definition().Fields[0] with
+                {
+                    MaxStringBytes = DiagnosticStringProjectionLimits.MaxInputUtf8Bytes
+                }
+            ],
+            Limits = Definition().Limits with { MaxPredicateValues = 9 }
+        };
+
+        DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(boundary);
+        var overQuery = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(
+                boundary with { Limits = boundary.Limits with { MaxPredicateValues = 10 } }));
+        var overflow = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(boundary with
+            {
+                Fields =
+                [
+                    boundary.Fields[0] with
+                    {
+                        Cardinality = DiagnosticFieldCardinality.Multiple,
+                        MaxValues = int.MaxValue
+                    }
+                ]
+            }));
+
+        Assert.Contains(overQuery.Errors, error => error.Code == "definition.projection.query_budget.exceeded");
+        Assert.Contains(overflow.Errors, error => error.Code == "definition.projection.record_budget.exceeded");
+    }
+
+    [Fact]
+    public void Append_projection_budget_rejects_many_individually_bounded_values_before_provider_io()
+    {
+        const int valueBytes = 1_024;
+        var definition = Definition() with
+        {
+            Fields = [Definition().Fields[0] with { MaxStringBytes = valueBytes }],
+            Limits = Definition().Limits with { MaxBatchRecords = 683 }
+        };
+        var value = DiagnosticFieldValue.String(new string('a', valueBytes));
+        DiagnosticRecordBatch Batch(int count) => DiagnosticRecordBatch.Create(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            new(TimeProvider.System.GetUtcNow(), $"aggregate-{count}"),
+            Enumerable.Range(0, count).Select(index => new DiagnosticRecordInput(
+                $"record-{index}",
+                TimeProvider.System.GetUtcNow(),
+                "{}",
+                new Dictionary<string, IReadOnlyList<DiagnosticFieldValue>> { ["message"] = [value] })).ToArray());
+
+        DiagnosticRecordRequestValidator.Validate(Batch(682), definition);
+        var exception = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordRequestValidator.Validate(Batch(683), definition));
+
+        Assert.Contains(exception.Errors, error => error.Code == "append.projection_budget.exceeded");
+    }
+
+    [Fact]
+    public void Query_projection_budget_rejects_many_individually_bounded_values_before_provider_io()
+    {
+        const int valueBytes = 1_024;
+        var predicates = new HashSet<DiagnosticPredicateOperator>
+        {
+            DiagnosticPredicateOperator.Equal,
+            DiagnosticPredicateOperator.In,
+            DiagnosticPredicateOperator.Contains
+        };
+        var definition = Definition() with
+        {
+            Fields = [Definition().Fields[0] with { SupportedPredicates = predicates, MaxStringBytes = valueBytes }],
+            Limits = Definition().Limits with { MaxPredicateValues = 683 }
+        };
+        var value = DiagnosticFieldValue.String(new string('a', valueBytes));
+        var handler = new StubQueryHandler(new(
+            predicates,
+            SupportsCursorOrder: true,
+            SupportsFieldOrder: true,
+            SupportsSnapshotContinuation: true,
+            SupportsExactCount: true,
+            SupportsLatestPerKey: true));
+        DiagnosticRecordQuery Query(int count) => new(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.In("message", Enumerable.Repeat(value, count).ToArray()));
+
+        DiagnosticRecordQueryValidator.Validate(Query(682), definition, handler);
+        var exception = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(Query(683), definition, handler));
+
+        Assert.Contains(exception.Errors, error => error.Code == "query.projection_budget.exceeded");
+    }
+
+    [Fact]
+    public void Query_and_continuation_string_bounds_accept_the_boundary_and_reject_cap_plus_one()
+    {
+        var definition = Definition() with
+        {
+            Fields =
+            [
+                Definition().Fields[0] with
+                {
+                    IsOrderable = true,
+                    MaxStringBytes = 4
+                }
+            ]
+        };
+        var handler = QueryHandler(DiagnosticPredicateOperator.Equal);
+        var boundary = DiagnosticFieldValue.String("😀");
+        var overBoundary = DiagnosticFieldValue.String("😀a");
+        var predicateQuery = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.Equal("message", boundary));
+
+        DiagnosticRecordQueryValidator.Validate(predicateQuery, definition, handler);
+        var predicateException = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(
+                predicateQuery with { Predicate = DiagnosticRecordPredicate.Equal("message", overBoundary) },
+                definition,
+                handler));
+
+        var orderedQuery = predicateQuery with { Predicate = null, Order = new("message") };
+        var fingerprint = DiagnosticRequestFingerprint.ForQuery(orderedQuery, definition);
+        DiagnosticRecordQuery WithContinuation(DiagnosticFieldValue value) => orderedQuery with
+        {
+            Continuation = new(new("1"), new("1"), fingerprint, value)
+        };
+        DiagnosticRecordQueryValidator.Validate(WithContinuation(boundary), definition, handler);
+        var continuationException = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(WithContinuation(overBoundary), definition, handler));
+
+        Assert.Contains(predicateException.Errors, error => error.Code == "query.predicate.string_too_large");
+        Assert.Contains(continuationException.Errors, error => error.Code == "query.continuation.string_too_large");
+    }
+
+    [Fact]
+    public void Oversized_unicode_range_is_budgeted_before_comparison_keys_are_created()
+    {
+        const int declaredBytes = 200_000;
+        var definition = Definition() with
+        {
+            Fields =
+            [
+                Definition().Fields[0] with
+                {
+                    SupportedPredicates = new HashSet<DiagnosticPredicateOperator>
+                    {
+                        DiagnosticPredicateOperator.RangeInclusive
+                    },
+                    CasePolicy = DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+                    MaxStringBytes = declaredBytes
+                }
+            ],
+            Limits = Definition().Limits with { MaxPredicateValues = 2 }
+        };
+        var query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.RangeInclusive(
+                "message",
+                DiagnosticFieldValue.String(new string('z', 350_000)),
+                DiagnosticFieldValue.String(new string('a', 350_000))));
+
+        var exception = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(
+                query,
+                definition,
+                QueryHandler(DiagnosticPredicateOperator.RangeInclusive)));
+
+        Assert.Contains(exception.Errors, error => error.Code == "query.projection_budget.exceeded");
+        Assert.Contains(exception.Errors, error => error.Code == "query.predicate.string_too_large");
+        Assert.DoesNotContain(exception.Errors, error => error.Code == "query.predicate.range_reversed");
+    }
+
+    [Fact]
+    public void Uninitialized_field_order_continuation_is_a_validation_error()
+    {
+        var definition = Definition() with
+        {
+            Fields = [Definition().Fields[0] with { IsOrderable = true }]
+        };
+        var query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            definition.Stream,
+            10,
+            Order: new("message"));
+        query = query with
+        {
+            Continuation = new(
+                new("1"),
+                new("1"),
+                DiagnosticRequestFingerprint.ForQuery(query, definition),
+                default(DiagnosticFieldValue))
+        };
+
+        var exception = Assert.Throws<DiagnosticRecordValidationException>(() =>
+            DiagnosticRecordQueryValidator.Validate(
+                query,
+                definition,
+                QueryHandler(DiagnosticPredicateOperator.Equal)));
+
+        Assert.Contains(exception.Errors, error => error.Code == "query.continuation.order_value.invalid");
     }
 
     private static DiagnosticRecordStreamDefinition Definition() => new(
@@ -282,6 +588,14 @@ public abstract class DiagnosticRecordContractTests
         MaxOperationClockSkew: TimeSpan.FromMinutes(5),
         AppendIdempotencyWindow: TimeSpan.FromMinutes(10),
         TrimIdempotencyWindow: TimeSpan.FromMinutes(10));
+
+    private static StubQueryHandler QueryHandler(params DiagnosticPredicateOperator[] predicates) => new(new(
+        predicates.ToHashSet(),
+        SupportsCursorOrder: true,
+        SupportsFieldOrder: true,
+        SupportsSnapshotContinuation: true,
+        SupportsExactCount: true,
+        SupportsLatestPerKey: true));
 
     private sealed class TestTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {

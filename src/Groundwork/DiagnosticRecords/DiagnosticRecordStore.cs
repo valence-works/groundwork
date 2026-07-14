@@ -370,6 +370,8 @@ public static class DiagnosticRecordRequestValidator
             }
         }
 
+        DiagnosticStringProjectionBudget.AddAppendError(batch, errors);
+
         if (errors.Count > 0)
             throw new DiagnosticRecordValidationException(errors);
         if (batch.RequestFingerprint != DiagnosticRequestFingerprint.ForAppend(batch.Scope, batch.Stream, batch.Records!))

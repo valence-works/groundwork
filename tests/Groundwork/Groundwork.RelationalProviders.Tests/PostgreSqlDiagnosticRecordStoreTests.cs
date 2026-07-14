@@ -20,7 +20,7 @@ public sealed class PostgreSqlDiagnosticRecordStoreTests(PostgreSqlDiagnosticCon
     public async Task InitializeAsync()
     {
         fixtureConnectionString = await container.CreateSchemaAsync();
-        fixture = await PostgreSqlDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString);
+        fixture = await PostgreSqlDiagnosticRecordStoreFixture.CreateAsync(fixtureConnectionString, TestDefinition);
     }
 
     public async Task DisposeAsync()
@@ -52,6 +52,7 @@ public sealed class PostgreSqlDiagnosticRecordStoreTests(PostgreSqlDiagnosticCon
         Assert.Equal(
             [
                 "groundwork_diagnostic_append_operations",
+                "groundwork_diagnostic_definitions",
                 "groundwork_diagnostic_fields",
                 "groundwork_diagnostic_provider_state",
                 "groundwork_diagnostic_records",
@@ -60,6 +61,22 @@ public sealed class PostgreSqlDiagnosticRecordStoreTests(PostgreSqlDiagnosticCon
             ],
             names);
         Assert.Contains("C", Assert.IsType<string>(await collation.ExecuteScalarAsync()), StringComparison.Ordinal);
+        await using var state = connection.CreateCommand();
+        state.CommandText = $"SELECT algorithm_manifest FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
+        state.Parameters.AddWithValue("stream", TestDefinition.Stream.Value);
+        Assert.Contains(
+            DiagnosticStringComparisonKey.UnicodeOrdinalIgnoreCaseAlgorithmId,
+            Assert.IsType<string>(await state.ExecuteScalarAsync()),
+            StringComparison.Ordinal);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(
+            fixture.ConnectionString,
+            TestDefinition with { SchemaVersion = TestDefinition.SchemaVersion + 1 }));
+
+        var direct = new PostgreSqlDiagnosticRecordStore(
+            fixture.ConnectionString,
+            TestDefinition with { SchemaVersion = TestDefinition.SchemaVersion + 1 });
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await direct.InspectAsync(new(new("tenant-a", "shell-a"), TestDefinition.Stream)));
     }
 }
 
@@ -79,15 +96,18 @@ internal sealed class PostgreSqlDiagnosticRecordStoreFixture : IServerDiagnostic
 
     public static async Task<PostgreSqlDiagnosticRecordStoreFixture> CreateAsync(
         string connectionString,
+        DiagnosticRecordStreamDefinition definition,
         CancellationToken cancellationToken = default)
     {
         await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(
             connectionString,
+            definition,
             cancellationToken: cancellationToken);
         return new(connectionString);
     }
 
     public string ConnectionString { get; }
+    public string FieldsPrimaryAccessPath => "groundwork_diagnostic_fields_pkey";
 
     public IDiagnosticRecordStore OpenStore(DiagnosticRecordStreamDefinition definition) =>
         new PostgreSqlDiagnosticRecordStore(sessions, definition, timeProvider, InterceptAsync);
@@ -282,12 +302,12 @@ internal sealed class PostgreSqlDiagnosticRecordStoreFixture : IServerDiagnostic
                 SELECT 'tenant-a', 'noise-scope-' || (n % 100), 'logs', ((n - 1) / 100) + 1, 'noise-record-' || n, n, '{}'
                 FROM generate_series(1, 10000) AS n;
                 INSERT INTO {{RelationalDiagnosticRecordSchema.FieldsTable}}
-                    (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key)
-                SELECT 'tenant-a', 'noise-scope-' || (n % 100), 'logs', ((n - 1) / 100) + 1, 'service', 0, 0, 'noise', 'noise'
+                    (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key, comparison_key_prefix, comparison_key_hash, search_key)
+                SELECT 'tenant-a', 'noise-scope-' || (n % 100), 'logs', ((n - 1) / 100) + 1, 'service', 0, 0, 'bm9pc2U=', 'noise', 'noise', repeat('0', 64), '|006E|006F|0069|0073|0065'
                 FROM generate_series(1, 10000) AS n;
                 INSERT INTO {{RelationalDiagnosticRecordSchema.FieldsTable}}
-                    (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key)
-                SELECT 'tenant-a', 'shell-a', 'logs', cursor_value, 'tags', value_ordinal, 0, 'tag', 'tag'
+                    (tenant_id, scope_id, stream_id, cursor, field_name, value_ordinal, field_type, canonical_value, comparison_key, comparison_key_prefix, comparison_key_hash, search_key)
+                SELECT 'tenant-a', 'shell-a', 'logs', cursor_value, 'tags', value_ordinal, 0, 'dGFn', 'tag', 'tag', repeat('1', 64), '|0074|0061|0067'
                 FROM generate_series(1, 500) AS cursor_value
                 CROSS JOIN generate_series(0, 7) AS value_ordinal;
                 """;

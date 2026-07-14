@@ -6,9 +6,7 @@ internal static class DiagnosticComparisonKeys
 {
     public static string Create(DiagnosticFieldValue value, DiagnosticStringCasePolicy casePolicy) => value.Type switch
     {
-        DiagnosticFieldType.String when casePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase =>
-            DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value.CanonicalValue),
-        DiagnosticFieldType.String => DiagnosticStringComparisonKey.CreateOrdinal(value.CanonicalValue),
+        DiagnosticFieldType.String => DiagnosticStringComparisonKey.Create(value.CanonicalValue, casePolicy),
         DiagnosticFieldType.Int64 => Int64(long.Parse(value.CanonicalValue, CultureInfo.InvariantCulture)),
         DiagnosticFieldType.Decimal => Decimal(decimal.Parse(value.CanonicalValue, CultureInfo.InvariantCulture)),
         DiagnosticFieldType.Boolean => value.CanonicalValue == "true" ? "1" : "0",

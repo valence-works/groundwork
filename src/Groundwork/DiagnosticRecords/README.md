@@ -153,16 +153,56 @@ definition and `IDiagnosticQueryHandler.Capabilities`. Capability metadata there
 same executable handler that runs the query; an unsupported operation fails before execution and
 cannot silently fall back to client-side loading.
 
-`DiagnosticStringCasePolicy.AsciiIgnoreCase` is deliberately narrower than .NET
-`OrdinalIgnoreCase`, database collations, and Unicode case folding. Its complete domain is empty text
-or characters U+0020 through U+007E. Values containing controls or any non-ASCII code point fail
-append, predicate, or continuation validation before fingerprint-sensitive execution. The canonical
-comparison-key algorithm is `groundwork-ascii-lower-v1`: map only `A` through `Z` to `a` through `z`
-and leave every other allowed character unchanged. It has no culture, normalization, operating-system,
-or Unicode-version dependency. Providers use the resulting key with binary semantics for equality,
-membership, inclusive range, substring, ordering, and latest-per-key grouping. A future wider case
-domain requires a new algorithm id and explicit schema/backfill evolution; it may not silently change
-this policy.
+String fields select one explicit comparison policy. `Ordinal` uses versioned UTF-16 keys.
+`AsciiIgnoreCase` accepts only U+0020 through U+007E and maps `A` through `Z` to `a` through `z`; it
+has no culture, normalization, operating-system, or Unicode-version dependency.
+`UnicodeOrdinalIgnoreCase` accepts every well-formed Unicode string and maps each Unicode scalar into
+a fixed-width scalar key only when the active runtime's ordinal-ignore-case comparer accepts that
+simple-uppercase mapping. This guard matters when the runtime's general Unicode table is newer than
+its ordinal-casing table. It preserves .NET ordinal-ignore-case equality and ordering without
+delegating semantics to provider collations. The Unicode algorithm id fingerprints every accepted
+non-identity scalar mapping in the active runtime, so Unicode-data or ordinal-casing drift is detected
+as physical schema drift instead of silently mixing keys.
+Malformed UTF-16 is rejected before provider I/O; no policy performs Unicode normalization.
+
+The canonical comparison policies, key algorithms, and SHA-256 lookup-hash projection live in
+`Groundwork.Core.Text.PortableStringComparison`, so document identity and diagnostic records share
+one implementation and one set of persisted version IDs. Diagnostic records map their case-policy
+enum at the package boundary and add only their storage-specific bounded prefix and substring-search
+projection.
+
+Providers persist the full comparison key for exact collision checks, a bounded order-preserving
+prefix for ordering, a SHA-256 key for equality and membership seeks, and a boundary-delimited search
+key for substring predicates. Native indexes contain only the bounded prefix or hash, never the full
+comparison or search key. Long values that share the entire bounded prefix are ordered by the full key
+and cursor, and hash matches are always rechecked against the full key. The persisted stream-definition
+state binds the complete definition to the comparison-algorithm manifest and their fingerprints; a
+definition or algorithm mismatch must be resolved through explicit schema evolution/backfill.
+The manifest separately versions the comparison mapping, UTF-8/SHA-256/lower-hex lookup hash, and
+boundary-delimited search-key format, and records the bounded-prefix length.
+
+`Contains` deliberately executes as a server-native substring filter over the boundary-delimited
+search key. It is not a substring B-tree seek: every provider first narrows the candidates through a
+native `(tenant, scope, stream, field, type)` access path and applies the substring filter on the
+server. It never scans unrelated scopes or evaluates records in the client. The snapshot high-water,
+request limits, 32 MiB projected-comparison budget, and stream retention policy bound the work; hosts
+that need arbitrary unbounded text search should use a dedicated search projection instead.
+
+Each provider validates its own legal field and aggregate request bounds before opening a connection,
+creating a database/file, probing topology, or issuing DDL. Provider-specific limits may be narrower
+than the provider-neutral contract, but a legal request is never silently truncated or evaluated on
+the client. The shipped adapters accept at most 65,536 UTF-8 bytes per string. Definition validation
+proves that one record and one maximum predicate/continuation shape fit the comparison budget, while
+append and query admission also sum the actual request values with overflow-safe arithmetic. The
+48-times input estimate covers the exact-size full/search UTF-16 strings and transient hash encoding;
+the full key is computed once and reused for prefix, hash, and search projection.
+
+Relational public store constructors perform a retryable one-time materialization admission after
+request validation and before their first provider operation. That admission reads the persisted
+definition and comparison-algorithm fingerprints, so direct construction cannot bypass drift checks.
+Concurrent callers share one successful admission; failure or caller cancellation does not poison a
+store and a later operation retries. Async factories return an already-admitted store after completing
+the same check explicitly.
 
 Continuation values carry the first page's committed cursor high-water, the exclusive last key,
 and a canonical fingerprint of both the query shape and stream definition. Concurrent or backdated

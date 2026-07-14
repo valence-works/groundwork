@@ -14,7 +14,7 @@ public static class MongoDbDiagnosticRecordMaterializer
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(database);
-        DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(definition);
+        MongoDbDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         definition = DiagnosticRecordStreamDefinitionSnapshot.Capture(definition);
 
         var existing = await ReadCollectionMetadataAsync(database, cancellationToken);
@@ -115,16 +115,17 @@ public static class MongoDbDiagnosticRecordMaterializer
         }
 
         var actual = await collection.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).SingleAsync(cancellationToken);
+        var state = DiagnosticRecordPhysicalSchemaState.Capture(definition);
         if (!StringComparer.Ordinal.Equals(actual["fingerprint"].AsString, expected["fingerprint"].AsString) ||
             actual["schema_version"].ToInt32() != definition.SchemaVersion ||
-            !StringComparer.Ordinal.Equals(actual["ascii_comparison_key_algorithm"].AsString, DiagnosticStringComparisonKey.AsciiIgnoreCaseAlgorithmId) ||
-            !StringComparer.Ordinal.Equals(actual["ordinal_comparison_key_algorithm"].AsString, DiagnosticStringComparisonKey.OrdinalAlgorithmId))
+            !StringComparer.Ordinal.Equals(actual["algorithm_manifest_fingerprint"].AsString, state.ComparisonAlgorithmManifestFingerprint))
             throw new InvalidOperationException(
-                $"MongoDB diagnostic stream '{definition.Stream.Value}' has an incompatible persisted definition.");
+                $"MongoDB diagnostic stream '{definition.Stream.Value}' has an incompatible persisted definition or comparison-key algorithm state.");
     }
 
     private static BsonDocument DefinitionDocument(string id, DiagnosticRecordStreamDefinition definition)
     {
+        var state = DiagnosticRecordPhysicalSchemaState.Capture(definition);
         var canonical = new BsonDocument
         {
             { "stream", definition.Stream.Value },
@@ -142,6 +143,7 @@ public static class MongoDbDiagnosticRecordMaterializer
                     { "max_fields_per_record", definition.Limits.MaxFieldsPerRecord },
                     { "max_query_limit", definition.Limits.MaxQueryLimit },
                     { "max_predicate_nodes", definition.Limits.MaxPredicateNodes },
+                    { "max_predicate_values", definition.Limits.MaxPredicateValues },
                     { "max_json_depth", definition.Limits.MaxJsonDepth }
                 }
             },
@@ -156,9 +158,12 @@ public static class MongoDbDiagnosticRecordMaterializer
                 }))
             },
             { "ascii_comparison_key_algorithm", DiagnosticStringComparisonKey.AsciiIgnoreCaseAlgorithmId },
-            { "ordinal_comparison_key_algorithm", DiagnosticStringComparisonKey.OrdinalAlgorithmId }
+            { "ordinal_comparison_key_algorithm", DiagnosticStringComparisonKey.OrdinalAlgorithmId },
+            { "algorithm_manifest", state.ComparisonAlgorithmManifest },
+            { "algorithm_manifest_fingerprint", state.ComparisonAlgorithmManifestFingerprint },
+            { "canonical_definition", state.CanonicalDefinition }
         };
-        var fingerprint = Convert.ToHexStringLower(SHA256.HashData(canonical.ToBson()));
+        var fingerprint = state.DefinitionFingerprint;
         canonical.InsertAt(0, new("_id", id));
         canonical.Add("fingerprint", fingerprint);
         return canonical;
@@ -181,7 +186,7 @@ public static class MongoDbDiagnosticRecordMaterializer
                 ("tenant_id", 1), ("scope_id", 1), ("stream_id", 1), ("cursor", 1)),
             Index("ix_groundwork_diagnostic_records_scope_fields", false,
                 ("tenant_id", 1), ("scope_id", 1), ("stream_id", 1), ("query_values.name", 1),
-                ("query_values.type", 1), ("query_values.comparison_key", 1), ("cursor", 1)),
+                ("query_values.type", 1), ("query_values.comparison_key_hash", 1), ("cursor", 1)),
             Index("ix_groundwork_diagnostic_records_scope_field_native", false,
                 ("tenant_id", 1), ("scope_id", 1), ("stream_id", 1), ("query_values.name", 1),
                 ("query_values.type", 1), ("query_values.native", 1), ("cursor", 1))
@@ -197,12 +202,12 @@ public static class MongoDbDiagnosticRecordMaterializer
             {
                 Index($"ix_groundwork_diagnostic_records_order_{hash}", false,
                     ("tenant_id", 1), ("scope_id", 1), ("stream_id", 1),
-                    (MongoDbDiagnosticRecordStore.SortPath(field.Name), 1), ("cursor", 1))
+                    (MongoDbDiagnosticRecordStore.SortPrefixPath(field.Name), 1), ("cursor", 1))
             };
             if (field.SupportsLatestPerKey)
                 result.Add(Index($"ix_groundwork_diagnostic_records_latest_{hash}", false,
                     ("tenant_id", 1), ("scope_id", 1), ("stream_id", 1),
-                    (MongoDbDiagnosticRecordStore.SortPath(field.Name), 1), ("cursor", -1)));
+                    (MongoDbDiagnosticRecordStore.SortPrefixPath(field.Name), 1), ("cursor", -1)));
             return result;
         }), cancellationToken);
 

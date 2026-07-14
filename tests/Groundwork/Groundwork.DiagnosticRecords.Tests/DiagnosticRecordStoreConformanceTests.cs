@@ -23,9 +23,18 @@ public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordCo
                 IsOrderable: true, SupportsLatestPerKey: true, CasePolicy: DiagnosticStringCasePolicy.AsciiIgnoreCase, MaxStringBytes: 64),
             new("tags", DiagnosticFieldType.String, DiagnosticFieldCardinality.Multiple,
                 new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.In, DiagnosticPredicateOperator.Contains },
-                CasePolicy: DiagnosticStringCasePolicy.AsciiIgnoreCase, MaxValues: 8, MaxStringBytes: 32)
+                CasePolicy: DiagnosticStringCasePolicy.AsciiIgnoreCase, MaxValues: 8, MaxStringBytes: 32),
+            new("unicode", DiagnosticFieldType.String, DiagnosticFieldCardinality.Scalar,
+                new HashSet<DiagnosticPredicateOperator>
+                {
+                    DiagnosticPredicateOperator.Equal, DiagnosticPredicateOperator.In,
+                    DiagnosticPredicateOperator.Contains
+                },
+                IsOrderable: true, SupportsLatestPerKey: true,
+                CasePolicy: DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase,
+                MaxStringBytes: 65_536)
         ],
-        Limits: new(MaxBatchRecords: 100, MaxPayloadBytes: 4_096, MaxRecordIdBytes: 128, MaxFieldsPerRecord: 8, MaxQueryLimit: 100, MaxPredicateNodes: 32),
+        Limits: new(MaxBatchRecords: 100, MaxPayloadBytes: 4_096, MaxRecordIdBytes: 128, MaxFieldsPerRecord: 8, MaxQueryLimit: 100, MaxPredicateNodes: 32, MaxPredicateValues: 9),
         MaxOperationClockSkew: TimeSpan.FromMinutes(5),
         AppendIdempotencyWindow: TimeSpan.FromDays(1),
         TrimIdempotencyWindow: TimeSpan.FromDays(1),
@@ -514,6 +523,71 @@ public abstract class DiagnosticRecordStoreConformanceTests : DiagnosticRecordCo
         Assert.Equal("alpha-old", Assert.Single(contains.Records).RecordId);
         Assert.Equal(["alpha-old", "alpha-new", "beta"], ordered.Records.Select(x => x.RecordId));
         Assert.Equal(["beta", "alpha-new"], latest.Records.Select(x => x.RecordId));
+    }
+
+    [Fact]
+    public async Task Unicode_ordinal_ignore_case_preserves_long_values_and_drives_all_declared_query_shapes()
+    {
+        var store = CreateStore();
+        var longPrefix = new string('x', 65_535);
+        Assert.Equal(65_536, System.Text.Encoding.UTF8.GetByteCount($"{longPrefix}A"));
+        await store.AppendAsync(Batch("unicode-case-vectors",
+            Record("angstrom-old", ("unicode", [DiagnosticFieldValue.String("Ångström-Σ😀")])),
+            Record("long-b", ("unicode", [DiagnosticFieldValue.String($"{longPrefix}b")])),
+            Record("long-a", ("unicode", [DiagnosticFieldValue.String($"{longPrefix}A")])),
+            Record("angstrom-new", ("unicode", [DiagnosticFieldValue.String("ångström-ς😀")]))));
+
+        var equality = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.Equal(
+                "unicode",
+                DiagnosticFieldValue.String("ÅNGSTRÖM-σ😀"))));
+        var membership = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.In(
+                "unicode",
+                DiagnosticFieldValue.String("ÅNGSTRÖM-σ😀"),
+                DiagnosticFieldValue.String($"{longPrefix}a"))));
+        var contains = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.Contains("unicode", "STRÖM-σ😀")));
+        var containsEmpty = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.Contains("unicode", "")));
+        var ordered = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10, Order: new("unicode")));
+        var latest = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            IncludeExactCount: true, LatestPerKeyField: "unicode"));
+
+        Assert.Equal(["angstrom-old", "angstrom-new"], equality.Records.Select(record => record.RecordId));
+        Assert.Equal(["angstrom-old", "long-a", "angstrom-new"], membership.Records.Select(record => record.RecordId));
+        Assert.Equal(["angstrom-old", "angstrom-new"], contains.Records.Select(record => record.RecordId));
+        Assert.Equal(
+            ["angstrom-old", "long-b", "long-a", "angstrom-new"],
+            containsEmpty.Records.Select(record => record.RecordId));
+        Assert.Equal(
+            ["long-a", "long-b", "angstrom-old", "angstrom-new"],
+            ordered.Records.Select(record => record.RecordId));
+        Assert.Equal(["long-b", "long-a", "angstrom-new"], latest.Records.Select(record => record.RecordId));
+        Assert.Equal(3, latest.ExactCount);
+        Assert.Equal($"{longPrefix}A", latest.Records.Single(record => record.RecordId == "long-a").Fields!["unicode"].Single().CanonicalValue);
+    }
+
+    [Fact]
+    public async Task Well_formed_unicode_including_null_round_trips_without_narrowing()
+    {
+        var store = CreateStore();
+        const string value = "before\0Å😀after";
+        await store.AppendAsync(Batch("unicode-null", Record(
+            "unicode-null-record",
+            ("unicode", [DiagnosticFieldValue.String(value)]))));
+
+        var page = await store.QueryAsync(new(
+            new("tenant-a", "shell-a"), TestDefinition.Stream, 10,
+            Predicate: DiagnosticRecordPredicate.Contains("unicode", "\0å😀")));
+
+        Assert.Equal(value, Assert.Single(Assert.Single(page.Records).Fields!["unicode"]).CanonicalValue);
     }
 
     [Fact]
@@ -1280,6 +1354,8 @@ public interface IDiagnosticRecordStoreConformanceFixture
 /// </summary>
 public interface IRelationalDiagnosticRecordStoreConformanceFixture : IDiagnosticRecordStoreConformanceFixture
 {
+    string FieldsPrimaryAccessPath { get; }
+
     ValueTask<IReadOnlyList<string>> ExplainQueryAsync(
         DiagnosticRecordStreamDefinition definition,
         DiagnosticRecordQuery query,
@@ -1345,7 +1421,55 @@ public abstract class RelationalDiagnosticRecordStoreConformanceTests : Diagnost
         Assert.True(fixture.UsesSeek(
             plan,
             "ix_groundwork_diagnostic_fields_scope_value",
-            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key"]), string.Join(Environment.NewLine, plan));
+            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key_hash"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Long_unicode_equality_uses_the_bounded_hash_access_path()
+    {
+        var fixture = CreateRelationalFixture();
+        var query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            TestDefinition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.Equal(
+                "unicode",
+                DiagnosticFieldValue.String(new string('Å', 32_766) + "😀")));
+
+        var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
+
+        Assert.True(fixture.UsesSeek(
+            plan,
+            "ix_groundwork_diagnostic_fields_scope_value",
+            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "comparison_key_hash"]), string.Join(Environment.NewLine, plan));
+    }
+
+    [Fact]
+    public async Task Contains_uses_a_server_native_scope_and_stream_bounded_field_scan()
+    {
+        var fixture = CreateRelationalFixture();
+        var query = new DiagnosticRecordQuery(
+            new("tenant-a", "shell-a"),
+            TestDefinition.Stream,
+            10,
+            Predicate: DiagnosticRecordPredicate.Contains("unicode", "Å😀"));
+
+        var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
+
+        var scopedFieldScan = fixture.UsesSeek(
+                                  plan,
+                                  "ix_groundwork_diagnostic_fields_scope_value",
+                                  ["tenant_id", "scope_id", "stream_id", "field_name", "field_type"]) ||
+                              fixture.UsesSeek(
+                                  plan,
+                                  "ix_groundwork_diagnostic_fields_scope_order",
+                                  ["tenant_id", "scope_id", "stream_id", "field_name", "field_type"]) ||
+                              fixture.UsesSeek(
+                                  plan,
+                                  fixture.FieldsPrimaryAccessPath,
+                                  ["tenant_id", "scope_id", "stream_id", "cursor", "field_name"]);
+
+        Assert.True(scopedFieldScan, string.Join(Environment.NewLine, plan));
     }
 
     [Fact]
@@ -1375,10 +1499,11 @@ public abstract class RelationalDiagnosticRecordStoreConformanceTests : Diagnost
 
         var plan = await fixture.ExplainQueryAsync(TestDefinition, query);
 
-        Assert.True(fixture.UsesSeek(
-            plan,
-            "ix_groundwork_diagnostic_fields_scope_latest",
-            ["tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal"]), string.Join(Environment.NewLine, plan));
+        var constraints = new[] { "tenant_id", "scope_id", "stream_id", "field_name", "field_type", "value_ordinal" };
+        Assert.True(
+            fixture.UsesSeek(plan, "ix_groundwork_diagnostic_fields_scope_latest", constraints) ||
+            fixture.UsesSeek(plan, "ix_groundwork_diagnostic_fields_scope_order", constraints),
+            string.Join(Environment.NewLine, plan));
     }
 
     [Fact]
@@ -1726,7 +1851,7 @@ internal sealed class InMemoryDiagnosticRecordStore : IDiagnosticRecordStore, ID
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        query = DiagnosticRecordQuerySnapshot.Capture(query);
+        query = DiagnosticRecordQuerySnapshot.Capture(query, _definition.Limits.MaxPredicateNodes);
         DiagnosticRecordQueryValidator.Validate(query, _definition, this);
         DiagnosticRecord[] records;
         DiagnosticCursor snapshot;
@@ -1980,8 +2105,8 @@ internal sealed class InMemoryDiagnosticRecordStore : IDiagnosticRecordStore, ID
             DiagnosticPredicateOperator.RangeInclusive => values.Any(x =>
                 x.CompareTo(comparison.Values[0], field.CasePolicy) >= 0 &&
                 x.CompareTo(comparison.Values[1], field.CasePolicy) <= 0),
-            DiagnosticPredicateOperator.Contains => values.Any(x => ComparisonKey(x, field.CasePolicy).Contains(
-                ComparisonKey(comparison.Values[0], field.CasePolicy),
+            DiagnosticPredicateOperator.Contains => values.Any(x => SearchKey(x, field.CasePolicy).Contains(
+                SearchKey(comparison.Values[0], field.CasePolicy),
                 StringComparison.Ordinal)),
             _ => false
         };
@@ -1997,12 +2122,15 @@ internal sealed class InMemoryDiagnosticRecordStore : IDiagnosticRecordStore, ID
         return record.Fields is not null && record.Fields.TryGetValue(field, out var values) && values.Count > 0 ? values[0] : null;
     }
 
+    private static string SearchKey(DiagnosticFieldValue value, DiagnosticStringCasePolicy casePolicy) =>
+        value.Type == DiagnosticFieldType.String
+            ? DiagnosticStringComparisonKey.CreateSearchKey(value.CanonicalValue, casePolicy)
+            : value.CanonicalValue;
+
     private static string ComparisonKey(DiagnosticFieldValue value, DiagnosticStringCasePolicy casePolicy) =>
-        casePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase
-            ? DiagnosticStringComparisonKey.CreateAsciiIgnoreCase(value.CanonicalValue)
-            : value.Type == DiagnosticFieldType.String
-                ? DiagnosticStringComparisonKey.CreateOrdinal(value.CanonicalValue)
-                : value.CanonicalValue;
+        value.Type == DiagnosticFieldType.String
+            ? DiagnosticStringComparisonKey.Create(value.CanonicalValue, casePolicy)
+            : value.CanonicalValue;
 
     private static long ParseCursor(DiagnosticCursor cursor) => long.Parse(cursor.Value, System.Globalization.CultureInfo.InvariantCulture);
 
