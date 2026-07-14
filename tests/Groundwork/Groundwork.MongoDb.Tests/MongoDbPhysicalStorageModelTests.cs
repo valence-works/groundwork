@@ -81,6 +81,97 @@ public sealed class MongoDbPhysicalStorageModelTests
         Assert.Contains("provider-owned infrastructure", exception.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("logical-path")]
+    [InlineData("collection-override")]
+    [InlineData("provider-field")]
+    [InlineData("provider-index")]
+    public void Compilation_reserves_mutation_binding_storage_across_the_complete_naming_matrix(
+        string surface)
+    {
+        const string reserved = "_groundwork_mutation_bindings";
+        if (surface == "logical-path")
+        {
+            var logicalPathException = Assert.Throws<InvalidOperationException>(() => MutationModel(
+                PortablePhysicalType.String,
+                IndexValueKind.Keyword,
+                $"details.{reserved}"));
+            Assert.Contains(reserved, logicalPathException.Message, StringComparison.Ordinal);
+            Assert.Contains("reserved", logicalPathException.Message, StringComparison.OrdinalIgnoreCase);
+            return;
+        }
+        var template = MutationModel(
+            PortablePhysicalType.String,
+            IndexValueKind.Keyword,
+            "status");
+        var manifest = template.Manifest;
+        IPhysicalNamePolicy? names = null;
+        if (surface == "collection-override")
+        {
+            var unit = Assert.Single(manifest.StorageUnits);
+            var storage = unit.PhysicalStorage!;
+            manifest = manifest with
+            {
+                StorageUnits =
+                [
+                    unit with
+                    {
+                        PhysicalStorage = new StorageUnitPhysicalStorage(
+                            storage.ProvisioningMode,
+                            storage.Policy,
+                            storage.LogicalIndexes,
+                            storage.BoundedQueries,
+                            storage.NameOverrides.Append(new PhysicalObjectNameOverride(
+                                PhysicalObjectKind.PrimaryStorage,
+                                "work_items",
+                                reserved)).ToArray(),
+                            storage.BoundedMutations)
+                    }
+                ]
+            };
+        }
+        else if (surface is "provider-field" or "provider-index")
+        {
+            var target = surface == "provider-field"
+                ? PhysicalObjectKind.ProjectedField
+                : PhysicalObjectKind.PhysicalIndex;
+            names = new DelegatePhysicalNamePolicy(context =>
+                context.ObjectKind == target ? reserved : context.FeatureDefaultLogicalName);
+        }
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbPhysicalStorageModel.Compile(manifest, namePolicy: names));
+
+        Assert.Contains(reserved, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("reserved", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.Contains)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Mutation_compilation_rejects_scale_bearing_case_insensitive_regex_operations(
+        PortableQueryOperation operation)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() => MutationModel(
+            PortablePhysicalType.String,
+            IndexValueKind.String,
+            "status",
+            new HashSet<PortableQueryOperation> { operation }));
+
+        Assert.Contains(operation.ToString(), exception.Message, StringComparison.Ordinal);
+        Assert.Contains("GW-QUERY-003", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Equivalent_mutation_selectors_emit_one_provider_schema_definition()
+    {
+        var model = MongoDbBoundedMutationTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+
+        Assert.Equal(2, model.MutationBindingsByStorageUnit["workItem"].Count);
+        Assert.Single(model.Target.ProviderDefinitions.Where(definition =>
+            definition.Kind.Contains("selector", StringComparison.Ordinal)));
+    }
+
     [Fact]
     public void Provider_normalization_applies_MongoDB_byte_limits_to_unicode_names()
     {
@@ -309,6 +400,120 @@ public sealed class MongoDbPhysicalStorageModelTests
             : DocumentQueryComparison.Equal("enabled", "not-a-boolean");
         await Assert.ThrowsAsync<InvalidDataException>(() => store.QueryAsync(new DocumentQuery(
             "workItem", "list-by-enabled", [DocumentQueryClause.Of(comparison)])));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Mutation_execute_and_explain_convert_typed_values_before_provider_traffic(
+        bool explain)
+    {
+        var model = MutationModel(
+            PortablePhysicalType.Boolean,
+            IndexValueKind.Boolean,
+            "enabled");
+        var (store, traffic) = TrafficObservedStore(
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            model);
+        var mutation = new DocumentMutation(
+            "workItem",
+            "prune-by-enabled",
+            $"invalid-boolean-{explain}",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("enabled", "not-a-boolean"))]);
+        var route = Assert.Single(model.Routes);
+
+        if (explain)
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() => MongoDbPhysicalMutationRuntime.ExplainAsync(
+                store,
+                model.Manifest,
+                route,
+                model.Provider,
+                mutation));
+        }
+        else
+        {
+            var mutations = MongoDbPhysicalMutationRuntime.Create(
+                store,
+                model.Manifest,
+                route,
+                model.Provider);
+            await Assert.ThrowsAsync<InvalidDataException>(() => mutations.ExecuteAsync(mutation));
+        }
+
+        traffic.AssertNone();
+    }
+
+    [Theory]
+    [InlineData("missing-required-clause", false, "requires exactly one clause")]
+    [InlineData("missing-required-clause", true, "requires exactly one clause")]
+    [InlineData("wrong-document-kind", false, "not bound to storage unit")]
+    [InlineData("wrong-document-kind", true, "not bound to storage unit")]
+    [InlineData("illegal-operator", false, "not bound to mutation")]
+    [InlineData("illegal-operator", true, "not bound to mutation")]
+    [InlineData("caller-transition-path", false, "is not caller supplied")]
+    [InlineData("caller-transition-path", true, "is not caller supplied")]
+    public async Task Mutation_execute_and_explain_admit_the_same_closed_shape_before_provider_traffic(
+        string shape,
+        bool explain,
+        string expectedMessage)
+    {
+        var model = shape == "caller-transition-path"
+            ? MongoDbBoundedMutationTests.Model(PhysicalStorageForm.PhysicalEntityTable)
+            : MutationModel(PortablePhysicalType.String, IndexValueKind.Keyword, "status");
+        var (store, traffic) = TrafficObservedStore(
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            model);
+        var mutation = shape switch
+        {
+            "missing-required-clause" => new DocumentMutation(
+                "workItem",
+                "prune-by-status",
+                $"{shape}-{explain}"),
+            "wrong-document-kind" => new DocumentMutation(
+                "other",
+                "prune-by-status",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "stale"))]),
+            "illegal-operator" => new DocumentMutation(
+                "workItem",
+                "prune-by-status",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.GreaterThan("status", "stale"))]),
+            "caller-transition-path" => new DocumentMutation(
+                "workItem",
+                "revoke-pending",
+                $"{shape}-{explain}",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "pending"))]),
+            _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, null)
+        };
+        var route = Assert.Single(model.Routes);
+
+        async Task InvokeAsync()
+        {
+            if (explain)
+            {
+                await MongoDbPhysicalMutationRuntime.ExplainAsync(
+                    store,
+                    model.Manifest,
+                    route,
+                    model.Provider,
+                    mutation);
+                return;
+            }
+
+            await MongoDbPhysicalMutationRuntime.Create(
+                    store,
+                    model.Manifest,
+                    route,
+                    model.Provider)
+                .ExecuteAsync(mutation);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(InvokeAsync);
+
+        Assert.Contains(expectedMessage, exception.Message, StringComparison.Ordinal);
+        traffic.AssertNone();
     }
 
     [Fact]
@@ -609,7 +814,8 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     private static (MongoDbPhysicalDocumentStore Store, ProviderTrafficProbe Traffic) TrafficObservedStore(
-        DocumentStoreAccess access)
+        DocumentStoreAccess access,
+        MongoDbPhysicalStorageModel? model = null)
     {
         var traffic = new ProviderTrafficProbe();
         var settings = MongoClientSettings.FromConnectionString(
@@ -622,7 +828,7 @@ public sealed class MongoDbPhysicalStorageModelTests
         });
         var store = new MongoDbPhysicalDocumentStore(
             new MongoClient(settings).GetDatabase("groundwork_local_validation_before_provider_traffic"),
-            MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable),
+            model ?? MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable),
             access,
             scopeObserver: null,
             options: null,
@@ -635,6 +841,41 @@ public sealed class MongoDbPhysicalStorageModelTests
             },
             capability);
         return (store, traffic);
+    }
+
+    private static MongoDbPhysicalStorageModel MutationModel(
+        PortablePhysicalType projectedType,
+        IndexValueKind valueKind,
+        string path,
+        IReadOnlySet<PortableQueryOperation>? operations = null)
+    {
+        var template = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            operations,
+            projectedType: projectedType,
+            valueKind: valueKind,
+            path: path);
+        var unit = Assert.Single(template.Manifest.StorageUnits);
+        var storage = unit.PhysicalStorage!;
+        return MongoDbPhysicalStorageModel.Compile(template.Manifest with
+        {
+            StorageUnits =
+            [
+                unit with
+                {
+                    PhysicalStorage = new StorageUnitPhysicalStorage(
+                        storage.ProvisioningMode,
+                        storage.Policy,
+                        storage.LogicalIndexes,
+                        storage.BoundedQueries,
+                        storage.NameOverrides,
+                        [new BoundedMutationDeclaration(
+                            $"prune-by-{path}",
+                            $"list-by-{path}",
+                            BoundedMutationAction.Delete())])
+                }
+            ]
+        });
     }
 
     private static MongoDbPhysicalStorageModel NativeBooleanModel()

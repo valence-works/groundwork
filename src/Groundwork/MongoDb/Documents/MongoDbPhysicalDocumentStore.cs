@@ -377,41 +377,12 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private PhysicalQueryPlannerCapabilities Capabilities(
         ExecutableStorageRoute route,
-        StorageUnitPhysicalStorage storage)
-    {
-        var fields = new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["id"] = route.Envelope.Id.Identifier,
-            ["documentKind"] = route.Envelope.DocumentKind.Identifier,
-            ["storageScope"] = route.Envelope.StorageScope.Identifier,
-            ["version"] = route.Envelope.Version.Identifier,
-            ["schemaVersion"] = route.Envelope.SchemaVersion.Identifier
-        };
-        foreach (var path in storage.LogicalIndexes.SelectMany(index => index.Fields).Select(field => field.Path).Distinct(StringComparer.Ordinal))
-        {
-            fields[path] = route.ProjectedColumns.SingleOrDefault(column =>
-                    column.Target == ExecutableStorageObjectRole.PrimaryStorage && column.Definition.Path == path)?.Column.Identifier
-                ?? $"{ContentField}.{path}";
-        }
-        return new PhysicalQueryPlannerCapabilities(
+        StorageUnitPhysicalStorage storage) =>
+        MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
             model.Provider,
-            [PhysicalQuerySourceKind.LinkedIndex, PhysicalQuerySourceKind.NativeDocumentFields],
-            MongoDbPhysicalQueryHandler.Operations,
-            new Dictionary<PhysicalQuerySourceKind, string>
-            {
-                [PhysicalQuerySourceKind.LinkedIndex] = MongoDbPhysicalQueryHandler.LinkedIdentity,
-                [PhysicalQuerySourceKind.NativeDocumentFields] = MongoDbPhysicalQueryHandler.NativeIdentity
-            },
-            fields,
-            supportsCompoundPredicates: true,
-            supportsDisjunction: true,
-            supportsOffsetPaging: true,
-            supportsKeysetPaging: false,
-            supportsCount: true,
-            supportsAny: true,
-            supportsFirst: true,
-            supportsLatestPerKey: false);
-    }
+            MongoDbPhysicalQueryHandler.Operations);
 
     private async Task<DocumentStoreWriteResult> ExecuteAtomicAsync(
         IReadOnlyList<string> documentKinds,
@@ -602,10 +573,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         var created = current is null ? now : new DateTimeOffset(current[CreatedField].ToUniversalTime());
         var version = current is null ? 1 : current[route.Envelope.Version.Identifier].ToInt64() + 1;
         var incarnation = current?.GetValue(MongoDbPhysicalStorageFields.Incarnation).AsString ?? Guid.NewGuid().ToString("N");
-        var content = BsonDocument.Parse(request.ContentJson);
+        var content = MongoDbCanonicalJson.Parse(request.ContentJson);
         var projectedValues = MongoDbPhysicalProjectionValues.ResolveAll(request.ContentJson, route.ProjectedColumns);
         var document = CreatePrimary(
             route,
+            GetMutationBindings(route.StorageUnit.Value),
             request,
             scope.StorageKey!,
             version,
@@ -628,7 +600,13 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             if (result.MatchedCount == 0)
                 return DocumentStoreWriteResult.ConcurrencyConflict;
         }
-        await MaintainLinkedAsync(route, document, projectedValues, session, cancellationToken);
+        await MaintainLinkedAsync(
+            route,
+            GetMutationBindings(route.StorageUnit.Value),
+            document,
+            projectedValues,
+            session,
+            cancellationToken);
         return DocumentStoreWriteResult.Saved(ReadEnvelope(route, document));
     }
 
@@ -687,6 +665,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private static BsonDocument CreatePrimary(
         ExecutableStorageRoute route,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> mutationBindings,
         SaveDocumentRequest request,
         string scope,
         long version,
@@ -703,7 +682,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             [route.Envelope.StorageScope.Identifier] = scope,
             [route.Envelope.Version.Identifier] = version,
             [route.Envelope.SchemaVersion.Identifier] = request.SchemaVersion,
-            [route.Envelope.CanonicalJson.Identifier] = request.ContentJson,
+            [route.Envelope.CanonicalJson.Identifier] = content.DeepClone(),
             [MongoDbPhysicalStorageFields.Incarnation] = incarnation,
             [ContentField] = content,
             [CreatedField] = created.UtcDateTime,
@@ -715,12 +694,21 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             if (value.IsPresent)
                 document[projection.Column.Identifier] = value.Value;
         }
+        MongoDbPhysicalMutationStorage.ApplyMirrors(
+            document,
+            document,
+            content,
+            route,
+            mutationBindings,
+            ExecutableStorageObjectRole.PrimaryStorage,
+            projectedValues);
         document[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.PrimaryKey, document);
         return document;
     }
 
     private async Task MaintainLinkedAsync(
         ExecutableStorageRoute route,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> mutationBindings,
         BsonDocument primary,
         IReadOnlyDictionary<ExecutableProjectedColumnRoute, MongoDbPhysicalProjectionValue> projectedValues,
         IClientSessionHandle session,
@@ -728,26 +716,19 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     {
         if (route.LinkedIndexStorage is null)
             return;
-        var rel = route.LinkedRelationship!;
-        var linked = new BsonDocument
-        {
-            [rel.DocumentId.Identifier] = primary[route.Envelope.Id.Identifier],
-            [rel.DocumentKind.Identifier] = route.Discriminator.Value,
-            [rel.StorageScope.Identifier] = primary[route.Envelope.StorageScope.Identifier],
-            [MongoDbPhysicalStorageFields.LinkedPrimaryVersion] = primary[route.Envelope.Version.Identifier],
-            [MongoDbPhysicalStorageFields.Incarnation] = primary[MongoDbPhysicalStorageFields.Incarnation]
-        };
-        foreach (var projection in route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage))
-        {
-            var value = projectedValues[projection];
-            if (value.IsPresent)
-                linked[projection.Column.Identifier] = value.Value;
-        }
-        linked[MongoDbPhysicalStorageFields.Id] = MongoDbPhysicalSchemaExecutor.KeyDocument(route.AuxiliaryKey!, linked);
+        var linked = MongoDbLinkedDocumentStorage.Create(route, primary, projectedValues);
+        MongoDbPhysicalMutationStorage.ApplyMirrors(
+            linked.Document,
+            primary,
+            primary[ContentField].AsBsonDocument,
+            route,
+            mutationBindings,
+            ExecutableStorageObjectRole.LinkedIndexStorage,
+            projectedValues);
         await database.GetCollection<BsonDocument>(route.LinkedIndexStorage.Name.Identifier).ReplaceOneAsync(
             session,
-            Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Id, linked[MongoDbPhysicalStorageFields.Id]),
-            linked,
+            Builders<BsonDocument>.Filter.Eq(MongoDbPhysicalStorageFields.Id, linked.Identity),
+            linked.Document,
             new ReplaceOptions { IsUpsert = true },
             cancellationToken);
     }
@@ -763,7 +744,7 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             document[route.Envelope.Id.Identifier].AsString,
             document[route.Envelope.SchemaVersion.Identifier].AsString,
             document[route.Envelope.Version.Identifier].ToInt64(),
-            document[route.Envelope.CanonicalJson.Identifier].AsString,
+            MongoDbCanonicalJson.Serialize(document[route.Envelope.CanonicalJson.Identifier]),
             new DateTimeOffset(document[CreatedField].ToUniversalTime()),
             new DateTimeOffset(document[UpdatedField].ToUniversalTime()))
         {
@@ -788,6 +769,97 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         string documentKind,
         StorageScopeOperation operation) =>
         (Route(documentKind), ResolveScope(Unit(documentKind), operation));
+
+    internal IMongoDatabase Database => database;
+
+    internal string ManifestIdentity => model.Manifest.Identity.Value;
+
+    internal StorageManifest Manifest => model.Manifest;
+
+    internal ProviderIdentity Provider => model.Provider;
+
+    internal ExecutableStorageRoute GetRoute(string documentKind) => Route(documentKind);
+
+    internal DocumentScopeSelection ResolveMutationScope(string documentKind) =>
+        ResolveScope(Unit(documentKind), StorageScopeOperation.Mutate);
+
+    internal PhysicalQueryPlannerCapabilities GetMutationCapabilities(
+        ExecutableStorageRoute route,
+        StorageUnitPhysicalStorage storage) =>
+        MongoDbPhysicalMutationCapabilities.Create(route, storage, model.Provider);
+
+    internal IReadOnlyList<MongoDbPhysicalMutationBinding> GetMutationBindings(string documentKind) =>
+        model.MutationBindingsByStorageUnit.TryGetValue(documentKind, out var bindings)
+            ? bindings
+            : [];
+
+    internal Task EnsureMutationSupportedAsync(string documentKind, CancellationToken cancellationToken) =>
+        transactionCapability.EnsureSupportedAsync(
+            [documentKind],
+            "physical bounded mutation explain",
+            cancellationToken);
+
+    internal async Task<T> ExecutePhysicalMutationAsync<T>(
+        string documentKind,
+        Func<IClientSessionHandle, CancellationToken, Task<T>> action,
+        Func<CancellationToken, ValueTask>? beforeCommit,
+        Func<CancellationToken, ValueTask>? afterCommitBeforeAcknowledgement,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        await transactionCapability.EnsureSupportedAsync(
+            [documentKind],
+            "physical bounded mutation",
+            cancellationToken);
+        var retryStarted = timeProvider.GetTimestamp();
+        for (var attempt = 1; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var session = await startSessionAsync(cancellationToken);
+            session.StartTransaction(new TransactionOptions(
+                ReadConcern.Snapshot,
+                writeConcern: WriteConcern.WMajority));
+            try
+            {
+                await hooks.TransactionBodyStarting(session, attempt, cancellationToken);
+                var result = await action(session, cancellationToken);
+                if (beforeCommit is not null)
+                    await beforeCommit(cancellationToken);
+                await CommitWithRetryAsync(session, [documentKind], cancellationToken);
+                if (afterCommitBeforeAcknowledgement is not null)
+                    await afterCommitBeforeAcknowledgement(cancellationToken);
+                return result;
+            }
+            catch (MongoException exception) when (
+                !cancellationToken.IsCancellationRequested &&
+                (IsDuplicateKey(exception) || IsTransientTransactionConflict(exception)))
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                if (!CanRetry(
+                        attempt,
+                        retryStarted,
+                        options.MaximumTransactionAttempts,
+                        options.TransactionRetryTimeout))
+                {
+                    throw;
+                }
+                await DelayBeforeRetryAsync(attempt, cancellationToken);
+                if (timeProvider.GetElapsedTime(retryStarted) >= options.TransactionRetryTimeout)
+                    throw;
+            }
+            catch (DocumentCommitAcknowledgementUncertainException)
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                throw;
+            }
+            catch
+            {
+                await AbortTransactionIgnoringFailureAsync(session);
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
+        }
+    }
 
     private static StorageScopePolicy ScopePolicy(StorageUnit unit) =>
         unit.Tenancy.Kind == TenancyKind.Scoped ? StorageScopePolicy.Scoped : StorageScopePolicy.Global;

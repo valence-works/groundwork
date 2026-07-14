@@ -1,7 +1,9 @@
 using System.Collections.Frozen;
 using System.Security.Cryptography;
 using System.Text;
+using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
+using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.Documents.Store;
@@ -179,6 +181,95 @@ public static class BoundedMutationRequestFingerprint
 }
 
 /// <summary>Immutable evidence that a mutation handler serves one exact compiled mutation plan.</summary>
+public sealed class PhysicalMutationSelectorCertification
+{
+    public PhysicalMutationSelectorCertification(
+        ExecutableStorageObjectRole target,
+        ProviderPhysicalObjectName storageObject,
+        ProviderPhysicalObjectName index,
+        IReadOnlyDictionary<string, string> fieldIdentifiers)
+    {
+        Target = target;
+        StorageObject = storageObject ?? throw new ArgumentNullException(nameof(storageObject));
+        Index = index ?? throw new ArgumentNullException(nameof(index));
+        FieldIdentifiers = (fieldIdentifiers ?? throw new ArgumentNullException(nameof(fieldIdentifiers)))
+            .ToFrozenDictionary(StringComparer.Ordinal);
+    }
+
+    public ExecutableStorageObjectRole Target { get; }
+
+    public ProviderPhysicalObjectName StorageObject { get; }
+
+    public ProviderPhysicalObjectName Index { get; }
+
+    public IReadOnlyDictionary<string, string> FieldIdentifiers { get; }
+}
+
+/// <summary>
+/// Provider-owned evidence for the immutable physical selectors actually consumed by one bounded
+/// mutation. It supplements the provider-neutral predicate plan without rewriting its semantics.
+/// </summary>
+public sealed class PhysicalMutationExecutionCertification
+{
+    public PhysicalMutationExecutionCertification(
+        PhysicalMutationPlan plan,
+        PhysicalMutationSelectorCertification primary,
+        PhysicalMutationSelectorCertification? linked,
+        string fingerprint)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        Primary = primary ?? throw new ArgumentNullException(nameof(primary));
+        Linked = linked;
+        Fingerprint = string.IsNullOrWhiteSpace(fingerprint)
+            ? throw new ArgumentException("An executable mutation binding fingerprint is required.", nameof(fingerprint))
+            : fingerprint;
+        Provider = plan.Predicate.Provider;
+        StorageUnit = plan.Predicate.StorageUnit;
+        MutationIdentity = plan.MutationIdentity;
+        RouteFingerprint = plan.RouteFingerprint;
+        ActionKind = plan.Action.Kind;
+        var transition = plan.Action as PhysicalTransitionMutationAction;
+        TransitionPath = transition?.Path;
+        TransitionTarget = transition?.TargetValue;
+        TransitionSources = Array.AsReadOnly(transition?.AllowedSourceValues.ToArray() ?? []);
+    }
+
+    public ProviderIdentity Provider { get; }
+
+    public StorageUnitIdentity StorageUnit { get; }
+
+    public string MutationIdentity { get; }
+
+    public string RouteFingerprint { get; }
+
+    public BoundedMutationActionKind ActionKind { get; }
+
+    public string? TransitionPath { get; }
+
+    public string? TransitionTarget { get; }
+
+    public IReadOnlyList<string> TransitionSources { get; }
+
+    public PhysicalMutationSelectorCertification Primary { get; }
+
+    public PhysicalMutationSelectorCertification? Linked { get; }
+
+    public string Fingerprint { get; }
+
+    internal bool Certifies(PhysicalMutationPlan plan)
+    {
+        var transition = plan.Action as PhysicalTransitionMutationAction;
+        return Provider == plan.Predicate.Provider &&
+               StorageUnit == plan.Predicate.StorageUnit &&
+               MutationIdentity == plan.MutationIdentity &&
+               RouteFingerprint == plan.RouteFingerprint &&
+               ActionKind == plan.Action.Kind &&
+               TransitionPath == transition?.Path &&
+               TransitionTarget == transition?.TargetValue &&
+               TransitionSources.SequenceEqual(transition?.AllowedSourceValues ?? []);
+    }
+}
+
 public sealed class PhysicalMutationHandlerCertification
 {
     private readonly PhysicalQueryHandlerCertification predicate;
@@ -186,7 +277,9 @@ public sealed class PhysicalMutationHandlerCertification
     private readonly string? transitionPath;
     private readonly string? transitionTarget;
 
-    public PhysicalMutationHandlerCertification(PhysicalMutationPlan plan)
+    public PhysicalMutationHandlerCertification(
+        PhysicalMutationPlan plan,
+        PhysicalMutationExecutionCertification? execution = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         MutationIdentity = plan.MutationIdentity;
@@ -213,17 +306,23 @@ public sealed class PhysicalMutationHandlerCertification
             plan.Predicate.IndexName,
             fields,
             plan.Predicate.RouteFingerprint);
+        if (execution is not null && !execution.Certifies(plan))
+            throw new ArgumentException("Executable mutation certification does not match the compiled mutation plan.", nameof(execution));
+        Execution = execution;
     }
 
     public string MutationIdentity { get; }
 
     public BoundedMutationActionKind ActionKind { get; }
 
+    public PhysicalMutationExecutionCertification? Execution { get; }
+
     internal bool Certifies(PhysicalMutationPlan plan)
     {
         if (MutationIdentity != plan.MutationIdentity ||
             ActionKind != plan.Action.Kind ||
-            !predicate.Certifies(plan.Predicate))
+            !predicate.Certifies(plan.Predicate) ||
+            (Execution is not null && !Execution.Certifies(plan)))
         {
             return false;
         }
@@ -319,6 +418,16 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
         DocumentMutation mutation,
         CancellationToken cancellationToken = default)
     {
+        var plan = Admit(mutation);
+        return handlers[plan.HandlerIdentity].ExecuteAsync(mutation, plan, cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves and validates one complete closed mutation request without invoking a provider.
+    /// Execution and provider-native explain paths use this same admission boundary.
+    /// </summary>
+    public PhysicalMutationPlan Admit(DocumentMutation mutation)
+    {
         ArgumentNullException.ThrowIfNull(mutation);
         if (!plans.TryGetValue(mutation.MutationIdentity, out var plan) ||
             plan.Predicate.StorageUnit.Value != mutation.DocumentKind)
@@ -328,7 +437,7 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
         }
 
         ValidateRuntimeShape(mutation, plan);
-        return handlers[plan.HandlerIdentity].ExecuteAsync(mutation, plan, cancellationToken);
+        return plan;
     }
 
     private static bool SupportsProfile(

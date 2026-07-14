@@ -17,6 +17,7 @@ public enum PhysicalSchemaOperationKind
     FinalizeProjectedColumn,
     CreatePhysicalIndex,
     BackfillCanonicalJson,
+    ApplyProviderDefinition,
     ValidatePhysicalSchema,
     RecordAppliedState
 }
@@ -314,24 +315,61 @@ public sealed class BackfillCanonicalJsonOperation : PhysicalSchemaOperation, IP
 
 }
 
+/// <summary>
+/// Applies one immutable provider-owned desired-state definition through the same leased,
+/// restart-safe operation ledger as portable physical-schema operations.
+/// </summary>
+public sealed class ApplyProviderPhysicalSchemaDefinitionOperation : PhysicalSchemaOperation
+{
+    internal ApplyProviderPhysicalSchemaDefinitionOperation(ProviderPhysicalSchemaDefinition definition)
+        : base(
+            PhysicalSchemaOperationKind.ApplyProviderDefinition,
+            definition.StorageUnit,
+            definition.SubjectIdentity,
+            CreateSlotIdentity(
+                PhysicalSchemaOperationKind.ApplyProviderDefinition,
+                definition.StorageUnit,
+                definition.SubjectIdentity,
+                definition.ProviderName,
+                definition.Kind),
+            [
+                definition.ProviderName,
+                definition.Kind,
+                definition.Fingerprint,
+                definition.CanonicalDefinition
+            ]) =>
+        Definition = definition;
+
+    public ProviderPhysicalSchemaDefinition Definition { get; }
+}
+
 public sealed class ValidatePhysicalSchemaOperation : PhysicalSchemaOperation
 {
-    internal ValidatePhysicalSchemaOperation(string targetFingerprint, IReadOnlyList<ExecutableStorageRoute> routes)
+    internal ValidatePhysicalSchemaOperation(
+        string targetFingerprint,
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        IReadOnlyList<ProviderPhysicalSchemaDefinition>? providerDefinitions = null)
         : base(
             PhysicalSchemaOperationKind.ValidatePhysicalSchema,
             null,
             "target",
-            [targetFingerprint, .. routes.Select(route => route.Fingerprint).Order(StringComparer.Ordinal)])
+            [
+                targetFingerprint,
+                .. routes.Select(route => route.Fingerprint).Order(StringComparer.Ordinal),
+                .. (providerDefinitions ?? []).Select(definition => definition.Fingerprint).Order(StringComparer.Ordinal)
+            ])
     {
         TargetFingerprint = targetFingerprint;
         Routes = Array.AsReadOnly(routes.OrderBy(route => route.StorageUnit.Value, StringComparer.Ordinal).ToArray());
         RouteFingerprints = Array.AsReadOnly(Routes.Select(route => route.Fingerprint).ToArray());
+        ProviderDefinitions = Array.AsReadOnly(
+            ProviderPhysicalSchemaDefinition.Canonicalize(providerDefinitions));
     }
 
     public static ValidatePhysicalSchemaOperation ForTarget(PhysicalSchemaTarget target)
     {
         ArgumentNullException.ThrowIfNull(target);
-        return new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+        return new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes, target.ProviderDefinitions);
     }
 
     public static ValidatePhysicalSchemaOperation ForAppliedState(PhysicalSchemaAppliedState appliedState)
@@ -349,7 +387,10 @@ public sealed class ValidatePhysicalSchemaOperation : PhysicalSchemaOperation
             }
             return route;
         }).ToArray();
-        return new ValidatePhysicalSchemaOperation(appliedState.TargetFingerprint, routes);
+        return new ValidatePhysicalSchemaOperation(
+            appliedState.TargetFingerprint,
+            routes,
+            appliedState.Snapshot.ProviderDefinitions);
     }
 
     public string TargetFingerprint { get; }
@@ -357,6 +398,8 @@ public sealed class ValidatePhysicalSchemaOperation : PhysicalSchemaOperation
     public IReadOnlyList<ExecutableStorageRoute> Routes { get; }
 
     public IReadOnlyList<string> RouteFingerprints { get; }
+
+    public IReadOnlyList<ProviderPhysicalSchemaDefinition> ProviderDefinitions { get; }
 }
 
 internal static class PhysicalSchemaOperationStorage
@@ -428,6 +471,24 @@ internal static class PhysicalSchemaOperationIntegrity
         IReadOnlyList<string?> semanticParts,
         out string slotIdentity)
     {
+        if (kind == PhysicalSchemaOperationKind.ApplyProviderDefinition)
+        {
+            if (semanticParts.Count < 6 ||
+                string.IsNullOrWhiteSpace(semanticParts[4]) ||
+                string.IsNullOrWhiteSpace(semanticParts[5]))
+            {
+                slotIdentity = string.Empty;
+                return false;
+            }
+            slotIdentity = PhysicalSchemaOperation.CreateSlotIdentity(
+                kind,
+                storageUnit,
+                subjectIdentity,
+                semanticParts[4],
+                semanticParts[5]);
+            return true;
+        }
+
         if (kind != PhysicalSchemaOperationKind.BackfillCanonicalJson)
         {
             slotIdentity = PhysicalSchemaOperation.CreateSlotIdentity(kind, storageUnit, subjectIdentity);

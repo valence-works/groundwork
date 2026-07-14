@@ -145,7 +145,10 @@ public static class PhysicalSchemaApplication
         }
         if (plan.Operations.Count == 0)
         {
-            var validation = new ValidatePhysicalSchemaOperation(target.Fingerprint, target.Routes);
+            var validation = new ValidatePhysicalSchemaOperation(
+                target.Fingerprint,
+                target.Routes,
+                target.ProviderDefinitions);
             var acknowledgement = await executor.ApplyOperationAsync(
                 target.Identity,
                 validation,

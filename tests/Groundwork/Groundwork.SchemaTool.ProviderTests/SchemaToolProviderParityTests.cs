@@ -3,6 +3,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Scoping;
 using Groundwork.SchemaTool;
@@ -81,6 +82,67 @@ public sealed class SchemaToolProviderParityTests
             () => DropMongoDbIndexAsync(connection, database),
             () => ReadMongoDbIndexStateAsync(connection, database),
             "mongodb://none:provider-secret@127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200");
+    }
+
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
+    public async Task MongoDb_cli_plans_applies_and_live_validates_bounded_mutation_bindings()
+    {
+        await using var container = new MongoDbBuilder("mongo:7.0.24")
+            .WithReplicaSet("groundwork-mutation-cli-rs")
+            .Build();
+        await container.StartAsync();
+        var connection = container.GetConnectionString();
+        const string database = "groundwork_schema_tool_mutation_tests";
+        const string selectorIdentity = "schema_tool_provider_mutation_documents-by-category";
+
+        var plan = await RunAsync(
+            "plan",
+            "mongodb",
+            connection,
+            database,
+            typeof(MutationManifestSource));
+
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, plan.ExitCode);
+        Assert.Contains(
+            plan.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation =>
+                operation.GetProperty("kind").GetString() == "ApplyProviderDefinition" &&
+                operation.GetProperty("subjectIdentity").GetString() == "prune-by-category");
+        Assert.Contains(
+            plan.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation =>
+                operation.GetProperty("kind").GetString() == "ApplyProviderDefinition" &&
+                operation.GetProperty("subjectIdentity").GetString() == selectorIdentity);
+
+        var apply = await RunAsync(
+            "apply",
+            "mongodb",
+            connection,
+            database,
+            typeof(MutationManifestSource),
+            "--safe");
+        var validate = await RunAsync(
+            "validate",
+            "mongodb",
+            connection,
+            database,
+            typeof(MutationManifestSource));
+
+        Assert.Equal(SchemaToolExitCodes.Success, apply.ExitCode);
+        Assert.Contains(
+            apply.Report.GetProperty("appliedOperations").EnumerateArray(),
+            operation =>
+                operation.GetProperty("kind").GetString() == "ApplyProviderDefinition" &&
+                operation.GetProperty("subjectIdentity").GetString() == "prune-by-category");
+        Assert.Contains(
+            apply.Report.GetProperty("appliedOperations").EnumerateArray(),
+            operation =>
+                operation.GetProperty("kind").GetString() == "ApplyProviderDefinition" &&
+                operation.GetProperty("subjectIdentity").GetString() == selectorIdentity);
+        Assert.Equal(SchemaToolExitCodes.Success, validate.ExitCode);
+        Assert.Equal("ready", validate.Report.GetProperty("outcome").GetString());
+        Assert.Empty(validate.Report.GetProperty("pendingOperations").EnumerateArray());
     }
 
     private static async Task ExerciseAsync(
@@ -364,6 +426,56 @@ public sealed class SchemaToolProviderParityTests
             "schema_tool_provider_documents",
             manifestVersion: "2",
             includePriority: true);
+    }
+
+    public sealed class MutationManifestSource : IPhysicalSchemaManifestSource
+    {
+        public StorageManifest CreateManifest()
+        {
+            var manifest = SchemaToolProviderParityTests.CreateManifest(
+                "schema-tool-provider-mutation-tests",
+                "schema_tool_provider_mutation_documents");
+            var unit = Assert.Single(manifest.StorageUnits);
+            var storage = unit.PhysicalStorage!;
+            const string indexIdentity = "schema_tool_provider_mutation_documents-by-category";
+            var logicalIndex = new LogicalIndexDeclaration(
+                indexIdentity,
+                [new IndexField("category", IndexValueKind.Keyword)],
+                IndexValueKind.Keyword,
+                isUnique: false,
+                MissingValueBehavior.Excluded);
+            var query = new BoundedQueryDeclaration(
+                "list-by-category",
+                indexIdentity,
+                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                QuerySortSupport.None,
+                QueryPagingSupport.None,
+                BoundedQueryExecutionClass.ScaleBearing,
+                supportsTotalCount: true,
+                resultOperations: new HashSet<BoundedQueryResultOperation>
+                {
+                    BoundedQueryResultOperation.Count
+                });
+            return manifest with
+            {
+                StorageUnits =
+                [
+                    unit with
+                    {
+                        PhysicalStorage = new StorageUnitPhysicalStorage(
+                            storage.ProvisioningMode,
+                            storage.Policy,
+                            [logicalIndex],
+                            [query],
+                            storage.NameOverrides,
+                            [new BoundedMutationDeclaration(
+                                "prune-by-category",
+                                query.Identity,
+                                BoundedMutationAction.Delete())])
+                    }
+                ]
+            };
+        }
     }
 
     private static StorageManifest CreateManifest(

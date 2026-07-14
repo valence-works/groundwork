@@ -148,6 +148,92 @@ public sealed class PhysicalSchemaDiffPlannerTests
     }
 
     [Fact]
+    public void Provider_owned_definition_is_planned_snapshotted_and_round_tripped()
+    {
+        var target = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            Definition("prune-by-category", "{\"index\":\"category\"}"));
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, PlannedAt);
+        var operation = Assert.Single(plan.Operations.OfType<ApplyProviderPhysicalSchemaDefinitionOperation>());
+        var applied = Complete(plan);
+        var restored = PhysicalSchemaAppliedStateSerializer.Deserialize(
+            PhysicalSchemaAppliedStateSerializer.Serialize(applied));
+
+        Assert.Equal("prune-by-category", operation.SubjectIdentity);
+        Assert.Equal(target.ProviderDefinitions, applied.Snapshot.ProviderDefinitions);
+        Assert.Equal(applied.Snapshot.ProviderDefinitions, restored.Snapshot.ProviderDefinitions);
+        Assert.Equal(target.ProviderDefinitions, ValidatePhysicalSchemaOperation.ForAppliedState(restored).ProviderDefinitions);
+    }
+
+    [Fact]
+    public void Additive_provider_owned_definition_produces_only_its_pending_semantic_work()
+    {
+        var initialTarget = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            Definition("prune-by-category", "{\"index\":\"category\"}"));
+        var applied = Complete(PhysicalSchemaDiffPlanner.Plan(
+            initialTarget,
+            PhysicalSchemaHistoryState.Empty,
+            PlannedAt));
+        var changedTarget = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            initialTarget.ProviderDefinitions[0],
+            Definition("prune-by-priority", "{\"index\":\"priority\"}"));
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            changedTarget,
+            PhysicalSchemaHistoryState.FromApplied(applied),
+            PlannedAt.AddHours(1));
+
+        Assert.True(plan.IsApplicable, JoinDiagnostics(plan));
+        Assert.Collection(
+            plan.Operations,
+            operation => Assert.Equal("prune-by-priority", Assert.IsType<ApplyProviderPhysicalSchemaDefinitionOperation>(operation).SubjectIdentity),
+            operation => Assert.IsType<ValidatePhysicalSchemaOperation>(operation),
+            operation => Assert.IsType<RecordPhysicalSchemaAppliedStateOperation>(operation));
+    }
+
+    [Fact]
+    public void Rewriting_an_applied_provider_owned_definition_is_rejected_as_non_additive()
+    {
+        var initialTarget = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            Definition("prune-by-category", "{\"index\":\"category\"}"));
+        var applied = Complete(PhysicalSchemaDiffPlanner.Plan(
+            initialTarget,
+            PhysicalSchemaHistoryState.Empty,
+            PlannedAt));
+        var changedTarget = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            Definition("prune-by-category", "{\"index\":\"rewritten\"}"));
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            changedTarget,
+            PhysicalSchemaHistoryState.FromApplied(applied),
+            PlannedAt.AddHours(1));
+
+        Assert.False(plan.IsApplicable);
+        Assert.Empty(plan.Operations);
+        Assert.Equal("GW-SCHEMA-003", Assert.Single(plan.Diagnostics).Code);
+    }
+
+    [Fact]
+    public void Provider_definition_kinds_with_the_same_subject_have_independent_semantic_slots()
+    {
+        var target = WithProviderDefinitions(
+            CreateTarget(PhysicalStorageForm.DedicatedDocumentTable, includeSecondProjection: false),
+            Definition("shared-subject", "{\"index\":\"category\"}"),
+            Definition("shared-subject", "{\"projection\":\"category\"}", "test-provider-projection.v1"));
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, PlannedAt);
+        var operations = plan.Operations.OfType<ApplyProviderPhysicalSchemaDefinitionOperation>().ToArray();
+
+        Assert.Equal(2, operations.Length);
+        Assert.Equal(2, operations.Select(operation => operation.SlotIdentity).Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
     public void RequiredProjectionIsStagedBackfilledAndFinalizedBeforeItsIndex()
     {
         var target = CreateTarget(PhysicalStorageForm.PhysicalEntityTable, includeSecondProjection: false);
@@ -542,6 +628,32 @@ public sealed class PhysicalSchemaDiffPlannerTests
             provider ?? Provider,
             compilation.Routes);
     }
+
+    private static ProviderPhysicalSchemaDefinition Definition(
+        string subjectIdentity,
+        string canonicalDefinition,
+        string kind = "test-provider-definition.v1") =>
+        new(
+            Provider.Name,
+            new StorageUnitIdentity("metadata"),
+            kind,
+            subjectIdentity,
+            canonicalDefinition);
+
+    private static PhysicalSchemaTarget WithProviderDefinitions(
+        PhysicalSchemaTarget target,
+        params ProviderPhysicalSchemaDefinition[] definitions) =>
+        new(
+            target.ManifestIdentity,
+            target.ManifestVersion,
+            target.Provider,
+            target.Routes,
+            definitions.Select(definition => new ProviderPhysicalSchemaDefinition(
+                definition.ProviderName,
+                Assert.Single(target.Routes).StorageUnit,
+                definition.Kind,
+                definition.SubjectIdentity,
+                definition.CanonicalDefinition)).ToArray());
 
     private static string JoinDiagnostics(PhysicalSchemaDiffPlan plan) =>
         string.Join("; ", plan.Diagnostics.Select(diagnostic => $"{diagnostic.Code}: {diagnostic.Message}"));

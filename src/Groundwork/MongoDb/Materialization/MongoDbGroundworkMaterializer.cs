@@ -1,4 +1,5 @@
 using Groundwork.Core.Indexing;
+using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Physicalization;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Materialization;
@@ -29,10 +30,11 @@ public sealed class MongoDbGroundworkMaterializer(IMongoDatabase database, Actio
             model.Routes.Select(route => route.StorageUnit.Value).ToArray(),
             "physical schema application",
             cancellationToken);
-        return await PhysicalSchemaApplication.ApplyAsync(
+        var result = await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new MongoDbPhysicalSchemaExecutor(database),
             cancellationToken: cancellationToken);
+        return result;
     }
 
     public async Task MaterializeAsync(MaterializationPlan plan, CancellationToken cancellationToken = default)

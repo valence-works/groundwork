@@ -72,7 +72,9 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
             .Find(Builders<BsonDocument>.Filter.Eq(route.Envelope.Id.Identifier, "1"))
             .SingleAsync();
-        Assert.Equal("""{"status":"open","rank":2}""", primary[route.Envelope.CanonicalJson.Identifier].AsString);
+        Assert.Equal(
+            """{"status":"open","rank":2}""",
+            MongoDbCanonicalJson.Serialize(primary[route.Envelope.CanonicalJson.Identifier]));
         if (form == PhysicalStorageForm.PhysicalEntityTable)
             Assert.Equal("open", primary[route.ProjectedColumns.Single().Column.Identifier].AsString);
         else

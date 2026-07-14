@@ -19,7 +19,7 @@ public static class ExecutableStorageRouteSerializer
     internal static string CreateFingerprint(ExecutableStorageRoute route) =>
         Convert.ToHexString(SHA256.HashData(SerializeCore(route, includeFingerprint: false))).ToLowerInvariant();
 
-    internal static ExecutableStorageRoute Deserialize(string canonicalJson)
+    public static ExecutableStorageRoute Deserialize(string canonicalJson)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(canonicalJson);
         using var document = JsonDocument.Parse(canonicalJson);

@@ -5,6 +5,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Physicalization;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.MongoDb.Documents;
 
 namespace Groundwork.MongoDb;
 
@@ -17,14 +18,32 @@ public sealed class MongoDbPhysicalStorageModel
     private MongoDbPhysicalStorageModel(
         StorageManifest manifest,
         ProviderIdentity provider,
-        IReadOnlyList<ExecutableStorageRoute> routes)
+        IReadOnlyList<ExecutableStorageRoute> routes,
+        IReadOnlyList<MongoDbPhysicalMutationBinding> mutationBindings)
     {
         Manifest = manifest;
         Provider = provider;
         Routes = Array.AsReadOnly(routes.OrderBy(route => route.StorageUnit.Value, StringComparer.Ordinal).ToArray());
         RoutesByStorageUnit = Routes.ToFrozenDictionary(route => route.StorageUnit.Value, StringComparer.Ordinal);
         StorageByStorageUnit = manifest.StorageUnits.ToFrozenDictionary(unit => unit.Identity.Value, unit => unit.PhysicalStorage!, StringComparer.Ordinal);
-        Target = new PhysicalSchemaTarget(manifest.Identity, manifest.Version, provider, Routes);
+        MutationBindingsByStorageUnit = mutationBindings
+            .GroupBy(binding => binding.Schema.Route.StorageUnit.Value, StringComparer.Ordinal)
+            .ToFrozenDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<MongoDbPhysicalMutationBinding>)Array.AsReadOnly(group
+                    .OrderBy(binding => binding.Plan.MutationIdentity, StringComparer.Ordinal)
+                    .ToArray()),
+                StringComparer.Ordinal);
+        Target = new PhysicalSchemaTarget(
+            manifest.Identity,
+            manifest.Version,
+            provider,
+            Routes,
+            mutationBindings.Select(binding => binding.ProviderDefinition)
+                .Concat(MongoDbPhysicalMutationSelectorSchemaDefinition
+                    .Compile(mutationBindings)
+                    .Select(definition => definition.ProviderDefinition))
+                .ToArray());
     }
 
     public StorageManifest Manifest { get; }
@@ -36,6 +55,8 @@ public sealed class MongoDbPhysicalStorageModel
     public IReadOnlyDictionary<string, ExecutableStorageRoute> RoutesByStorageUnit { get; }
 
     public IReadOnlyDictionary<string, StorageUnitPhysicalStorage> StorageByStorageUnit { get; }
+
+    internal IReadOnlyDictionary<string, IReadOnlyList<MongoDbPhysicalMutationBinding>> MutationBindingsByStorageUnit { get; }
 
     public PhysicalSchemaTarget Target { get; }
 
@@ -56,16 +77,122 @@ public sealed class MongoDbPhysicalStorageModel
         if (!compilation.IsValid)
             throw Invalid("executable routes", compilation.Diagnostics.Select(diagnostic => $"{diagnostic.Code}: {diagnostic.Message}"));
 
+        ValidateMutationBindingReservation(manifest, compilation.Routes);
         ValidateReservedFields(compilation.Routes);
         ValidateReservedCollections(compilation.Routes);
         foreach (var projection in compilation.Routes.SelectMany(route => route.ProjectedColumns))
             MongoDbPhysicalProjectionValues.ValidateDefault(projection);
 
-        return new MongoDbPhysicalStorageModel(manifest, provider, compilation.Routes);
+        var bindings = compilation.Routes.SelectMany(route =>
+            MongoDbPhysicalMutationBinding.Compile(
+                route,
+                manifest.StorageUnits.Single(unit => unit.Identity == route.StorageUnit).PhysicalStorage!,
+                provider)).ToArray();
+        return new MongoDbPhysicalStorageModel(manifest, provider, compilation.Routes, bindings);
     }
 
     private static InvalidOperationException Invalid(string phase, IEnumerable<string> diagnostics) =>
         new($"MongoDB {phase} compilation failed:{Environment.NewLine}{string.Join(Environment.NewLine, diagnostics)}");
+
+    private static void ValidateMutationBindingReservation(
+        StorageManifest manifest,
+        IReadOnlyList<ExecutableStorageRoute> routes)
+    {
+        var reserved = new HashSet<string>(StringComparer.Ordinal)
+        {
+            MongoDbPhysicalMutationStorage.Root,
+            MongoDbPhysicalMutationStorage.BindingRoot
+        };
+        var names = new List<(string Surface, string Value)>();
+        foreach (var unit in manifest.StorageUnits.Where(unit => unit.PhysicalStorage is not null))
+        {
+            var storage = unit.PhysicalStorage!;
+            names.AddRange(storage.LogicalIndexes.SelectMany(index =>
+                new[] { ("logical index", index.Identity) }
+                    .Concat(index.Fields.Select(field => ("logical index path", field.Path)))));
+            names.AddRange(storage.BoundedQueries.SelectMany(query =>
+                new[]
+                {
+                    ("bounded query", query.Identity),
+                    ("bounded query index", query.IndexIdentity)
+                }.Concat(query.PredicateFields.Select(field => ("bounded query path", field.Path)))));
+            names.AddRange(storage.BoundedMutations.SelectMany(mutation =>
+                new[]
+                {
+                    ("bounded mutation", mutation.Identity),
+                    ("bounded mutation query", mutation.PredicateQueryIdentity)
+                }.Concat(mutation.Action is BoundedTransitionMutationAction transition
+                    ? [("bounded mutation transition path", transition.Path)]
+                    : [])));
+            names.AddRange(storage.NameOverrides.SelectMany(nameOverride => new[]
+            {
+                ("physical name override source", nameOverride.FeatureDefaultLogicalName),
+                ("physical name override target", nameOverride.LogicalName)
+            }));
+        }
+
+        foreach (var route in routes)
+        {
+            AddName(names, "primary collection", route.PrimaryStorage.Name);
+            if (route.LinkedIndexStorage is not null)
+                AddName(names, "linked collection", route.LinkedIndexStorage.Name);
+            AddColumn(names, "envelope field", route.Envelope.Id);
+            AddColumn(names, "envelope field", route.Envelope.DocumentKind);
+            AddColumn(names, "envelope field", route.Envelope.StorageScope);
+            AddColumn(names, "envelope field", route.Envelope.Version);
+            AddColumn(names, "envelope field", route.Envelope.SchemaVersion);
+            AddColumn(names, "envelope field", route.Envelope.CanonicalJson);
+            if (route.LinkedRelationship is not null)
+            {
+                AddColumn(names, "linked field", route.LinkedRelationship.DocumentId);
+                AddColumn(names, "linked field", route.LinkedRelationship.DocumentKind);
+                AddColumn(names, "linked field", route.LinkedRelationship.StorageScope);
+            }
+            foreach (var projection in route.ProjectedColumns)
+            {
+                names.Add(("projected field logical name", projection.Definition.LogicalName));
+                names.Add(("projected field path", projection.Definition.Path));
+                AddColumn(names, "projected field", projection.Column);
+                AddName(names, "projected provider field", projection.Name);
+            }
+            foreach (var index in route.Indexes)
+            {
+                names.Add(("physical index logical name", index.Definition.LogicalName));
+                AddName(names, "physical index", index.Name);
+                foreach (var column in index.Columns)
+                    AddColumn(names, "physical index field", column.Column);
+            }
+        }
+
+        var collision = names.FirstOrDefault(item => item.Value
+            .Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(reserved.Contains));
+        if (collision != default)
+        {
+            throw Invalid(
+                "reserved mutation binding name",
+                [$"{collision.Surface} '{collision.Value}' collides with MongoDB provider-owned mutation binding storage."]);
+        }
+    }
+
+    private static void AddName(
+        ICollection<(string Surface, string Value)> names,
+        string surface,
+        ProviderPhysicalObjectName name)
+    {
+        names.Add(($"{surface} feature-default name", name.FeatureDefaultLogicalName));
+        names.Add(($"{surface} logical name", name.LogicalName));
+        names.Add(($"{surface} provider identifier", name.Identifier));
+    }
+
+    private static void AddColumn(
+        ICollection<(string Surface, string Value)> names,
+        string surface,
+        ExecutableColumnRoute column)
+    {
+        names.Add(($"{surface} logical name", column.LogicalName));
+        names.Add(($"{surface} provider identifier", column.Identifier));
+    }
 
     private static void ValidateReservedFields(IReadOnlyList<ExecutableStorageRoute> routes)
     {
@@ -201,11 +328,14 @@ internal static class MongoDbPhysicalStorageFields
     public const string UpdatedAt = "_groundwork_updated_at";
     public const string Incarnation = "_groundwork_incarnation";
     public const string LinkedPrimaryVersion = "_groundwork_primary_version";
+    public const string BoundedMutationOperationsCollection = "groundwork_bounded_mutation_operations";
 
     public static IReadOnlySet<string> PrimaryReserved { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         Id,
         NativeContent,
+        Documents.MongoDbPhysicalMutationStorage.Root,
+        Documents.MongoDbPhysicalMutationStorage.BindingRoot,
         CreatedAt,
         UpdatedAt,
         Incarnation
@@ -214,6 +344,8 @@ internal static class MongoDbPhysicalStorageFields
     public static IReadOnlySet<string> LinkedReserved { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         Id,
+        Documents.MongoDbPhysicalMutationStorage.Root,
+        Documents.MongoDbPhysicalMutationStorage.BindingRoot,
         LinkedPrimaryVersion,
         Incarnation
     }.ToFrozenSet(StringComparer.Ordinal);
@@ -224,6 +356,7 @@ internal static class MongoDbPhysicalStorageFields
         "groundwork_physical_schema_state",
         "groundwork_physical_schema_operations",
         "groundwork_physical_schema_locks",
+        BoundedMutationOperationsCollection,
         "groundwork_diagnostic_records",
         "groundwork_diagnostic_streams",
         "groundwork_diagnostic_append_operations",
