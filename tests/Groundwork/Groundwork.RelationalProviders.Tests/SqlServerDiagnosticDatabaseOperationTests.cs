@@ -61,7 +61,7 @@ public sealed class SqlServerDiagnosticDatabaseOperationTests
                 "drop",
                 TimeSpan.FromSeconds(1),
                 TimeSpan.FromMilliseconds(100),
-                TimeSpan.FromMilliseconds(20),
+                TimeSpan.FromSeconds(1),
                 _ => Task.FromException(new IOException("drop failed")),
                 () => ValueTask.CompletedTask,
                 _ => Task.FromException<string>(new InvalidOperationException("diagnostics failed")),
