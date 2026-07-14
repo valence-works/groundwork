@@ -156,7 +156,9 @@ public sealed class SqlServerSupportTicketProviderTests : SupportTicketProviderC
 
 public sealed class MongoDbSupportTicketProviderTests : SupportTicketProviderContractTests, IAsyncLifetime
 {
-    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24").Build();
+    private readonly MongoDbContainer container = new MongoDbBuilder("mongo:7.0.24")
+        .WithReplicaSet("groundwork-support")
+        .Build();
 
     public async Task InitializeAsync() => await container.StartAsync();
 
