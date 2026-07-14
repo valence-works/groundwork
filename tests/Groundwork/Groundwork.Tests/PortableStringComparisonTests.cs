@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Groundwork.Core.Text;
 using Xunit;
@@ -51,6 +52,18 @@ public sealed class PortableStringComparisonTests
             Math.Sign(StringComparer.Ordinal.Compare(
                 leftKey,
                 PortableStringComparison.CreateUnicodeOrdinalIgnoreCase("z"))));
+    }
+
+    [Fact]
+    public void Unicode_key_matches_dotnet_ordinal_ignore_case_for_Garay_supplementary_case_pair()
+    {
+        const string lowercase = "\U00010D70";
+        const string uppercase = "\U00010D50";
+
+        Assert.True(StringComparer.OrdinalIgnoreCase.Equals(lowercase, uppercase));
+        Assert.Equal(
+            PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(uppercase),
+            PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(lowercase));
     }
 
     [Fact]
@@ -119,6 +132,52 @@ public sealed class PortableStringComparisonTests
         Assert.NotEqual(
             PortableStringComparison.CreateUnicodeOrdinalIgnoreCase("ſ"),
             PortableStringComparison.CreateUnicodeOrdinalIgnoreCase("S"));
+    }
+
+    [Fact]
+    public void Unicode_key_exhaustively_matches_dotnet_for_supplementary_case_equivalence_and_order()
+    {
+        var values = new List<string>();
+        var hashBuckets = new Dictionary<int, List<string>>();
+        var equivalencePairCount = 0;
+
+        for (var scalar = 0x10000; scalar <= 0x10FFFF; scalar++)
+        {
+            var rune = new Rune(scalar);
+            if (Rune.GetUnicodeCategory(rune) is not (
+                    UnicodeCategory.UppercaseLetter or
+                    UnicodeCategory.LowercaseLetter or
+                    UnicodeCategory.TitlecaseLetter))
+                continue;
+
+            var value = rune.ToString();
+            values.Add(value);
+            var hash = StringComparer.OrdinalIgnoreCase.GetHashCode(value);
+            if (!hashBuckets.TryGetValue(hash, out var candidates))
+                hashBuckets.Add(hash, candidates = []);
+
+            foreach (var candidate in candidates)
+            {
+                if (!StringComparer.OrdinalIgnoreCase.Equals(candidate, value))
+                    continue;
+                equivalencePairCount++;
+                Assert.Equal(
+                    PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(candidate),
+                    PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(value));
+            }
+            candidates.Add(value);
+        }
+
+        Assert.Equal(282, equivalencePairCount);
+        var expectedOrder = values
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(value => value, StringComparer.Ordinal)
+            .ToArray();
+        var actualOrder = values
+            .OrderBy(PortableStringComparison.CreateUnicodeOrdinalIgnoreCase, StringComparer.Ordinal)
+            .ThenBy(value => value, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(expectedOrder, actualOrder);
     }
 
     [Fact]
