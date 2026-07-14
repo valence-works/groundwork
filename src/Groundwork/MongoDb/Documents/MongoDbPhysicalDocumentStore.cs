@@ -339,15 +339,10 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     private static void ValidateScaleBearingOperations(StorageUnitPhysicalStorage storage)
     {
-        var nonIndexable = new HashSet<PortableQueryOperation>
-        {
-            PortableQueryOperation.Contains,
-            PortableQueryOperation.StartsWith
-        };
         foreach (var query in storage.BoundedQueries.Where(query =>
                      query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing))
         {
-            var unsupported = query.Operations.Intersect(nonIndexable).Order().ToArray();
+            var unsupported = MongoDbScaleBearingOperationValidation.UnsupportedOperations(storage, query);
             if (unsupported.Length == 0)
                 continue;
 

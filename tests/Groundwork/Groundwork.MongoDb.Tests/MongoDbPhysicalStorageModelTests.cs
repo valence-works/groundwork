@@ -65,6 +65,66 @@ public sealed class MongoDbPhysicalStorageModelTests
         Assert.Contains("00004D00004500005400005200004900004300002D01040000002D0000C9", lower.ToJson(), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Exact_identity_mutation_selector_certifies_and_indexes_the_executed_projected_evidence()
+    {
+        var model = IdentityModel(includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                route.Envelope.Identity.LookupKey.Identifier,
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            route.Envelope.Identity.LookupKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Lookup]);
+        Assert.Equal(
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Comparison]);
+        Assert.DoesNotContain(PhysicalDocumentFieldPaths.Id, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(route.Envelope.Identity.OriginalId.Identifier, binding.Schema.Primary.IndexKeys.Names);
+    }
+
+    [Theory]
+    [InlineData(PortableQueryOperation.GreaterThan)]
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Ordered_identity_mutation_selector_certifies_only_the_comparison_evidence(
+        PortableQueryOperation operation)
+    {
+        var model = IdentityModel(operation, includeMutation: true);
+        var route = Assert.Single(model.Routes);
+        var binding = Assert.Single(model.MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+
+        Assert.Equal(
+            [
+                route.Envelope.DocumentKind.Identifier,
+                route.Envelope.StorageScope.Identifier,
+                route.Envelope.Identity.ComparisonKey.Identifier
+            ],
+            binding.Schema.Primary.IndexKeys.Names);
+        Assert.Equal(
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            binding.Certification.Primary.FieldIdentifiers[PhysicalDocumentIdentityFieldPaths.Comparison]);
+        Assert.DoesNotContain(PhysicalDocumentIdentityFieldPaths.Lookup, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(PhysicalDocumentFieldPaths.Id, binding.Certification.Primary.FieldIdentifiers.Keys);
+        Assert.DoesNotContain(route.Envelope.Identity.OriginalId.Identifier, binding.Schema.Primary.IndexKeys.Names);
+    }
+
+    [Fact]
+    public void Identity_contains_surfaces_the_core_identity_diagnostic_before_provider_execution()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            IdentityModel(PortableQueryOperation.Contains, includeMutation: true));
+
+        Assert.Contains("GW-QUERY-011", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("GW-QUERY-003", exception.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(PortableQueryOperation.GreaterThan)]
     [InlineData(PortableQueryOperation.StartsWith)]
@@ -99,6 +159,12 @@ public sealed class MongoDbPhysicalStorageModelTests
         Assert.Equal(lower, upper);
         Assert.Contains("00004D00004500005400005200004900004300002D01040000002D0000C9", lower.ToJson(), StringComparison.Ordinal);
         Assert.DoesNotContain(plan.DocumentIdentity.Lookup.Identifier, lower.ToJson(), StringComparison.Ordinal);
+        if (operation == PortableQueryOperation.StartsWith)
+        {
+            Assert.Contains("$gte", lower.ToJson(), StringComparison.Ordinal);
+            Assert.Contains("$lt", lower.ToJson(), StringComparison.Ordinal);
+            Assert.DoesNotContain("$regularExpression", lower.ToJson(), StringComparison.Ordinal);
+        }
     }
 
     [Fact]

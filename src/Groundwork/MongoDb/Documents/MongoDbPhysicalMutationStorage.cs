@@ -21,10 +21,16 @@ internal static class MongoDbPhysicalMutationStorage
 
     public static string IndexName(
         ExecutableStorageRoute route,
-        BoundedQueryDeclaration query,
+        string logicalIndexIdentity,
         ExecutableStorageObjectRole target) =>
         $"groundwork_mutation_{(target == ExecutableStorageObjectRole.PrimaryStorage ? "p" : "l")}_" +
-        Encoded($"{route.StorageUnit.Value}\u001f{query.IndexIdentity}\u001f{target}");
+        Encoded($"{route.StorageUnit.Value}\u001f{logicalIndexIdentity}\u001f{target}");
+
+    public static string IndexName(
+        ExecutableStorageRoute route,
+        BoundedQueryDeclaration query,
+        ExecutableStorageObjectRole target) =>
+        IndexName(route, query.IndexIdentity, target);
 
     public static IReadOnlyList<string> IndexPaths(
         StorageUnitPhysicalStorage storage,

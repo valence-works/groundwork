@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Store;
 using MongoDB.Bson;
@@ -10,26 +9,31 @@ internal static class MongoDbPhysicalIdentityQuery
 {
     public static FilterDefinition<BsonDocument> Build(
         DocumentQueryComparison comparison,
-        PhysicalQueryPlan plan)
+        PhysicalQueryPlan plan,
+        string? lookupIdentifier = null,
+        string? comparisonIdentifier = null)
     {
+        lookupIdentifier ??= plan.DocumentIdentity.Lookup.Identifier;
+        comparisonIdentifier ??= plan.DocumentIdentity.Comparison.Identifier;
         var bound = PhysicalDocumentIdentityQuery.Bind(plan, comparison);
         if (comparison.Operator == QueryComparisonOperator.In)
         {
             return bound.Values.Count == 0
                 ? Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true)
                 : Builders<BsonDocument>.Filter.Or(bound.Values.Select(value =>
-                    Exact(plan.DocumentIdentity, RequireExact(value), QueryComparisonOperator.Equal)));
+                    Exact(lookupIdentifier, comparisonIdentifier, RequireExact(value), QueryComparisonOperator.Equal)));
         }
 
         var evidence = bound.Values.Single();
         return evidence switch
         {
             PhysicalQueryIdentityValue.Exact exact => Exact(
-                plan.DocumentIdentity,
+                lookupIdentifier,
+                comparisonIdentifier,
                 exact,
                 comparison.Operator),
             PhysicalQueryIdentityValue.Ordered ordered => Ordered(
-                plan.DocumentIdentity.Comparison.Identifier,
+                comparisonIdentifier,
                 ordered.ComparisonKey,
                 comparison.Operator),
             _ => throw new ArgumentOutOfRangeException(nameof(evidence), evidence, null)
@@ -37,7 +41,8 @@ internal static class MongoDbPhysicalIdentityQuery
     }
 
     private static FilterDefinition<BsonDocument> Exact(
-        PhysicalQueryDocumentIdentityBinding identity,
+        string lookupIdentifier,
+        string comparisonIdentifier,
         PhysicalQueryIdentityValue.Exact evidence,
         QueryComparisonOperator operation)
     {
@@ -45,11 +50,11 @@ internal static class MongoDbPhysicalIdentityQuery
         return operation switch
         {
             QueryComparisonOperator.Equal => builder.And(
-                builder.Eq(identity.Lookup.Identifier, evidence.LookupKey),
-                builder.Eq(identity.Comparison.Identifier, evidence.ComparisonKey)),
+                builder.Eq(lookupIdentifier, evidence.LookupKey),
+                builder.Eq(comparisonIdentifier, evidence.ComparisonKey)),
             QueryComparisonOperator.NotEqual => builder.Or(
-                builder.Ne(identity.Lookup.Identifier, evidence.LookupKey),
-                builder.Ne(identity.Comparison.Identifier, evidence.ComparisonKey)),
+                builder.Ne(lookupIdentifier, evidence.LookupKey),
+                builder.Ne(comparisonIdentifier, evidence.ComparisonKey)),
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
         };
     }
@@ -62,15 +67,24 @@ internal static class MongoDbPhysicalIdentityQuery
         var builder = Builders<BsonDocument>.Filter;
         return operation switch
         {
-            QueryComparisonOperator.StartsWith => builder.Regex(
-                field,
-                new BsonRegularExpression("^" + Regex.Escape(comparisonKey))),
+            QueryComparisonOperator.StartsWith => builder.And(
+                builder.Gte(field, comparisonKey),
+                builder.Lt(field, PrefixUpperBound(comparisonKey))),
             QueryComparisonOperator.GreaterThan => builder.Gt(field, comparisonKey),
             QueryComparisonOperator.GreaterThanOrEqual => builder.Gte(field, comparisonKey),
             QueryComparisonOperator.LessThan => builder.Lt(field, comparisonKey),
             QueryComparisonOperator.LessThanOrEqual => builder.Lte(field, comparisonKey),
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
         };
+    }
+
+    private static string PrefixUpperBound(string prefix)
+    {
+        if (prefix.Length == 0)
+            throw new InvalidOperationException("Document identity prefix evidence cannot be empty.");
+        var upper = prefix.ToCharArray();
+        upper[^1]++;
+        return new string(upper);
     }
 
     private static PhysicalQueryIdentityValue.Exact RequireExact(PhysicalQueryIdentityValue value) =>
