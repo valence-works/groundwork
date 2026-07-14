@@ -72,11 +72,17 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         var lowerEvidence = lower.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
         var upperEvidence = upper.Parameters.Where(parameter => parameter.Name.StartsWith('q')).ToArray();
         Assert.Equal(lowerEvidence, upperEvidence);
-        Assert.Single(lowerEvidence);
-        Assert.StartsWith(
-            "00004D00004500005400005200004900004300002D01040000002D0000C9",
-            Assert.IsType<string>(lowerEvidence[0].Value),
-            StringComparison.Ordinal);
+        const string comparisonKey = "00004D00004500005400005200004900004300002D01040000002D0000C9";
+        Assert.Equal(comparisonKey, Assert.IsType<string>(lowerEvidence[0].Value));
+        if (operation == PortableQueryOperation.StartsWith)
+        {
+            Assert.Equal(2, lowerEvidence.Length);
+            Assert.Equal(
+                comparisonKey[..^1] + (char)(comparisonKey[^1] + 1),
+                Assert.IsType<string>(lowerEvidence[1].Value));
+        }
+        else
+            Assert.Single(lowerEvidence);
     }
 
     [Fact]
