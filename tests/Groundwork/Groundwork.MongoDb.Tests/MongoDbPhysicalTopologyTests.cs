@@ -49,6 +49,25 @@ public sealed class MongoDbPhysicalTopologyTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Physical_open_factory_rejects_a_fresh_standalone_before_inspecting_or_creating_database_state()
+    {
+        var databaseName = $"groundwork_standalone_open_{Guid.NewGuid():N}";
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+
+        var exception = await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
+            MongoDbDocumentStoreFactory.OpenPhysicalAsync(
+                container.GetConnectionString(),
+                databaseName,
+                model.Manifest,
+                model.Provider,
+                DocumentStoreAccess.Scoped(new("tenant-a"))));
+
+        Assert.Equal(["workItem"], exception.Units);
+        using var names = await Database(databaseName).ListCollectionNamesAsync();
+        Assert.Empty(await names.ToListAsync());
+    }
+
+    [Fact]
     public async Task Conventional_factory_rejects_a_fresh_standalone_before_creating_database_state()
     {
         var databaseName = $"gw_conv_standalone_{Guid.NewGuid():N}";
