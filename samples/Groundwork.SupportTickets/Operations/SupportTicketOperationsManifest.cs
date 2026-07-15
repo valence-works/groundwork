@@ -72,7 +72,10 @@ public static class SupportTicketOperationsManifest
     public static ProviderCapabilityReport OperationalProvider() =>
         OperationalProvider(new ProviderIdentity("groundwork-sqlite-operational", "1.0.0"));
 
-    /// <summary>A portable document-only provider supports no operational requirements.</summary>
+    /// <summary>
+    /// A portable document provider supports atomic document commits, but not the queue and lease
+    /// semantics required by the operational storage units.
+    /// </summary>
     public static ProviderCapabilityReport DocumentOnlyProvider() =>
         SqliteGroundworkCapabilities.Runtime(new ProviderIdentity("groundwork-document-only", "1.0.0"));
 

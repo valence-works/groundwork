@@ -173,11 +173,12 @@ public sealed class SupportTicketOperationsTests
         // Same operational requirements: Supported on an operational provider...
         Assert.IsType<ProviderFit.Supported>(host.OperationalFit.OperationalProvider);
 
-        // ...Unsupported on a portable document-only provider, with the missing capabilities reported.
+        // ...Unsupported on a portable document provider, with only its absent queue and lease
+        // semantics reported. Atomic document commit is a real capability of that provider.
         var unsupported = Assert.IsType<ProviderFit.Unsupported>(host.OperationalFit.DocumentOnlyProvider);
         Assert.Contains(WellKnownCapabilities.OrderedConsumption, unsupported.MissingRequirements);
         Assert.Contains(WellKnownCapabilities.AtomicClaim, unsupported.MissingRequirements);
         Assert.Contains(WellKnownCapabilities.FencedOwnership, unsupported.MissingRequirements);
-        Assert.Contains(WellKnownCapabilities.AtomicCommit, unsupported.MissingRequirements);
+        Assert.DoesNotContain(WellKnownCapabilities.AtomicCommit, unsupported.MissingRequirements);
     }
 }

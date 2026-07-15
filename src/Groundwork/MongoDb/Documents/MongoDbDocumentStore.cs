@@ -24,6 +24,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     private readonly IStorageScopeObserver scopeObserver;
     private readonly Func<CancellationToken, Task<bool>> supportsTransactionsAsync;
     private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
+    private readonly Func<bool> isTransactionSupportKnown;
 
     public DocumentStoreAccess Access => access;
 
@@ -32,7 +33,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         StorageManifest manifest,
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver = null)
-        : this(database, manifest, access, scopeObserver, null, null)
+        : this(database, manifest, access, scopeObserver, null, null, null)
     {
     }
 
@@ -42,7 +43,8 @@ public sealed class MongoDbDocumentStore : IDocumentStore
         DocumentStoreAccess access,
         IStorageScopeObserver? scopeObserver,
         Func<CancellationToken, Task<bool>>? supportsTransactionsAsync,
-        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync)
+        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync,
+        Func<bool>? isTransactionSupportKnown = null)
     {
         this.database = database ?? throw new ArgumentNullException(nameof(database));
         this.manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
@@ -53,6 +55,8 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             (ct => MongoDbTransactionTopology.SupportsTransactionsAsync(this.database, ct));
         this.startSessionAsync = startSessionAsync ??
             (ct => this.database.Client.StartSessionAsync(cancellationToken: ct));
+        this.isTransactionSupportKnown = isTransactionSupportKnown ??
+            (() => MongoDbTransactionTopology.IsKnownTransactionCapable(this.database.Client.Cluster.Description));
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
     }
 
@@ -179,7 +183,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
     }
 
     public TransactionBoundary TransactionBoundary =>
-        MongoDbTransactionTopology.IsKnownTransactionCapable(database.Client.Cluster.Description)
+        isTransactionSupportKnown()
             ? TransactionBoundary.CrossUnitAtomic
             : TransactionBoundary.PerOperation;
 

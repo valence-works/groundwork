@@ -29,6 +29,28 @@ public sealed class MongoDbDocumentStoreTests : IAsyncLifetime
     public void DocumentStoreConstructionRequiresFactoryAdmission() =>
         Assert.Empty(typeof(MongoDbDocumentStore).GetConstructors());
 
+    [Fact]
+    public async Task Factory_admits_atomic_commit_manifest_on_a_replica_set()
+    {
+        var databaseName = $"groundwork_atomic_manifest_{Guid.NewGuid():N}";
+        var client = new MongoClient(container.GetConnectionString());
+        try
+        {
+            await using var handle = await MongoDbDocumentStoreFactory.CreateAsync(
+                container.GetConnectionString(),
+                databaseName,
+                MongoDbTestManifests.AtomicCommitManifest(),
+                MongoDbTestManifests.Provider,
+                DocumentStoreAccess.Global);
+
+            Assert.Equal(Groundwork.Core.Transactions.TransactionBoundary.CrossUnitAtomic, handle.Store.TransactionBoundary);
+        }
+        finally
+        {
+            await client.DropDatabaseAsync(databaseName);
+        }
+    }
+
     [Theory]
     [InlineData(StorageIdentityKind.Guid)]
     [InlineData(StorageIdentityKind.Composite)]
