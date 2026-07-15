@@ -2,6 +2,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Relational.Physicalization;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -89,7 +90,7 @@ public sealed class LegacyPhysicalStorageBridgeTests
     }
 
     [Fact]
-    public void PortableUnitPreservesPerIndexOptimizedLinkedProjection()
+    public void PortableUnitPreservesPerIndexOptimizedNullableLinkedProjection()
     {
         var template = SampleManifests.MetadataManifest().StorageUnits.Single();
         var unit = template with
@@ -111,13 +112,41 @@ public sealed class LegacyPhysicalStorageBridgeTests
         var projected = Assert.Single(policy.Definition.ProjectedColumns);
         Assert.Equal("by-key", projected.LogicalName);
         Assert.Equal("key", projected.Path);
+        Assert.True(projected.IsNullable);
         Assert.Equal("configurationDocument_projection", policy.Definition.LinkedProjectionLogicalName);
         var physicalIndex = Assert.Single(policy.Definition.Indexes);
         Assert.True(physicalIndex.IsUnique);
+        Assert.Equal(MissingValueBehavior.Excluded, physicalIndex.MissingValueBehavior);
         Assert.Collection(
             physicalIndex.Columns,
             column => Assert.Equal("storage_scope", column.ColumnLogicalName),
             column => Assert.Equal("by-key", column.ColumnLogicalName));
+
+        var binding = new SharedStorageBinding("legacy-documents");
+        var manifest = SampleManifests.MetadataManifest() with
+        {
+            StorageUnits = [unit with { PhysicalStorage = result.PhysicalStorage }],
+            SharedDocumentStorages =
+            [
+                new SharedDocumentStorageDefinition(
+                    binding,
+                    "legacy_documents",
+                    new DocumentEnvelopeDefinition())
+            ]
+        };
+        var resolution = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+        Assert.True(resolution.IsValid, string.Join("; ", resolution.Diagnostics.Select(x => x.Message)));
+        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
+        Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(x => x.Message)));
+
+        var values = RelationalPhysicalProjectionValues.Read(
+            "{}",
+            Assert.Single(compilation.Routes).ProjectedColumns);
+
+        Assert.Null(values["by-key"]);
     }
 
     [Fact]
