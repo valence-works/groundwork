@@ -688,8 +688,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         if (retained is null)
             return null;
         MongoDbPhysicalDocumentIdentity.ThrowIfCollision(route, identity, retained);
-        throw new InvalidDataException(
-            $"MongoDB physical identity lookup for '{route.StorageUnit.Value}' returned inconsistent comparison evidence.");
+
+        // A matching identity may be inserted after the exact read reports no document and before
+        // the collision-evidence fallback runs. The retained comparison key is the authoritative
+        // exact evidence in that race; a different comparison key still fails closed above.
+        return retained;
     }
 
     private async Task<DocumentStoreWriteResult> ClassifyDuplicateIdentityAsync(

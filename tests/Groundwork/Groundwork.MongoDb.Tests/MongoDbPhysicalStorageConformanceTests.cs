@@ -230,6 +230,65 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Load_accepts_same_comparison_evidence_when_insert_commits_between_identity_reads()
+    {
+        var databaseName = $"groundwork_{Guid.NewGuid():N}";
+        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var materializationDatabase = new MongoClient(container.GetConnectionString()).GetDatabase(databaseName);
+        await new MongoDbGroundworkMaterializer(materializationDatabase).MaterializeAsync(model);
+        var route = Assert.Single(model.Routes);
+        using var allowLookupFallback = new ManualResetEventSlim();
+        var exactMissed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var armed = 0;
+        var observedExactMiss = 0;
+        var loaderSettings = MongoClientSettings.FromConnectionString(container.GetConnectionString());
+        loaderSettings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(@event =>
+        {
+            if (Volatile.Read(ref armed) == 0 ||
+                !string.Equals(@event.CommandName, "find", StringComparison.Ordinal) ||
+                !IsEmptyFirstBatch(@event.Reply) ||
+                Interlocked.Exchange(ref observedExactMiss, 1) != 0)
+            {
+                return;
+            }
+
+            exactMissed.TrySetResult();
+            allowLookupFallback.Wait(TimeSpan.FromSeconds(10));
+        });
+        var access = DocumentStoreAccess.Scoped(new("tenant-a"));
+        var loader = new MongoDbPhysicalDocumentStore(
+            new MongoClient(loaderSettings).GetDatabase(databaseName),
+            model,
+            access);
+        var writer = new MongoDbPhysicalDocumentStore(
+            new MongoClient(container.GetConnectionString()).GetDatabase(databaseName),
+            model,
+            access);
+
+        Volatile.Write(ref armed, 1);
+        var load = loader.LoadAsync("workItem", "contended");
+        try
+        {
+            await exactMissed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await writer.SaveAsync(new SaveDocumentRequest(
+                "workItem",
+                "contended",
+                "1",
+                """{"status":"open"}""",
+                ExpectedVersion: 0))).Status);
+        }
+        finally
+        {
+            allowLookupFallback.Set();
+        }
+
+        var loaded = await load;
+        Assert.NotNull(loaded);
+        Assert.Equal("contended", loaded.Id);
+        Assert.Equal(route.StorageUnit.Value, loaded.DocumentKind);
+    }
+
+    [Fact]
     public async Task Unit_of_work_identity_conflict_is_terminal_and_rolls_back_prior_writes()
     {
         var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
@@ -2011,6 +2070,13 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         };
         return MongoDbPhysicalStorageModel.Compile(manifest);
     }
+
+    private static bool IsEmptyFirstBatch(BsonDocument reply) =>
+        reply.TryGetValue("cursor", out var cursorValue) &&
+        cursorValue.IsBsonDocument &&
+        cursorValue.AsBsonDocument.TryGetValue("firstBatch", out var batchValue) &&
+        batchValue.IsBsonArray &&
+        batchValue.AsBsonArray.Count == 0;
 
     private sealed class LeaseLossBlockingExecutor(IPhysicalSchemaExecutor inner) : IPhysicalSchemaExecutor
     {
