@@ -30,7 +30,7 @@ public sealed class PostgreSqlPhysicalStorageContainer : IAsyncLifetime
     public Task DisposeAsync() => Container.DisposeAsync().AsTask();
 }
 
-public sealed class PostgreSqlRelationalPhysicalStorageConformanceTests(
+public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
     PostgreSqlPhysicalStorageContainer fixture)
     : RelationalServerPhysicalIdentityConformance, IClassFixture<PostgreSqlPhysicalStorageContainer>
 {

@@ -4,8 +4,6 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Materialization;
-using System.Security.Cryptography;
-using System.Text;
 
 namespace Groundwork.PostgreSql;
 
@@ -22,9 +20,9 @@ public static class PostgreSqlGroundworkCapabilities
 
     public static ProviderIdentity Provider { get; } = new("groundwork-postgresql", "1.0.0");
 
-    /// <summary>PostgreSQL identifier normalization with its native 63-byte UTF-8 limit.</summary>
+    /// <summary>PostgreSQL identifier normalization with its schema-global relation namespace and native 63-byte UTF-8 limit.</summary>
     public static IProviderPhysicalNameNormalizer PhysicalNames { get; } =
-        new DelegateProviderPhysicalNameNormalizer(context => NormalizePhysicalName(context.LogicalName));
+        PostgreSqlPhysicalNameNormalizer.Instance;
 
     public static ProviderCapabilityReport Runtime() => Runtime(Provider);
 
@@ -43,23 +41,4 @@ public static class PostgreSqlGroundworkCapabilities
     public static MaterializationCapabilityReport Materialization(ProviderIdentity provider) =>
         new(provider, MaterializationOperations, SupportsSchemaHistory: true);
 
-    private static string NormalizePhysicalName(string value)
-    {
-        const int maximumBytes = 63;
-        if (Encoding.UTF8.GetByteCount(value) <= maximumBytes)
-            return value;
-        var suffix = "_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..12].ToLowerInvariant();
-        var prefixBudget = maximumBytes - Encoding.UTF8.GetByteCount(suffix);
-        var builder = new StringBuilder();
-        var used = 0;
-        foreach (var rune in value.EnumerateRunes())
-        {
-            var bytes = rune.Utf8SequenceLength;
-            if (used + bytes > prefixBudget)
-                break;
-            builder.Append(rune);
-            used += bytes;
-        }
-        return builder.Append(suffix).ToString();
-    }
 }
