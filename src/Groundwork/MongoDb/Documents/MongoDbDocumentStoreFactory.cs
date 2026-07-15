@@ -12,6 +12,84 @@ namespace Groundwork.MongoDb.Documents;
 
 public static class MongoDbDocumentStoreFactory
 {
+    /// <summary>
+    /// Opens a physical document store only when the compiled manifest/provider target has already
+    /// been applied exactly. This operation inspects schema state but never applies or mutates it.
+    /// The returned handle owns the client created from <paramref name="connectionString"/>.
+    /// </summary>
+    public static async Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenPhysicalAsync(
+        string connectionString,
+        string databaseName,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        MongoDbPhysicalDocumentStoreOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
+        var validatedOptions = options ?? new MongoDbPhysicalDocumentStoreOptions();
+        validatedOptions.Validate();
+        var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
+
+        var client = new MongoClient(connectionString);
+        var disposableClient = (object)client as IDisposable;
+        try
+        {
+            var database = client.GetDatabase(databaseName);
+            return await OpenAdmittedPhysicalAsync(
+                database,
+                disposableClient,
+                model,
+                access,
+                scopeObserver,
+                validatedOptions,
+                cancellationToken);
+        }
+        catch
+        {
+            disposableClient?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Opens a physical document store only when the compiled manifest/provider target has already
+    /// been applied exactly. This operation inspects schema state but never applies or mutates it.
+    /// The caller retains ownership of <paramref name="database"/> and its client.
+    /// </summary>
+    public static Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenPhysicalAsync(
+        IMongoDatabase database,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        MongoDbPhysicalDocumentStoreOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
+        var validatedOptions = options ?? new MongoDbPhysicalDocumentStoreOptions();
+        validatedOptions.Validate();
+        var model = MongoDbPhysicalStorageModel.Compile(manifest, provider, namePolicy);
+        return OpenAdmittedPhysicalAsync(
+            database,
+            client: null,
+            model,
+            access,
+            scopeObserver,
+            validatedOptions,
+            cancellationToken);
+    }
+
     public static async Task<MongoDbPhysicalDocumentStoreHandle> CreatePhysicalAsync(
         string connectionString,
         string databaseName,
@@ -116,6 +194,37 @@ public static class MongoDbDocumentStoreFactory
         new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
             .Plan(manifest, MongoDbGroundworkCapabilities.Runtime(provider), MongoDbGroundworkCapabilities.Materialization(provider));
 
+    private static async Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenAdmittedPhysicalAsync(
+        IMongoDatabase database,
+        IDisposable? client,
+        MongoDbPhysicalStorageModel model,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver,
+        MongoDbPhysicalDocumentStoreOptions options,
+        CancellationToken cancellationToken)
+    {
+        var transactionCapability = MongoDbTransactionCapability.ForDatabase(database);
+        await transactionCapability.EnsureSupportedAsync(
+            DocumentKinds(model),
+            "physical storage",
+            cancellationToken);
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database).InspectHistoryAsync(
+            model.Target,
+            cancellationToken);
+        EnsureOpenAdmitted(model, inspection);
+        return new MongoDbPhysicalDocumentStoreOpenHandle(
+            client,
+            model,
+            inspection,
+            CreatePhysicalStore(
+                database,
+                model,
+                access,
+                scopeObserver,
+                options,
+                transactionCapability));
+    }
+
     private static async Task<MongoDbPhysicalDocumentStoreHandle> CreateAdmittedPhysicalAsync(
         IMongoDatabase database,
         IDisposable? client,
@@ -126,12 +235,8 @@ public static class MongoDbDocumentStoreFactory
         CancellationToken cancellationToken)
     {
         var transactionCapability = MongoDbTransactionCapability.ForDatabase(database);
-        var documentKinds = model.Manifest.StorageUnits
-            .Select(unit => unit.Identity.Value)
-            .Order(StringComparer.Ordinal)
-            .ToArray();
         await transactionCapability.EnsureSupportedAsync(
-            documentKinds,
+            DocumentKinds(model),
             "physical storage",
             cancellationToken);
         var application = await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
@@ -143,16 +248,63 @@ public static class MongoDbDocumentStoreFactory
             client,
             model,
             application,
-            new MongoDbPhysicalDocumentStore(
+            CreatePhysicalStore(
                 database,
                 model,
                 access,
                 scopeObserver,
                 options,
-                TimeProvider.System,
-                hooks: null,
-                startSessionAsync: null,
                 transactionCapability));
+    }
+
+    private static string[] DocumentKinds(MongoDbPhysicalStorageModel model) =>
+        model.Manifest.StorageUnits
+            .Select(unit => unit.Identity.Value)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+    private static MongoDbPhysicalDocumentStore CreatePhysicalStore(
+        IMongoDatabase database,
+        MongoDbPhysicalStorageModel model,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver,
+        MongoDbPhysicalDocumentStoreOptions options,
+        MongoDbTransactionCapability transactionCapability) =>
+        new(
+            database,
+            model,
+            access,
+            scopeObserver,
+            options,
+            TimeProvider.System,
+            hooks: null,
+            startSessionAsync: null,
+            transactionCapability);
+
+    private static void EnsureOpenAdmitted(
+        MongoDbPhysicalStorageModel model,
+        PhysicalSchemaInspectionResult inspection)
+    {
+        if (!inspection.IsAppliedSchemaValid)
+        {
+            throw new InvalidOperationException(
+                "MongoDB physical document store admission found drift in the applied schema.");
+        }
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(
+            model.Target,
+            inspection.History,
+            DateTimeOffset.UnixEpoch);
+        if (!plan.IsApplicable || plan.Operations.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "MongoDB physical document store admission requires the exact target to be applied before the store is opened.");
+        }
+
+        EnsureExactAppliedState(
+            model,
+            inspection.History.AppliedState ?? throw new InvalidOperationException(
+                "MongoDB physical document store admission requires durable applied schema state."));
     }
 
     private static void EnsureAdmitted(
@@ -175,6 +327,13 @@ public static class MongoDbDocumentStoreFactory
 
         var applied = application.AppliedState ?? throw new InvalidOperationException(
             "MongoDB physical document store admission requires durable applied schema state.");
+        EnsureExactAppliedState(model, applied);
+    }
+
+    private static void EnsureExactAppliedState(
+        MongoDbPhysicalStorageModel model,
+        PhysicalSchemaAppliedState applied)
+    {
         if (applied.ManifestIdentity != model.Manifest.Identity ||
             applied.ManifestVersion != model.Manifest.Version ||
             applied.Provider != model.Provider ||
@@ -201,32 +360,60 @@ public static class MongoDbDocumentStoreFactory
     }
 }
 
+/// <summary>
+/// Owns a physical document store opened from an exactly applied MongoDB schema target and exposes
+/// the point-in-time inspection evidence used for admission.
+/// </summary>
+public sealed class MongoDbPhysicalDocumentStoreOpenHandle(
+    IDisposable? client,
+    MongoDbPhysicalStorageModel model,
+    PhysicalSchemaInspectionResult schemaInspection,
+    MongoDbPhysicalDocumentStore store) : IAsyncDisposable
+{
+    private readonly MongoDbClientLease clientLease = new(client);
+
+    public MongoDbPhysicalStorageModel Model { get; } = model;
+
+    public PhysicalSchemaInspectionResult SchemaInspection { get; } = schemaInspection;
+
+    public MongoDbPhysicalDocumentStore Store { get; } = store;
+
+    public ValueTask DisposeAsync() => clientLease.DisposeAsync();
+}
+
 public sealed class MongoDbPhysicalDocumentStoreHandle(
     IDisposable? client,
     MongoDbPhysicalStorageModel model,
     PhysicalSchemaApplicationResult schemaApplication,
     MongoDbPhysicalDocumentStore store) : IAsyncDisposable
 {
+    private readonly MongoDbClientLease clientLease = new(client);
+
     public MongoDbPhysicalStorageModel Model { get; } = model;
 
     public PhysicalSchemaApplicationResult SchemaApplication { get; } = schemaApplication;
 
     public MongoDbPhysicalDocumentStore Store { get; } = store;
 
-    public ValueTask DisposeAsync()
-    {
-        client?.Dispose();
-        return ValueTask.CompletedTask;
-    }
+    public ValueTask DisposeAsync() => clientLease.DisposeAsync();
 }
 
 public sealed class MongoDbDocumentStoreHandle(IDisposable? client, MongoDbDocumentStore store) : IAsyncDisposable
 {
+    private readonly MongoDbClientLease clientLease = new(client);
+
     public MongoDbDocumentStore Store { get; } = store;
+
+    public ValueTask DisposeAsync() => clientLease.DisposeAsync();
+}
+
+internal sealed class MongoDbClientLease(IDisposable? client) : IAsyncDisposable
+{
+    private IDisposable? disposableClient = client;
 
     public ValueTask DisposeAsync()
     {
-        client?.Dispose();
+        Interlocked.Exchange(ref disposableClient, null)?.Dispose();
         return ValueTask.CompletedTask;
     }
 }
