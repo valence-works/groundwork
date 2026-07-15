@@ -6,6 +6,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Scoping;
+using Groundwork.PostgreSql;
 using Groundwork.SchemaTool;
 using Microsoft.Data.SqlClient;
 using MongoDB.Driver;
@@ -351,16 +352,19 @@ public sealed class SchemaToolProviderParityTests
 
     private static async Task DropPostgreSqlIndexAsync(string connectionString)
     {
+        var indexName = GetPostgreSqlIndexName("schema_tool_provider_documents-by-category");
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText = "DROP INDEX \"schema_tool_provider_documents-by-category\";";
+        command.CommandText = $"DROP INDEX {new NpgsqlCommandBuilder().QuoteIdentifier(indexName)};";
         await command.ExecuteNonQueryAsync();
     }
 
     private static async Task<(bool AppliedIndexExists, bool PendingIndexExists)> ReadPostgreSqlIndexStateAsync(
         string connectionString)
     {
+        var appliedIndexName = GetPostgreSqlIndexName("schema_tool_provider_documents-by-category");
+        var pendingIndexName = GetPostgreSqlIndexName("schema_tool_provider_documents-by-priority");
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
@@ -368,16 +372,24 @@ public sealed class SchemaToolProviderParityTests
             SELECT indexname
             FROM pg_indexes
             WHERE schemaname = current_schema()
-              AND indexname IN ('schema_tool_provider_documents-by-category', 'schema_tool_provider_documents-by-priority');
+              AND indexname IN (@applied, @pending);
             """;
+        command.Parameters.AddWithValue("applied", appliedIndexName);
+        command.Parameters.AddWithValue("pending", pendingIndexName);
         var names = new HashSet<string>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
             names.Add(reader.GetString(0));
         return (
-            names.Contains("schema_tool_provider_documents-by-category"),
-            names.Contains("schema_tool_provider_documents-by-priority"));
+            names.Contains(appliedIndexName),
+            names.Contains(pendingIndexName));
     }
+
+    private static string GetPostgreSqlIndexName(string logicalName) =>
+        PostgreSqlGroundworkCapabilities.PhysicalNames.Normalize(new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("documents"),
+            PhysicalObjectKind.PhysicalIndex,
+            logicalName));
 
     private static async Task DropMongoDbIndexAsync(string connectionString, string database)
     {
