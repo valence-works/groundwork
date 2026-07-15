@@ -8,6 +8,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Scoping;
 using Groundwork.SchemaTool;
+using Groundwork.Sqlite;
 using Microsoft.Data.Sqlite;
 using Xunit;
 
@@ -15,6 +16,12 @@ namespace Groundwork.SchemaTool.Tests;
 
 public sealed class GroundworkSchemaCliTests : IDisposable
 {
+    private static readonly string SqliteByCategoryIndex = SqliteGroundworkCapabilities.PhysicalNames.Normalize(
+        new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("documents"),
+            PhysicalObjectKind.PhysicalIndex,
+            "by-category"));
+
     private readonly string directory = Path.Combine(Path.GetTempPath(), $"groundwork-schema-tool-{Guid.NewGuid():N}");
     private readonly StringWriter output = new();
     private readonly StringWriter error = new();
@@ -219,7 +226,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         {
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
-            command.CommandText = "DROP INDEX \"by-category\";";
+            command.CommandText = $"DROP INDEX \"{SqliteByCategoryIndex}\";";
             await command.ExecuteNonQueryAsync();
         }
 
@@ -234,7 +241,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal(
             "GW-CLI-012",
             Assert.Single(validation.RootElement.GetProperty("diagnostics").EnumerateArray()).GetProperty("code").GetString());
-        Assert.False(await IndexExistsAsync(database, "by-category"));
+        Assert.False(await IndexExistsAsync(database, SqliteByCategoryIndex));
         Assert.Equal(string.Empty, error.ToString());
     }
 
@@ -253,7 +260,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         {
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
-            command.CommandText = "DROP INDEX \"by-category\";";
+            command.CommandText = $"DROP INDEX \"{SqliteByCategoryIndex}\";";
             await command.ExecuteNonQueryAsync();
         }
 
@@ -273,7 +280,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
             operation => operation.GetProperty("kind").GetString() == "AddProjectedColumn");
         Assert.NotNull(validation.RootElement.GetProperty("appliedTargetFingerprint").GetString());
         Assert.True(validation.RootElement.GetProperty("appliedOperations").GetArrayLength() > 0);
-        Assert.False(await IndexExistsAsync(database, "by-category"));
+        Assert.False(await IndexExistsAsync(database, SqliteByCategoryIndex));
         Assert.False(await ColumnExistsAsync(database, "schema_tool_documents", "priority"));
         Assert.Equal(string.Empty, error.ToString());
     }
