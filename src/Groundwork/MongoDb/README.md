@@ -41,9 +41,12 @@ transactional diagnostic-record provider.
   page, and linked-primary hydration share one snapshot attempt; transient failures retry the whole
   attempt on a fresh session within the same attempt and elapsed-time budgets.
 - Exposes native `explain` evidence for the resolved collection and selected physical index.
-- Admits physical document stores only through `MongoDbDocumentStoreFactory.CreatePhysicalAsync`.
-  The factory compiles the model, proves replica-set or sharded transaction support, applies or
-  validates the durable physical-schema state, and only then returns a store handle. The handle's
+- Admits physical document stores only through `MongoDbDocumentStoreFactory.CreatePhysicalAsync`
+  or its validate-only `OpenPhysicalAsync` counterpart. The factory compiles the model, proves
+  replica-set or sharded transaction support, applies or validates the durable physical-schema
+  state, and only then returns a store handle. A validate-only handle can create additional
+  immutable access-bound stores over the same admitted client, model, and transaction runtime
+  without repeating provider admission; the handle must outlive those stores. The apply handle's
   `SchemaApplication` result reports whether admission applied work or followed the restart-safe
   `NoChanges` path against matching durable state; physical store constructors remain internal.
 - Executes named bounded transitions and deletes through set-based `UpdateMany`/`DeleteMany`

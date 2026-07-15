@@ -25,15 +25,16 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
     private const string ContentField = MongoDbPhysicalStorageFields.NativeContent;
     private const string CreatedField = MongoDbPhysicalStorageFields.CreatedAt;
     private const string UpdatedField = MongoDbPhysicalStorageFields.UpdatedAt;
-    private readonly IMongoDatabase database;
-    private readonly MongoDbPhysicalStorageModel model;
+    private readonly MongoDbPhysicalDocumentStoreRuntime runtime;
     private readonly IStorageScopeObserver scopeObserver;
     private readonly IReadOnlyDictionary<string, PhysicalQueryDocumentStore> queryStores;
-    private readonly MongoDbPhysicalDocumentStoreOptions options;
-    private readonly TimeProvider timeProvider;
-    private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
-    private readonly Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync;
-    private readonly MongoDbTransactionCapability transactionCapability;
+    private IMongoDatabase database => runtime.Database;
+    private MongoDbPhysicalStorageModel model => runtime.Model;
+    private MongoDbPhysicalDocumentStoreOptions options => runtime.Options;
+    private TimeProvider timeProvider => runtime.TimeProvider;
+    private MongoDbPhysicalDocumentStoreExecutionHooks hooks => runtime.Hooks;
+    private Func<CancellationToken, Task<IClientSessionHandle>> startSessionAsync => runtime.StartSessionAsync;
+    private MongoDbTransactionCapability transactionCapability => runtime.TransactionCapability;
 
     internal MongoDbPhysicalDocumentStore(
         IMongoDatabase database,
@@ -55,21 +56,28 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         MongoDbPhysicalDocumentStoreExecutionHooks? hooks,
         Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync = null,
         MongoDbTransactionCapability? transactionCapability = null)
+        : this(
+            new MongoDbPhysicalDocumentStoreRuntime(
+                database,
+                model,
+                options,
+                timeProvider,
+                hooks,
+                startSessionAsync,
+                transactionCapability),
+            access,
+            scopeObserver)
     {
-        ArgumentNullException.ThrowIfNull(database);
-        this.database = database
-            .WithReadConcern(ReadConcern.Majority)
-            .WithWriteConcern(WriteConcern.WMajority);
-        this.model = model ?? throw new ArgumentNullException(nameof(model));
+    }
+
+    private MongoDbPhysicalDocumentStore(
+        MongoDbPhysicalDocumentStoreRuntime runtime,
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver)
+    {
+        this.runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         Access = access ?? throw new ArgumentNullException(nameof(access));
         this.scopeObserver = scopeObserver ?? NullStorageScopeObserver.Instance;
-        this.options = options ?? new MongoDbPhysicalDocumentStoreOptions();
-        this.options.Validate();
-        this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
-        this.hooks = hooks ?? MongoDbPhysicalDocumentStoreExecutionHooks.None;
-        this.startSessionAsync = startSessionAsync ??
-            (ct => this.database.Client.StartSessionAsync(cancellationToken: ct));
-        this.transactionCapability = transactionCapability ?? MongoDbTransactionCapability.ForDatabase(this.database);
         DocumentStoreScopeResolver.ObserveAcquisition(access, this.scopeObserver);
         queryStores = model.Routes.ToFrozenDictionary(
             route => route.StorageUnit.Value,
@@ -808,6 +816,11 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
 
     internal IMongoDatabase Database => database;
 
+    internal MongoDbPhysicalDocumentStore WithAccess(
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver) =>
+        new(runtime, access, scopeObserver);
+
     internal string ManifestIdentity => model.Manifest.Identity.Value;
 
     internal StorageManifest Manifest => model.Manifest;
@@ -1016,6 +1029,40 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
             session.Dispose();
         }
     }
+}
+
+internal sealed class MongoDbPhysicalDocumentStoreRuntime
+{
+    public MongoDbPhysicalDocumentStoreRuntime(
+        IMongoDatabase database,
+        MongoDbPhysicalStorageModel model,
+        MongoDbPhysicalDocumentStoreOptions? options,
+        TimeProvider timeProvider,
+        MongoDbPhysicalDocumentStoreExecutionHooks? hooks,
+        Func<CancellationToken, Task<IClientSessionHandle>>? startSessionAsync,
+        MongoDbTransactionCapability? transactionCapability)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+        Database = database
+            .WithReadConcern(ReadConcern.Majority)
+            .WithWriteConcern(WriteConcern.WMajority);
+        Model = model ?? throw new ArgumentNullException(nameof(model));
+        Options = options ?? new MongoDbPhysicalDocumentStoreOptions();
+        Options.Validate();
+        TimeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        Hooks = hooks ?? MongoDbPhysicalDocumentStoreExecutionHooks.None;
+        StartSessionAsync = startSessionAsync ??
+            (ct => Database.Client.StartSessionAsync(cancellationToken: ct));
+        TransactionCapability = transactionCapability ?? MongoDbTransactionCapability.ForDatabase(Database);
+    }
+
+    public IMongoDatabase Database { get; }
+    public MongoDbPhysicalStorageModel Model { get; }
+    public MongoDbPhysicalDocumentStoreOptions Options { get; }
+    public TimeProvider TimeProvider { get; }
+    public MongoDbPhysicalDocumentStoreExecutionHooks Hooks { get; }
+    public Func<CancellationToken, Task<IClientSessionHandle>> StartSessionAsync { get; }
+    public MongoDbTransactionCapability TransactionCapability { get; }
 }
 
 internal sealed record MongoDbPhysicalDocumentStoreExecutionHooks(
