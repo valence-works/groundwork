@@ -178,10 +178,26 @@ public static class MongoDbDocumentStoreFactory
         try
         {
             var database = client.GetDatabase(databaseName);
-            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
-                CreateMaterializationPlan(manifest, provider),
+            var transactionCapability = MongoDbTransactionCapability.ForDatabase(database);
+            await transactionCapability.EnsureSupportedAsync(
+                DocumentKinds(manifest),
+                "document storage",
                 cancellationToken);
-            return new MongoDbDocumentStoreHandle(disposableClient, new MongoDbDocumentStore(database, manifest, access, scopeObserver));
+            var runtimeCapabilities = MongoDbGroundworkCapabilities.RuntimeForTransactionCapableDeployment(provider);
+
+            await new MongoDbGroundworkMaterializer(database).MaterializeAsync(
+                CreateMaterializationPlan(manifest, runtimeCapabilities),
+                cancellationToken);
+            return new MongoDbDocumentStoreHandle(
+                disposableClient,
+                new MongoDbDocumentStore(
+                    database,
+                    manifest,
+                    access,
+                    scopeObserver,
+                    transactionCapability.SupportsTransactionsAsync,
+                    startSessionAsync: null,
+                    isTransactionSupportKnown: () => transactionCapability.IsKnownSupported));
         }
         catch
         {
@@ -190,9 +206,20 @@ public static class MongoDbDocumentStoreFactory
         }
     }
 
-    private static MaterializationPlan CreateMaterializationPlan(StorageManifest manifest, ProviderIdentity provider) =>
+    private static MaterializationPlan CreateMaterializationPlan(
+        StorageManifest manifest,
+        ProviderCapabilityReport runtimeCapabilities) =>
         new MaterializationPlanner(new StorageManifestValidator(), new ProviderCapabilityValidator())
-            .Plan(manifest, MongoDbGroundworkCapabilities.Runtime(provider), MongoDbGroundworkCapabilities.Materialization(provider));
+            .Plan(
+                manifest,
+                runtimeCapabilities,
+                MongoDbGroundworkCapabilities.Materialization(runtimeCapabilities.Provider));
+
+    private static string[] DocumentKinds(StorageManifest manifest) =>
+        manifest.StorageUnits
+            .Select(unit => unit.Identity.Value)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
     private static async Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenAdmittedPhysicalAsync(
         IMongoDatabase database,

@@ -42,8 +42,8 @@ public static class SqlServerGroundworkCapabilities
     public static ProviderCapabilityReport Runtime(ProviderIdentity provider) =>
         new(
             provider,
-            new HashSet<CapabilityId>(),
-            new HashSet<CapabilityId>(),
+            new HashSet<CapabilityId> { WellKnownCapabilities.AtomicCommit },
+            new HashSet<CapabilityId> { WellKnownCapabilities.AtomicCommit },
             new IndexCapabilities(
                 IndexValueKinds,
                 SupportsUniqueIndexes: true,

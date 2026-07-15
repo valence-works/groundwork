@@ -71,7 +71,7 @@ public sealed class MongoDbPhysicalTopologyTests : IAsyncLifetime
     public async Task Conventional_factory_rejects_a_fresh_standalone_before_creating_database_state()
     {
         var databaseName = $"gw_conv_standalone_{Guid.NewGuid():N}";
-        var manifest = MongoDbTestManifests.MetadataManifest();
+        var manifest = MongoDbTestManifests.AtomicCommitManifest();
 
         var exception = await Assert.ThrowsAsync<UnsupportedAtomicCommitException>(() =>
             MongoDbDocumentStoreFactory.CreateAsync(

@@ -70,6 +70,24 @@ internal static class MongoDbTestManifests
 
     public static ProviderIdentity Provider { get; } = new("groundwork-mongodb", "1.0.0");
 
+    public static StorageManifest AtomicCommitManifest()
+    {
+        var manifest = MetadataManifest();
+        return manifest with
+        {
+            StorageUnits =
+            [
+                manifest.StorageUnits.Single() with
+                {
+                    Intent = StorageIntent.Operational(
+                        "Configuration changes require an atomic commit.",
+                        WorkloadIntent.RuntimeContinuationState,
+                        WellKnownCapabilities.AtomicCommit)
+                }
+            ]
+        };
+    }
+
     public static StorageManifest UnicodeIdentityManifest()
     {
         var manifest = MetadataManifest();

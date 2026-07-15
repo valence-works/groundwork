@@ -29,8 +29,8 @@ public static class PostgreSqlGroundworkCapabilities
     public static ProviderCapabilityReport Runtime(ProviderIdentity provider) =>
         new(
             provider,
-            new HashSet<CapabilityId>(),
-            new HashSet<CapabilityId>(),
+            new HashSet<CapabilityId> { WellKnownCapabilities.AtomicCommit },
+            new HashSet<CapabilityId> { WellKnownCapabilities.AtomicCommit },
             IndexCapabilities.All,
             QueryOperations,
             ConcurrencyModes,
