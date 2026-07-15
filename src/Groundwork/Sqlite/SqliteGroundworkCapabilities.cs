@@ -2,6 +2,7 @@ using Groundwork.Core.Capabilities;
 using Groundwork.Core.Materialization;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
 using Groundwork.Materialization;
 
 namespace Groundwork.Sqlite;
@@ -18,6 +19,10 @@ public static class SqliteGroundworkCapabilities
         Enum.GetValues<MaterializationOperationKind>().ToHashSet();
 
     public static ProviderIdentity Provider { get; } = new("groundwork-sqlite", "1.0.0");
+
+    /// <summary>SQLite physical naming with schema-global table and index collision semantics.</summary>
+    public static IProviderPhysicalNameNormalizer PhysicalNames { get; } =
+        SqlitePhysicalNameNormalizer.Instance;
 
     public static ProviderCapabilityReport Runtime() => Runtime(Provider);
 

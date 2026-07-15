@@ -90,7 +90,7 @@ internal sealed record ProviderDescriptor(
     [
         new("mongodb", MongoDbGroundworkCapabilities.Provider, MongoDbPhysicalNameNormalizer.Instance),
         new("postgresql", PostgreSqlGroundworkCapabilities.Provider, PostgreSqlGroundworkCapabilities.PhysicalNames),
-        new("sqlite", SqliteGroundworkCapabilities.Provider, ProviderPhysicalNameNormalizer.Identity),
+        new("sqlite", SqliteGroundworkCapabilities.Provider, SqliteGroundworkCapabilities.PhysicalNames),
         new("sqlserver", SqlServerGroundworkCapabilities.Provider, SqlServerGroundworkCapabilities.PhysicalNames)
     ];
 
