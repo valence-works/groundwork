@@ -63,12 +63,14 @@ public static class LegacyPhysicalStorageBridge
                 query.SupportsTotalCount))
             .ToArray();
 
+        // Eligible legacy fields use MissingValueBehavior.Excluded. An absent canonical path must
+        // therefore become a null/omitted projection value instead of rejecting the document write.
         var projectedColumns = PhysicalizationProjection.EligibleFields(unit)
             .Select(field => new ProjectedColumnDefinition(
                 field.Name,
                 field.Path,
                 ToPortableType(field.ValueKind),
-                IsNullable: false))
+                IsNullable: true))
             .ToArray();
         var projectedNames = projectedColumns.Select(x => x.LogicalName).ToHashSet(StringComparer.Ordinal);
         var physicalIndexes = unit.Indexes
