@@ -371,6 +371,11 @@ public sealed class MongoDbPhysicalDocumentStoreOpenHandle(
     MongoDbPhysicalDocumentStore store) : IAsyncDisposable
 {
     private readonly MongoDbClientLease clientLease = new(client);
+    private readonly object gate = new();
+    private TaskCompletionSource? bindingDrain;
+    private TaskCompletionSource? disposal;
+    private int activeBindings;
+    private bool disposed;
 
     public MongoDbPhysicalStorageModel Model { get; } = model;
 
@@ -378,7 +383,74 @@ public sealed class MongoDbPhysicalDocumentStoreOpenHandle(
 
     public MongoDbPhysicalDocumentStore Store { get; } = store;
 
-    public ValueTask DisposeAsync() => clientLease.DisposeAsync();
+    /// <summary>
+    /// Creates an immutable access-bound store over this already-admitted MongoDB runtime. This
+    /// operation performs no topology probe, physical-model compilation, or schema inspection.
+    /// The handle must outlive every store it creates.
+    /// </summary>
+    public MongoDbPhysicalDocumentStore CreateStore(
+        DocumentStoreAccess access,
+        IStorageScopeObserver? scopeObserver = null)
+    {
+        ArgumentNullException.ThrowIfNull(access);
+        lock (gate)
+        {
+            if (disposed)
+                throw new ObjectDisposedException(nameof(MongoDbPhysicalDocumentStoreOpenHandle));
+            activeBindings++;
+        }
+
+        try
+        {
+            return Store.WithAccess(access, scopeObserver);
+        }
+        finally
+        {
+            lock (gate)
+            {
+                activeBindings--;
+                if (activeBindings == 0)
+                    bindingDrain?.TrySetResult();
+            }
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        TaskCompletionSource completion;
+        Task drain;
+        lock (gate)
+        {
+            if (disposal is not null)
+                return new(disposal.Task);
+
+            disposed = true;
+            completion = disposal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            drain = activeBindings == 0
+                ? Task.CompletedTask
+                : (bindingDrain = new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+
+        _ = CompleteDisposalAsync(drain, clientLease, completion);
+        return new(completion.Task);
+    }
+
+    private static async Task CompleteDisposalAsync(
+        Task bindingDrain,
+        MongoDbClientLease clientLease,
+        TaskCompletionSource completion)
+    {
+        try
+        {
+            await bindingDrain;
+            await clientLease.DisposeAsync();
+            completion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
+    }
 }
 
 public sealed class MongoDbPhysicalDocumentStoreHandle(
