@@ -12,6 +12,12 @@ authorize traffic. The explicit legacy handler certifies only single-field ordin
 provider contract can represent. See
 [`docs/bounded-physical-query-plans.md`](../../../docs/bounded-physical-query-plans.md).
 
+Provider runtimes also expose `IPhysicalDocumentQueryExplainer` for diagnostic explanation of the
+same bounded `DocumentQuery`. It dispatches by `ResultOperation` and returns the compiled plan plus
+ordered provider-native command plans. Explanation may execute bounded reads, native output is not
+sanitized, and its pseudonymous invocation fingerprint is not a secrecy boundary. See
+[`Runtime plan explanation`](../../../docs/bounded-physical-query-plans.md#runtime-plan-explanation).
+
 Named update/delete lifecycle work uses `BoundedMutationDeclaration` and
 `PhysicalMutationDocumentStore`. Mutation declarations reuse a scale-bearing bounded query as their
 closed selector and fix either a field transition or deletion at manifest construction time. See

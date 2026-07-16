@@ -116,6 +116,25 @@ order, and rejects scale-bearing, compound/multi-path, keyset, latest, and opera
 contract cannot express. It never collapses several stable paths into one legacy index identity.
 Providers must not add a third query family.
 
+## Runtime plan explanation
+
+`IPhysicalDocumentQueryExplainer.ExplainAsync` accepts the same `DocumentQuery` used for execution
+and dispatches through its `ResultOperation` (`Documents`, `Count`, `First`, or `Any`). Its result
+contains the compiled `PhysicalQueryPlan`, a runtime-invocation fingerprint, and the ordered
+`Commands` planned for that operation. Commands have stable stage identities such as count, page,
+first, any, linked-identity collision check, and primary hydration; shape-conditional stages are
+omitted when they are not needed, while data-dependent early exits may still stop later work.
+
+Each command carries a provider-native plan and format. Current formats are `sqlite-query-plan`,
+`sqlserver-statistics-xml`, `postgresql-json`, and `mongodb-json`. Explanation is a diagnostic
+operation, not a dry-run contract: SQL Server executes the exact parameterized read under runtime
+statistics collection, and MongoDB may execute bounded selector reads to explain the exact linked
+primary hydration. It can therefore consume database resources and observe live data.
+
+Native plans are provider output and are returned unsanitized; treat them as sensitive. The
+runtime-invocation fingerprint excludes raw query values, but it is only a pseudonymous correlation
+identifier. Low-entropy inputs may still be guessable, so the fingerprint is not a secrecy boundary.
+
 The [relational physical storage runtime](relational-physical-storage-runtime.md) implements the
 reusable relational handler and SQLite reference execution for linked+primary, dedicated, and entity
 plans. Exact handler certifications are built from compiled plans; predicates, compound filters,
@@ -131,5 +150,5 @@ parameter ceilings are enforced before SQL dispatch.
 Intrinsic envelope paths reject a conflicting declared logical kind instead of silently switching
 between numeric and lexical semantics. SQLite uses exact fixed-scale integer Decimal projections and
 UTC-tick DateTime projections; its canonical-JSON source does not certify Number or DateTime plans.
-SQL Server and PostgreSQL plus their native explain assertions remain #47. MongoDB remains #48.
-#24 is superseded for SQLite only after this execution slice.
+SQL Server, PostgreSQL, SQLite, and MongoDB now expose provider-native bounded-query explanations.
+#24 is superseded by the provider implementations in this execution slice.

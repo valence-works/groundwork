@@ -173,6 +173,13 @@ public interface IPhysicalDocumentQueryHandler
     Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken);
     Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken);
     Task<bool> AnyAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken);
+
+    Task<PhysicalDocumentQueryExplanation> ExplainAsync(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        CancellationToken cancellationToken) =>
+        Task.FromException<PhysicalDocumentQueryExplanation>(new NotSupportedException(
+            $"Physical query handler '{Identity}' does not support provider-native explain evidence."));
 }
 
 /// <summary>
@@ -180,7 +187,7 @@ public interface IPhysicalDocumentQueryHandler
 /// only to registered executable handlers. Invalid scale-bearing declarations fail before a store
 /// capable of serving traffic is returned.
 /// </summary>
-public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore
+public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysicalDocumentQueryExplainer
 {
     private readonly IReadOnlyDictionary<string, PhysicalQueryPlan> plans;
     private readonly IReadOnlyDictionary<string, IPhysicalDocumentQueryHandler> handlers;
@@ -276,6 +283,15 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore
     {
         var (plan, handler) = Resolve(query, BoundedQueryResultOperation.Any);
         return handler.AnyAsync(query, plan, cancellationToken);
+    }
+
+    public Task<PhysicalDocumentQueryExplanation> ExplainAsync(
+        DocumentQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        var (plan, handler) = Resolve(query, query.ResultOperation);
+        return handler.ExplainAsync(query, plan, cancellationToken);
     }
 
     /// <summary>

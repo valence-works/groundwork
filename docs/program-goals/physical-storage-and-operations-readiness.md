@@ -88,8 +88,9 @@ compiles one closed declaration family against executable routes and provider ha
 Plans cover linked+primary, primary envelope/JSON, entity projections, and provider-native fields;
 scope, compound prefix/direction, identity tie-breaking, paging/results, latest/keyset behavior, and
 scale-bearing fail-fast are binding. The `DocumentQuery` compatibility bridge is in place. SQLite
-SQL execution and native explain assertions are now delivered by #46; remaining providers are
-subsequent work units, so #24 is superseded only for SQLite.
+SQL execution and native explain assertions are delivered by #46. Provider-native bounded-query
+explanations now cover SQLite, SQL Server, PostgreSQL, and MongoDB through #89, with ordered
+receipts for every exact production command stage; #24 is superseded for that evidence surface.
 
 Relational physical-runtime progress: [issue #46](https://github.com/valence-works/Groundwork/issues/46)
 connects executable routes, typed schema diffs/applied state, and bounded query plans through a

@@ -1,3 +1,4 @@
+using System.Data.Common;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
@@ -13,5 +14,20 @@ public static class PostgreSqlPhysicalQueryRuntime
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        RelationalPhysicalQueryRuntime.Create(store, manifest, route, provider, "postgresql");
+        RelationalPhysicalQueryRuntime.CreateWithExplainer(
+            store,
+            manifest,
+            route,
+            provider,
+            "postgresql",
+            ExplainAsync);
+
+    private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+        DbCommand command,
+        CancellationToken cancellationToken)
+    {
+        command.CommandText = $"EXPLAIN (FORMAT JSON) {command.CommandText}";
+        var content = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
+        return new RelationalPhysicalNativeQueryPlan("postgresql-json", content);
+    }
 }

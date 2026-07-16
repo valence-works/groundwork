@@ -109,6 +109,88 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
 
     [Fact]
+    public async Task Public_query_explain_executes_exact_parameterized_reads_and_restores_the_pooled_session()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "showplan-target", "1", "{\"category\":\"owner's-pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "showplan-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        await ExecuteAdminAsync($"UPDATE STATISTICS {Q(route.PrimaryStorage.Name.Identifier)};");
+        var runtime = SqlServerPhysicalQueryRuntime.Create(store, model.Manifest, route, model.Target.Provider);
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "owner's-pending"))],
+            take: 1);
+
+        var explanation = await explainer.ExplainAsync(query);
+        var result = await runtime.QueryAsync(query);
+
+        Assert.Equal(["count", "page"], explanation.Commands.Select(command => command.Identity));
+        Assert.All(explanation.Commands, command =>
+        {
+            Assert.Equal("sqlserver-statistics-xml", command.NativePlanFormat);
+            Assert.Contains("ShowPlanXML", command.NativePlan, StringComparison.Ordinal);
+            Assert.Contains(explanation.Plan.IndexName!.Identifier, command.NativePlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("PhysicalOp=\"Table Scan\"", command.NativePlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("PhysicalOp=\"Index Scan\"", command.NativePlan, StringComparison.Ordinal);
+        });
+        Assert.Equal("showplan-target", Assert.Single(result.Documents).Id);
+    }
+
+    [Fact]
+    public async Task Query_explain_preserves_primary_failure_attaches_disable_failure_and_quarantines_the_session()
+    {
+        var connectionString = new SqlConnectionStringBuilder(container.GetConnectionString()) { MaxPoolSize = 1 }.ConnectionString;
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(connectionString));
+        var route = model.Target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            connectionString, model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "cleanup-target", "1", "{\"category\":\"pending\"}"))).Status);
+        var hooks = new SqlServerPhysicalQueryExplainHooks(
+            BeforeRead: static (_, _) => ValueTask.FromException(new InvalidOperationException("primary explain failure")),
+            BeforeDisable: static _ => ValueTask.FromException(new InvalidOperationException("disable failure")));
+        var runtime = SqlServerPhysicalQueryRuntime.Create(
+            store, model.Manifest, route, model.Target.Provider, hooks);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending"))],
+            take: 1);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime).ExplainAsync(query));
+        var cleanupFailures = Assert.IsType<List<Exception>>(
+            exception.Data["Groundwork.Relational.CleanupFailures"]);
+        var result = await runtime.QueryAsync(query);
+
+        Assert.Equal("primary explain failure", exception.Message);
+        Assert.Contains(cleanupFailures, failure => failure.Message == "disable failure");
+        Assert.Equal("cleanup-target", Assert.Single(result.Documents).Id);
+    }
+
+    [Fact]
     public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
     {
         var model = RelationalPhysicalStorageTestModels.Create(
@@ -873,10 +955,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             "list-by-category",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
             resultOperation: BoundedQueryResultOperation.Count);
-        var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
-            store, manifest, route, provider, "sqlserver", query);
         await SeedPlanNoiseAsync(route);
-        return await ExplainAsync(rendered, route);
+        await ExecuteAdminAsync(route.LinkedIndexStorage is null
+            ? $"UPDATE STATISTICS {Q(route.PrimaryStorage.Name.Identifier)};"
+            : $"UPDATE STATISTICS {Q(route.PrimaryStorage.Name.Identifier)}; UPDATE STATISTICS {Q(route.LinkedIndexStorage.Name.Identifier)};");
+        var runtime = SqlServerPhysicalQueryRuntime.Create(store, manifest, route, provider);
+        var explanation = await Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime).ExplainAsync(query);
+        return string.Join(Environment.NewLine, explanation.Commands.Select(command => command.NativePlan));
     }
 
     private async Task<string> ExplainAsync(

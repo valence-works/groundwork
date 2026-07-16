@@ -1483,22 +1483,58 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Explain_proves_the_resolved_collection_and_native_index_are_selected()
+    public async Task Explain_returns_complete_scan_free_command_receipts_for_every_terminal_operation()
     {
         var database = Database();
-        var model = Model(PhysicalStorageForm.PhysicalEntityTable);
+        var model = Model(PhysicalStorageForm.SharedDocuments);
         await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
         var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
         await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open"}"""));
-        var query = new DocumentQuery(
+        var baseQuery = new DocumentQuery(
             "workItem", "list-by-status",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
+        var expected = new Dictionary<BoundedQueryResultOperation, string[]>
+        {
+            [BoundedQueryResultOperation.Documents] = ["count", "page", "primary-hydration"],
+            [BoundedQueryResultOperation.Count] = ["count"],
+            [BoundedQueryResultOperation.First] = ["count", "first", "primary-hydration"],
+            [BoundedQueryResultOperation.Any] = ["any"]
+        };
 
-        var explain = await store.ExplainAsync(query);
         var route = Assert.Single(model.Routes);
-        Assert.Contains(route.PrimaryStorage.Name.Identifier, explain.ToJson(), StringComparison.Ordinal);
-        Assert.Contains(route.Indexes.Single().Name.Identifier, explain.ToJson(), StringComparison.Ordinal);
-        Assert.Contains("IXSCAN", explain.ToJson(), StringComparison.Ordinal);
+        foreach (var (operation, commandIdentities) in expected)
+        {
+            var query = operation == BoundedQueryResultOperation.Any
+                ? baseQuery.Page(skip: 7, take: null).Select(operation)
+                : baseQuery.Select(operation);
+            var explanation = await store.ExplainAsync(query);
+
+            Assert.Equal(commandIdentities, explanation.Commands.Select(command => command.Identity));
+            Assert.Equal(route.Indexes.Single().Name, explanation.Plan.IndexName);
+            Assert.Equal(
+                PhysicalDocumentQueryInvocationFingerprint.Compute(
+                    query,
+                    explanation.Plan,
+                    new DocumentScopeSelection("tenant-a", new("tenant-a"), false)),
+                explanation.RuntimeInvocationFingerprint);
+            Assert.All(explanation.Commands, command =>
+            {
+                Assert.Equal("mongodb-json", command.NativePlanFormat);
+                Assert.DoesNotContain("COLLSCAN", command.NativePlan, StringComparison.Ordinal);
+                Assert.False(string.IsNullOrWhiteSpace(command.NativePlan));
+            });
+            Assert.Contains(explanation.Commands, command =>
+                command.NativePlan.Contains(route.Indexes.Single().Name.Identifier, StringComparison.Ordinal) ||
+                command.Identity == PhysicalDocumentQueryCommandIdentities.PrimaryHydration);
+            if (operation == BoundedQueryResultOperation.Any)
+            {
+                Assert.True(await store.AnyAsync(query));
+                Assert.DoesNotContain("SKIP", Assert.Single(explanation.Commands).NativePlan, StringComparison.Ordinal);
+            }
+        }
+
+        var takeNone = await store.ExplainAsync(baseQuery.Page(skip: null, take: 0));
+        Assert.Equal([PhysicalDocumentQueryCommandIdentities.Count], takeNone.Commands.Select(command => command.Identity));
     }
 
     [Fact]
