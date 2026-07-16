@@ -1,8 +1,11 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.PostgreSql.Materialization;
+using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Provider.Relational;
 using Groundwork.Documents.Scoping;
 using Npgsql;
@@ -11,6 +14,42 @@ namespace Groundwork.PostgreSql.Documents;
 
 public static class PostgreSqlDocumentStoreFactory
 {
+    /// <summary>
+    /// Opens a physical document store after inspect-only runtime schema admission. Safe pending
+    /// operations are applied only when <see cref="GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup"/>
+    /// is enabled.
+    /// </summary>
+    public static async Task<PostgreSqlPhysicalDocumentStore> OpenPhysicalAsync(
+        string connectionString,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        GroundworkRuntimeSchemaAdmissionOptions? options = null,
+        Action<GroundworkRuntimeSchemaAdmissionLogEntry>? schemaAdmissionLog = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
+        var target = PhysicalSchemaTargetCompiler.Compile(
+            manifest,
+            provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            namePolicy);
+        var admission = await new PostgreSqlPhysicalSchemaExecutor(connectionString)
+            .InspectRuntimeAdmissionAsync(target, options, schemaAdmissionLog, cancellationToken);
+        admission.EnsureReady();
+        return new PostgreSqlPhysicalDocumentStore(
+            connectionString,
+            manifest,
+            target.Routes,
+            access,
+            scopeObserver);
+    }
+
     public static Task<PostgreSqlDocumentStore> CreateAsync(
         string connectionString,
         StorageManifest manifest,

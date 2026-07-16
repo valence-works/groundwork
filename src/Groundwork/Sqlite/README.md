@@ -50,6 +50,11 @@ retained, explicitly serialized in-memory store is intentional. The former
 `SqliteDocumentStoreHandle` and its lifetime-owning `Connection` property were removed because no
 truthful connection can represent the lifetime of a stateless store.
 
+`SqliteDocumentStoreFactory.OpenPhysicalAsync` is the route-driven startup gate. It inspects the
+durable physical schema without mutation by default and accepts
+`GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup` for opt-in safe-only application. Use
+the retained-connection overload for private in-memory databases.
+
 `SqliteDiagnosticRecordStoreFactory.CreateAsync` applies the provider-neutral relational diagnostic
 schema through a short-lived materialization connection. The returned store uses serialized,
 per-operation sessions and explicit transactions. Reads use deferred transactions; writes acquire

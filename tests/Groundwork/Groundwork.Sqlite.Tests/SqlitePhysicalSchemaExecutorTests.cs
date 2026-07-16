@@ -20,6 +20,129 @@ public sealed class SqlitePhysicalSchemaExecutorTests
 {
     private const string CrossProcessDatabaseEnvironment = "GROUNDWORK_SCHEMA_LOCK_DATABASE";
 
+    [Fact]
+    public async Task Physical_factory_is_inspect_only_by_default()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var model = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+
+        await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
+            SqliteDocumentStoreFactory.OpenPhysicalAsync(
+                connection,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global));
+
+        Assert.False(await TableExistsAsync(connection, "groundwork_physical_schema_state"));
+    }
+
+    [Fact]
+    public async Task Physical_factory_auto_applies_safe_schema_when_enabled()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var model = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+
+        var store = await SqliteDocumentStoreFactory.OpenPhysicalAsync(
+            connection,
+            model.Manifest,
+            model.Target.Provider,
+            DocumentStoreAccess.Global,
+            options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+
+        Assert.NotNull(store);
+        Assert.True(await TableExistsAsync(connection, "groundwork_physical_schema_state"));
+    }
+
+    [Fact]
+    public async Task File_backed_physical_factory_persists_safe_auto_apply_before_returning()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"groundwork-startup-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={databasePath};Pooling=False";
+        var model = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+        try
+        {
+            var store = await SqliteDocumentStoreFactory.OpenPhysicalAsync(
+                connectionString,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global,
+                options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+            await using var inspection = new SqliteConnection(connectionString);
+            await inspection.OpenAsync();
+
+            Assert.NotNull(store);
+            Assert.True(await TableExistsAsync(inspection, "groundwork_physical_schema_state"));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task Physical_factory_rejects_invalid_manifest_before_auto_apply_mutates_schema()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var model = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+        var invalidManifest = model.Manifest with
+        {
+            StorageUnits =
+            [
+                model.Manifest.StorageUnits.Single() with { Lifecycle = null! }
+            ]
+        };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            SqliteDocumentStoreFactory.OpenPhysicalAsync(
+                connection,
+                invalidManifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global,
+                options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true }));
+
+        Assert.Contains("GW-UNIT-006", exception.Message, StringComparison.Ordinal);
+        await connection.OpenAsync();
+        Assert.False(await TableExistsAsync(connection, "groundwork_physical_schema_state"));
+    }
+
+    [Fact]
+    public async Task Named_private_in_memory_factory_reuses_retained_database_for_restart_admission()
+    {
+        var dataSource = Path.Combine(Path.GetTempPath(), $"groundwork-memory-{Guid.NewGuid():N}");
+        var connectionString = $"Data Source={dataSource};Mode=Memory;Cache=Private";
+        await using var connection = new SqliteConnection(connectionString);
+        var model = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: false);
+        try
+        {
+            await SqliteDocumentStoreFactory.OpenPhysicalAsync(
+                connection,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global,
+                options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+
+            var restart = await SqliteDocumentStoreFactory.OpenPhysicalAsync(
+                connection,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global);
+
+            Assert.NotNull(restart);
+            Assert.True(await TableExistsAsync(connection, "groundwork_physical_schema_state"));
+        }
+        finally
+        {
+            foreach (var lockFile in Directory.GetFiles(
+                         Path.GetDirectoryName(dataSource)!,
+                         $"{Path.GetFileName(dataSource)}.groundwork-*.schema.lock"))
+            {
+                File.Delete(lockFile);
+            }
+            File.Delete(dataSource);
+        }
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]

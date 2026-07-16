@@ -6,6 +6,7 @@ using Groundwork.Core.Validation;
 using Groundwork.Documents.Scoping;
 using Groundwork.Materialization;
 using Groundwork.MongoDb.Materialization;
+using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 
 namespace Groundwork.MongoDb.Documents;
@@ -14,7 +15,9 @@ public static class MongoDbDocumentStoreFactory
 {
     /// <summary>
     /// Opens a physical document store only when the compiled manifest/provider target has already
-    /// been applied exactly. This operation inspects schema state but never applies or mutates it.
+    /// been applied exactly. By default this operation only inspects schema state. Safe pending
+    /// operations may be applied when <see cref="MongoDbPhysicalDocumentStoreOptions.AutoApplyOnStartup"/>
+    /// is enabled; destructive and semantic work is never auto-applied.
     /// The returned handle owns the client created from <paramref name="connectionString"/>.
     /// </summary>
     public static async Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenPhysicalAsync(
@@ -60,7 +63,9 @@ public static class MongoDbDocumentStoreFactory
 
     /// <summary>
     /// Opens a physical document store only when the compiled manifest/provider target has already
-    /// been applied exactly. This operation inspects schema state but never applies or mutates it.
+    /// been applied exactly. By default this operation only inspects schema state. Safe pending
+    /// operations may be applied when <see cref="MongoDbPhysicalDocumentStoreOptions.AutoApplyOnStartup"/>
+    /// is enabled; destructive and semantic work is never auto-applied.
     /// The caller retains ownership of <paramref name="database"/> and its client.
     /// </summary>
     public static Task<MongoDbPhysicalDocumentStoreOpenHandle> OpenPhysicalAsync(
@@ -235,14 +240,26 @@ public static class MongoDbDocumentStoreFactory
             DocumentKinds(model),
             "physical storage",
             cancellationToken);
-        var inspection = await new MongoDbPhysicalSchemaExecutor(database).InspectHistoryAsync(
+        var admission = await new MongoDbPhysicalSchemaExecutor(database).InspectRuntimeAdmissionAsync(
             model.Target,
+            new GroundworkRuntimeSchemaAdmissionOptions
+            {
+                AutoApplyOnStartup = options.AutoApplyOnStartup
+            },
+            options.SchemaAdmissionLogger is null
+                ? null
+                : entry => options.SchemaAdmissionLogger.Log(
+                    entry.Level == GroundworkRuntimeSchemaAdmissionLogLevel.Information
+                        ? LogLevel.Information
+                        : LogLevel.Warning,
+                    "{AdmissionMessage}",
+                    entry.Message),
             cancellationToken);
-        EnsureOpenAdmitted(model, inspection);
+        EnsureOpenAdmitted(model, admission);
         return new MongoDbPhysicalDocumentStoreOpenHandle(
             client,
             model,
-            inspection,
+            admission.Inspection,
             CreatePhysicalStore(
                 database,
                 model,
@@ -310,27 +327,13 @@ public static class MongoDbDocumentStoreFactory
 
     private static void EnsureOpenAdmitted(
         MongoDbPhysicalStorageModel model,
-        PhysicalSchemaInspectionResult inspection)
+        GroundworkRuntimeSchemaAdmissionResult admission)
     {
-        if (!inspection.IsAppliedSchemaValid)
-        {
-            throw new InvalidOperationException(
-                "MongoDB physical document store admission found drift in the applied schema.");
-        }
-
-        var plan = PhysicalSchemaDiffPlanner.Plan(
-            model.Target,
-            inspection.History,
-            DateTimeOffset.UnixEpoch);
-        if (!plan.IsApplicable || plan.Operations.Count != 0)
-        {
-            throw new InvalidOperationException(
-                "MongoDB physical document store admission requires the exact target to be applied before the store is opened.");
-        }
+        admission.EnsureReady();
 
         EnsureExactAppliedState(
             model,
-            inspection.History.AppliedState ?? throw new InvalidOperationException(
+            admission.Inspection.History.AppliedState ?? throw new InvalidOperationException(
                 "MongoDB physical document store admission requires durable applied schema state."));
     }
 

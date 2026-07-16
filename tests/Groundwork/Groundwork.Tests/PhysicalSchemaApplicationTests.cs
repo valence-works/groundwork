@@ -11,6 +11,120 @@ namespace Groundwork.Tests;
 public sealed class PhysicalSchemaApplicationTests
 {
     [Fact]
+    public async Task Runtime_admission_is_inspect_only_by_default()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions());
+
+        Assert.False(result.IsReady);
+        Assert.NotEmpty(result.PendingOperations);
+        Assert.Equal(0, executor.LockAcquisitionCount);
+        Assert.Empty(executor.DurableOperations);
+        Assert.Null(executor.AppliedState);
+        Assert.Throws<GroundworkRuntimeSchemaAdmissionException>(() => result.EnsureReady());
+    }
+
+    [Fact]
+    public async Task Runtime_admission_auto_applies_a_safe_pending_plan()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+
+        Assert.True(result.IsReady);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Application!.Outcome);
+        Assert.True(result.AppliedOperationCount > 0);
+        Assert.Equal(1, executor.LockAcquisitionCount);
+        Assert.Equal(target.Fingerprint, executor.AppliedState!.TargetFingerprint);
+    }
+
+    [Fact]
+    public async Task Runtime_admission_never_auto_applies_a_destructive_plan()
+    {
+        var target = CreateTarget(
+            includeSecondProjection: false,
+            new PhysicalEvolutionMetadata(IsDestructive: true));
+        var executor = new FakePhysicalSchemaExecutor();
+        var logger = new RecordingLogger();
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true },
+            logger.Log);
+
+        Assert.False(result.IsReady);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.AuthorizationRequired, result.Application!.Outcome);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-RUNTIME-002");
+        Assert.Empty(executor.DurableOperations);
+        Assert.Null(executor.AppliedState);
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == GroundworkRuntimeSchemaAdmissionLogLevel.Warning);
+        Assert.DoesNotContain(logger.Entries, entry =>
+            entry.Message.Contains("executing", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Runtime_admission_never_auto_applies_a_semantic_migration()
+    {
+        var target = CreateTarget(
+            includeSecondProjection: false,
+            new PhysicalEvolutionMetadata(SemanticMigrationIdentity: "reclassify-v2"));
+        var executor = new FakePhysicalSchemaExecutor();
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+
+        Assert.False(result.IsReady);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Message.Contains("reclassify-v2", StringComparison.Ordinal));
+        Assert.Empty(executor.DurableOperations);
+    }
+
+    [Fact]
+    public async Task Runtime_admission_never_repairs_physical_drift()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor { IsAppliedSchemaValid = false };
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+
+        Assert.False(result.IsReady);
+        Assert.Null(result.Application);
+        Assert.Equal(0, executor.LockAcquisitionCount);
+        Assert.Throws<GroundworkRuntimeSchemaAdmissionException>(() => result.EnsureReady());
+    }
+
+    [Fact]
+    public async Task Runtime_admission_logs_safe_auto_apply_start_and_operation_count()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+        var logger = new RecordingLogger();
+
+        var result = await executor.InspectRuntimeAdmissionAsync(
+            target,
+            new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true },
+            logger.Log);
+
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == GroundworkRuntimeSchemaAdmissionLogLevel.Information &&
+            entry.Message.Contains("executing", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == GroundworkRuntimeSchemaAdmissionLogLevel.Information &&
+            entry.Message.Contains(result.AppliedOperationCount.ToString(), StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Plan_backfills_existing_canonical_documents_before_creating_physical_indexes()
     {
         var plan = PhysicalSchemaDiffPlanner.Plan(
@@ -222,7 +336,9 @@ public sealed class PhysicalSchemaApplicationTests
         Assert.Null(executor.AppliedState);
     }
 
-    private static PhysicalSchemaTarget CreateTarget(bool includeSecondProjection)
+    private static PhysicalSchemaTarget CreateTarget(
+        bool includeSecondProjection,
+        PhysicalEvolutionMetadata? evolution = null)
     {
         var template = SampleManifests.MetadataManifest();
         var projectedColumns = new List<ProjectedColumnDefinition>
@@ -246,7 +362,8 @@ public sealed class PhysicalSchemaApplicationTests
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             "configuration_entities",
             projectedColumns,
-            indexes: indexes);
+            indexes: indexes,
+            evolution: evolution);
         var manifest = template with
         {
             StorageUnits =
@@ -273,7 +390,7 @@ public sealed class PhysicalSchemaApplicationTests
             compiled.Routes);
     }
 
-    private sealed class FakePhysicalSchemaExecutor : IPhysicalSchemaExecutor
+    private sealed class FakePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhysicalSchemaHistoryInspector
     {
         private readonly SemaphoreSlim applicationLock = new(1, 1);
         private readonly ConcurrentDictionary<string, string> durableOperations = new(StringComparer.Ordinal);
@@ -299,8 +416,18 @@ public sealed class PhysicalSchemaApplicationTests
         public int RecordedStateCount => recordedStateCount;
         public bool OperationObservedLeaseLoss { get; private set; }
         public int LiveValidationCount { get; private set; }
+        public bool IsAppliedSchemaValid { get; set; } = true;
         public bool IsLockHeld => Volatile.Read(ref currentLockHolders) == 1;
         private CancellationTokenSource? leaseLoss;
+
+        public ValueTask<PhysicalSchemaInspectionResult> InspectHistoryAsync(
+            PhysicalSchemaTarget target,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(new PhysicalSchemaInspectionResult(
+                AppliedState is null
+                    ? PhysicalSchemaHistoryState.Empty
+                    : PhysicalSchemaHistoryState.FromApplied(AppliedState),
+                IsAppliedSchemaValid));
 
         public async ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
             PhysicalSchemaTargetIdentity target,
@@ -431,4 +558,11 @@ public sealed class PhysicalSchemaApplicationTests
 
     private sealed class InjectedExecutionException : Exception;
     private sealed class InjectedAcknowledgementLossException : Exception;
+
+    private sealed class RecordingLogger
+    {
+        public List<GroundworkRuntimeSchemaAdmissionLogEntry> Entries { get; } = [];
+
+        public void Log(GroundworkRuntimeSchemaAdmissionLogEntry entry) => Entries.Add(entry);
+    }
 }

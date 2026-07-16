@@ -1,16 +1,55 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.Provider.Relational;
 using Groundwork.Documents.Scoping;
 using Groundwork.SqlServer.Materialization;
+using Groundwork.SqlServer.PhysicalStorage;
 using Microsoft.Data.SqlClient;
 
 namespace Groundwork.SqlServer.Documents;
 
 public static class SqlServerDocumentStoreFactory
 {
+    /// <summary>
+    /// Opens a physical document store after inspect-only runtime schema admission. Safe pending
+    /// operations are applied only when <see cref="GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup"/>
+    /// is enabled.
+    /// </summary>
+    public static async Task<SqlServerPhysicalDocumentStore> OpenPhysicalAsync(
+        string connectionString,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        GroundworkRuntimeSchemaAdmissionOptions? options = null,
+        Action<GroundworkRuntimeSchemaAdmissionLogEntry>? schemaAdmissionLog = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentNullException.ThrowIfNull(access);
+        var target = PhysicalSchemaTargetCompiler.Compile(
+            manifest,
+            provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            namePolicy);
+        var admission = await new SqlServerPhysicalSchemaExecutor(connectionString)
+            .InspectRuntimeAdmissionAsync(target, options, schemaAdmissionLog, cancellationToken);
+        admission.EnsureReady();
+        return new SqlServerPhysicalDocumentStore(
+            connectionString,
+            manifest,
+            target.Routes,
+            access,
+            scopeObserver);
+    }
+
     public static Task<SqlServerDocumentStore> CreateAsync(
         string connectionString,
         StorageManifest manifest,

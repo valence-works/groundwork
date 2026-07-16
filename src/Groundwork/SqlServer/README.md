@@ -39,6 +39,10 @@ stateless: independent operations acquire concurrent pooled connections, while a
 work owns one connection and transaction until completion. Pool limits and timeouts—not a
 Groundwork-wide semaphore—provide backpressure.
 
+`SqlServerDocumentStoreFactory.OpenPhysicalAsync` is the route-driven startup gate. It inspects the
+durable physical schema without mutation by default and accepts
+`GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup` for opt-in safe-only application.
+
 Diagnostic-record databases must have `READ_COMMITTED_SNAPSHOT ON`. Materialization validates this
 prerequisite and fails with an actionable error when it is absent; the provider does not silently
 change a host-owned database setting. Row-versioned reads let inspection observe the last durable

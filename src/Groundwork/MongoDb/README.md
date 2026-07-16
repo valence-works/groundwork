@@ -44,7 +44,11 @@ transactional diagnostic-record provider.
 - Admits physical document stores only through `MongoDbDocumentStoreFactory.CreatePhysicalAsync`
   or its validate-only `OpenPhysicalAsync` counterpart. The factory compiles the model, proves
   replica-set or sharded transaction support, applies or validates the durable physical-schema
-  state, and only then returns a store handle. A validate-only handle can create additional
+  state, and only then returns a store handle. `OpenPhysicalAsync` remains inspect-only by default;
+  setting `MongoDbPhysicalDocumentStoreOptions.AutoApplyOnStartup` applies a pending plan only when
+  the complete locked plan is safe, while destructive and semantic migrations remain blocked. An
+  optional `SchemaAdmissionLogger` routes the auto-apply lifecycle into host logging; otherwise it
+  is written through `System.Diagnostics.Trace`. A validate-only handle can create additional
   immutable access-bound stores over the same admitted client, model, and transaction runtime
   without repeating provider admission; the handle must outlive those stores. The apply handle's
   `SchemaApplication` result reports whether admission applied work or followed the restart-safe
