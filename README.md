@@ -51,7 +51,11 @@ dotnet test tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.Rel
 
 For explicit deployment-time schema planning and application, see the
 [Groundwork schema tool](docs/schema-tool.md). It supports stable human/JSON output and documented
-pipeline exit codes without introducing application-startup migration fallback.
+pipeline exit codes. Runtime admission remains inspect-only by default; applications may explicitly
+opt into safe-only startup application through `GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup`.
+Protected destructive or semantic-migration work still requires explicit operator authorization.
+The SQLite, PostgreSQL, and SQL Server `OpenPhysicalAsync` factories accept that common options type;
+MongoDB exposes the same boolean on `MongoDbPhysicalDocumentStoreOptions`.
 
 The physical-storage macrobenchmark scaffolding and its current evidence limits are documented
 in [`benchmarks/Groundwork.PhysicalStorage.Benchmarks`](benchmarks/Groundwork.PhysicalStorage.Benchmarks/README.md).

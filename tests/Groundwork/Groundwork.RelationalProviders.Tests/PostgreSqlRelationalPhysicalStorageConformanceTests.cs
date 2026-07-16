@@ -37,6 +37,46 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
     private readonly PostgreSqlContainer container = fixture.Container;
 
     [Fact]
+    public async Task Physical_factory_auto_applies_safe_schema_when_enabled()
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var database = $"groundwork_startup_{suffix}";
+        await ExecuteAdminAsync($"CREATE DATABASE {Q(database)};");
+        var connectionString = new NpgsqlConnectionStringBuilder(container.GetConnectionString())
+        {
+            Database = database
+        }.ConnectionString;
+        try
+        {
+            var model = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                PostgreSqlGroundworkCapabilities.Provider,
+                includePriority: false,
+                instance: suffix,
+                normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+
+            var store = await PostgreSqlDocumentStoreFactory.OpenPhysicalAsync(
+                connectionString,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global,
+                namePolicy: new DelegatePhysicalNamePolicy(
+                    context => $"gw_{suffix}_{context.FeatureDefaultLogicalName}"),
+                options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+            var inspection = await new PostgreSqlPhysicalSchemaExecutor(connectionString)
+                .InspectHistoryAsync(model.Target, CancellationToken.None);
+
+            Assert.NotNull(store);
+            Assert.Equal(model.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+            await DropDatabaseAsync(database);
+        }
+    }
+
+    [Fact]
     public void PrimaryInsertConflictTargetsOnlyTheCompiledIdentityKey()
     {
         var sql = new PostgreSqlPhysicalDocumentDialect().InsertPrimaryIfAbsent(

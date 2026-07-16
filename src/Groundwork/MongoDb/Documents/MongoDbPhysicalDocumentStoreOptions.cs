@@ -1,8 +1,20 @@
 namespace Groundwork.MongoDb.Documents;
 
-/// <summary>Bounds MongoDB physical-document transaction recovery.</summary>
+/// <summary>Configures MongoDB physical-document startup admission and transaction recovery.</summary>
 public sealed record MongoDbPhysicalDocumentStoreOptions
 {
+    /// <summary>
+    /// Applies pending physical-schema operations while opening the store only when the complete
+    /// plan is safe. Disabled by default; destructive and semantic work always remains blocked.
+    /// </summary>
+    public bool AutoApplyOnStartup { get; init; }
+
+    /// <summary>
+    /// Optional logger for runtime schema admission and auto-apply events. When omitted, events are
+    /// written through <see cref="System.Diagnostics.Trace"/>.
+    /// </summary>
+    public Microsoft.Extensions.Logging.ILogger? SchemaAdmissionLogger { get; init; }
+
     /// <summary>
     /// Maximum transaction-body executions, including the initial attempt. A retry always uses a
     /// fresh driver session and transaction.

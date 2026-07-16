@@ -34,6 +34,47 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     private readonly MsSqlContainer container = fixture.Container;
 
     [Fact]
+    public async Task Physical_factory_auto_applies_safe_schema_when_enabled()
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var database = $"groundwork_startup_{suffix}";
+        await ExecuteAdminAsync($"CREATE DATABASE {Q(database)};");
+        var connectionString = new SqlConnectionStringBuilder(container.GetConnectionString())
+        {
+            InitialCatalog = database
+        }.ConnectionString;
+        try
+        {
+            var model = RelationalPhysicalStorageTestModels.Create(
+                PhysicalStorageForm.PhysicalEntityTable,
+                SqlServerGroundworkCapabilities.Provider,
+                includePriority: false,
+                instance: suffix,
+                normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+
+            var store = await SqlServerDocumentStoreFactory.OpenPhysicalAsync(
+                connectionString,
+                model.Manifest,
+                model.Target.Provider,
+                DocumentStoreAccess.Global,
+                namePolicy: new DelegatePhysicalNamePolicy(
+                    context => $"gw_{suffix}_{context.FeatureDefaultLogicalName}"),
+                options: new GroundworkRuntimeSchemaAdmissionOptions { AutoApplyOnStartup = true });
+            var inspection = await new SqlServerPhysicalSchemaExecutor(connectionString)
+                .InspectHistoryAsync(model.Target, CancellationToken.None);
+
+            Assert.NotNull(store);
+            Assert.Equal(model.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        }
+        finally
+        {
+            SqlConnection.ClearAllPools();
+            await ExecuteAdminAsync(
+                $"ALTER DATABASE {Q(database)} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {Q(database)};");
+        }
+    }
+
+    [Fact]
     public void PrimaryInsertUsesGuardedKeyRangeLockWithoutMerge()
     {
         var sql = new SqlServerPhysicalDocumentDialect().InsertPrimaryIfAbsent(

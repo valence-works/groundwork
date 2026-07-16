@@ -59,18 +59,25 @@ internal static class SqliteRelationalSessions
                 nameof(connectionString));
         }
 
-        var queryIndex = dataSource.IndexOf('?');
-        var uriPath = queryIndex >= 0 ? dataSource[..queryIndex] : dataSource;
-        if (builder.Mode == SqliteOpenMode.Memory ||
-            dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase) ||
-            uriPath.Equals("file::memory:", StringComparison.OrdinalIgnoreCase) ||
-            HasMemoryUriMode(dataSource, queryIndex))
+        if (IsInMemory(builder))
         {
             throw new ArgumentException(
                 "A per-operation SQLite store cannot use a private in-memory database. " +
                 "Use the direct-connection constructor for an explicitly serialized in-memory store.",
                 nameof(connectionString));
         }
+    }
+
+    internal static bool IsInMemory(SqliteConnectionStringBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var dataSource = builder.DataSource;
+        var queryIndex = dataSource.IndexOf('?');
+        var uriPath = queryIndex >= 0 ? dataSource[..queryIndex] : dataSource;
+        return builder.Mode == SqliteOpenMode.Memory ||
+               dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase) ||
+               uriPath.Equals("file::memory:", StringComparison.OrdinalIgnoreCase) ||
+               HasMemoryUriMode(dataSource, queryIndex);
     }
 
     private static bool HasMemoryUriMode(string dataSource, int queryIndex)

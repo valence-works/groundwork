@@ -303,20 +303,18 @@ internal static class SchemaToolReportWriter
 
     private static void WriteAuthorization(Utf8JsonWriter writer, SchemaToolReport report)
     {
-        var destructive = SchemaToolAuthorization.RequiresDestructive(report.PendingOperations);
-        var destructiveOperations = SchemaToolAuthorization.DestructiveOperationIdentities(report.PendingOperations);
-        var semantic = SchemaToolAuthorization.SemanticIdentities(report.PendingOperations);
+        var protection = PhysicalSchemaPlanProtection.Inspect(report.PendingOperations);
         writer.WritePropertyName("authorization");
         writer.WriteStartObject();
-        writer.WriteBoolean("destructiveRequired", destructive);
+        writer.WriteBoolean("destructiveRequired", protection.DestructiveOperationIdentities.Count != 0);
         writer.WritePropertyName("destructiveOperationsRequired");
         writer.WriteStartArray();
-        foreach (var identity in destructiveOperations)
+        foreach (var identity in protection.DestructiveOperationIdentities)
             writer.WriteStringValue(identity);
         writer.WriteEndArray();
         writer.WritePropertyName("semanticRequired");
         writer.WriteStartArray();
-        foreach (var identity in semantic)
+        foreach (var identity in protection.SemanticMigrationIdentities)
             writer.WriteStringValue(identity);
         writer.WriteEndArray();
         writer.WriteEndObject();

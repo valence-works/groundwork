@@ -1,16 +1,114 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Validation;
 using Groundwork.Materialization;
 using Groundwork.Provider.Relational;
 using Groundwork.Documents.Scoping;
 using Groundwork.Sqlite.Materialization;
+using Groundwork.Sqlite.PhysicalStorage;
 using Microsoft.Data.Sqlite;
 
 namespace Groundwork.Sqlite.Documents;
 
 public static class SqliteDocumentStoreFactory
 {
+    /// <summary>
+    /// Opens a physical document store after inspect-only runtime schema admission. Safe pending
+    /// operations are applied only when <see cref="GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup"/>
+    /// is enabled.
+    /// </summary>
+    public static async Task<SqlitePhysicalDocumentStore> OpenPhysicalAsync(
+        SqliteConnection connection,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        GroundworkRuntimeSchemaAdmissionOptions? options = null,
+        Action<GroundworkRuntimeSchemaAdmissionLogEntry>? schemaAdmissionLog = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(access);
+        var target = await AdmitPhysicalAsync(
+            connection,
+            manifest,
+            provider,
+            namePolicy,
+            options,
+            schemaAdmissionLog,
+            cancellationToken);
+        return new SqlitePhysicalDocumentStore(
+            connection,
+            manifest,
+            target.Routes,
+            access,
+            scopeObserver);
+    }
+
+    /// <summary>
+    /// Opens a file-backed physical document store after inspect-only runtime schema admission.
+    /// Safe pending operations are applied only when
+    /// <see cref="GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup"/> is enabled.
+    /// </summary>
+    public static async Task<SqlitePhysicalDocumentStore> OpenPhysicalAsync(
+        string connectionString,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        DocumentStoreAccess access,
+        IPhysicalNamePolicy? namePolicy = null,
+        IStorageScopeObserver? scopeObserver = null,
+        GroundworkRuntimeSchemaAdmissionOptions? options = null,
+        Action<GroundworkRuntimeSchemaAdmissionLogEntry>? schemaAdmissionLog = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentNullException.ThrowIfNull(access);
+        SqliteRelationalSessions.ValidateStatelessConnectionString(connectionString);
+        await using var admissionConnection = new SqliteConnection(connectionString);
+        var target = await AdmitPhysicalAsync(
+            admissionConnection,
+            manifest,
+            provider,
+            namePolicy,
+            options,
+            schemaAdmissionLog,
+            cancellationToken);
+        return new SqlitePhysicalDocumentStore(
+            connectionString,
+            manifest,
+            target.Routes,
+            access,
+            scopeObserver);
+    }
+
+    private static async Task<PhysicalSchemaTarget> AdmitPhysicalAsync(
+        SqliteConnection connection,
+        StorageManifest manifest,
+        ProviderIdentity provider,
+        IPhysicalNamePolicy? namePolicy,
+        GroundworkRuntimeSchemaAdmissionOptions? options,
+        Action<GroundworkRuntimeSchemaAdmissionLogEntry>? schemaAdmissionLog,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(provider);
+        var target = PhysicalSchemaTargetCompiler.Compile(
+            manifest,
+            provider,
+            SqliteGroundworkCapabilities.PhysicalNames,
+            namePolicy);
+        var admission = await new SqlitePhysicalSchemaExecutor(connection).InspectRuntimeAdmissionAsync(
+            target,
+            options,
+            schemaAdmissionLog,
+            cancellationToken);
+        admission.EnsureReady();
+        return target;
+    }
+
     public static async Task<SqliteDocumentStore> CreateAsync(
         SqliteConnection connection,
         StorageManifest manifest,

@@ -1,5 +1,6 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.MongoDb.Documents;
@@ -185,7 +186,7 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
         var database = Database();
         var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
             MongoDbDocumentStoreFactory.OpenPhysicalAsync(
                 database,
                 model.Manifest,
@@ -193,6 +194,48 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
                 DocumentStoreAccess.Scoped(new("tenant-a"))));
 
         Assert.Contains("requires the exact target", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(await CollectionNamesAsync(database));
+    }
+
+    [Fact]
+    public async Task OpenPhysicalAsync_auto_applies_a_safe_pending_target_when_enabled()
+    {
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+
+        await using var handle = await MongoDbDocumentStoreFactory.OpenPhysicalAsync(
+            database,
+            model.Manifest,
+            model.Provider,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            options: new MongoDbPhysicalDocumentStoreOptions { AutoApplyOnStartup = true });
+
+        Assert.Equal(model.Target.Fingerprint, handle.SchemaInspection.History.AppliedState!.TargetFingerprint);
+        Assert.NotEmpty(await CollectionNamesAsync(database));
+    }
+
+    [Fact]
+    public async Task OpenPhysicalAsync_rejects_invalid_manifest_before_auto_apply_mutates_schema()
+    {
+        var database = Database();
+        var model = MongoDbPhysicalStorageConformanceTests.Model(PhysicalStorageForm.PhysicalEntityTable);
+        var invalidManifest = model.Manifest with
+        {
+            StorageUnits =
+            [
+                model.Manifest.StorageUnits.Single() with { Lifecycle = null! }
+            ]
+        };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            MongoDbDocumentStoreFactory.OpenPhysicalAsync(
+                database,
+                invalidManifest,
+                model.Provider,
+                DocumentStoreAccess.Scoped(new("tenant-a")),
+                options: new MongoDbPhysicalDocumentStoreOptions { AutoApplyOnStartup = true }));
+
+        Assert.Contains("GW-UNIT-006", exception.Message, StringComparison.Ordinal);
         Assert.Empty(await CollectionNamesAsync(database));
     }
 
@@ -208,7 +251,7 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
         var beforeCollections = await CollectionNamesAsync(database);
         var beforeState = await AppliedStateAsync(database);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
             MongoDbDocumentStoreFactory.OpenPhysicalAsync(
                 database,
                 pending.Manifest,
@@ -235,7 +278,7 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
         await collection.Indexes.DropOneAsync(index.Name.Identifier);
         var beforeState = await AppliedStateAsync(database);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
             MongoDbDocumentStoreFactory.OpenPhysicalAsync(
                 database,
                 model.Manifest,
@@ -284,7 +327,7 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
             identityCasePolicy: StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase);
         var beforeState = await AppliedStateAsync(database);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
             MongoDbDocumentStoreFactory.OpenPhysicalAsync(
                 database,
                 changedIdentity.Manifest,
@@ -306,7 +349,7 @@ public sealed class MongoDbPhysicalStoreAdmissionTests : IAsyncLifetime
             "next");
         var beforeState = await AppliedStateAsync(database);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var exception = await Assert.ThrowsAsync<GroundworkRuntimeSchemaAdmissionException>(() =>
             MongoDbDocumentStoreFactory.OpenPhysicalAsync(
                 database,
                 applied.Manifest,

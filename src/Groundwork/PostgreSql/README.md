@@ -36,6 +36,10 @@ stateless: independent operations acquire concurrent pooled connections, while a
 work owns one connection and transaction until completion. Pool limits and timeouts—not a
 Groundwork-wide semaphore—provide backpressure.
 
+`PostgreSqlDocumentStoreFactory.OpenPhysicalAsync` is the route-driven startup gate. It inspects the
+durable physical schema without mutation by default and accepts
+`GroundworkRuntimeSchemaAdmissionOptions.AutoApplyOnStartup` for opt-in safe-only application.
+
 The former `PostgreSqlDocumentStoreHandle` and its lifetime-owning `Connection` property were
 removed because a stateless store has no single connection to expose or dispose.
 

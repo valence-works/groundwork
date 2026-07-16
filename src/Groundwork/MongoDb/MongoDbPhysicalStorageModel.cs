@@ -5,6 +5,7 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Physicalization;
 using Groundwork.Core.SchemaEvolution;
+using Groundwork.Core.Validation;
 using Groundwork.MongoDb.Documents;
 
 namespace Groundwork.MongoDb;
@@ -68,6 +69,7 @@ public sealed class MongoDbPhysicalStorageModel
         ArgumentNullException.ThrowIfNull(manifest);
         provider ??= MongoDbGroundworkCapabilities.Provider;
         namePolicy ??= PhysicalNamePolicy.Identity;
+        new StorageManifestValidator().Validate(manifest).RequireValid();
 
         var resolution = PhysicalStorageResolver.Resolve(manifest, namePolicy, MongoDbPhysicalNameNormalizer.Instance);
         if (!resolution.IsValid)

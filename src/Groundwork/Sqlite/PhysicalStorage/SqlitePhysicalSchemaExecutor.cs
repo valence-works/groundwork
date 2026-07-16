@@ -81,7 +81,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
     {
         ArgumentNullException.ThrowIfNull(target);
         var builder = new SqliteConnectionStringBuilder(connection.ConnectionString);
-        if (string.Equals(builder.DataSource, ":memory:", StringComparison.Ordinal))
+        if (SqliteRelationalSessions.IsInMemory(builder))
         {
             return await WithConnectionAsync(
                 ct => ReadAndValidateInspectedHistoryAsync(this, connection, target, ct),
@@ -1069,8 +1069,11 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
 
     private async Task<FileStream?> AcquireFileLockAsync(PhysicalSchemaTargetIdentity target, CancellationToken ct)
     {
-        var dataSource = connection.DataSource;
-        if (string.IsNullOrWhiteSpace(dataSource) || dataSource == ":memory:")
+        var builder = new SqliteConnectionStringBuilder(connection.ConnectionString);
+        if (SqliteRelationalSessions.IsInMemory(builder))
+            return null;
+        var dataSource = builder.DataSource;
+        if (string.IsNullOrWhiteSpace(dataSource))
             return null;
         var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(target.ToString())))[..16].ToLowerInvariant();
         var lockPath = $"{Path.GetFullPath(dataSource)}.groundwork-{fingerprint}.schema.lock";
