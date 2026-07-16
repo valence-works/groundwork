@@ -36,6 +36,7 @@
     <Project Path="tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/Groundwork.PhysicalStorage.Benchmarks.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.SchemaTool.ProviderTests/Groundwork.SchemaTool.ProviderTests.csproj" />
+    <Project Path="tests/Groundwork/Groundwork.SchemaTool.ExplicitSourceFixture/Groundwork.SchemaTool.ExplicitSourceFixture.csproj" />
     <Project Path="tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">

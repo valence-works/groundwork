@@ -22,6 +22,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\Groundwork\SchemaTool\Groundwork.SchemaTool.csproj" />
+    <ProjectReference Include="..\Groundwork.SchemaTool.ExplicitSourceFixture\Groundwork.SchemaTool.ExplicitSourceFixture.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <Target Name="CopyExplicitSourceFixture" AfterTargets="Build">
+    <ItemGroup>
+      <_ExplicitSourceFixture Include="$(MSBuildProjectDirectory)/../Groundwork.SchemaTool.ExplicitSourceFixture/bin/$(Configuration)/$(TargetFramework)/Groundwork.SchemaTool.ExplicitSourceFixture.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ExplicitSourceFixture)"
+          DestinationFolder="$(TargetDir)ExplicitSourceFixture" />
+  </Target>
 
 </Project>

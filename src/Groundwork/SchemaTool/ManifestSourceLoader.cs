@@ -15,31 +15,31 @@ internal static class ManifestSourceLoader
         var assembly = AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(candidate => SameLocation(candidate, path))
             ?? Load(path);
-        var candidates = assembly.GetTypes()
-            .Where(type => !type.IsAbstract &&
-                           !type.IsInterface &&
-                           typeof(IPhysicalSchemaManifestSource).IsAssignableFrom(type))
-            .OrderBy(type => type.FullName, StringComparer.Ordinal)
-            .ToArray();
         Type sourceType;
         if (typeName is not null)
         {
             sourceType = assembly.GetType(typeName, throwOnError: false, ignoreCase: false)
                 ?? throw new SchemaToolConfigurationException("GW-CLI-004", "Manifest source type was not found.");
-            if (!candidates.Contains(sourceType))
+            if (sourceType.IsAbstract ||
+                sourceType.IsInterface ||
+                !typeof(IPhysicalSchemaManifestSource).IsAssignableFrom(sourceType))
                 throw new SchemaToolConfigurationException("GW-CLI-004", "Manifest source type does not implement IPhysicalSchemaManifestSource.");
-        }
-        else if (candidates.Length == 1)
-        {
-            sourceType = candidates[0];
         }
         else
         {
-            throw new SchemaToolConfigurationException(
-                "GW-CLI-004",
-                candidates.Length == 0
-                    ? "Manifest assembly contains no IPhysicalSchemaManifestSource implementation."
-                    : "Manifest assembly contains multiple sources; specify '--manifest-type'.");
+            var candidates = assembly.GetTypes()
+                .Where(type => !type.IsAbstract &&
+                               !type.IsInterface &&
+                               typeof(IPhysicalSchemaManifestSource).IsAssignableFrom(type))
+                .OrderBy(type => type.FullName, StringComparer.Ordinal)
+                .ToArray();
+            sourceType = candidates.Length == 1
+                ? candidates[0]
+                : throw new SchemaToolConfigurationException(
+                    "GW-CLI-004",
+                    candidates.Length == 0
+                        ? "Manifest assembly contains no IPhysicalSchemaManifestSource implementation."
+                        : "Manifest assembly contains multiple sources; specify '--manifest-type'.");
         }
 
         try
