@@ -20,7 +20,10 @@ using MongoDB.Driver;
 namespace Groundwork.MongoDb.Documents;
 
 /// <summary>Route-driven MongoDB document store for all three physical storage forms.</summary>
-public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocumentStore
+public sealed class MongoDbPhysicalDocumentStore :
+    IDocumentStore,
+    IBoundedDocumentStore,
+    IPhysicalDocumentQueryExplainer
 {
     private const string ContentField = MongoDbPhysicalStorageFields.NativeContent;
     private const string CreatedField = MongoDbPhysicalStorageFields.CreatedAt;
@@ -183,72 +186,19 @@ public sealed class MongoDbPhysicalDocumentStore : IDocumentStore, IBoundedDocum
         throw new NotSupportedException("Route-driven MongoDB storage requires DocumentQuery with an explicit bounded-query identity.");
 #pragma warning restore GW0004
 
-    /// <summary>Returns native MongoDB explain evidence for the exact compiled bounded query.</summary>
-    public Task<BsonDocument> ExplainAsync(DocumentQuery query, CancellationToken cancellationToken = default)
-    {
-        return ExplainCoreAsync(query, count: false, cancellationToken);
-    }
-
-    /// <summary>Returns native MongoDB explain evidence for the exact compiled bounded count query.</summary>
-    public Task<BsonDocument> ExplainCountAsync(DocumentQuery query, CancellationToken cancellationToken = default)
-    {
-        return ExplainCoreAsync(query, count: true, cancellationToken);
-    }
-
-    private async Task<BsonDocument> ExplainCoreAsync(
+    /// <summary>
+    /// Returns ordered native MongoDB evidence. Linked queries can execute the bounded selector to
+    /// derive exact hydration identities; this sensitive diagnostic operation can therefore be costly.
+    /// </summary>
+    public Task<PhysicalDocumentQueryExplanation> ExplainAsync(
         DocumentQuery query,
-        bool count,
-        CancellationToken cancellationToken)
-    {
-        var route = Route(query.DocumentKind);
-        var physical = model.StorageByStorageUnit[query.DocumentKind];
-        var plan = QueryStore(query.DocumentKind).ResolvePlan(
-            query,
-            count ? BoundedQueryResultOperation.Count : BoundedQueryResultOperation.Documents);
-        var scope = ResolveScope(Unit(query.DocumentKind), StorageScopeOperation.Query, allowAcrossScopes: true);
-        var filter = MongoDbPhysicalQueryHandler.BuildFilter(query, plan, scope, physical, route);
-        var sort = MongoDbPhysicalQueryHandler.BuildSort(query, plan);
-        var renderedFilter = filter.Render(new RenderArgs<BsonDocument>(
-            database.GetCollection<BsonDocument>(plan.LookupObject.Identifier).DocumentSerializer,
-            BsonSerializer.SerializerRegistry));
-        var explainedCommand = count
-            ? new BsonDocument
-            {
-                ["aggregate"] = plan.LookupObject.Identifier,
-                ["pipeline"] = new BsonArray
-                {
-                    new BsonDocument("$match", renderedFilter),
-                    new BsonDocument("$group", new BsonDocument
-                    {
-                        ["_id"] = 1,
-                        ["n"] = new BsonDocument("$sum", 1)
-                    })
-                },
-                ["cursor"] = new BsonDocument()
-            }
-            : new BsonDocument
-            {
-                ["find"] = plan.LookupObject.Identifier,
-                ["filter"] = renderedFilter,
-                ["sort"] = sort.Render(new RenderArgs<BsonDocument>(
-                    database.GetCollection<BsonDocument>(plan.LookupObject.Identifier).DocumentSerializer,
-                    BsonSerializer.SerializerRegistry))
-            };
-        if (!count && query.Skip is { } skip)
-            explainedCommand["skip"] = skip;
-        if (!count && query.Take is { } take)
-            explainedCommand["limit"] = take;
-        var command = new BsonDocument
-        {
-            ["explain"] = explainedCommand,
-            ["verbosity"] = "queryPlanner"
-        };
-        await transactionCapability.EnsureSupportedAsync(
-            [query.DocumentKind],
-            "physical query explain",
-            cancellationToken);
-        return await database.RunCommandAsync<BsonDocument>(command, cancellationToken: cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        QueryStore(query.DocumentKind).ExplainAsync(query, cancellationToken);
+
+    public PhysicalQueryPlan ResolvePlan(
+        DocumentQuery query,
+        BoundedQueryResultOperation operation = BoundedQueryResultOperation.Documents) =>
+        QueryStore(query.DocumentKind).ResolvePlan(query, operation);
 
     private PhysicalQueryDocumentStore CreateQueryStore(ExecutableStorageRoute route)
     {
@@ -1104,6 +1054,10 @@ internal sealed record MongoDbPhysicalDocumentStoreExecutionHooks(
         static (_, _, _) => ValueTask.CompletedTask);
 }
 
+internal sealed record MongoDbPhysicalQueryPredicate(
+    FilterDefinition<BsonDocument> Filter,
+    IReadOnlyList<string> FieldIdentifiers);
+
 internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandler
 {
     internal const string LinkedIdentity = "Groundwork.MongoDb.LinkedIndex.v1";
@@ -1118,6 +1072,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     private readonly TimeProvider timeProvider;
     private readonly MongoDbPhysicalDocumentStoreExecutionHooks hooks;
     private readonly MongoDbTransactionCapability transactionCapability;
+    private readonly MongoDbPhysicalQueryExplainer explainer;
 
     public MongoDbPhysicalQueryHandler(
         string identity,
@@ -1143,6 +1098,12 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         this.timeProvider = timeProvider;
         this.hooks = hooks;
         this.transactionCapability = transactionCapability;
+        explainer = new MongoDbPhysicalQueryExplainer(
+            database,
+            route,
+            storage,
+            scope,
+            transactionCapability);
         Certifications = Array.AsReadOnly(certifications.ToArray());
         NativeFieldIdentifiers = source == PhysicalQuerySourceKind.NativeDocumentFields
             ? nativeFieldIdentifiers.ToFrozenDictionary(StringComparer.Ordinal)
@@ -1252,19 +1213,40 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             .Find(filter).Limit(1).AnyAsync(cancellationToken);
     }
 
+    public Task<PhysicalDocumentQueryExplanation> ExplainAsync(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        CancellationToken cancellationToken) =>
+        explainer.ExplainAsync(query, plan, cancellationToken);
+
     internal static FilterDefinition<BsonDocument> BuildFilter(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        DocumentScopeSelection scope,
+        StorageUnitPhysicalStorage storage,
+        ExecutableStorageRoute route) =>
+        BuildPredicate(query, plan, scope, storage, route).Filter;
+
+    internal static MongoDbPhysicalQueryPredicate BuildPredicate(
         DocumentQuery query,
         PhysicalQueryPlan plan,
         DocumentScopeSelection scope,
         StorageUnitPhysicalStorage storage,
         ExecutableStorageRoute route)
     {
+        var fieldIdentifiers = new HashSet<string>(StringComparer.Ordinal)
+        {
+            plan.Discriminator.Identifier
+        };
         var filters = new List<FilterDefinition<BsonDocument>>
         {
             Builders<BsonDocument>.Filter.Eq(plan.Discriminator.Identifier, plan.StorageUnit.Value)
         };
         if (scope.StorageKey is not null)
+        {
             filters.Add(Builders<BsonDocument>.Filter.Eq(plan.Scope.Field.Identifier, scope.StorageKey));
+            fieldIdentifiers.Add(plan.Scope.Field.Identifier);
+        }
         var logicalIndex = storage.LogicalIndexes.Single(index => index.Identity == plan.LogicalIndexIdentity);
         if (logicalIndex.MissingValueBehavior == MissingValueBehavior.Excluded)
         {
@@ -1276,11 +1258,19 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                     .ToArray()
                 : MongoDbPhysicalIndexSemantics.ValueFields(route, physicalIndex);
             filters.AddRange(membershipFields.Select(field => Builders<BsonDocument>.Filter.Exists(field, true)));
+            fieldIdentifiers.UnionWith(membershipFields);
         }
         foreach (var clause in query.Clauses)
         {
             if (clause.Comparisons.Count == 0)
-                return Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true);
+            {
+                const string matchNone = "_groundwork_match_none";
+                return new MongoDbPhysicalQueryPredicate(
+                    Builders<BsonDocument>.Filter.Eq(matchNone, true),
+                    [matchNone]);
+            }
+            fieldIdentifiers.UnionWith(clause.Comparisons.Select(comparison =>
+                plan.Predicates.Single(predicate => predicate.Path == comparison.Path).Field.Identifier));
             filters.Add(Builders<BsonDocument>.Filter.Or(clause.Comparisons.Select(comparison =>
                 Comparison(
                     comparison,
@@ -1288,7 +1278,9 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                     plan.Predicates.Single(predicate => predicate.Path == comparison.Path).Field,
                     route))));
         }
-        return Builders<BsonDocument>.Filter.And(filters);
+        return new MongoDbPhysicalQueryPredicate(
+            Builders<BsonDocument>.Filter.And(filters),
+            fieldIdentifiers.Order(StringComparer.Ordinal).ToArray());
     }
 
     internal static SortDefinition<BsonDocument> BuildSort(DocumentQuery query, PhysicalQueryPlan plan)

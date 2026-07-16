@@ -16,6 +16,59 @@ namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqlitePhysicalQueryRuntimeTests
 {
+    [Theory]
+    [InlineData(BoundedQueryResultOperation.Documents, 1, "linked-identity-collision-check", "count", "page")]
+    [InlineData(BoundedQueryResultOperation.Documents, 0, "linked-identity-collision-check", "count", null)]
+    [InlineData(BoundedQueryResultOperation.Count, 1, "linked-identity-collision-check", "count", null)]
+    [InlineData(BoundedQueryResultOperation.First, 1, "linked-identity-collision-check", "first", null)]
+    [InlineData(BoundedQueryResultOperation.Any, 1, "linked-identity-collision-check", "any", null)]
+    public async Task Public_explain_returns_every_exact_production_command_in_terminal_operation_order(
+        BoundedQueryResultOperation operation,
+        int take,
+        string firstCommand,
+        string secondCommand,
+        string? thirdCommand)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("a", "tools"));
+        await writer.SaveAsync(Save("b", "other"));
+        var runtime = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            take: take,
+            resultOperation: operation);
+
+        var explanation = await explainer.ExplainAsync(query);
+
+        Assert.Equal(
+            new[] { firstCommand, secondCommand, thirdCommand }.Where(identity => identity is not null),
+            explanation.Commands.Select(command => command.Identity));
+        Assert.Equal(
+            PhysicalDocumentQueryInvocationFingerprint.Compute(query, explanation.Plan, DocumentScopeSelection.Global),
+            explanation.RuntimeInvocationFingerprint);
+        Assert.Equal(route.Indexes.Single(index => index.Identity == "by-category").Name, explanation.Plan.IndexName);
+        Assert.All(explanation.Commands, command =>
+        {
+            Assert.Equal("sqlite-query-plan", command.NativePlanFormat);
+            Assert.Contains("SEARCH", command.NativePlan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("SCAN", command.NativePlan, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(explanation.Plan.Discriminator.Identifier, command.PredicateFieldIdentifiers);
+            Assert.Contains(Assert.Single(explanation.Plan.Predicates).Field.Identifier, command.PredicateFieldIdentifiers);
+        });
+        Assert.Contains(explanation.Commands, command =>
+            command.NativePlan.Contains(explanation.Plan.IndexName!.Identifier, StringComparison.OrdinalIgnoreCase));
+    }
+
     [Fact]
     public async Task Exact_identity_query_binds_equivalent_unicode_spelling_to_the_same_plan_evidence()
     {

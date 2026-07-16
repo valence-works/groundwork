@@ -1,6 +1,7 @@
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Scoping;
+using Groundwork.Documents.Store;
 using Groundwork.MongoDb;
 using Groundwork.MongoDb.Documents;
 using Groundwork.TestInfrastructure;
@@ -267,7 +268,8 @@ public sealed class MongoDbDocumentIdentityAcceptanceTests(MongoDbDocumentIdenti
     {
         var explanation = await documents.ExplainAsync(query);
         var expectedIndex = DocumentIdentityAcceptanceModel.ExactIndex(route);
-        var winningPlan = MongoDbWinningPlanInspector.ExactWinningPlan(explanation);
+        var selector = explanation.Commands.Single(command => command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        var winningPlan = MongoDbWinningPlanInspector.ExactWinningPlan(BsonDocument.Parse(selector.NativePlan));
         var index = await ReadIndexAsync(
             documents.Database,
             route.PrimaryStorage.Name.Identifier,

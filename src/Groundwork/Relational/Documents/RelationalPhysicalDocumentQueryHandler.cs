@@ -8,20 +8,43 @@ using Groundwork.Relational.Physicalization;
 
 namespace Groundwork.Relational.Documents;
 
+internal sealed record RelationalPhysicalNativeQueryPlan(string Format, string Content);
+
+internal delegate Task<RelationalPhysicalNativeQueryPlan> RelationalPhysicalQueryExplainExecutor(
+    DbCommand command,
+    CancellationToken cancellationToken);
+
+internal sealed record RelationalPhysicalQueryExplainCommand(
+    PhysicalDocumentQueryCommandKind Kind,
+    string Identity,
+    RelationalPhysicalQueryCommand Command);
+
 /// <summary>Reusable relational execution engine for one certified physical query source.</summary>
 public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHandler
 {
     private readonly RelationalPhysicalDocumentStore store;
+    private readonly RelationalPhysicalQueryExplainExecutor? explain;
 
     public RelationalPhysicalDocumentQueryHandler(
         string identity,
         PhysicalQuerySourceKind source,
         RelationalPhysicalDocumentStore store,
         IReadOnlyList<PhysicalQueryHandlerCertification> certifications)
+        : this(identity, source, store, certifications, null)
+    {
+    }
+
+    internal RelationalPhysicalDocumentQueryHandler(
+        string identity,
+        PhysicalQuerySourceKind source,
+        RelationalPhysicalDocumentStore store,
+        IReadOnlyList<PhysicalQueryHandlerCertification> certifications,
+        RelationalPhysicalQueryExplainExecutor? explain)
     {
         Identity = string.IsNullOrWhiteSpace(identity) ? throw new ArgumentException("A handler identity is required.", nameof(identity)) : identity;
         Source = source;
         this.store = store ?? throw new ArgumentNullException(nameof(store));
+        this.explain = explain;
         Certifications = Array.AsReadOnly((certifications ?? throw new ArgumentNullException(nameof(certifications))).ToArray());
     }
 
@@ -45,13 +68,13 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
-            var total = await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
+            var scope = store.ResolveQueryScope(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, BuildCollisionCheckCommand(query, plan, route, scope), route, ct);
+            var total = await CountCoreAsync(connection, BuildCountCommand(query, plan, route, scope), ct);
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult([], total);
 
-            var built = Build(query, plan, route, requiresPrimaryLookup: true);
-            var rendered = RenderQuery(query, plan, built, route);
+            var rendered = BuildQueryCommand(query, plan, route, scope);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
             AddParameters(command, rendered.Parameters);
             var documents = new List<DocumentEnvelope>();
@@ -68,18 +91,116 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
-            return await CountCoreAsync(connection, Build(query, plan, route, requiresPrimaryLookup: false), ct);
+            var scope = store.ResolveQueryScope(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, BuildCollisionCheckCommand(query, plan, route, scope), route, ct);
+            return await CountCoreAsync(connection, BuildCountCommand(query, plan, route, scope), ct);
         }, cancellationToken);
     }
 
-    internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan) =>
-        RenderCount(Build(query, plan, store.GetRoute(query.DocumentKind), requiresPrimaryLookup: false));
+    internal RelationalPhysicalQueryCommand BuildCountCommand(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var route = store.GetRoute(query.DocumentKind);
+        return BuildCountCommand(query, plan, route, store.ResolveQueryScope(query.DocumentKind));
+    }
 
     internal RelationalPhysicalQueryCommand BuildQueryCommand(DocumentQuery query, PhysicalQueryPlan plan)
     {
         var route = store.GetRoute(query.DocumentKind);
-        return RenderQuery(query, plan, Build(query, plan, route, requiresPrimaryLookup: true), route);
+        return BuildQueryCommand(query, plan, route, store.ResolveQueryScope(query.DocumentKind));
+    }
+
+    public Task<PhysicalDocumentQueryExplanation> ExplainAsync(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        CancellationToken cancellationToken)
+    {
+        if (explain is null)
+        {
+            return Task.FromException<PhysicalDocumentQueryExplanation>(new NotSupportedException(
+                $"Physical query handler '{Identity}' does not support provider-native explain evidence."));
+        }
+
+        ValidateDocumentIdentityValues(query.Clauses);
+        return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+        {
+            var route = store.GetRoute(query.DocumentKind);
+            var scope = store.ResolveQueryScope(query.DocumentKind);
+            var commands = new List<PhysicalDocumentQueryCommandExplanation>();
+            foreach (var explained in BuildExplainCommands(query, plan, route, scope))
+            {
+                await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
+                    connection,
+                    explained.Command.CommandText);
+                AddParameters(command, explained.Command.Parameters);
+                var native = await explain(command, ct);
+                commands.Add(new PhysicalDocumentQueryCommandExplanation(
+                    explained.Kind,
+                    explained.Identity,
+                    native.Format,
+                    native.Content,
+                    explained.Command.PredicateFieldIdentifiers));
+            }
+            return new PhysicalDocumentQueryExplanation(
+                plan,
+                PhysicalDocumentQueryInvocationFingerprint.Compute(query, plan, scope),
+                commands);
+        }, cancellationToken);
+    }
+
+    private IReadOnlyList<RelationalPhysicalQueryExplainCommand> BuildExplainCommands(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope)
+    {
+        var commands = new List<RelationalPhysicalQueryExplainCommand>();
+        if (BuildCollisionCheckCommand(query, plan, route, scope) is { } collision)
+        {
+            commands.Add(new RelationalPhysicalQueryExplainCommand(
+                PhysicalDocumentQueryCommandKind.LinkedIdentityCollisionCheck,
+                PhysicalDocumentQueryCommandIdentities.LinkedIdentityCollisionCheck,
+                collision));
+        }
+
+        switch (query.ResultOperation)
+        {
+            case BoundedQueryResultOperation.Documents:
+                commands.Add(new RelationalPhysicalQueryExplainCommand(
+                    PhysicalDocumentQueryCommandKind.Count,
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    BuildCountCommand(query, plan, route, scope)));
+                if (query.Take != 0)
+                {
+                    commands.Add(new RelationalPhysicalQueryExplainCommand(
+                        PhysicalDocumentQueryCommandKind.Page,
+                        PhysicalDocumentQueryCommandIdentities.Page,
+                        BuildQueryCommand(query, plan, route, scope)));
+                }
+                break;
+            case BoundedQueryResultOperation.Count:
+                commands.Add(new RelationalPhysicalQueryExplainCommand(
+                    PhysicalDocumentQueryCommandKind.Count,
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    BuildCountCommand(query, plan, route, scope)));
+                break;
+            case BoundedQueryResultOperation.First:
+                commands.Add(new RelationalPhysicalQueryExplainCommand(
+                    PhysicalDocumentQueryCommandKind.First,
+                    PhysicalDocumentQueryCommandIdentities.First,
+                    BuildFirstCommand(query, plan, route, scope)));
+                break;
+            case BoundedQueryResultOperation.Any:
+                commands.Add(new RelationalPhysicalQueryExplainCommand(
+                    PhysicalDocumentQueryCommandKind.Any,
+                    PhysicalDocumentQueryCommandIdentities.Any,
+                    BuildAnyCommand(query, plan, route, scope)));
+                break;
+            default:
+                throw new NotSupportedException(
+                    $"Provider-native explain does not support result operation '{query.ResultOperation}'.");
+        }
+
+        return commands;
     }
 
     private RelationalPhysicalQueryCommand RenderQuery(
@@ -110,11 +231,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
-            var built = Build(query, plan, route, requiresPrimaryLookup: true);
-            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, store.ApplyFirst(
-                $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"));
-            AddParameters(command, built.Parameters);
+            var scope = store.ResolveQueryScope(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, BuildCollisionCheckCommand(query, plan, route, scope), route, ct);
+            var rendered = BuildFirstCommand(query, plan, route, scope);
+            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
+            AddParameters(command, rendered.Parameters);
             await using var reader = await command.ExecuteReaderAsync(ct);
             return await reader.ReadAsync(ct) ? store.ReadPhysicalEnvelope(reader).Envelope : null;
         }, cancellationToken);
@@ -126,12 +247,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
             var route = store.GetRoute(query.DocumentKind);
-            await ThrowIfLinkedIdentityCollisionAsync(connection, query, plan, route, ct);
-            var built = Build(query, plan, route, requiresPrimaryLookup: true);
-            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
-                connection,
-                store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"));
-            AddParameters(command, built.Parameters);
+            var scope = store.ResolveQueryScope(query.DocumentKind);
+            await ThrowIfLinkedIdentityCollisionAsync(connection, BuildCollisionCheckCommand(query, plan, route, scope), route, ct);
+            var rendered = BuildAnyCommand(query, plan, route, scope);
+            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
+            AddParameters(command, rendered.Parameters);
             return await command.ExecuteScalarAsync(ct) is not null;
         }, cancellationToken);
     }
@@ -169,9 +289,77 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             requiresPrimaryLookup: !linkedIdentityOnly,
             fixedScope: scope);
 
-    private async Task<long> CountCoreAsync(DbConnection connection, RelationalPhysicalQueryPredicate built, CancellationToken ct)
+    private RelationalPhysicalQueryCommand BuildCountCommand(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope) =>
+        RenderCount(Build(query, plan, route, requiresPrimaryLookup: false, fixedScope: scope));
+
+    private RelationalPhysicalQueryCommand BuildQueryCommand(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope) =>
+        RenderQuery(query, plan, Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope), route);
+
+    private RelationalPhysicalQueryCommand BuildFirstCommand(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope)
     {
-        var rendered = RenderCount(built);
+        var built = Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope);
+        return new RelationalPhysicalQueryCommand(
+            store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"),
+            built.Parameters,
+            built.PredicateFieldIdentifiers);
+    }
+
+    private RelationalPhysicalQueryCommand BuildAnyCommand(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope)
+    {
+        var built = Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope);
+        return new RelationalPhysicalQueryCommand(
+            store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"),
+            built.Parameters,
+            built.PredicateFieldIdentifiers);
+    }
+
+    private RelationalPhysicalQueryCommand? BuildCollisionCheckCommand(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        DocumentScopeSelection scope)
+    {
+        if (plan.AccessKind != PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+            return null;
+
+        var built = Build(
+            query,
+            plan,
+            route,
+            requiresPrimaryLookup: true,
+            fixedScope: scope,
+            detectIdentityCollision: true);
+        var relationship = route.LinkedRelationship!;
+        return new RelationalPhysicalQueryCommand(
+            store.ApplyFirst(
+                $"SELECT l.{store.Q(relationship.DocumentId.Identifier)}, " +
+                $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
+                $"l.{store.Q(relationship.Identity.LookupKey.Identifier)} {built.FromAndWhere}"),
+            built.Parameters,
+            built.PredicateFieldIdentifiers);
+    }
+
+    private async Task<long> CountCoreAsync(
+        DbConnection connection,
+        RelationalPhysicalQueryCommand rendered,
+        CancellationToken ct)
+    {
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
         AddParameters(command, rendered.Parameters);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct));
@@ -224,6 +412,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             predicates.Add(
                 $"p.{store.Q(route.Envelope.Identity.ComparisonKey.Identifier)} <> " +
                 $"l.{store.Q(route.LinkedRelationship!.Identity.ComparisonKey.Identifier)}");
+            predicateFieldIdentifiers.Add(route.Envelope.Identity.ComparisonKey.Identifier);
+            predicateFieldIdentifiers.Add(route.LinkedRelationship.Identity.ComparisonKey.Identifier);
         }
 
         var parameterIndex = 0;
@@ -280,27 +470,15 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private async Task ThrowIfLinkedIdentityCollisionAsync(
         DbConnection connection,
-        DocumentQuery query,
-        PhysicalQueryPlan plan,
+        RelationalPhysicalQueryCommand? rendered,
         ExecutableStorageRoute route,
         CancellationToken ct)
     {
-        if (plan.AccessKind != PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+        if (rendered is null)
             return;
 
-        var built = Build(
-            query,
-            plan,
-            route,
-            requiresPrimaryLookup: true,
-            detectIdentityCollision: true);
-        var relationship = route.LinkedRelationship!;
-        var sql = store.ApplyFirst(
-            $"SELECT l.{store.Q(relationship.DocumentId.Identifier)}, " +
-            $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
-            $"l.{store.Q(relationship.Identity.LookupKey.Identifier)} {built.FromAndWhere}");
-        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, sql);
-        AddParameters(command, built.Parameters);
+        await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
+        AddParameters(command, rendered.Parameters);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return;

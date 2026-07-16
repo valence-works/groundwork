@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Data.Common;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
@@ -39,9 +40,22 @@ public static class SqlitePhysicalQueryRuntime
                 registration.Value,
                 registration.Key,
                 store,
-                certifications);
+                certifications,
+                ExplainAsync);
         }).ToArray();
         return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
+    }
+
+    private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+        DbCommand command,
+        CancellationToken cancellationToken)
+    {
+        command.CommandText = $"EXPLAIN QUERY PLAN {command.CommandText}";
+        var details = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            details.Add(reader.GetString(3));
+        return new RelationalPhysicalNativeQueryPlan("sqlite-query-plan", string.Join(Environment.NewLine, details));
     }
 
     public static PhysicalQueryPlannerCapabilities Capabilities(ProviderIdentity provider)

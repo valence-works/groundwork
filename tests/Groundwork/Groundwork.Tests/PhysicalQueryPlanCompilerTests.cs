@@ -3,6 +3,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Core.Scoping;
 using Groundwork.Core.Transactions;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
@@ -677,6 +678,108 @@ public sealed class PhysicalQueryPlanCompilerTests
                 "workflowTriggerBinding",
                 "unknown-query",
                 [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))])));
+    }
+
+    [Fact]
+    public void Runtime_invocation_fingerprint_omits_raw_values_and_covers_query_route_scope_and_exact_utf16()
+    {
+        const string sensitiveValue = "tenant-secret-value";
+        var fixture = CreateFixture(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            BoundedQueryExecutionClass.Ordinary);
+        var alternateFixture = CreateFixture(
+            PhysicalStorageForm.SharedDocuments,
+            BoundedQueryExecutionClass.Ordinary);
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson)));
+        var alternatePlan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            alternateFixture.Route,
+            alternateFixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson)));
+        var query = new DocumentQuery(
+            "workflowTriggerBinding",
+            "list-by-stimulus-type",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", sensitiveValue))],
+            [new DocumentQueryOrder("createdAt", PhysicalSortDirection.Descending)],
+            skip: 3,
+            take: 25,
+            latestPerKeyPath: "correlationId");
+        var scoped = new DocumentScopeSelection("tenant-a", new StorageScope("tenant-a"), false);
+        var acrossScopes = new DocumentScopeSelection(null, null, true);
+
+        var fingerprint = PhysicalDocumentQueryInvocationFingerprint.Compute(query, plan, scoped);
+
+        Assert.Equal(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(query, plan, scoped));
+        Assert.Matches("^[0-9a-f]{64}$", fingerprint);
+        Assert.DoesNotContain(sensitiveValue, fingerprint, StringComparison.Ordinal);
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(query.Page(4, 25), plan, scoped));
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "different"))],
+            query.Order,
+            query.Skip,
+            query.Take,
+            query.Continuation,
+            query.LatestPerKeyPath,
+            query.ResultOperation), plan, scoped));
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(
+            query.Select(BoundedQueryResultOperation.Count), plan, scoped));
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(query, alternatePlan, scoped));
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(query, plan, acrossScopes));
+        Assert.NotEqual(
+            PhysicalDocumentQueryInvocationFingerprint.Compute(QueryWithValue("\ud800"), plan, scoped),
+            PhysicalDocumentQueryInvocationFingerprint.Compute(QueryWithValue("\ud801"), plan, scoped));
+
+        DocumentQuery QueryWithValue(string value) => new(
+            query.DocumentKind,
+            query.QueryIdentity,
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", value))]);
+    }
+
+    [Fact]
+    public async Task Runtime_explain_uses_the_same_resolution_path_and_fails_closed_for_custom_handlers()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            BoundedQueryExecutionClass.Ordinary);
+        var capabilities = Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson);
+        var planned = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            capabilities));
+        var handler = new RecordingHandler(
+            planned.HandlerIdentity,
+            PhysicalQuerySourceKind.PrimaryCanonicalJson,
+            certifications: [CertificationFor(planned)]);
+        var store = new PhysicalQueryDocumentStore(
+            fixture.Route,
+            fixture.Storage,
+            capabilities,
+            [handler]);
+        var invalid = new DocumentQuery(
+            "workflowTriggerBinding",
+            "unknown-query",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))]);
+
+        var execution = await Assert.ThrowsAsync<InvalidOperationException>(() => store.QueryAsync(invalid));
+        var explain = await Assert.ThrowsAsync<InvalidOperationException>(() => store.ExplainAsync(invalid));
+        var unsupported = new List<NotSupportedException>();
+        foreach (var operation in Enum.GetValues<BoundedQueryResultOperation>())
+        {
+            unsupported.Add(await Assert.ThrowsAsync<NotSupportedException>(() => store.ExplainAsync(
+                new DocumentQuery(
+                    "workflowTriggerBinding",
+                    "list-by-stimulus-type",
+                    [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))],
+                    resultOperation: operation))));
+        }
+
+        Assert.Equal(execution.Message, explain.Message);
+        Assert.All(unsupported, exception =>
+            Assert.Contains(handler.Identity, exception.Message, StringComparison.Ordinal));
     }
 
     [Fact]

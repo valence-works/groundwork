@@ -211,6 +211,47 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             "postgresql");
 
     [Fact]
+    public async Task Public_query_explain_uses_json_plan_and_leaves_normal_execution_usable()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "explain-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "explain-noise", "1", "{\"category\":\"tools\"}"))).Status);
+        await SeedPlanNoiseAsync(route);
+        await AnalyzeRouteAsync(route);
+        var runtime = PostgreSqlPhysicalQueryRuntime.Create(store, model.Manifest, route, model.Target.Provider);
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending"))],
+            take: 1);
+
+        var explanation = await explainer.ExplainAsync(query);
+        var result = await runtime.QueryAsync(query);
+
+        Assert.Equal(["count", "page"], explanation.Commands.Select(command => command.Identity));
+        Assert.All(explanation.Commands, command =>
+        {
+            Assert.Equal("postgresql-json", command.NativePlanFormat);
+            Assert.Contains(explanation.Plan.IndexName!.Identifier, command.NativePlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("\"Node Type\": \"Seq Scan\"", command.NativePlan, StringComparison.Ordinal);
+        });
+        Assert.Equal("explain-target", Assert.Single(result.Documents).Id);
+    }
+
+    [Fact]
     public async Task Concurrent_distinct_targets_can_bootstrap_a_clean_schema()
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -698,11 +739,11 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             "list-by-category",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
             resultOperation: BoundedQueryResultOperation.Count);
-        var rendered = RelationalPhysicalQueryRuntime.BuildCountCommand(
-            store, manifest, route, provider, "postgresql", query);
         await SeedPlanNoiseAsync(route);
         await AnalyzeRouteAsync(route);
-        return await ExplainAsync(rendered);
+        var runtime = PostgreSqlPhysicalQueryRuntime.Create(store, manifest, route, provider);
+        var explanation = await Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime).ExplainAsync(query);
+        return string.Join(Environment.NewLine, explanation.Commands.Select(command => command.NativePlan));
     }
 
     private async Task AnalyzeRouteAsync(ExecutableStorageRoute route)

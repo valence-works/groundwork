@@ -64,10 +64,15 @@ public sealed class MongoDbBenchmarkTarget(
         foreach (var request in requests)
         {
             var query = Query(request.Skip, request.Take, request.Ordered);
-            var planDocument = request.Operation == NativePlanOperation.Selection
-                ? await tenantAHandle!.Store.ExplainAsync(query, cancellationToken)
-                : await tenantAHandle!.Store.ExplainCountAsync(
-                    query.Select(BoundedQueryResultOperation.Count), cancellationToken);
+            var operation = request.Operation == NativePlanOperation.Selection
+                ? BoundedQueryResultOperation.Documents
+                : BoundedQueryResultOperation.Count;
+            var explanation = await tenantAHandle!.Store.ExplainAsync(query.Select(operation), cancellationToken);
+            var commandKind = request.Operation == NativePlanOperation.Selection
+                ? PhysicalDocumentQueryCommandKind.Page
+                : PhysicalDocumentQueryCommandKind.Count;
+            var command = explanation.Commands.Single(candidate => candidate.Kind == commandKind);
+            var planDocument = BsonDocument.Parse(command.NativePlan);
             var plan = planDocument.ToJson(new MongoDB.Bson.IO.JsonWriterSettings { Indent = true });
             try
             {
