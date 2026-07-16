@@ -1,5 +1,8 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Intents;
@@ -155,7 +158,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     [Theory]
     [InlineData("plan")]
     [InlineData("status")]
-    public async Task Read_commands_report_pending_sqlite_work_with_pipeline_exit_code(string command)
+    public async Task Read_commands_report_pending_sqlite_work_without_creating_an_empty_catalog(string command)
     {
         var database = Path.Combine(directory, $"{command}.db");
         var arguments = Arguments(command, database);
@@ -168,7 +171,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal(SchemaToolExitCodes.PendingChanges, firstExit);
         Assert.Equal(firstExit, secondExit);
         Assert.Equal(first, output.ToString());
-        Assert.True(File.Exists(database));
+        Assert.False(File.Exists(database));
         Assert.Equal(string.Empty, error.ToString());
 
         using var report = JsonDocument.Parse(first);
@@ -178,6 +181,66 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.NotEqual(string.Empty, root.GetProperty("planFingerprint").GetString());
         Assert.Equal(0, root.GetProperty("appliedOperations").GetArrayLength());
         Assert.True(root.GetProperty("pendingOperations").GetArrayLength() > 0);
+    }
+
+    [Theory]
+    [InlineData("plan")]
+    [InlineData("status")]
+    public async Task Read_commands_do_not_change_an_applied_sqlite_catalog(string command)
+    {
+        var database = Path.Combine(directory, $"applied-{command}.db");
+        var applyExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var applied = ParseOutput();
+        var before = await CaptureSqliteCatalogAsync(database);
+
+        var exit = await GroundworkSchemaCli.RunAsync(Arguments(command, database), output, error);
+        using var report = ParseOutput();
+        var after = await CaptureSqliteCatalogAsync(database);
+
+        Assert.Equal(SchemaToolExitCodes.Success, applyExit);
+        Assert.Equal(SchemaToolExitCodes.Success, exit);
+        Assert.Equal("ready", report.RootElement.GetProperty("outcome").GetString());
+        Assert.False(report.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal(before, after);
+        Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Theory]
+    [InlineData("plan")]
+    [InlineData("status")]
+    public async Task Read_commands_block_on_applied_schema_drift_without_changing_the_catalog(string command)
+    {
+        var database = Path.Combine(directory, $"drifted-{command}.db");
+        var applyExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var applied = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, applyExit);
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var dropIndex = connection.CreateCommand();
+            dropIndex.CommandText = $"DROP INDEX \"{SqliteByCategoryIndex}\";";
+            await dropIndex.ExecuteNonQueryAsync();
+        }
+        var before = await CaptureSqliteCatalogAsync(database);
+
+        var exit = await GroundworkSchemaCli.RunAsync(Arguments(command, database), output, error);
+        using var report = ParseOutput();
+        var after = await CaptureSqliteCatalogAsync(database);
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, exit);
+        Assert.Equal("blocked", report.RootElement.GetProperty("outcome").GetString());
+        Assert.Contains(
+            report.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-CLI-012");
+        Assert.False(report.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal(before, after);
+        Assert.Equal(string.Empty, error.ToString());
     }
 
     [Fact]
@@ -576,6 +639,82 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         command.Parameters.AddWithValue("@name", column);
         return Convert.ToInt64(await command.ExecuteScalarAsync()) == 1;
     }
+
+    private static async Task<string> CaptureSqliteCatalogAsync(string database)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = database,
+            Mode = SqliteOpenMode.ReadOnly
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        var lines = new List<string>();
+        var tables = new List<string>();
+        await using (var schema = connection.CreateCommand())
+        {
+            schema.CommandText = """
+                SELECT type, name, tbl_name, COALESCE(sql, '')
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type, name, tbl_name, sql;
+                """;
+            await using var reader = await schema.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var type = reader.GetString(0);
+                var name = reader.GetString(1);
+                lines.Add(JsonSerializer.Serialize(new[]
+                {
+                    "schema", type, name, reader.GetString(2), reader.GetString(3)
+                }));
+                if (type == "table")
+                    tables.Add(name);
+            }
+        }
+
+        foreach (var table in tables.Order(StringComparer.Ordinal))
+        {
+            var columns = new List<string>();
+            await using (var tableInfo = connection.CreateCommand())
+            {
+                tableInfo.CommandText = $"PRAGMA table_info({QuoteSqliteIdentifier(table)});";
+                await using var reader = await tableInfo.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    columns.Add(reader.GetString(1));
+            }
+
+            var rows = new List<string>();
+            await using (var contents = connection.CreateCommand())
+            {
+                contents.CommandText = $"SELECT {string.Join(", ", columns.Select(QuoteSqliteIdentifier))} FROM {QuoteSqliteIdentifier(table)};";
+                await using var reader = await contents.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var values = Enumerable.Range(0, reader.FieldCount)
+                        .Select(index => CanonicalSqliteValue(reader.GetValue(index)))
+                        .Prepend(table)
+                        .Prepend("row")
+                        .ToArray();
+                    rows.Add(JsonSerializer.Serialize(values));
+                }
+            }
+            lines.AddRange(rows.Order(StringComparer.Ordinal));
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines))))
+            .ToLowerInvariant();
+    }
+
+    private static string QuoteSqliteIdentifier(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
+
+    private static string CanonicalSqliteValue(object value) => value switch
+    {
+        DBNull => "null",
+        byte[] bytes => $"blob:{Convert.ToHexString(bytes)}",
+        _ => $"{value.GetType().FullName}:{Convert.ToString(value, CultureInfo.InvariantCulture)}"
+    };
 
     public sealed class TestManifestSource : IPhysicalSchemaManifestSource
     {

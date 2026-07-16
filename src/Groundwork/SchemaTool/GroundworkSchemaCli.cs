@@ -128,10 +128,7 @@ public static class GroundworkSchemaCli
                         compilation.Target,
                         compilation.Diagnostics.Concat(
                         [
-                            GroundworkDiagnostic.Error(
-                                "GW-CLI-012",
-                                "Live provider state is incompatible with the recorded physical-schema target.",
-                                "providerState")
+                            AppliedSchemaDriftDiagnostic()
                         ]).ToArray(),
                         PhysicalSchemaHistoryState.Empty,
                         "live");
@@ -142,10 +139,7 @@ public static class GroundworkSchemaCli
                     ? compilation.Diagnostics
                     : compilation.Diagnostics.Concat(
                     [
-                        GroundworkDiagnostic.Error(
-                            "GW-CLI-012",
-                            "Live provider state is incompatible with the recorded physical-schema target.",
-                            "providerState")
+                        AppliedSchemaDriftDiagnostic()
                     ]).ToArray();
                 var validation = SchemaToolReport.Validate(
                     compilation.Target,
@@ -180,18 +174,19 @@ public static class GroundworkSchemaCli
                 };
             }
 
-            var (history, plan) = await ReadPlanAsync(
+            var (planInspection, plan) = await ReadPlanAsync(
                 compilation.Target!,
-                provider.Executor,
+                provider.Inspector,
                 cancellationToken);
 
             var report = SchemaToolReport.FromPlan(
                 parsedOptions.Command.ToString().ToLowerInvariant(),
                 compilation.Target!,
-                history,
-                plan);
+                planInspection.History,
+                plan,
+                planInspection.IsAppliedSchemaValid ? [] : [AppliedSchemaDriftDiagnostic()]);
             await SchemaToolReportWriter.WriteAsync(report, parsedOptions.Output, output);
-            if (!plan.IsApplicable)
+            if (report.Diagnostics.Any(item => item.IsError))
                 return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
             return plan.Operations.Count == 0
                 ? Finish(SchemaToolExitCodes.Success, "ready")
@@ -284,24 +279,21 @@ public static class GroundworkSchemaCli
             "This command requires explicit '--connection' or '--connection-env' input.");
     }
 
-    private static async Task<(PhysicalSchemaHistoryState History, PhysicalSchemaDiffPlan Plan)> ReadPlanAsync(
+    private static GroundworkDiagnostic AppliedSchemaDriftDiagnostic() => GroundworkDiagnostic.Error(
+        "GW-CLI-012",
+        "Live provider state is incompatible with the recorded physical-schema target.",
+        "providerState");
+
+    private static async Task<(PhysicalSchemaInspectionResult Inspection, PhysicalSchemaDiffPlan Plan)> ReadPlanAsync(
         PhysicalSchemaTarget target,
-        IPhysicalSchemaExecutor executor,
+        IPhysicalSchemaHistoryInspector inspector,
         CancellationToken cancellationToken)
     {
-        await using var applicationLock = await executor.AcquireApplicationLockAsync(target.Identity, cancellationToken);
-        if (applicationLock.Target != target.Identity)
-            throw new InvalidOperationException("Provider returned a physical schema lock for another target.");
-        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            applicationLock.OwnershipLost);
-        var token = linkedCancellation.Token;
-        token.ThrowIfCancellationRequested();
-        var history = await executor.ReadHistoryAsync(target.Identity, applicationLock, token);
-        token.ThrowIfCancellationRequested();
+        var inspection = await inspector.InspectHistoryAsync(target, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         return (
-            history,
-            PhysicalSchemaDiffPlanner.Plan(target, history, DateTimeOffset.UnixEpoch));
+            inspection,
+            PhysicalSchemaDiffPlanner.Plan(target, inspection.History, DateTimeOffset.UnixEpoch));
     }
 }
 

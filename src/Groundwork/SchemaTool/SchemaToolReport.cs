@@ -46,9 +46,11 @@ internal sealed record SchemaToolReport(
         string command,
         PhysicalSchemaTarget target,
         PhysicalSchemaHistoryState history,
-        PhysicalSchemaDiffPlan plan)
+        PhysicalSchemaDiffPlan plan,
+        IReadOnlyList<GroundworkDiagnostic> inspectionDiagnostics)
     {
-        var outcome = !plan.IsApplicable
+        var diagnostics = inspectionDiagnostics.Concat(plan.Diagnostics).ToArray();
+        var outcome = diagnostics.Any(item => item.IsError)
             ? "blocked"
             : plan.Operations.Count == 0
                 ? "ready"
@@ -62,7 +64,7 @@ internal sealed record SchemaToolReport(
             history.AppliedState?.TargetFingerprint,
             plan.Operations,
             history.AppliedState?.AppliedOperations ?? [],
-            plan.Diagnostics,
+            diagnostics,
             Mutated: false);
     }
 
