@@ -106,11 +106,12 @@ recorded applied routes before computing the desired diff. This detects drift in
 even when an additive or semantic target change is pending, without executing any pending operation.
 Deployment still recomputes and authorizes the exact plan under the application lock.
 
-`plan` and `status` read durable applied state under the provider/manifest exclusion lock; an
-executor may establish its provider-owned lock/history infrastructure while doing so, but neither
-command applies target operations. `apply` reads, authorizes, and executes one exact plan without
-releasing that lock between those phases. Execution, retry, cancellation, acknowledgement-loss
-recovery, and applied-state publication remain #44's `PhysicalSchemaApplication` protocol.
+`plan` and `status` use the same non-locking provider inspection path as live validation. They do
+not create lock/history infrastructure or change an existing provider catalog, and they block when
+inspection finds drift in the recorded applied schema. `apply` alone acquires the provider/manifest
+exclusion lock, then reads, authorizes, and executes one exact plan without releasing that lock
+between those phases. Execution, retry, cancellation, acknowledgement-loss recovery, and
+applied-state publication remain #44's `PhysicalSchemaApplication` protocol.
 
 MongoDB requires `--database` unless the connection URI already contains the database name.
 `--connection` is supported for non-interactive runners, but `--connection-env` is preferred because

@@ -169,6 +169,7 @@ public sealed class SchemaToolProviderParityTests
         Assert.Equal(
             plan.Report.GetProperty("planFingerprint").GetString(),
             status.Report.GetProperty("planFingerprint").GetString());
+        Assert.Equal(0, await countInfrastructure());
 
         var applied = await RunAsync(
             "apply",
