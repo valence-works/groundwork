@@ -16,3 +16,21 @@ Named update/delete lifecycle work uses `BoundedMutationDeclaration` and
 `PhysicalMutationDocumentStore`. Mutation declarations reuse a scale-bearing bounded query as their
 closed selector and fix either a field transition or deletion at manifest construction time. See
 [`docs/bounded-document-mutations.md`](../../../docs/bounded-document-mutations.md).
+
+## Versioned canonical JSON
+
+`VersionedJsonDocumentCodec` is the guarded typed path for canonical JSON whose shape evolves. A
+caller declares a `DocumentSchemaVersionPolicy` per document kind, contributes contiguous
+`IDocumentJsonUpcaster` steps from the minimum readable version to the current version, and supplies
+a `DocumentSchemaVersionFormat` that owns its persisted stamp syntax and any legacy aliases.
+Construction validates the complete policy, upcaster, and stamp-format contract before traffic.
+
+The codec always writes the current stamp. On reads it parses and bounds-checks the envelope's
+`SchemaVersion` before parsing `ContentJson`; malformed, unsupported older, and future stamps raise a
+structured `DocumentSchemaVersionException`. Supported older JSON objects are upcasted one integer
+step at a time before typed deserialization. Groundwork deliberately does not assign meaning to
+application-specific stamps or choose clean-break boundaries for callers.
+
+`JsonDocumentStoreExtensions` remains the raw, explicitly version-blind compatibility surface.
+Durable typed stores should use `VersionedJsonDocumentCodec.CreateSaveRequest` and
+`VersionedJsonDocumentCodec.Deserialize` instead.
