@@ -740,6 +740,122 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void Continuation_codec_allows_page_size_changes_and_rejects_query_scope_and_token_rewriting()
+    {
+        var declaration = Query(
+            BoundedQueryExecutionClass.ScaleBearing,
+            pagingSupport: QueryPagingSupport.Cursor);
+        var fixture = CreateEntityFixture(StimulusTypeIndex(), declaration);
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            CapabilitiesWithPaging(
+                supportsKeysetPaging: true,
+                supportsLatestPerKey: false,
+                sources: [PhysicalQuerySourceKind.PrimaryProjectedColumns])));
+        var upgradedPlan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            CapabilitiesWithPaging(
+                new ProviderIdentity("test-provider", "2.0.0"),
+                supportsKeysetPaging: true,
+                supportsLatestPerKey: false,
+                sources: [PhysicalQuerySourceKind.PrimaryProjectedColumns])));
+        var query = new DocumentQuery(
+            "workflowTriggerBinding",
+            declaration.Identity,
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))],
+            take: 10);
+        var scope = new DocumentScopeSelection("tenant-a", new StorageScope("tenant-a"), false);
+        var values = DocumentQueryOrderResolver.Resolve(query, plan)
+            .Select((order, index) => new DocumentQueryContinuationValue(
+                order.Field.ValueKind,
+                DocumentQueryContinuationScalarKind.String,
+                $"value-{index}"))
+            .ToArray();
+
+        var token = DocumentQueryContinuationCodec.Encode(query, plan, scope, values);
+
+        Assert.Equal(values, DocumentQueryContinuationCodec.Decode(
+            token,
+            new DocumentQuery(
+                query.DocumentKind,
+                query.QueryIdentity,
+                query.Clauses,
+                query.Order,
+                take: 50,
+                continuation: token),
+            plan,
+            scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                token,
+                new DocumentQuery(
+                    query.DocumentKind,
+                    query.QueryIdentity,
+                    [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "timer"))],
+                    take: 10,
+                    continuation: token),
+                plan,
+                scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                token,
+                query.ContinueAfter(token),
+                plan,
+                new DocumentScopeSelection("tenant-b", new StorageScope("tenant-b"), false)));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                token[..^1] + (token[^1] == 'a' ? 'b' : 'a'),
+                query.ContinueAfter(token[..^1] + (token[^1] == 'a' ? 'b' : 'a')),
+                plan,
+                scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                "not-a-groundwork-continuation",
+                query.ContinueAfter("not-a-groundwork-continuation"),
+                plan,
+                scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(" ", query, plan, scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Encode(
+                query,
+                plan,
+                scope,
+                values.Select((value, index) => index == 0
+                        ? value with
+                        {
+                            ScalarKind = DocumentQueryContinuationScalarKind.Int64,
+                            Value = "not-an-integer"
+                        }
+                        : value)
+                    .ToArray()));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                token,
+                new DocumentQuery(
+                    query.DocumentKind,
+                    query.QueryIdentity,
+                    query.Clauses,
+                    [new DocumentQueryOrder("stimulusType", PhysicalSortDirection.Descending)],
+                    take: 10,
+                    continuation: token),
+                plan,
+                scope));
+        Assert.Throws<InvalidDocumentQueryContinuationException>(() =>
+            DocumentQueryContinuationCodec.Decode(
+                token,
+                query.ContinueAfter(token),
+                upgradedPlan,
+                scope));
+        Assert.Throws<InvalidOperationException>(() =>
+            DocumentQueryContinuationCodec.ValidateScope(
+                plan,
+                new DocumentScopeSelection(null, null, true)));
+    }
+
+    [Fact]
     public async Task Runtime_explain_uses_the_same_resolution_path_and_fails_closed_for_custom_handlers()
     {
         var fixture = CreateFixture(
@@ -1504,6 +1620,52 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void RuntimeOrderPrefixRetainsTheRemainingDeclaredCompoundOrderBeforeTieBreaks()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-stimulus-created",
+            [new IndexField("stimulusType"), new IndexField("createdAt", IndexValueKind.DateTime)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var declaration = new BoundedQueryDeclaration(
+            "list-by-stimulus-created",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Both,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("stimulusType", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Descending)
+            ]);
+        var fixture = CreateEntityFixture(logicalIndex, declaration);
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+        var query = new DocumentQuery(
+            "workflowTriggerBinding",
+            declaration.Identity,
+            order: [new DocumentQueryOrder("stimulusType", PhysicalSortDirection.Ascending)]);
+
+        var resolved = DocumentQueryOrderResolver.Resolve(query, plan);
+
+        Assert.Equal(
+            ["stimulusType", "createdAt", "storageScope", "id"],
+            resolved.Select(order => order.Path));
+        Assert.Equal(
+            [
+                PhysicalSortDirection.Ascending,
+                PhysicalSortDirection.Descending,
+                PhysicalSortDirection.Ascending,
+                PhysicalSortDirection.Ascending
+            ],
+            resolved.Select(order => order.Direction));
+    }
+
+    [Fact]
     public void LatestPerKeyAndKeysetMustBeServedByDeclaredProviderHandlers()
     {
         var query = Query(
@@ -2019,6 +2181,13 @@ public sealed class PhysicalQueryPlanCompilerTests
                 index + 1,
                 query.SortFields.SingleOrDefault(sort => sort.Path == field.Path)?.Direction
                 ?? PhysicalSortDirection.Ascending)));
+        if (query.PagingSupport == QueryPagingSupport.Cursor &&
+            logicalIndex.Fields.All(field => field.Path != PhysicalDocumentFieldPaths.Id))
+        {
+            columns.Add(new PhysicalIndexColumnDefinition(
+                new DocumentEnvelopeDefinition().IdLookupKeyColumn,
+                columns.Count));
+        }
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
             "workflow_trigger_bindings",
             projections,

@@ -101,6 +101,12 @@ A query-shape-bound keyset value carrying the first page's committed cursor high
 ordered key/cursor. It provides a stable traversal that excludes later and backdated appends.
 _Avoid_: Offset, live-view page token
 
+**Document Query Continuation**:
+An opaque, plan/query/scope-bound exclusive keyset boundary returned by a cursor-declared bounded
+document query. It is stable across restart but intentionally uses live-view semantics between page
+requests; it does not claim the snapshot high-water guarantees of a Diagnostic Continuation.
+_Avoid_: Offset token, snapshot cursor
+
 **Storage Scope**:
 A provider-neutral, opaque partition identity bound to a document-store session and explicit unit
 of work. Groundwork stamps it into envelope and dependent physical keys; it is never inferred from

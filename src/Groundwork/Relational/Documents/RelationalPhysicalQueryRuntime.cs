@@ -66,7 +66,7 @@ public static class RelationalPhysicalQueryRuntime
             supportsCompoundPredicates: true,
             supportsDisjunction: true,
             supportsOffsetPaging: true,
-            supportsKeysetPaging: false,
+            supportsKeysetPaging: true,
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,

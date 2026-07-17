@@ -28,6 +28,7 @@
   </Folder>
   <Folder Name="/tests/" />
   <Folder Name="/tests/Groundwork/">
+    <Project Path="tests/Groundwork/Groundwork.DocumentCursor.ProcessProbe/Groundwork.DocumentCursor.ProcessProbe.csproj" />
     <Project Path="tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.DiagnosticRecords.Tests/Groundwork.DiagnosticRecords.Tests.csproj" />
     <Project Path="tests/Groundwork/Groundwork.Materialization.Tests/Groundwork.Materialization.Tests.csproj" />

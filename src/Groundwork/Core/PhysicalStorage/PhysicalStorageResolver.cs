@@ -593,6 +593,14 @@ public static class PhysicalStorageResolver
                     : projectedNames[field.Path],
                 firstFieldOrder + order,
                 sortDirections[order])));
+            if (queryGroup.Any(query => query.PagingSupport == QueryPagingSupport.Cursor) &&
+                logicalIndex.Fields.All(field => field.Path != PhysicalDocumentFieldPaths.Id))
+            {
+                columns.Add(new PhysicalIndexColumnDefinition(
+                    envelope.IdLookupKeyColumn,
+                    columns.Count,
+                    PhysicalSortDirection.Ascending));
+            }
             physicalIndexes.Add(new PhysicalIndexDefinition(
                 logicalIndex.Identity,
                 columns,
@@ -1439,6 +1447,14 @@ public static class PhysicalStorageResolver
                 logicalName,
                 result.Count,
                 sortDirections[fieldOrder]));
+        }
+        if (query.PagingSupport == QueryPagingSupport.Cursor &&
+            logicalIndex.Fields.All(field => field.Path != PhysicalDocumentFieldPaths.Id))
+        {
+            result.Add(new PhysicalIndexColumnDefinition(
+                envelope.IdLookupKeyColumn,
+                result.Count,
+                PhysicalSortDirection.Ascending));
         }
 
         return result;

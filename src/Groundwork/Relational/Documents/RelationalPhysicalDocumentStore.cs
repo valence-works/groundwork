@@ -162,6 +162,8 @@ public abstract class RelationalPhysicalDocumentDialect
     public abstract string StartsWith(string fieldExpression, string parameterExpression);
     public abstract string ApplyOffsetPage(string selectSql, string takeParameter, string skipParameter);
     public abstract string ApplyFirst(string selectSql);
+    public virtual string OrderExpression(string fieldExpression, PhysicalSortDirection direction) =>
+        $"{fieldExpression} {(direction == PhysicalSortDirection.Descending ? "DESC" : "ASC")}";
     public virtual string QuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
         $"{QuoteIdentifier(tableIdentifier)} {alias}";
     public virtual string MutationQuerySource(string tableIdentifier, string alias, string? indexIdentifier) =>
@@ -585,6 +587,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal string StartsWith(string field, string parameter) => dialect.StartsWith(field, parameter);
     internal string ApplyOffsetPage(string sql, string take, string skip) => dialect.ApplyOffsetPage(sql, take, skip);
     internal string ApplyFirst(string sql) => dialect.ApplyFirst(sql);
+    internal string OrderPhysicalQueryExpression(string field, PhysicalSortDirection direction) =>
+        dialect.OrderExpression(field, direction);
     internal string PhysicalQuerySource(string table, string alias, string? index) =>
         dialect.QuerySource(table, alias, index);
     internal string PhysicalMutationQuerySource(string table, string alias, string? index) =>

@@ -36,7 +36,8 @@ internal static class RelationalPhysicalStorageTestModels
         string documentKind = "configurationDocument",
         Func<PhysicalNameContext, string>? namePolicy = null,
         RelationalMutationScenarioOptions? mutationOptions = null,
-        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
+        QueryPagingSupport categoryPaging = QueryPagingSupport.Offset)
     {
         mutationOptions ??= new RelationalMutationScenarioOptions();
         var typedTransitions = mutationOptions.TypedTransitions ?? new RelationalTypedTransitionTestOptions();
@@ -50,6 +51,12 @@ internal static class RelationalPhysicalStorageTestModels
         if (scoped)
             categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
         categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("category", categoryIndexColumns.Count));
+        if (categoryPaging == QueryPagingSupport.Cursor)
+        {
+            categoryIndexColumns.Add(new PhysicalIndexColumnDefinition(
+                new DocumentEnvelopeDefinition().IdLookupKeyColumn,
+                categoryIndexColumns.Count));
+        }
         var indexes = new List<PhysicalIndexDefinition>
         {
             new("by-category", categoryIndexColumns, categoryUnique)
@@ -97,7 +104,7 @@ internal static class RelationalPhysicalStorageTestModels
             logicalIndex.Identity,
             new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
             QuerySortSupport.Ascending,
-            QueryPagingSupport.Offset,
+            categoryPaging,
             BoundedQueryExecutionClass.ScaleBearing,
             supportsTotalCount: true,
             resultOperations: new HashSet<BoundedQueryResultOperation>

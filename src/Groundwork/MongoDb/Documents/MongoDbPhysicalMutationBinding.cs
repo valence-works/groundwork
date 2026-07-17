@@ -114,7 +114,7 @@ internal static class MongoDbPhysicalMutationCapabilities
             supportsCompoundPredicates: true,
             supportsDisjunction: true,
             supportsOffsetPaging: true,
-            supportsKeysetPaging: false,
+            supportsKeysetPaging: true,
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,

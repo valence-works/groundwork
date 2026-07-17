@@ -149,6 +149,19 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
         RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
 
     [Fact]
+    public Task Cursor_pages_resume_across_a_reopened_store() =>
+        RelationalPhysicalServerAssertions.CursorPagesResumeAcrossReopenedStoreAsync(
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            "postgresql");
+
+    [Fact]
     public async Task Bounded_mutation_ledger_supports_unbounded_operation_identity()
     {
         var model = RelationalPhysicalStorageTestModels.Create(
@@ -257,7 +270,8 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PhysicalStorageForm.PhysicalEntityTable,
             PostgreSqlGroundworkCapabilities.Provider,
             includePriority: false,
-            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames,
+            categoryPaging: QueryPagingSupport.Cursor);
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -266,6 +280,8 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument", "explain-target", "1", "{\"category\":\"pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "explain-target-2", "1", "{\"category\":\"pending\"}"))).Status);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument", "explain-noise", "1", "{\"category\":\"tools\"}"))).Status);
         await SeedPlanNoiseAsync(route);
@@ -278,8 +294,17 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending"))],
             take: 1);
 
-        var explanation = await explainer.ExplainAsync(query);
-        var result = await runtime.QueryAsync(query);
+        var first = await runtime.QueryAsync(query);
+        Assert.NotNull(first.NextContinuation);
+        var continued = new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 1,
+            continuation: first.NextContinuation);
+        var explanation = await explainer.ExplainAsync(continued);
+        var result = await runtime.QueryAsync(continued);
 
         Assert.Equal(["count", "page"], explanation.Commands.Select(command => command.Identity));
         Assert.All(explanation.Commands, command =>
@@ -288,7 +313,12 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             Assert.Contains(explanation.Plan.IndexName!.Identifier, command.NativePlan, StringComparison.Ordinal);
             Assert.DoesNotContain("\"Node Type\": \"Seq Scan\"", command.NativePlan, StringComparison.Ordinal);
         });
-        Assert.Equal("explain-target", Assert.Single(result.Documents).Id);
+        var page = explanation.Commands.Single(command =>
+            command.Identity == PhysicalDocumentQueryCommandIdentities.Page);
+        Assert.Contains("\"Node Type\": \"Limit\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"Node Type\": \"Sort\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.Single(result.Documents);
+        Assert.Null(result.NextContinuation);
     }
 
     [Fact]

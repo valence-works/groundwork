@@ -127,7 +127,9 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
 
     public override string CreateIndexSql(string table, ExecutablePhysicalIndexRoute index, IReadOnlyList<string> nullableColumns) =>
         $"CREATE {(index.IsUnique ? "UNIQUE " : string.Empty)}INDEX {Q(index.Name.Identifier)} ON {Q(table)} " +
-        $"({string.Join(", ", index.Columns.Select(column => $"{Q(column.Column.Identifier)} {(column.Direction == PhysicalSortDirection.Descending ? "DESC" : "ASC")}"))});";
+        $"({string.Join(", ", index.Columns.Select(column =>
+            $"{Q(column.Column.Identifier)} " +
+            (column.Direction == PhysicalSortDirection.Descending ? "DESC NULLS LAST" : "ASC NULLS FIRST")))});";
 
     public override string UpsertLinkedSql(
         string table,

@@ -100,6 +100,10 @@ internal sealed class PostgreSqlPhysicalDocumentDialect : RelationalPhysicalDocu
 
     public override string ApplyFirst(string selectSql) => $"{selectSql} LIMIT 1;";
 
+    public override string OrderExpression(string fieldExpression, PhysicalSortDirection direction) =>
+        base.OrderExpression(fieldExpression, direction) +
+        (direction == PhysicalSortDirection.Descending ? " NULLS LAST" : " NULLS FIRST");
+
     public override string CompleteMutationSelection(string selectSql, bool includesLinkedStorage) =>
         $"{selectSql} FOR UPDATE OF p{(includesLinkedStorage ? ", l" : string.Empty)}";
 

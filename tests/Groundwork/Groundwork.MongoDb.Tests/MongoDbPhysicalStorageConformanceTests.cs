@@ -1482,6 +1482,140 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.Equal(normal.Message, explain.Message);
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Cursor_pages_resume_by_identity_across_a_reopened_store(PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(form, pagingSupport: QueryPagingSupport.Cursor);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        foreach (var id in new[] { "c", "a", "b", "d", "e" })
+            await store.SaveAsync(new SaveDocumentRequest("workItem", id, "1", """{"status":"open"}"""));
+        var predicate = DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"));
+        var query = new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [predicate],
+            [new DocumentQueryOrder("status")],
+            take: 1);
+
+        var first = await store.QueryAsync(query);
+        var reopened = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var middleQuery = new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 2,
+            continuation: first.NextContinuation);
+        var explanation = await reopened.ExplainAsync(middleQuery);
+        var middle = await reopened.QueryAsync(middleQuery);
+        var final = await reopened.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 10,
+            continuation: middle.NextContinuation));
+        var route = model.Routes.Single();
+        var expected = new[] { "a", "b", "c", "d", "e" }
+            .OrderBy(id => route.Envelope.Identity.Project(id).LookupKey, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(expected[0], Assert.Single(first.Documents).Id);
+        Assert.NotNull(first.NextContinuation);
+        Assert.Equal(expected[1..3], middle.Documents.Select(document => document.Id));
+        Assert.NotNull(middle.NextContinuation);
+        Assert.Equal(expected[3..], final.Documents.Select(document => document.Id));
+        Assert.Null(final.NextContinuation);
+        Assert.Equal(5, final.TotalCount);
+        var pagePlan = explanation.Commands.Single(command =>
+            command.Identity == PhysicalDocumentQueryCommandIdentities.Page);
+        Assert.Contains(route.Indexes.Single().Name.Identifier, pagePlan.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("COLLSCAN", pagePlan.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"stage\" : \"SORT\"", pagePlan.NativePlan, StringComparison.Ordinal);
+        Assert.Contains("\"stage\" : \"LIMIT\"", pagePlan.NativePlan, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Cursor_pages_apply_documented_live_view_mutation_semantics()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            pagingSupport: QueryPagingSupport.Cursor);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var firstClient = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        foreach (var id in new[] { "a", "b", "c" })
+            await firstClient.SaveAsync(new SaveDocumentRequest("workItem", id, "1", """{"status":"open"}"""));
+        var query = new DocumentQuery(
+            "workItem",
+            "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))],
+            [new DocumentQueryOrder("status")],
+            take: 1);
+        var first = await firstClient.QueryAsync(query);
+        var route = model.Routes.Single();
+        var boundary = route.Envelope.Identity.Project(Assert.Single(first.Documents).Id).LookupKey;
+        var unseen = new[] { "a", "b", "c" }
+            .Where(id => id != first.Documents[0].Id)
+            .OrderBy(id => route.Envelope.Identity.Project(id).LookupKey, StringComparer.Ordinal)
+            .ToArray();
+        var before = Enumerable.Range(0, 10_000)
+            .Select(index => $"before-{index}")
+            .First(id => StringComparer.Ordinal.Compare(
+                route.Envelope.Identity.Project(id).LookupKey,
+                boundary) < 0);
+        var after = Enumerable.Range(0, 10_000)
+            .Select(index => $"after-{index}")
+            .First(id => StringComparer.Ordinal.Compare(
+                route.Envelope.Identity.Project(id).LookupKey,
+                boundary) > 0);
+        var secondClient = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        Assert.Equal(
+            DocumentStoreWriteStatus.Deleted,
+            (await secondClient.DeleteAsync(new DeleteDocumentRequest("workItem", unseen[0]))).Status);
+        Assert.Equal(
+            DocumentStoreWriteStatus.Saved,
+            (await secondClient.SaveAsync(new SaveDocumentRequest(
+                "workItem",
+                unseen[1],
+                "2",
+                """{"status":"closed"}""",
+                ExpectedVersion: 1))).Status);
+        await secondClient.SaveAsync(new SaveDocumentRequest("workItem", before, "1", """{"status":"open"}"""));
+        await secondClient.SaveAsync(new SaveDocumentRequest("workItem", after, "1", """{"status":"open"}"""));
+
+        var resumed = await secondClient.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 10,
+            continuation: first.NextContinuation));
+
+        Assert.Equal(3, resumed.TotalCount);
+        Assert.DoesNotContain(resumed.Documents, document => document.Id == before);
+        Assert.Contains(resumed.Documents, document => document.Id == after);
+        Assert.DoesNotContain(resumed.Documents, document => unseen.Contains(document.Id, StringComparer.Ordinal));
+        Assert.Null(resumed.NextContinuation);
+    }
+
     [Fact]
     public async Task Explain_returns_complete_scan_free_command_receipts_for_every_terminal_operation()
     {
@@ -1821,7 +1955,8 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         string? defaultValue = null,
         bool isUnique = false,
         MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded,
-        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal)
+        StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal,
+        QueryPagingSupport pagingSupport = QueryPagingSupport.Offset)
     {
         var binding = new SharedStorageBinding("runtime");
         var projected = new ProjectedColumnDefinition(
@@ -1833,12 +1968,16 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             IsNullable: isNullable,
             DefaultValue: defaultValue);
         var indexIdentity = $"by-{path}";
+        var physicalIndexColumns = new List<PhysicalIndexColumnDefinition>
+        {
+            new("storage_scope", 0),
+            new(path, 1)
+        };
+        if (pagingSupport == QueryPagingSupport.Cursor)
+            physicalIndexColumns.Add(new("id_lookup_key", physicalIndexColumns.Count));
         var physicalIndex = new PhysicalIndexDefinition(
             indexIdentity,
-            [
-                new PhysicalIndexColumnDefinition("storage_scope", 0),
-                new PhysicalIndexColumnDefinition(path, 1)
-            ],
+            physicalIndexColumns,
             isUnique,
             missingValueBehavior: missingValueBehavior);
         var definition = form switch
@@ -1858,7 +1997,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             logical.Identity,
             operations ?? new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
             QuerySortSupport.Ascending,
-            QueryPagingSupport.Offset,
+            pagingSupport,
             executionClass,
             supportsTotalCount: true);
         var unit = new StorageUnit(

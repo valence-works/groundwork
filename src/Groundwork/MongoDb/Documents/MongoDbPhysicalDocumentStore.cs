@@ -1118,7 +1118,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     public bool SupportsCompoundPredicates => true;
     public bool SupportsDisjunction => true;
     public bool SupportsOffsetPaging => true;
-    public bool SupportsKeysetPaging => false;
+    public bool SupportsKeysetPaging => true;
     public bool SupportsCount => true;
     public bool SupportsAny => true;
     public bool SupportsFirst => true;
@@ -1127,7 +1127,10 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     public async Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
         var collection = database.GetCollection<BsonDocument>(plan.LookupObject.Identifier);
-        var filter = BuildFilter(query, plan, scope(), storage, route);
+        var resolvedScope = scope();
+        DocumentQueryContinuationCodec.ValidateScope(plan, resolvedScope);
+        var basePredicate = BuildPredicate(query, plan, resolvedScope, storage, route);
+        var pagePredicate = BuildPagePredicate(query, plan, resolvedScope, basePredicate);
         var sort = BuildSort(query, plan);
         await transactionCapability.EnsureSupportedAsync(
             [route.StorageUnit.Value],
@@ -1142,22 +1145,38 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             try
             {
                 await hooks.QueryAttemptStarting(session, attempt, cancellationToken);
-                var total = await collection.CountDocumentsAsync(session, filter, cancellationToken: cancellationToken);
+                var total = await collection.CountDocumentsAsync(
+                    session,
+                    basePredicate.Filter,
+                    cancellationToken: cancellationToken);
                 await hooks.QueryCountRead(session, attempt, cancellationToken);
                 if (total == 0 || query.Take == 0)
                 {
                     await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
                     return new DocumentQueryResult([], total);
                 }
-                var find = collection.Find(session, filter).Sort(sort).Skip(query.Skip ?? 0);
-                if (query.Take is { } take) find = find.Limit(take);
-                var found = await find.ToListAsync(cancellationToken);
+                var find = collection.Find(session, pagePredicate.Filter).Sort(sort)
+                    .Skip(plan.PagingSupport == QueryPagingSupport.Cursor ? 0 : query.Skip ?? 0);
+                if (PageReadLimit(query, plan) is { } limit) find = find.Limit(limit);
+                var found = (await find.ToListAsync(cancellationToken)).ToList();
                 await hooks.QueryPageRead(session, attempt, cancellationToken);
+                var hasMore = query.Take is { } take &&
+                              take < int.MaxValue &&
+                              found.Count > take;
+                if (hasMore)
+                    found.RemoveAt(found.Count - 1);
                 var documents = plan.RequiresPrimaryLookup
                     ? await LoadPrimaryAsync(session, found, attempt, cancellationToken)
                     : found.Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
+                var next = hasMore && found.Count != 0
+                    ? DocumentQueryContinuationCodec.Encode(
+                        query,
+                        plan,
+                        resolvedScope,
+                        ReadContinuationValues(found[^1], query, plan))
+                    : null;
                 await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
-                return new DocumentQueryResult(documents, total);
+                return new DocumentQueryResult(documents, total, next);
             }
             catch (MongoException exception) when (
                 MongoDbPhysicalDocumentStore.IsTransientTransactionConflict(exception) &&
@@ -1283,19 +1302,175 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             fieldIdentifiers.Order(StringComparer.Ordinal).ToArray());
     }
 
+    internal static MongoDbPhysicalQueryPredicate BuildPagePredicate(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        DocumentScopeSelection scope,
+        MongoDbPhysicalQueryPredicate basePredicate)
+    {
+        if (query.Continuation is null)
+            return basePredicate;
+        var values = DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        return new MongoDbPhysicalQueryPredicate(
+            Builders<BsonDocument>.Filter.And(
+                basePredicate.Filter,
+                ContinuationFilter(order, values)),
+            basePredicate.FieldIdentifiers
+                .Concat(order.Select(item => item.Field.Identifier))
+                .Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToArray());
+    }
+
     internal static SortDefinition<BsonDocument> BuildSort(DocumentQuery query, PhysicalQueryPlan plan)
     {
-        var requested = query.Order.Count == 0
-            ? plan.Order
-            : query.Order.Select(order => new PhysicalQueryOrder(
-                order.Path,
-                plan.Order.Single(planned => planned.Path == order.Path).Field,
-                order.Direction,
-                false)).Concat(plan.Order.Where(order => order.IsIdentityTieBreak)).ToArray();
+        var requested = DocumentQueryOrderResolver.Resolve(query, plan);
         return Builders<BsonDocument>.Sort.Combine(requested.Select(order =>
             order.Direction == PhysicalSortDirection.Ascending
                 ? Builders<BsonDocument>.Sort.Ascending(order.Field.Identifier)
                 : Builders<BsonDocument>.Sort.Descending(order.Field.Identifier)));
+    }
+
+    private static FilterDefinition<BsonDocument> ContinuationFilter(
+        IReadOnlyList<PhysicalQueryOrder> order,
+        IReadOnlyList<DocumentQueryContinuationValue> values)
+    {
+        var alternatives = new List<FilterDefinition<BsonDocument>>();
+        for (var boundaryIndex = 0; boundaryIndex < order.Count; boundaryIndex++)
+        {
+            var conjunction = new List<FilterDefinition<BsonDocument>>();
+            for (var prefixIndex = 0; prefixIndex < boundaryIndex; prefixIndex++)
+            {
+                conjunction.Add(Builders<BsonDocument>.Filter.Eq(
+                    order[prefixIndex].Field.Identifier,
+                    ToBsonValue(values[prefixIndex])));
+            }
+
+            conjunction.Add(ContinuationAfter(order[boundaryIndex], values[boundaryIndex]));
+            alternatives.Add(Builders<BsonDocument>.Filter.And(conjunction));
+        }
+        return Builders<BsonDocument>.Filter.Or(alternatives);
+    }
+
+    private static FilterDefinition<BsonDocument> ContinuationAfter(
+        PhysicalQueryOrder order,
+        DocumentQueryContinuationValue value)
+    {
+        var field = order.Field.Identifier;
+        if (value.ScalarKind == DocumentQueryContinuationScalarKind.Null)
+        {
+            return order.Direction == PhysicalSortDirection.Ascending
+                ? Builders<BsonDocument>.Filter.Ne(field, BsonNull.Value)
+                : Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true);
+        }
+
+        var boundary = ToBsonValue(value);
+        return order.Direction == PhysicalSortDirection.Ascending
+            ? Builders<BsonDocument>.Filter.Gt(field, boundary)
+            : Builders<BsonDocument>.Filter.Or(
+                Builders<BsonDocument>.Filter.Lt(field, boundary),
+                Builders<BsonDocument>.Filter.Eq(field, BsonNull.Value));
+    }
+
+    internal static int? PageReadLimit(DocumentQuery query, PhysicalQueryPlan plan) =>
+        plan.PagingSupport == QueryPagingSupport.Cursor &&
+        query.Take is { } take &&
+        take < int.MaxValue
+            ? take + 1
+            : query.Take;
+
+    private static IReadOnlyList<DocumentQueryContinuationValue> ReadContinuationValues(
+        BsonDocument document,
+        DocumentQuery query,
+        PhysicalQueryPlan plan) =>
+        DocumentQueryOrderResolver.Resolve(query, plan)
+            .Select(order =>
+                TryReadDotted(document, order.Field.Identifier, out var value)
+                    ? FromBsonValue(order.Field.ValueKind, value)
+                    : new DocumentQueryContinuationValue(
+                        order.Field.ValueKind,
+                        DocumentQueryContinuationScalarKind.Null,
+                        null))
+            .ToArray();
+
+    private static DocumentQueryContinuationValue FromBsonValue(IndexValueKind kind, BsonValue value)
+    {
+        if (value.IsBsonNull)
+            return new(kind, DocumentQueryContinuationScalarKind.Null, null);
+        return value.BsonType switch
+        {
+            BsonType.String => new(kind, DocumentQueryContinuationScalarKind.String, value.AsString),
+            BsonType.Int32 => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Int64,
+                value.AsInt32.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            BsonType.Int64 => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Int64,
+                value.AsInt64.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            BsonType.Double => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Double,
+                value.AsDouble.ToString("R", System.Globalization.CultureInfo.InvariantCulture)),
+            BsonType.Decimal128 => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Decimal,
+                value.AsDecimal128.ToString()),
+            BsonType.Boolean => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Boolean,
+                value.AsBoolean.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            BsonType.DateTime => new(
+                kind,
+                DocumentQueryContinuationScalarKind.DateTimeOffset,
+                new DateTimeOffset(value.ToUniversalTime()).ToString(
+                    "O",
+                    System.Globalization.CultureInfo.InvariantCulture)),
+            BsonType.Binary => new(
+                kind,
+                DocumentQueryContinuationScalarKind.Binary,
+                Convert.ToBase64String(value.AsBsonBinaryData.Bytes)),
+            _ => throw new InvalidOperationException(
+                $"MongoDB physical query order returned unsupported BSON type '{value.BsonType}'.")
+        };
+    }
+
+    private static BsonValue ToBsonValue(DocumentQueryContinuationValue value) =>
+        value.ScalarKind switch
+        {
+            DocumentQueryContinuationScalarKind.Null => BsonNull.Value,
+            DocumentQueryContinuationScalarKind.String => new BsonString(value.Value!),
+            DocumentQueryContinuationScalarKind.Int64 => new BsonInt64(long.Parse(
+                value.Value!,
+                System.Globalization.CultureInfo.InvariantCulture)),
+            DocumentQueryContinuationScalarKind.Decimal => new BsonDecimal128(Decimal128.Parse(value.Value!)),
+            DocumentQueryContinuationScalarKind.Double => new BsonDouble(double.Parse(
+                value.Value!,
+                System.Globalization.CultureInfo.InvariantCulture)),
+            DocumentQueryContinuationScalarKind.Boolean => new BsonBoolean(bool.Parse(value.Value!)),
+            DocumentQueryContinuationScalarKind.DateTimeOffset => new BsonDateTime(DateTimeOffset.Parse(
+                    value.Value!,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind)
+                .UtcDateTime),
+            DocumentQueryContinuationScalarKind.Binary => new BsonBinaryData(Convert.FromBase64String(value.Value!)),
+            _ => throw new InvalidDocumentQueryContinuationException(
+                "The document-query continuation contains an unsupported MongoDB physical value.")
+        };
+
+    private static bool TryReadDotted(BsonDocument document, string path, out BsonValue value)
+    {
+        value = document;
+        foreach (var segment in path.Split('.'))
+        {
+            if (value is not BsonDocument current || !current.TryGetValue(segment, out value!))
+            {
+                value = BsonNull.Value;
+                return false;
+            }
+        }
+        return true;
     }
 
     private async Task<IReadOnlyList<DocumentEnvelope>> LoadPrimaryAsync(

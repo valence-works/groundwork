@@ -1,3 +1,6 @@
+using System.Data;
+using System.Diagnostics;
+using System.Text.Json;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
@@ -214,6 +217,190 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         Assert.Equal(2, compoundCount);
         Assert.Contains(route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier,
             await ExplainCategoryLookupAsync(connection, route));
+    }
+
+    [Fact]
+    public async Task Cursor_pages_use_the_compiled_identity_tie_break_and_bind_the_token_to_the_query()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: false,
+            categoryPaging: QueryPagingSupport.Cursor);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        var empty = await SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider).QueryAsync(
+            new DocumentQuery(
+                "configurationDocument",
+                "list-by-category",
+                [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "missing"))],
+                [new DocumentQueryOrder("category")],
+                take: 1));
+        Assert.Empty(empty.Documents);
+        Assert.Equal(0, empty.TotalCount);
+        Assert.Null(empty.NextContinuation);
+
+        await writer.SaveAsync(Save("c", "tools"));
+        await writer.SaveAsync(Save("a", "tools"));
+        await writer.SaveAsync(Save("b", "tools"));
+        await writer.SaveAsync(Save("d", "tools"));
+        await writer.SaveAsync(Save("e", "tools"));
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+        var predicate = DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"));
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [predicate],
+            [new DocumentQueryOrder("category")],
+            take: 1);
+
+        var first = await queries.QueryAsync(query);
+        var middle = await queries.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 2,
+            continuation: first.NextContinuation));
+        var final = await queries.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 10,
+            continuation: middle.NextContinuation));
+        var expected = new[] { "a", "b", "c", "d", "e" }
+            .OrderBy(id => route.Envelope.Identity.Project(id).LookupKey, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(5, first.TotalCount);
+        Assert.Equal(expected[0], Assert.Single(first.Documents).Id);
+        Assert.NotNull(first.NextContinuation);
+        Assert.Equal(expected[1..3], middle.Documents.Select(document => document.Id));
+        Assert.NotNull(middle.NextContinuation);
+        Assert.Equal(expected[3..], final.Documents.Select(document => document.Id));
+        Assert.Null(final.NextContinuation);
+
+        var otherQuery = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "other"))],
+            [new DocumentQueryOrder("category")],
+            take: 1,
+            continuation: first.NextContinuation);
+        await Assert.ThrowsAsync<InvalidDocumentQueryContinuationException>(() => queries.QueryAsync(otherQuery));
+    }
+
+    [Fact]
+    public async Task Cursor_token_resumes_after_the_issuing_process_has_exited()
+    {
+        var databasePath = Path.Combine(
+            Path.GetTempPath(),
+            $"groundwork-document-cursor-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var seed = JsonDocument.Parse(await RunCursorProbeAsync("seed", databasePath));
+            var token = seed.RootElement.GetProperty("Continuation").GetString();
+            Assert.False(string.IsNullOrWhiteSpace(token));
+
+            using var resumed = JsonDocument.Parse(
+                await RunCursorProbeAsync("resume", databasePath, token!));
+            var allIds = seed.RootElement.GetProperty("Ids").EnumerateArray()
+                .Concat(resumed.RootElement.GetProperty("Ids").EnumerateArray())
+                .Select(element => element.GetString())
+                .ToArray();
+
+            Assert.Equal(3, resumed.RootElement.GetProperty("TotalCount").GetInt64());
+            Assert.Equal(["a", "b", "c"], allIds.Order(StringComparer.Ordinal));
+            Assert.Equal(3, allIds.Distinct(StringComparer.Ordinal).Count());
+            Assert.Equal(JsonValueKind.Null, resumed.RootElement.GetProperty("Continuation").ValueKind);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+                File.Delete(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task Invalid_cursor_token_is_rejected_before_the_provider_connection_opens()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: false,
+            categoryPaging: QueryPagingSupport.Cursor);
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(
+            connection,
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        var queries = SqlitePhysicalQueryRuntime.Create(store, manifest, route, target.Provider);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            [new DocumentQueryOrder("category")],
+            take: 1,
+            continuation: "invalid");
+
+        await Assert.ThrowsAsync<InvalidDocumentQueryContinuationException>(() => queries.QueryAsync(query));
+
+        Assert.Equal(ConnectionState.Closed, connection.State);
+    }
+
+    [Fact]
+    public async Task Cursor_pages_preserve_mixed_direction_compound_order_across_ties()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: true,
+            compoundPaging: QueryPagingSupport.Cursor);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(
+            connection,
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        foreach (var (id, priority) in new[] { ("a", 2), ("b", 3), ("c", 2), ("d", 1) })
+        {
+            Assert.Equal(
+                DocumentStoreWriteStatus.Saved,
+                (await store.SaveAsync(new SaveDocumentRequest(
+                    "configurationDocument",
+                    id,
+                    "1",
+                    $"{{\"category\":\"tools\",\"priority\":{priority}}}"))).Status);
+        }
+        var queries = SqlitePhysicalQueryRuntime.Create(store, manifest, route, target.Provider);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "find-by-category-priority",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            [new DocumentQueryOrder("priority", PhysicalSortDirection.Descending)],
+            take: 2);
+
+        var first = await queries.QueryAsync(query);
+        var second = await queries.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 2,
+            continuation: first.NextContinuation));
+        var tied = new[] { "a", "c" }
+            .OrderBy(id => route.Envelope.Identity.Project(id).LookupKey, StringComparer.Ordinal);
+
+        Assert.Equal(new[] { "b" }.Concat(tied).Append("d"),
+            first.Documents.Concat(second.Documents).Select(document => document.Id));
+        Assert.NotNull(first.NextContinuation);
+        Assert.Null(second.NextContinuation);
     }
 
     [Fact]
@@ -824,5 +1011,44 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         while (await reader.ReadAsync())
             details.Add(reader.GetString(3));
         return string.Join(Environment.NewLine, details);
+    }
+
+    private static async Task<string> RunCursorProbeAsync(
+        string operation,
+        string databasePath,
+        string? continuation = null)
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "Groundwork.slnx")))
+            root = root.Parent;
+        if (root is null)
+            throw new InvalidOperationException("Could not locate the Groundwork repository root.");
+        var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
+        var probe = Path.Combine(
+            root.FullName,
+            "tests",
+            "Groundwork",
+            "Groundwork.DocumentCursor.ProcessProbe",
+            "bin",
+            configuration,
+            "net10.0",
+            "Groundwork.DocumentCursor.ProcessProbe.dll");
+        var start = new ProcessStartInfo("dotnet")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        start.ArgumentList.Add(probe);
+        start.ArgumentList.Add(operation);
+        start.ArgumentList.Add(databasePath);
+        if (continuation is not null)
+            start.ArgumentList.Add(continuation);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start cursor process probe.");
+        var output = await process.StandardOutput.ReadToEndAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        Assert.True(process.ExitCode == 0, error);
+        return output.Trim();
     }
 }
