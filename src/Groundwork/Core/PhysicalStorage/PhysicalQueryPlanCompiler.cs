@@ -547,9 +547,12 @@ public static class PhysicalQueryPlanCompiler
         }
         if (order.All(item => item.Path != PhysicalDocumentFieldPaths.Id))
         {
+            var identityTieBreak = query.PagingSupport == QueryPagingSupport.Cursor
+                ? identityFields.Binding.Lookup
+                : identityFields.Binding.Comparison;
             order.Add(new PhysicalQueryOrder(
                 PhysicalDocumentFieldPaths.Id,
-                identityFields.Binding.Comparison,
+                identityTieBreak,
                 PhysicalSortDirection.Ascending,
                 IsIdentityTieBreak: true));
         }

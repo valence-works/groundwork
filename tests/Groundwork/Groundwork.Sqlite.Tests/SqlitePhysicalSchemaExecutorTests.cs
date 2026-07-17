@@ -1063,7 +1063,9 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         IProviderPhysicalNameNormalizer? normalizer = null,
         string? priorityCollation = null,
         bool categoryNullable = false,
-        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal)
+        StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
+        QueryPagingSupport categoryPaging = QueryPagingSupport.Offset,
+        QueryPagingSupport compoundPaging = QueryPagingSupport.None)
     {
         var template = SqliteTestManifests.MetadataManifest();
         var columns = new List<ProjectedColumnDefinition>
@@ -1074,6 +1076,12 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         if (scoped)
             categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
         categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("category", categoryIndexColumns.Count));
+        if (categoryPaging == QueryPagingSupport.Cursor)
+        {
+            categoryIndexColumns.Add(new PhysicalIndexColumnDefinition(
+                new DocumentEnvelopeDefinition().IdLookupKeyColumn,
+                categoryIndexColumns.Count));
+        }
         var indexes = new List<PhysicalIndexDefinition>
         {
             new("by-category", categoryIndexColumns, isUnique: categoryUnique)
@@ -1098,7 +1106,18 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             if (scoped)
                 compoundColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
             compoundColumns.Add(new PhysicalIndexColumnDefinition("category", compoundColumns.Count));
-            compoundColumns.Add(new PhysicalIndexColumnDefinition("priority", compoundColumns.Count));
+            compoundColumns.Add(new PhysicalIndexColumnDefinition(
+                "priority",
+                compoundColumns.Count,
+                compoundPaging == QueryPagingSupport.Cursor
+                    ? PhysicalSortDirection.Descending
+                    : PhysicalSortDirection.Ascending));
+            if (compoundPaging == QueryPagingSupport.Cursor)
+            {
+                compoundColumns.Add(new PhysicalIndexColumnDefinition(
+                    new DocumentEnvelopeDefinition().IdLookupKeyColumn,
+                    compoundColumns.Count));
+            }
             indexes.Add(new PhysicalIndexDefinition("by-category-priority", compoundColumns));
         }
 
@@ -1114,7 +1133,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             logicalIndex.Identity,
             categoryOperations ?? new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
             QuerySortSupport.Ascending,
-            QueryPagingSupport.Offset,
+            categoryPaging,
             BoundedQueryExecutionClass.ScaleBearing,
             supportsTotalCount: true,
             resultOperations: new HashSet<BoundedQueryResultOperation>
@@ -1135,24 +1154,48 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                 false,
                 MissingValueBehavior.Excluded);
             logicalIndexes.Add(compound);
-            boundedQueries.Add(new BoundedQueryDeclaration(
-                "find-by-category-priority",
-                compound.Identity,
-                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
-                QuerySortSupport.None,
-                QueryPagingSupport.None,
-                BoundedQueryExecutionClass.ScaleBearing,
-                supportsTotalCount: true,
-                predicateFields:
-                [
-                    new BoundedQueryPredicateField("category", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
-                    new BoundedQueryPredicateField("priority", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
-                ],
-                resultOperations: new HashSet<BoundedQueryResultOperation>
-                {
-                    BoundedQueryResultOperation.Documents,
-                    BoundedQueryResultOperation.Count
-                }));
+            boundedQueries.Add(compoundPaging == QueryPagingSupport.Cursor
+                ? new BoundedQueryDeclaration(
+                    "find-by-category-priority",
+                    compound.Identity,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.Descending,
+                    QueryPagingSupport.Cursor,
+                    BoundedQueryExecutionClass.ScaleBearing,
+                    supportsTotalCount: true,
+                    sortFields:
+                    [
+                        new BoundedQuerySortField("priority", PhysicalSortDirection.Descending)
+                    ],
+                    predicateFields:
+                    [
+                        new BoundedQueryPredicateField(
+                            "category",
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                    ],
+                    resultOperations: new HashSet<BoundedQueryResultOperation>
+                    {
+                        BoundedQueryResultOperation.Documents,
+                        BoundedQueryResultOperation.Count
+                    })
+                : new BoundedQueryDeclaration(
+                    "find-by-category-priority",
+                    compound.Identity,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.None,
+                    QueryPagingSupport.None,
+                    BoundedQueryExecutionClass.ScaleBearing,
+                    supportsTotalCount: true,
+                    predicateFields:
+                    [
+                        new BoundedQueryPredicateField("category", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                        new BoundedQueryPredicateField("priority", new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                    ],
+                    resultOperations: new HashSet<BoundedQueryResultOperation>
+                    {
+                        BoundedQueryResultOperation.Documents,
+                        BoundedQueryResultOperation.Count
+                    }));
         }
         var definition = form switch
         {

@@ -1,5 +1,6 @@
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
@@ -11,6 +12,83 @@ namespace Groundwork.RelationalProviders.Tests;
 
 internal static class RelationalPhysicalServerAssertions
 {
+    public static async Task CursorPagesResumeAcrossReopenedStoreAsync(
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<
+            Groundwork.Core.Manifests.StorageManifest,
+            IReadOnlyList<ExecutableStorageRoute>,
+            RelationalPhysicalDocumentStore> createStore,
+        string handlerPrefix)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            provider,
+            includePriority: false,
+            normalizer: normalizer,
+            categoryPaging: QueryPagingSupport.Cursor);
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var store = createStore(model.Manifest, model.Target.Routes);
+        foreach (var id in new[] { "c", "a", "b", "d", "e" })
+        {
+            Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(
+                new SaveDocumentRequest(
+                    "configurationDocument",
+                    id,
+                    "1",
+                    """{"category":"tools"}"""))).Status);
+        }
+
+        var route = model.Target.Routes.Single();
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            [new DocumentQueryOrder("category")],
+            take: 1);
+        var firstRuntime = RelationalPhysicalQueryRuntime.Create(
+            store,
+            model.Manifest,
+            route,
+            provider,
+            handlerPrefix);
+        var first = await firstRuntime.QueryAsync(query);
+
+        var reopenedStore = createStore(model.Manifest, model.Target.Routes);
+        var reopenedRuntime = RelationalPhysicalQueryRuntime.Create(
+            reopenedStore,
+            model.Manifest,
+            route,
+            provider,
+            handlerPrefix);
+        var middle = await reopenedRuntime.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 2,
+            continuation: first.NextContinuation));
+        var final = await reopenedRuntime.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 10,
+            continuation: middle.NextContinuation));
+        var expected = new[] { "a", "b", "c", "d", "e" }
+            .OrderBy(id => route.Envelope.Identity.Project(id).LookupKey, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(expected[0], Assert.Single(first.Documents).Id);
+        Assert.NotNull(first.NextContinuation);
+        Assert.Equal(expected[1..3], middle.Documents.Select(document => document.Id));
+        Assert.NotNull(middle.NextContinuation);
+        Assert.Equal(expected[3..], final.Documents.Select(document => document.Id));
+        Assert.Null(final.NextContinuation);
+        Assert.Equal(5, final.TotalCount);
+    }
+
     public static async Task LostOperationLockCannotPublishEvidenceAsync(
         ProviderIdentity provider,
         IProviderPhysicalNameNormalizer normalizer,

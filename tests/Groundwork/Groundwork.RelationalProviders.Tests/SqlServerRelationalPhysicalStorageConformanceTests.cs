@@ -150,13 +150,27 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         RelationalBoundedMutationServerAssertions.AcknowledgementLossRestartAndProviderUpgradeReplayAsync(MutationHarness());
 
     [Fact]
+    public Task Cursor_pages_resume_across_a_reopened_store() =>
+        RelationalPhysicalServerAssertions.CursorPagesResumeAcrossReopenedStoreAsync(
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            "sqlserver");
+
+    [Fact]
     public async Task Public_query_explain_executes_exact_parameterized_reads_and_restores_the_pooled_session()
     {
         var model = RelationalPhysicalStorageTestModels.Create(
             PhysicalStorageForm.PhysicalEntityTable,
             SqlServerGroundworkCapabilities.Provider,
             includePriority: false,
-            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            categoryPaging: QueryPagingSupport.Cursor);
         await PhysicalSchemaApplication.ApplyAsync(
             model.Target,
             new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
@@ -165,6 +179,8 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument", "showplan-target", "1", "{\"category\":\"owner's-pending\"}"))).Status);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "showplan-target-2", "1", "{\"category\":\"owner's-pending\"}"))).Status);
         Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
             "configurationDocument", "showplan-noise", "1", "{\"category\":\"tools\"}"))).Status);
         await SeedPlanNoiseAsync(route);
@@ -177,8 +193,17 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "owner's-pending"))],
             take: 1);
 
-        var explanation = await explainer.ExplainAsync(query);
-        var result = await runtime.QueryAsync(query);
+        var first = await runtime.QueryAsync(query);
+        Assert.NotNull(first.NextContinuation);
+        var continued = new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 1,
+            continuation: first.NextContinuation);
+        var explanation = await explainer.ExplainAsync(continued);
+        var result = await runtime.QueryAsync(continued);
 
         Assert.Equal(["count", "page"], explanation.Commands.Select(command => command.Identity));
         Assert.All(explanation.Commands, command =>
@@ -189,7 +214,12 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             Assert.DoesNotContain("PhysicalOp=\"Table Scan\"", command.NativePlan, StringComparison.Ordinal);
             Assert.DoesNotContain("PhysicalOp=\"Index Scan\"", command.NativePlan, StringComparison.Ordinal);
         });
-        Assert.Equal("showplan-target", Assert.Single(result.Documents).Id);
+        var page = explanation.Commands.Single(command =>
+            command.Identity == PhysicalDocumentQueryCommandIdentities.Page);
+        Assert.Contains("PhysicalOp=\"Top\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("PhysicalOp=\"Sort\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.Single(result.Documents);
+        Assert.Null(result.NextContinuation);
     }
 
     [Fact]

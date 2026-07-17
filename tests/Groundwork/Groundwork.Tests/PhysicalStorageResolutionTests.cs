@@ -651,7 +651,7 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
-    public void DynamicDefaultScaleBearingDemandSynthesizesLinkedProjectionAndPhysicalIndex()
+    public void DynamicDefaultCursorDemandSynthesizesLinkedProjectionAndIdentityTieBreakIndex()
     {
         var binding = new SharedStorageBinding("application-documents");
         var physicalStorage = new StorageUnitPhysicalStorage(
@@ -671,7 +671,7 @@ public sealed class PhysicalStorageResolutionTests
                     "by-category",
                     new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
                     QuerySortSupport.Ascending,
-                    QueryPagingSupport.Offset,
+                    QueryPagingSupport.Cursor,
                     BoundedQueryExecutionClass.ScaleBearing)
             ]);
         var manifest = WithPhysicalStorage(
@@ -697,7 +697,8 @@ public sealed class PhysicalStorageResolutionTests
         Assert.Collection(
             physicalIndex.Columns,
             column => Assert.Equal("storage_scope", column.ColumnLogicalName),
-            column => Assert.Equal("category", column.ColumnLogicalName));
+            column => Assert.Equal("category", column.ColumnLogicalName),
+            column => Assert.Equal("id_lookup_key", column.ColumnLogicalName));
     }
 
     [Fact]
@@ -1344,6 +1345,52 @@ public sealed class PhysicalStorageResolutionTests
                     [
                         new PhysicalIndexColumnDefinition("customerId", 0, PhysicalSortDirection.Ascending),
                         new PhysicalIndexColumnDefinition("createdAt", 1, PhysicalSortDirection.Ascending)
+                    ])
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-025");
+    }
+
+    [Fact]
+    public void ExplicitCursorIndexMustIncludeTheIdentityLookupTieBreak()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-category",
+            [new IndexField("category")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-category",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "configurationDocument",
+            [new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String)],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("category", 1)
                     ])
             ]);
         var manifest = WithPhysicalStorage(

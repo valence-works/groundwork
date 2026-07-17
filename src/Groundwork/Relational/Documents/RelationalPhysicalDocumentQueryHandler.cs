@@ -1,7 +1,9 @@
 using System.Collections.Frozen;
 using System.Data.Common;
+using System.Globalization;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
+using Groundwork.Core.Queries;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
 using Groundwork.Relational.Physicalization;
@@ -56,7 +58,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public bool SupportsCompoundPredicates => true;
     public bool SupportsDisjunction => true;
     public bool SupportsOffsetPaging => true;
-    public bool SupportsKeysetPaging => false;
+    public bool SupportsKeysetPaging => true;
     public bool SupportsCount => true;
     public bool SupportsAny => true;
     public bool SupportsFirst => true;
@@ -65,23 +67,44 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
         ValidateDocumentIdentityValues(query.Clauses);
+        var route = store.GetRoute(query.DocumentKind);
+        var scope = store.ResolveQueryScope(query.DocumentKind);
+        DocumentQueryContinuationCodec.ValidateScope(plan, scope);
+        var continuation = query.Continuation is null
+            ? null
+            : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            var route = store.GetRoute(query.DocumentKind);
-            var scope = store.ResolveQueryScope(query.DocumentKind);
             await ThrowIfLinkedIdentityCollisionAsync(connection, BuildCollisionCheckCommand(query, plan, route, scope), route, ct);
             var total = await CountCoreAsync(connection, BuildCountCommand(query, plan, route, scope), ct);
             if (total == 0 || query.Take == 0)
                 return new DocumentQueryResult([], total);
 
-            var rendered = BuildQueryCommand(query, plan, route, scope);
+            var rendered = BuildQueryCommand(query, plan, route, scope, continuation);
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, rendered.CommandText);
             AddParameters(command, rendered.Parameters);
-            var documents = new List<DocumentEnvelope>();
+            var rows = new List<RelationalPhysicalQueryRow>();
             await using var reader = await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
-                documents.Add(store.ReadPhysicalEnvelope(reader).Envelope);
-            return new DocumentQueryResult(documents, total);
+            {
+                var envelope = store.ReadPhysicalEnvelope(reader).Envelope;
+                var boundary = plan.PagingSupport == QueryPagingSupport.Cursor
+                    ? ReadContinuationValues(
+                        reader,
+                        query,
+                        plan,
+                        RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route).Count)
+                    : [];
+                rows.Add(new RelationalPhysicalQueryRow(envelope, boundary));
+            }
+
+            var hasMore = query.Take is { } take && take < int.MaxValue && rows.Count > take;
+            if (hasMore)
+                rows.RemoveAt(rows.Count - 1);
+            var next = hasMore && rows.Count != 0
+                ? DocumentQueryContinuationCodec.Encode(query, plan, scope, rows[^1].Boundary)
+                : null;
+            return new DocumentQueryResult(rows.Select(row => row.Envelope).ToArray(), total, next);
         }, cancellationToken);
     }
 
@@ -106,7 +129,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     internal RelationalPhysicalQueryCommand BuildQueryCommand(DocumentQuery query, PhysicalQueryPlan plan)
     {
         var route = store.GetRoute(query.DocumentKind);
-        return BuildQueryCommand(query, plan, route, store.ResolveQueryScope(query.DocumentKind));
+        var scope = store.ResolveQueryScope(query.DocumentKind);
+        var continuation = query.Continuation is null
+            ? null
+            : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
+        return BuildQueryCommand(query, plan, route, scope, continuation);
     }
 
     public Task<PhysicalDocumentQueryExplanation> ExplainAsync(
@@ -121,12 +148,16 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         }
 
         ValidateDocumentIdentityValues(query.Clauses);
+        var route = store.GetRoute(query.DocumentKind);
+        var scope = store.ResolveQueryScope(query.DocumentKind);
+        DocumentQueryContinuationCodec.ValidateScope(plan, scope);
+        var continuation = query.Continuation is null
+            ? null
+            : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
         return store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            var route = store.GetRoute(query.DocumentKind);
-            var scope = store.ResolveQueryScope(query.DocumentKind);
             var commands = new List<PhysicalDocumentQueryCommandExplanation>();
-            foreach (var explained in BuildExplainCommands(query, plan, route, scope))
+            foreach (var explained in BuildExplainCommands(query, plan, route, scope, continuation))
             {
                 await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
                     connection,
@@ -151,7 +182,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         DocumentQuery query,
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
-        DocumentScopeSelection scope)
+        DocumentScopeSelection scope,
+        IReadOnlyList<DocumentQueryContinuationValue>? continuation)
     {
         var commands = new List<RelationalPhysicalQueryExplainCommand>();
         if (BuildCollisionCheckCommand(query, plan, route, scope) is { } collision)
@@ -174,7 +206,12 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                     commands.Add(new RelationalPhysicalQueryExplainCommand(
                         PhysicalDocumentQueryCommandKind.Page,
                         PhysicalDocumentQueryCommandIdentities.Page,
-                        BuildQueryCommand(query, plan, route, scope)));
+                        BuildQueryCommand(
+                            query,
+                            plan,
+                            route,
+                            scope,
+                            continuation)));
                 }
                 break;
             case BoundedQueryResultOperation.Count:
@@ -212,13 +249,20 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         var parameters = built.Parameters
             .Concat(new[]
             {
-                ("take", (object?)(query.Take ?? int.MaxValue)),
-                ("skip", (object?)(query.Skip ?? 0))
+                ("take", (object?)PageReadLimit(query, plan)),
+                ("skip", (object?)(plan.PagingSupport == QueryPagingSupport.Cursor ? 0 : query.Skip ?? 0))
             })
             .ToArray();
+        var selection = EnvelopeSelection(route);
+        if (plan.PagingSupport == QueryPagingSupport.Cursor)
+        {
+            selection += ", " + string.Join(
+                ", ",
+                DocumentQueryOrderResolver.Resolve(query, plan).Select(order => Field(order.Field)));
+        }
         return new RelationalPhysicalQueryCommand(
             store.ApplyOffsetPage(
-                $"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}",
+                $"SELECT {selection} {built.FromAndWhere} {OrderBy(query, plan)}",
                 store.P("take"),
                 store.P("skip")),
             parameters,
@@ -287,7 +331,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             plan,
             store.GetRoute(query.DocumentKind),
             requiresPrimaryLookup: !linkedIdentityOnly,
-            fixedScope: scope);
+            fixedScope: scope,
+            continuation: query.Continuation is null
+                ? null
+                : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope));
 
     private RelationalPhysicalQueryCommand BuildCountCommand(
         DocumentQuery query,
@@ -300,8 +347,19 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         DocumentQuery query,
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
-        DocumentScopeSelection scope) =>
-        RenderQuery(query, plan, Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope), route);
+        DocumentScopeSelection scope,
+        IReadOnlyList<DocumentQueryContinuationValue>? continuation) =>
+        RenderQuery(
+            query,
+            plan,
+            Build(
+                query,
+                plan,
+                route,
+                requiresPrimaryLookup: true,
+                fixedScope: scope,
+                continuation: continuation),
+            route);
 
     private RelationalPhysicalQueryCommand BuildFirstCommand(
         DocumentQuery query,
@@ -311,7 +369,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     {
         var built = Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope);
         return new RelationalPhysicalQueryCommand(
-            store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(plan)}"),
+            store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(query, plan)}"),
             built.Parameters,
             built.PredicateFieldIdentifiers);
     }
@@ -374,10 +432,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         ExecutableStorageRoute route,
         bool requiresPrimaryLookup,
         DocumentScopeSelection? fixedScope = null,
-        bool detectIdentityCollision = false)
+        bool detectIdentityCollision = false,
+        IReadOnlyList<DocumentQueryContinuationValue>? continuation = null)
     {
-        if (query.Continuation is not null)
-            throw new NotSupportedException("This relational handler profile does not certify keyset continuations.");
         if (query.LatestPerKeyPath is not null)
             throw new NotSupportedException("This relational handler profile does not certify latest-per-key selection.");
 
@@ -433,6 +490,16 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                     predicateFieldIdentifiers,
                     ref parameterIndex)).ToArray();
             predicates.Add($"({string.Join(" OR ", alternatives)})");
+        }
+        if (continuation is not null)
+        {
+            predicates.Add(ContinuationPredicate(
+                query,
+                plan,
+                continuation,
+                parameters,
+                predicateFieldIdentifiers,
+                ref parameterIndex));
         }
         if (parameters.Count > store.MaxPhysicalParameters - 2)
         {
@@ -732,11 +799,14 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             PhysicalDocumentIdentityFieldPaths.Comparison or
             PhysicalDocumentIdentityFieldPaths.Lookup;
 
-    private string OrderBy(PhysicalQueryPlan plan) =>
-        plan.Order.Count == 0
+    private string OrderBy(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        return order.Count == 0
             ? string.Empty
-            : "ORDER BY " + string.Join(", ", plan.Order.Select(order =>
-                $"{Field(order.Field)} {(order.Direction == PhysicalSortDirection.Descending ? "DESC" : "ASC")}"));
+            : "ORDER BY " + string.Join(", ", order.Select(item =>
+                store.OrderPhysicalQueryExpression(Field(item.Field), item.Direction)));
+    }
 
     private string EnvelopeSelection(ExecutableStorageRoute route) => string.Join(", ",
         RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route)
@@ -748,7 +818,181 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             store.AddPhysicalParameter(command, name, value);
     }
 
+    private static int PageReadLimit(DocumentQuery query, PhysicalQueryPlan plan) =>
+        plan.PagingSupport == QueryPagingSupport.Cursor &&
+        query.Take is { } take &&
+        take < int.MaxValue
+            ? take + 1
+            : query.Take ?? int.MaxValue;
+
+    private string ContinuationPredicate(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        IReadOnlyList<DocumentQueryContinuationValue> values,
+        List<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
+        ref int parameterIndex)
+    {
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        var alternatives = new List<string>();
+        for (var boundaryIndex = 0; boundaryIndex < order.Count; boundaryIndex++)
+        {
+            var conjunction = new List<string>();
+            for (var prefixIndex = 0; prefixIndex < boundaryIndex; prefixIndex++)
+            {
+                conjunction.Add(ContinuationEquality(
+                    order[prefixIndex],
+                    values[prefixIndex],
+                    parameters,
+                    predicateFieldIdentifiers,
+                    ref parameterIndex));
+            }
+            conjunction.Add(ContinuationAfter(
+                order[boundaryIndex],
+                values[boundaryIndex],
+                parameters,
+                predicateFieldIdentifiers,
+                ref parameterIndex));
+            alternatives.Add($"({string.Join(" AND ", conjunction)})");
+        }
+        return $"({string.Join(" OR ", alternatives)})";
+    }
+
+    private string ContinuationEquality(
+        PhysicalQueryOrder order,
+        DocumentQueryContinuationValue value,
+        ICollection<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
+        ref int parameterIndex)
+    {
+        predicateFieldIdentifiers.Add(order.Field.Identifier);
+        var field = Field(order.Field);
+        if (value.ScalarKind == DocumentQueryContinuationScalarKind.Null)
+            return $"{field} IS NULL";
+        var parameter = AddContinuationParameter(order.Field, value, parameters, ref parameterIndex);
+        return $"{field} = {parameter}";
+    }
+
+    private string ContinuationAfter(
+        PhysicalQueryOrder order,
+        DocumentQueryContinuationValue value,
+        ICollection<(string Name, object? Value)> parameters,
+        ISet<string> predicateFieldIdentifiers,
+        ref int parameterIndex)
+    {
+        predicateFieldIdentifiers.Add(order.Field.Identifier);
+        var field = Field(order.Field);
+        if (value.ScalarKind == DocumentQueryContinuationScalarKind.Null)
+            return order.Direction == PhysicalSortDirection.Ascending ? $"{field} IS NOT NULL" : "0 = 1";
+        var parameter = AddContinuationParameter(order.Field, value, parameters, ref parameterIndex);
+        return order.Direction == PhysicalSortDirection.Ascending
+            ? $"{field} > {parameter}"
+            : $"({field} < {parameter} OR {field} IS NULL)";
+    }
+
+    private string AddContinuationParameter(
+        PhysicalQueryField field,
+        DocumentQueryContinuationValue value,
+        ICollection<(string Name, object? Value)> parameters,
+        ref int parameterIndex)
+    {
+        var name = $"c{parameterIndex++}";
+        object? parameterValue = value.ScalarKind switch
+        {
+            DocumentQueryContinuationScalarKind.String => value.Value!,
+            DocumentQueryContinuationScalarKind.Int64 => long.Parse(value.Value!, CultureInfo.InvariantCulture),
+            DocumentQueryContinuationScalarKind.Decimal => decimal.Parse(value.Value!, CultureInfo.InvariantCulture),
+            DocumentQueryContinuationScalarKind.Double => double.Parse(value.Value!, CultureInfo.InvariantCulture),
+            DocumentQueryContinuationScalarKind.Boolean => bool.Parse(value.Value!),
+            DocumentQueryContinuationScalarKind.DateTimeOffset => DateTimeOffset.Parse(
+                value.Value!,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind),
+            DocumentQueryContinuationScalarKind.Binary => Convert.FromBase64String(value.Value!),
+            DocumentQueryContinuationScalarKind.Null => null,
+            _ => throw new InvalidDocumentQueryContinuationException(
+                "The document-query continuation contains an unsupported physical value.")
+        };
+        if (IsDocumentIdentityField(field) && parameterValue is string identityValue)
+            parameterValue = store.ConvertDocumentIdentityQueryValue(field, identityValue);
+        parameters.Add((name, parameterValue));
+        return store.NormalizeQueryExpression(store.P(name), field.Source, field.ValueKind);
+    }
+
+    private IReadOnlyList<DocumentQueryContinuationValue> ReadContinuationValues(
+        DbDataReader reader,
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        int startOrdinal) =>
+        DocumentQueryOrderResolver.Resolve(query, plan)
+            .Select((order, index) => ReadContinuationValue(reader, startOrdinal + index, order.Field))
+            .ToArray();
+
+    private DocumentQueryContinuationValue ReadContinuationValue(
+        DbDataReader reader,
+        int ordinal,
+        PhysicalQueryField field)
+    {
+        if (reader.IsDBNull(ordinal))
+            return new(field.ValueKind, DocumentQueryContinuationScalarKind.Null, null);
+        if (IsDocumentIdentityField(field))
+        {
+            var identityValue = field.Path == PhysicalDocumentIdentityFieldPaths.Lookup
+                ? store.ReadDocumentIdentityLookup(reader, ordinal)
+                : store.ReadDocumentIdentityComparison(reader, ordinal);
+            return new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.String,
+                identityValue);
+        }
+
+        var value = reader.GetValue(ordinal);
+        return value switch
+        {
+            string text => new(field.ValueKind, DocumentQueryContinuationScalarKind.String, text),
+            byte[] binary => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Binary,
+                Convert.ToBase64String(binary)),
+            bool boolean => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Boolean,
+                boolean.ToString(CultureInfo.InvariantCulture)),
+            decimal number => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Decimal,
+                number.ToString(CultureInfo.InvariantCulture)),
+            double number => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Double,
+                number.ToString("R", CultureInfo.InvariantCulture)),
+            float number => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Double,
+                number.ToString("R", CultureInfo.InvariantCulture)),
+            sbyte or byte or short or ushort or int or uint or long => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.Int64,
+                Convert.ToInt64(value, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture)),
+            DateTimeOffset instant => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.DateTimeOffset,
+                instant.ToString("O", CultureInfo.InvariantCulture)),
+            DateTime instant => new(
+                field.ValueKind,
+                DocumentQueryContinuationScalarKind.DateTimeOffset,
+                new DateTimeOffset(DateTime.SpecifyKind(instant, DateTimeKind.Utc))
+                    .ToString("O", CultureInfo.InvariantCulture)),
+            _ => throw new InvalidOperationException(
+                $"Physical query order field '{field.Path}' returned unsupported value type '{value.GetType().FullName}'.")
+        };
+    }
+
 }
+
+internal sealed record RelationalPhysicalQueryRow(
+    DocumentEnvelope Envelope,
+    IReadOnlyList<DocumentQueryContinuationValue> Boundary);
 
 internal sealed record RelationalPhysicalQueryPredicate(
     string FromAndWhere,

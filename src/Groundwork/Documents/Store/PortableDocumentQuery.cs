@@ -382,8 +382,14 @@ public sealed record PortableDocumentQuery
 
 }
 
-/// <summary>The result of a paged portable query: the page window plus the total predicate count.</summary>
-public sealed record DocumentQueryResult(IReadOnlyList<DocumentEnvelope> Documents, long TotalCount)
+/// <summary>
+/// The result of a bounded query: the page window, the total predicate count, and an opaque
+/// continuation when the declared cursor route has another page.
+/// </summary>
+public sealed record DocumentQueryResult(
+    IReadOnlyList<DocumentEnvelope> Documents,
+    long TotalCount,
+    string? NextContinuation = null)
 {
     public static DocumentQueryResult Empty { get; } = new(Array.Empty<DocumentEnvelope>(), 0);
 }

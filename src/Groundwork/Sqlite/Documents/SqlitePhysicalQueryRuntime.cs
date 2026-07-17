@@ -76,7 +76,7 @@ public static class SqlitePhysicalQueryRuntime
             supportsCompoundPredicates: true,
             supportsDisjunction: true,
             supportsOffsetPaging: true,
-            supportsKeysetPaging: false,
+            supportsKeysetPaging: true,
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,

@@ -346,6 +346,8 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysica
             throw new InvalidOperationException($"Offset paging is not bound to query '{query.QueryIdentity}'.");
         if (query.Continuation is not null && plan.PagingSupport != QueryPagingSupport.Cursor)
             throw new InvalidOperationException($"Keyset paging is not bound to query '{query.QueryIdentity}'.");
+        if (query.Continuation is not null && query.ResultOperation != BoundedQueryResultOperation.Documents)
+            throw new InvalidOperationException("Keyset continuations apply only to document-page results.");
         if (query.LatestPerKeyPath is not null &&
             (plan.LatestPerKeyPath is null || query.LatestPerKeyPath != plan.LatestPerKeyPath))
         {

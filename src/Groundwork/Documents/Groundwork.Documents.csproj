@@ -11,4 +11,10 @@
     <ProjectReference Include="..\Materialization\Groundwork.Materialization.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Groundwork.MongoDb" />
+    <InternalsVisibleTo Include="Groundwork.Relational" />
+    <InternalsVisibleTo Include="Groundwork.Tests" />
+  </ItemGroup>
+
 </Project>

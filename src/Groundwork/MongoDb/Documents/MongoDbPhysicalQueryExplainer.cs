@@ -27,9 +27,14 @@ internal sealed class MongoDbPhysicalQueryExplainer(
         CancellationToken cancellationToken)
     {
         var resolvedScope = scope();
-        var predicate = MongoDbPhysicalQueryHandler.BuildPredicate(query, plan, resolvedScope, storage, route);
+        DocumentQueryContinuationCodec.ValidateScope(plan, resolvedScope);
+        var basePredicate = MongoDbPhysicalQueryHandler.BuildPredicate(
+            query, plan, resolvedScope, storage, route);
+        var pagePredicate = MongoDbPhysicalQueryHandler.BuildPagePredicate(
+            query, plan, resolvedScope, basePredicate);
         var lookup = database.GetCollection<BsonDocument>(plan.LookupObject.Identifier);
-        var renderedFilter = Render(lookup, predicate.Filter);
+        var renderedBaseFilter = Render(lookup, basePredicate.Filter);
+        var renderedPageFilter = Render(lookup, pagePredicate.Filter);
         var sort = MongoDbPhysicalQueryHandler.BuildSort(query, plan);
         await transactionCapability.EnsureSupportedAsync(
             [route.StorageUnit.Value],
@@ -43,19 +48,22 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
-                    CountCommand(plan.LookupObject.Identifier, renderedFilter),
-                    predicate.FieldIdentifiers);
+                    CountCommand(plan.LookupObject.Identifier, renderedBaseFilter),
+                    basePredicate.FieldIdentifiers);
                 if (query.Take != 0)
                 {
+                    var pageLimit = MongoDbPhysicalQueryHandler.PageReadLimit(query, plan);
                     await AddAsync(
                         PhysicalDocumentQueryCommandKind.Page,
                         PhysicalDocumentQueryCommandIdentities.Page,
-                        FindCommand(lookup, query, renderedFilter, sort, query.Take, includeSort: true, includeSkip: true),
-                        predicate.FieldIdentifiers);
+                        FindCommand(lookup, query, renderedPageFilter, sort, pageLimit, includeSort: true, includeSkip: true),
+                        pagePredicate.FieldIdentifiers);
                     if (plan.RequiresPrimaryLookup)
                     {
                         var found = await ExecuteBoundedFindAsync(
-                            lookup, query, predicate.Filter, sort, query.Take, cancellationToken);
+                            lookup, query, pagePredicate.Filter, sort, pageLimit, cancellationToken);
+                        if (query.Take is { } take && found.Count > take)
+                            found = found.Take(take).ToArray();
                         await AddPrimaryHydrationAsync(found);
                     }
                 }
@@ -64,23 +72,24 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
-                    CountCommand(plan.LookupObject.Identifier, renderedFilter),
-                    predicate.FieldIdentifiers);
+                    CountCommand(plan.LookupObject.Identifier, renderedBaseFilter),
+                    basePredicate.FieldIdentifiers);
                 break;
             case BoundedQueryResultOperation.First:
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
-                    CountCommand(plan.LookupObject.Identifier, renderedFilter),
-                    predicate.FieldIdentifiers);
+                    CountCommand(plan.LookupObject.Identifier, renderedBaseFilter),
+                    basePredicate.FieldIdentifiers);
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.First,
                     PhysicalDocumentQueryCommandIdentities.First,
-                    FindCommand(lookup, query, renderedFilter, sort, 1, includeSort: true, includeSkip: true),
-                    predicate.FieldIdentifiers);
+                    FindCommand(lookup, query, renderedPageFilter, sort, 1, includeSort: true, includeSkip: true),
+                    pagePredicate.FieldIdentifiers);
                 if (plan.RequiresPrimaryLookup)
                 {
-                    var found = await ExecuteBoundedFindAsync(lookup, query, predicate.Filter, sort, 1, cancellationToken);
+                    var found = await ExecuteBoundedFindAsync(
+                        lookup, query, pagePredicate.Filter, sort, 1, cancellationToken);
                     await AddPrimaryHydrationAsync(found);
                 }
                 break;
@@ -88,8 +97,8 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Any,
                     PhysicalDocumentQueryCommandIdentities.Any,
-                    FindCommand(lookup, query, renderedFilter, sort: null, limit: 1, includeSort: false, includeSkip: false),
-                    predicate.FieldIdentifiers);
+                    FindCommand(lookup, query, renderedBaseFilter, sort: null, limit: 1, includeSort: false, includeSkip: false),
+                    basePredicate.FieldIdentifiers);
                 break;
             default:
                 throw new NotSupportedException(

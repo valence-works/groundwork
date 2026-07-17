@@ -57,6 +57,48 @@ public static class PhysicalDocumentQueryInvocationFingerprint
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
+    internal static string ComputeContinuationBinding(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        DocumentScopeSelection scope)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(scope);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Append(hash, "groundwork-physical-document-query-continuation-v1");
+        Append(hash, plan.Fingerprint);
+        Append(hash, scope.AcrossScopes);
+        Append(hash, scope.StorageKey);
+        Append(hash, scope.Scope?.Value);
+        Append(hash, query.DocumentKind);
+        Append(hash, query.QueryIdentity);
+        Append(hash, query.Clauses.Count);
+        foreach (var clause in query.Clauses)
+        {
+            Append(hash, clause.Comparisons.Count);
+            foreach (var comparison in clause.Comparisons)
+            {
+                Append(hash, comparison.Path);
+                Append(hash, (int)comparison.Operator);
+                Append(hash, comparison.Values.Count);
+                foreach (var value in comparison.Values)
+                    Append(hash, value);
+            }
+        }
+
+        Append(hash, query.Order.Count);
+        foreach (var order in query.Order)
+        {
+            Append(hash, order.Path);
+            Append(hash, (int)order.Direction);
+        }
+
+        Append(hash, query.LatestPerKeyPath);
+        Append(hash, (int)query.ResultOperation);
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
     private static void Append(IncrementalHash hash, bool value) => Append(hash, value ? 1 : 0);
 
     private static void Append(IncrementalHash hash, int value) => Append(hash, (int?)value);
