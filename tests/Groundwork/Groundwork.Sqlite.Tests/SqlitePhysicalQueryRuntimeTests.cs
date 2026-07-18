@@ -294,6 +294,53 @@ public sealed class SqlitePhysicalQueryRuntimeTests
     }
 
     [Fact]
+    public async Task ResidualPredicatesExecuteBeforeCountLimitAndCursorContinuation()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = CreateResidualHistoryModel();
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(
+            connection,
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        await writer.SaveAsync(HistorySave("newest-blocked", "blocked", "2026-07-17T12:00:00Z"));
+        await writer.SaveAsync(HistorySave("middle-ready", "ready", "2026-07-17T11:00:00Z"));
+        await writer.SaveAsync(HistorySave("oldest-ready", "ready", "2026-07-17T10:00:00Z"));
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+        var ready = DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "ready"));
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "history-by-created-at",
+            [ready],
+            [new DocumentQueryOrder("createdAt", PhysicalSortDirection.Descending)],
+            take: 1);
+
+        var first = await queries.QueryAsync(query);
+        var second = await queries.QueryAsync(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            query.Clauses,
+            query.Order,
+            take: 1,
+            continuation: first.NextContinuation));
+        var count = await queries.CountAsync(query.Select(BoundedQueryResultOperation.Count));
+
+        Assert.Equal(2, first.TotalCount);
+        Assert.Equal("middle-ready", Assert.Single(first.Documents).Id);
+        Assert.NotNull(first.NextContinuation);
+        Assert.Equal(2, second.TotalCount);
+        Assert.Equal("oldest-ready", Assert.Single(second.Documents).Id);
+        Assert.Null(second.NextContinuation);
+        Assert.Equal(2, count);
+        var plan = Assert.IsAssignableFrom<PhysicalQueryDocumentStore>(queries).ResolvePlan(query);
+        Assert.True(plan.Predicates.Single(predicate => predicate.Path == "status").IsResidual);
+        Assert.NotNull(plan.IndexName);
+    }
+
+    [Fact]
     public async Task Cursor_token_resumes_after_the_issuing_process_has_exited()
     {
         var databasePath = Path.Combine(
@@ -865,8 +912,106 @@ public sealed class SqlitePhysicalQueryRuntimeTests
     private static SaveDocumentRequest Save(string id, string category) =>
         new("configurationDocument", id, "1", $"{{\"category\":\"{category}\",\"priority\":1}}", 0);
 
+    private static SaveDocumentRequest HistorySave(string id, string status, string createdAt) =>
+        new(
+            "configurationDocument",
+            id,
+            "1",
+            $"{{\"status\":\"{status}\",\"createdAt\":\"{createdAt}\"}}",
+            0);
+
     private static SaveDocumentRequest Value(string id, string jsonValue) =>
         new("configurationDocument", id, "1", $"{{\"value\":{jsonValue}}}", 0);
+
+    private static (StorageManifest Manifest, PhysicalSchemaTarget Target) CreateResidualHistoryModel()
+    {
+        var template = SqliteTestManifests.MetadataManifest();
+        var logicalIndex = new LogicalIndexDeclaration(
+            "history-order",
+            [new IndexField("createdAt", IndexValueKind.DateTime)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "history-by-created-at",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.In
+            },
+            QuerySortSupport.Descending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            supportsTotalCount: true,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Descending)
+            ],
+            resultOperations: new HashSet<BoundedQueryResultOperation>
+            {
+                BoundedQueryResultOperation.Documents,
+                BoundedQueryResultOperation.Count
+            },
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.Equal,
+                        PortableQueryOperation.In
+                    })
+            ]);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "workflow_execution_history",
+            [
+                new ProjectedColumnDefinition(
+                    "created_at",
+                    "createdAt",
+                    PortablePhysicalType.DateTime),
+                new ProjectedColumnDefinition(
+                    "status",
+                    "status",
+                    PortablePhysicalType.String)
+            ],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition(
+                            "created_at",
+                            0,
+                            PhysicalSortDirection.Descending),
+                        new PhysicalIndexColumnDefinition("id_lookup_key", 1)
+                    ])
+            ]);
+        var unit = template.StorageUnits.Single() with
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query])
+        };
+        var manifest = template with { StorageUnits = [unit] };
+        var resolution = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+        Assert.True(resolution.IsValid, string.Join("; ", resolution.Diagnostics.Select(x => x.Message)));
+        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
+        Assert.True(compilation.IsValid, string.Join("; ", compilation.Diagnostics.Select(x => x.Message)));
+        return (
+            manifest,
+            new PhysicalSchemaTarget(
+                manifest.Identity,
+                manifest.Version,
+                SqliteTestManifests.Provider,
+                compilation.Routes));
+    }
 
     private static (Groundwork.Core.Manifests.StorageManifest Manifest, PhysicalSchemaTarget Target) CreateCanonicalValueModel()
     {

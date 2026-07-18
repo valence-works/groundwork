@@ -24,6 +24,47 @@ namespace Groundwork.MongoDb.Tests;
 public sealed class MongoDbPhysicalStorageModelTests
 {
     [Fact]
+    public void ResidualPredicateCompilesIntoTheNativeMongoFilterWithoutBecomingIndexKeyEvidence()
+    {
+        var model = ResidualHistoryModel();
+        var route = Assert.Single(model.Routes);
+        var storage = Assert.Single(model.Manifest.StorageUnits).PhysicalStorage!;
+        var capabilities = MongoDbPhysicalMutationCapabilities.Create(
+            route,
+            storage,
+            model.Provider,
+            MongoDbPhysicalQueryHandler.Operations);
+        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
+        Assert.True(
+            compilation.IsValid,
+            string.Join("; ", compilation.Diagnostics.Select(diagnostic => diagnostic.Message)));
+        var plan = Assert.Single(compilation.Plans);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "history-by-created-at",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "ready"))],
+            [new DocumentQueryOrder("createdAt", PhysicalSortDirection.Descending)],
+            take: 10);
+
+        var filter = Render(MongoDbPhysicalQueryHandler.BuildFilter(
+            query,
+            plan,
+            DocumentScopeSelection.Global,
+            storage,
+            route));
+
+        var residual = plan.Predicates.Single(predicate => predicate.Path == "status");
+        var version = plan.Predicates.Single(predicate =>
+            predicate.Path == PhysicalDocumentFieldPaths.Version);
+        Assert.True(residual.IsResidual);
+        Assert.Equal(route.Envelope.Version.Identifier, version.Field.Identifier);
+        Assert.NotNull(plan.IndexName);
+        Assert.Contains(residual.Field.Identifier, filter.ToJson(), StringComparison.Ordinal);
+        Assert.Contains("ready", filter.ToJson(), StringComparison.Ordinal);
+        Assert.DoesNotContain("status", plan.LogicalIndexPaths);
+    }
+
+    [Fact]
     public void Exact_identity_filter_binds_equivalent_unicode_spelling_to_the_same_plan_evidence()
     {
         var model = IdentityModel();
@@ -1129,6 +1170,80 @@ public sealed class MongoDbPhysicalStorageModelTests
         };
         return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
             new StorageManifestIdentity("mongo.native-boolean"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
+    }
+
+    private static MongoDbPhysicalStorageModel ResidualHistoryModel()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "history-order",
+            [new IndexField("createdAt", IndexValueKind.DateTime)],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "history-by-created-at",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.In
+            },
+            QuerySortSupport.Descending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Descending)
+            ],
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.Equal,
+                        PortableQueryOperation.In
+                    }),
+                new BoundedQueryResidualPredicateField(
+                    PhysicalDocumentFieldPaths.Version,
+                    IndexValueKind.Number,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "workflow_execution_history",
+            [
+                new ProjectedColumnDefinition("created_at", "createdAt", PortablePhysicalType.DateTime),
+                new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String)
+            ],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition(
+                            "created_at",
+                            0,
+                            PhysicalSortDirection.Descending),
+                        new PhysicalIndexColumnDefinition("id_lookup_key", 1)
+                    ])
+            ]);
+        var unit = Unit("configurationDocument", definition) with
+        {
+            Tenancy = TenancyPolicy.Global,
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logicalIndex],
+                [query])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.residual-history"),
             new StorageManifestOwner("tests"),
             new StorageManifestVersion("1"),
             [unit],

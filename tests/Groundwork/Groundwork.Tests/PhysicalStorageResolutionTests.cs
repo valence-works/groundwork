@@ -1215,6 +1215,168 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
+    public void DefaultScaleBearingResolutionProjectsResidualPathsWithoutAddingThemToTheIndexKey()
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-category",
+            [new IndexField("category")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-category",
+            index.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [index],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        var definition = Assert.Single(result.Definitions).Definition;
+        Assert.Equal(PhysicalStorageForm.PhysicalEntityTable, definition.Form);
+        Assert.Equal(
+            new[] { "category", "status" },
+            definition.ProjectedColumns.Select(column => column.Path).Order(StringComparer.Ordinal));
+        var physicalIndex = Assert.Single(definition.Indexes);
+        Assert.DoesNotContain(
+            physicalIndex.Columns,
+            column => column.ColumnLogicalName == "status");
+    }
+
+    [Fact]
+    public void ExplicitScaleBearingResidualProjectionMustPreserveItsDeclaredValueKind()
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-category",
+            [new IndexField("category")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "list-by-category",
+            index.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "score",
+                    IndexValueKind.Number,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "configurationDocument",
+            [
+                new ProjectedColumnDefinition("category", "category", PortablePhysicalType.String),
+                new ProjectedColumnDefinition("score", "score", PortablePhysicalType.String)
+            ],
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    index.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("category", 1)
+                    ])
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [index],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-PHYSICAL-036" &&
+            diagnostic.Message.Contains("score", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ConflictingResidualValueKindsFailResolutionWithoutPublishingAnArbitraryDefinition()
+    {
+        var firstIndex = new LogicalIndexDeclaration(
+            "by-category",
+            [new IndexField("category")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var secondIndex = new LogicalIndexDeclaration(
+            "by-owner",
+            [new IndexField("owner")],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        BoundedQueryDeclaration Query(
+            string identity,
+            string indexIdentity,
+            IndexValueKind residualKind) =>
+            new(
+                identity,
+                indexIdentity,
+                new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                QuerySortSupport.None,
+                QueryPagingSupport.None,
+                BoundedQueryExecutionClass.ScaleBearing,
+                residualPredicateFields:
+                [
+                    new BoundedQueryResidualPredicateField(
+                        "status",
+                        residualKind,
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [firstIndex, secondIndex],
+                [
+                    Query("by-category", firstIndex.Identity, IndexValueKind.Keyword),
+                    Query("by-owner", secondIndex.Identity, IndexValueKind.Number)
+                ]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-PHYSICAL-036" &&
+            diagnostic.Message.Contains("status", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ExplicitScaleBearingDemandRequiresMatchingOrderedPhysicalIndex()
     {
         var index = new LogicalIndexDeclaration(

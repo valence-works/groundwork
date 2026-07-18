@@ -279,12 +279,16 @@ public sealed record PhysicalQueryDocumentIdentityBinding(
 public sealed record PhysicalQueryPredicate(
     string Path,
     PhysicalQueryField Field,
-    IReadOnlySet<PortableQueryOperation> Operations)
+    IReadOnlySet<PortableQueryOperation> Operations,
+    bool IsResidual = false,
+    bool IsRequired = false)
 {
     public bool Equals(PhysicalQueryPredicate? other) =>
         other is not null &&
         Path == other.Path &&
         Field == other.Field &&
+        IsResidual == other.IsResidual &&
+        IsRequired == other.IsRequired &&
         Operations.SetEquals(other.Operations);
 
     public override int GetHashCode()
@@ -292,6 +296,8 @@ public sealed record PhysicalQueryPredicate(
         var hash = new HashCode();
         hash.Add(Path, StringComparer.Ordinal);
         hash.Add(Field);
+        hash.Add(IsResidual);
+        hash.Add(IsRequired);
         foreach (var operation in Operations.Order())
             hash.Add(operation);
         return hash.ToHashCode();
@@ -532,6 +538,8 @@ public static class PhysicalQueryPlanSerializer
                 writer.WriteStartObject();
                 writer.WriteString("path", predicate.Path);
                 WriteField(writer, "field", predicate.Field);
+                writer.WriteBoolean("residual", predicate.IsResidual);
+                writer.WriteBoolean("required", predicate.IsRequired);
                 writer.WritePropertyName("operations");
                 writer.WriteStartArray();
                 foreach (var operation in predicate.Operations.Order())
