@@ -14,7 +14,7 @@ public static class DiagnosticStringComparisonKey
     public const string OrdinalAlgorithmId = PortableStringComparison.OrdinalAlgorithmId;
     public const string AsciiIgnoreCaseAlgorithmId = PortableStringComparison.AsciiIgnoreCaseAlgorithmId;
     public const string LookupHashAlgorithmId = PortableStringComparison.LookupHashAlgorithmId;
-    public const string SearchKeyAlgorithmId = "groundwork-boundary-delimited-search-key-v1";
+    public const string SearchKeyAlgorithmId = PortableStringComparison.SearchKeyAlgorithmId;
     public const int BoundedPrefixLength = 256;
 
     public static string UnicodeOrdinalIgnoreCaseAlgorithmId => PortableStringComparison.UnicodeOrdinalIgnoreCaseAlgorithmId;
@@ -29,10 +29,7 @@ public static class DiagnosticStringComparisonKey
     public static string Create(string value, DiagnosticStringCasePolicy casePolicy) =>
         PortableStringComparison.Create(value, Map(casePolicy));
     public static string CreateSearchKey(string value, DiagnosticStringCasePolicy casePolicy)
-    {
-        var policy = Map(casePolicy);
-        return CreateSearchKeyFromComparison(PortableStringComparison.Create(value, policy), casePolicy);
-    }
+        => PortableStringComparison.CreateSearchKey(value, Map(casePolicy));
     public static DiagnosticStringComparisonProjection Project(
         string value,
         DiagnosticStringCasePolicy casePolicy)
@@ -43,47 +40,7 @@ public static class DiagnosticStringComparisonKey
             identity.ComparisonKey,
             PortableStringComparison.CreateBoundedPrefix(identity.ComparisonKey, BoundedPrefixLength),
             identity.ComparisonKeyHash,
-            CreateSearchKeyFromComparison(identity.ComparisonKey, casePolicy));
-    }
-
-    private static string CreateSearchKeyFromComparison(
-        string comparisonKey,
-        DiagnosticStringCasePolicy casePolicy)
-    {
-        if (casePolicy == DiagnosticStringCasePolicy.AsciiIgnoreCase)
-        {
-            return string.Create(comparisonKey.Length * 5, comparisonKey, static (buffer, source) =>
-            {
-                const string hex = "0123456789ABCDEF";
-                for (var index = 0; index < source.Length; index++)
-                {
-                    var character = source[index];
-                    var offset = index * 5;
-                    buffer[offset] = '|';
-                    buffer[offset + 1] = hex[(character >> 12) & 0xF];
-                    buffer[offset + 2] = hex[(character >> 8) & 0xF];
-                    buffer[offset + 3] = hex[(character >> 4) & 0xF];
-                    buffer[offset + 4] = hex[character & 0xF];
-                }
-            });
-        }
-
-        var unitLength = casePolicy == DiagnosticStringCasePolicy.UnicodeOrdinalIgnoreCase ? 6 : 4;
-        var unitCount = (comparisonKey.Length + unitLength - 1) / unitLength;
-        return string.Create(
-            comparisonKey.Length + unitCount,
-            (comparisonKey, unitLength),
-            static (buffer, state) =>
-            {
-                var target = 0;
-                for (var source = 0; source < state.comparisonKey.Length; source += state.unitLength)
-                {
-                    buffer[target++] = '|';
-                    var length = Math.Min(state.unitLength, state.comparisonKey.Length - source);
-                    state.comparisonKey.AsSpan(source, length).CopyTo(buffer[target..]);
-                    target += length;
-                }
-            });
+            PortableStringComparison.CreateSearchKeyFromComparisonKey(identity.ComparisonKey, policy));
     }
 
     private static PortableStringComparisonPolicy Map(DiagnosticStringCasePolicy casePolicy) => casePolicy switch
