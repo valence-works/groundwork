@@ -66,6 +66,57 @@ public sealed class PortableStringComparisonTests
             PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(lowercase));
     }
 
+    [Theory]
+    [InlineData(PortableStringComparisonPolicy.Ordinal, "xÅ😀y", "Å😀")]
+    [InlineData(PortableStringComparisonPolicy.AsciiIgnoreCase, "xAPI-z", "api")]
+    [InlineData(PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase, "xÅ😀y", "å😀")]
+    public void Search_key_preserves_comparison_unit_boundaries_for_portable_contains(
+        PortableStringComparisonPolicy policy,
+        string value,
+        string search)
+    {
+        var valueKey = PortableStringComparison.CreateSearchKey(value, policy);
+        var searchKey = PortableStringComparison.CreateSearchKey(search, policy);
+
+        Assert.Equal(
+            "groundwork-boundary-delimited-search-key-v1",
+            PortableStringComparison.SearchKeyAlgorithmId);
+        Assert.Contains(searchKey, valueKey, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(PortableStringComparisonPolicy.Ordinal, "A", "|0041")]
+    [InlineData(PortableStringComparisonPolicy.AsciiIgnoreCase, "A", "|0061")]
+    [InlineData(PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase, "å😀", "|0000C5|01F600")]
+    public void Search_key_version_one_has_stable_golden_vectors(
+        PortableStringComparisonPolicy policy,
+        string value,
+        string expected)
+    {
+        Assert.Equal("groundwork-boundary-delimited-search-key-v1", PortableStringComparison.SearchKeyAlgorithmId);
+        Assert.Equal(expected, PortableStringComparison.CreateSearchKey(value, policy));
+    }
+
+    [Fact]
+    public void Search_key_does_not_match_across_encoded_comparison_unit_boundaries()
+    {
+        const string value = "\u0001\u0002";
+        const string search = "\U00010000";
+        Assert.Contains(
+            PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(search),
+            PortableStringComparison.CreateUnicodeOrdinalIgnoreCase(value),
+            StringComparison.Ordinal);
+
+        var valueKey = PortableStringComparison.CreateSearchKey(
+            value,
+            PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase);
+        var crossBoundaryScalarKey = PortableStringComparison.CreateSearchKey(
+            search,
+            PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase);
+
+        Assert.DoesNotContain(crossBoundaryScalarKey, valueKey, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Unicode_key_matches_dotnet_ordinal_ignore_case_for_case_fold_boundaries()
     {

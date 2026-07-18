@@ -25,7 +25,7 @@ public readonly record struct PortableStringIdentityProjection(
 
 /// <summary>
 /// Owns provider-neutral, versioned string comparison and lookup projections that may be persisted
-/// by any Groundwork storage form. Storage-specific search projections remain with adapters.
+/// by any Groundwork storage form.
 /// </summary>
 public static class PortableStringComparison
 {
@@ -36,6 +36,7 @@ public static class PortableStringComparison
     public const string OrdinalAlgorithmId = "groundwork-utf16-hex-v1";
     public const string AsciiIgnoreCaseAlgorithmId = "groundwork-ascii-lower-v1";
     public const string LookupHashAlgorithmId = "groundwork-sha256-utf8-lowerhex-v1";
+    public const string SearchKeyAlgorithmId = "groundwork-boundary-delimited-search-key-v1";
     private const string UnicodeOrdinalIgnoreCaseAlgorithmName = "groundwork-unicode-ordinal-ignore-case-v1";
 
     private static readonly Lazy<UnicodeOrdinalIgnoreCaseState> UnicodeOrdinalIgnoreCase = new(
@@ -96,6 +97,72 @@ public static class PortableStringComparison
         PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase => CreateUnicodeOrdinalIgnoreCase(value),
         _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
     };
+
+    /// <summary>
+    /// Produces an ASCII comparison key whose unit delimiters make substring matching independent
+    /// of database collation, regular-expression syntax, and encoded scalar boundaries.
+    /// </summary>
+    public static string CreateSearchKey(string value, PortableStringComparisonPolicy policy)
+        => CreateSearchKeyFromComparisonKey(Create(value, policy), policy);
+
+    /// <summary>
+    /// Produces the search projection from a comparison key that was already created with the same
+    /// policy, avoiding duplicate Unicode projection work when both keys are persisted.
+    /// </summary>
+    public static string CreateSearchKeyFromComparisonKey(
+        string comparisonKey,
+        PortableStringComparisonPolicy policy)
+    {
+        ArgumentNullException.ThrowIfNull(comparisonKey);
+        var encodedUnitLength = policy switch
+        {
+            PortableStringComparisonPolicy.Ordinal => 4,
+            PortableStringComparisonPolicy.UnicodeOrdinalIgnoreCase => 6,
+            PortableStringComparisonPolicy.AsciiIgnoreCase => 1,
+            _ => throw new ArgumentOutOfRangeException(nameof(policy), policy, null)
+        };
+        if (comparisonKey.Length % encodedUnitLength != 0)
+        {
+            throw new ArgumentException(
+                "The comparison key does not contain complete encoded comparison units.",
+                nameof(comparisonKey));
+        }
+
+        if (policy == PortableStringComparisonPolicy.AsciiIgnoreCase)
+        {
+            return string.Create(comparisonKey.Length * 5, comparisonKey, static (buffer, source) =>
+            {
+                const string hex = "0123456789ABCDEF";
+                for (var index = 0; index < source.Length; index++)
+                {
+                    var character = source[index];
+                    var offset = index * 5;
+                    buffer[offset] = '|';
+                    buffer[offset + 1] = hex[(character >> 12) & 0xF];
+                    buffer[offset + 2] = hex[(character >> 8) & 0xF];
+                    buffer[offset + 3] = hex[(character >> 4) & 0xF];
+                    buffer[offset + 4] = hex[character & 0xF];
+                }
+            });
+        }
+
+        var unitLength = encodedUnitLength;
+        var unitCount = comparisonKey.Length / unitLength;
+        return string.Create(
+            comparisonKey.Length + unitCount,
+            (comparisonKey, unitLength),
+            static (buffer, state) =>
+            {
+                var target = 0;
+                for (var source = 0; source < state.comparisonKey.Length; source += state.unitLength)
+                {
+                    buffer[target++] = '|';
+                    var length = Math.Min(state.unitLength, state.comparisonKey.Length - source);
+                    state.comparisonKey.AsSpan(source, length).CopyTo(buffer[target..]);
+                    target += length;
+                }
+            });
+    }
 
     public static string CreateBoundedPrefix(string comparisonKey, int maximumLength)
     {
