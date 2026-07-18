@@ -1544,6 +1544,18 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.DoesNotContain("COLLSCAN", pagePlan.NativePlan, StringComparison.Ordinal);
         Assert.DoesNotContain("\"stage\" : \"SORT\"", pagePlan.NativePlan, StringComparison.Ordinal);
         Assert.Contains("\"stage\" : \"LIMIT\"", pagePlan.NativePlan, StringComparison.Ordinal);
+        Assert.Equal(3, pagePlan.ProviderAppliedMaximumRows);
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.Field.Identifier),
+            pagePlan.ProviderAppliedOrder.Select(order => order.FieldIdentifier));
+        Assert.True(pagePlan.ProviderAppliedOrder[^1].IsIdentityTieBreak);
+        if (explanation.Plan.RequiresPrimaryLookup)
+        {
+            Assert.Equal(
+                2,
+                explanation.Commands.Single(command =>
+                    command.Kind == PhysicalDocumentQueryCommandKind.PrimaryHydration).ProviderAppliedMaximumRows);
+        }
     }
 
     [Theory]
@@ -1657,6 +1669,19 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
                     PhysicalDocumentQueryCommandIdentities.PrimaryHydration
                 ],
             firstExplanation.Commands.Select(command => command.Identity));
+        Assert.All(explanation.Commands, command => Assert.Equal(1, command.ProviderAppliedMaximumRows));
+        var pageExplanation = explanation.Commands.Single(command =>
+            command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.Field.Identifier),
+            pageExplanation.ProviderAppliedOrder.Select(order => order.FieldIdentifier));
+        Assert.All(
+            pageExplanation.ProviderAppliedOrder,
+            order => Assert.Equal(PhysicalSortDirection.Ascending, order.Direction));
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.IsIdentityTieBreak),
+            pageExplanation.ProviderAppliedOrder.Select(order => order.IsIdentityTieBreak));
+        Assert.Contains(pageExplanation.ProviderAppliedOrder, order => order.IsIdentityTieBreak);
         Assert.DoesNotContain(
             "COLLSCAN",
             explanation.Commands.Single(command => command.Identity == PhysicalDocumentQueryCommandIdentities.Page).NativePlan,
@@ -1741,6 +1766,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
         var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
         await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open"}"""));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "2", "1", """{"status":"open"}"""));
         var baseQuery = new DocumentQuery(
             "workItem", "list-by-status",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("status", "open"))]);
@@ -1777,6 +1803,23 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             Assert.Contains(explanation.Commands, command =>
                 command.NativePlan.Contains(route.Indexes.Single().Name.Identifier, StringComparison.Ordinal) ||
                 command.Identity == PhysicalDocumentQueryCommandIdentities.PrimaryHydration);
+            Assert.All(explanation.Commands, command =>
+                Assert.Equal(
+                    command.Kind switch
+                    {
+                        PhysicalDocumentQueryCommandKind.Page => int.MaxValue,
+                        PhysicalDocumentQueryCommandKind.PrimaryHydration
+                            when operation == BoundedQueryResultOperation.Documents => 2,
+                        _ => 1
+                    },
+                    command.ProviderAppliedMaximumRows));
+            foreach (var ordered in explanation.Commands.Where(command =>
+                         command.Kind is PhysicalDocumentQueryCommandKind.Page or
+                             PhysicalDocumentQueryCommandKind.First))
+            {
+                Assert.NotEmpty(ordered.ProviderAppliedOrder);
+                Assert.True(ordered.ProviderAppliedOrder[^1].IsIdentityTieBreak);
+            }
             if (operation == BoundedQueryResultOperation.Any)
             {
                 Assert.True(await store.AnyAsync(query));

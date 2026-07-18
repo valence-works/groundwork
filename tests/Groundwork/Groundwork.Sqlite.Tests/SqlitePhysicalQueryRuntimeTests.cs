@@ -70,6 +70,27 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         });
         Assert.Contains(explanation.Commands, command =>
             command.NativePlan.Contains(explanation.Plan.IndexName!.Identifier, StringComparison.OrdinalIgnoreCase));
+        Assert.All(explanation.Commands, command => Assert.Equal(1, command.ProviderAppliedMaximumRows));
+        var page = explanation.Commands.SingleOrDefault(command =>
+            command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        if (page is not null)
+        {
+            Assert.Equal(take, page.ProviderAppliedMaximumRows);
+            Assert.Collection(
+                page.ProviderAppliedOrder,
+                order =>
+                {
+                    Assert.Equal(explanation.Plan.Order[0].Field.Identifier, order.FieldIdentifier);
+                    Assert.Equal(PhysicalSortDirection.Ascending, order.Direction);
+                    Assert.False(order.IsIdentityTieBreak);
+                },
+                order =>
+                {
+                    Assert.Equal(explanation.Plan.Order[1].Field.Identifier, order.FieldIdentifier);
+                    Assert.Equal(PhysicalSortDirection.Ascending, order.Direction);
+                    Assert.True(order.IsIdentityTieBreak);
+                });
+        }
     }
 
     [Fact]
@@ -467,6 +488,7 @@ public sealed class SqlitePhysicalQueryRuntimeTests
                     $"{{\"category\":\"tools\",\"priority\":{priority}}}"))).Status);
         }
         var queries = SqlitePhysicalQueryRuntime.Create(store, manifest, route, target.Provider);
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(queries);
         var query = new DocumentQuery(
             "configurationDocument",
             "find-by-category-priority",
@@ -474,6 +496,7 @@ public sealed class SqlitePhysicalQueryRuntimeTests
             [new DocumentQueryOrder("priority", PhysicalSortDirection.Descending)],
             take: 2);
 
+        var explanation = await explainer.ExplainAsync(query);
         var first = await queries.QueryAsync(query);
         var second = await queries.QueryAsync(new DocumentQuery(
             query.DocumentKind,
@@ -487,6 +510,14 @@ public sealed class SqlitePhysicalQueryRuntimeTests
 
         Assert.Equal(new[] { "b" }.Concat(tied).Append("d"),
             first.Documents.Concat(second.Documents).Select(document => document.Id));
+        var page = explanation.Commands.Single(command =>
+            command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        Assert.Equal(3, page.ProviderAppliedMaximumRows);
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.Field.Identifier),
+            page.ProviderAppliedOrder.Select(order => order.FieldIdentifier));
+        Assert.Equal(PhysicalSortDirection.Descending, page.ProviderAppliedOrder[0].Direction);
+        Assert.True(page.ProviderAppliedOrder[^1].IsIdentityTieBreak);
         Assert.NotNull(first.NextContinuation);
         Assert.Null(second.NextContinuation);
     }

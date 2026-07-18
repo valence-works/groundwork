@@ -169,7 +169,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                     explained.Identity,
                     native.Format,
                     native.Content,
-                    explained.Command.PredicateFieldIdentifiers));
+                    explained.Command.PredicateFieldIdentifiers,
+                    explained.Command.ProviderAppliedMaximumRows,
+                    explained.Command.ProviderAppliedOrder));
             }
             return new PhysicalDocumentQueryExplanation(
                 plan,
@@ -269,7 +271,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 store.P("take"),
                 store.P("skip")),
             parameters,
-            built.PredicateFieldIdentifiers);
+            built.PredicateFieldIdentifiers,
+            PageReadLimit(query, plan),
+            ProviderAppliedOrder(query, plan));
     }
 
     public Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
@@ -382,7 +386,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return new RelationalPhysicalQueryCommand(
             store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(query, plan)}"),
             built.Parameters,
-            built.PredicateFieldIdentifiers);
+            built.PredicateFieldIdentifiers,
+            1,
+            ProviderAppliedOrder(query, plan));
     }
 
     private RelationalPhysicalQueryCommand BuildAnyCommand(
@@ -395,7 +401,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         return new RelationalPhysicalQueryCommand(
             store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"),
             built.Parameters,
-            built.PredicateFieldIdentifiers);
+            built.PredicateFieldIdentifiers,
+            1);
     }
 
     private RelationalPhysicalQueryCommand? BuildCollisionCheckCommand(
@@ -421,7 +428,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 $"p.{store.Q(route.Envelope.Id.Identifier)}, " +
                 $"l.{store.Q(relationship.Identity.LookupKey.Identifier)} {built.FromAndWhere}"),
             built.Parameters,
-            built.PredicateFieldIdentifiers);
+            built.PredicateFieldIdentifiers,
+            1);
     }
 
     private async Task<long> CountCoreAsync(
@@ -435,7 +443,11 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     }
 
     private static RelationalPhysicalQueryCommand RenderCount(RelationalPhysicalQueryPredicate built) =>
-        new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters, built.PredicateFieldIdentifiers);
+        new(
+            $"SELECT COUNT(*) {built.FromAndWhere};",
+            built.Parameters,
+            built.PredicateFieldIdentifiers,
+            1);
 
     private RelationalPhysicalQueryCommand RenderLatestPerKeyCount(
         DocumentQuery query,
@@ -449,7 +461,8 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             built.PredicateFieldIdentifiers
                 .Append(group.Identifier)
                 .Distinct(StringComparer.Ordinal)
-                .ToArray());
+                .ToArray(),
+            1);
     }
 
     private RelationalPhysicalQueryCommand RenderLatestPerKeyPage(
@@ -501,7 +514,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 .Concat(order.Select(item => item.Field.Identifier))
                 .Append(group.Identifier)
                 .Distinct(StringComparer.Ordinal)
-                .ToArray());
+                .ToArray(),
+            take,
+            ProviderAppliedOrder(order));
     }
 
     private static PhysicalQueryField LatestPerKeyField(DocumentQuery query, PhysicalQueryPlan plan)
@@ -513,6 +528,19 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private static string LatestEnvelopeAlias(int index) => $"groundwork_envelope_{index}";
     private static string LatestOrderAlias(int index) => $"groundwork_order_{index}";
+
+    private static IReadOnlyList<PhysicalDocumentQueryCommandOrder> ProviderAppliedOrder(
+        DocumentQuery query,
+        PhysicalQueryPlan plan) =>
+        ProviderAppliedOrder(DocumentQueryOrderResolver.Resolve(query, plan));
+
+    private static IReadOnlyList<PhysicalDocumentQueryCommandOrder> ProviderAppliedOrder(
+        IEnumerable<PhysicalQueryOrder> order) =>
+        order.Select(item => new PhysicalDocumentQueryCommandOrder(
+                item.Field.Identifier,
+                item.Direction,
+                item.IsIdentityTieBreak))
+            .ToArray();
 
     private RelationalPhysicalQueryPredicate Build(
         DocumentQuery query,
@@ -1087,4 +1115,6 @@ internal sealed record RelationalPhysicalQueryPredicate(
 internal sealed record RelationalPhysicalQueryCommand(
     string CommandText,
     IReadOnlyList<(string Name, object? Value)> Parameters,
-    IReadOnlyList<string> PredicateFieldIdentifiers);
+    IReadOnlyList<string> PredicateFieldIdentifiers,
+    int? ProviderAppliedMaximumRows = null,
+    IReadOnlyList<PhysicalDocumentQueryCommandOrder>? ProviderAppliedOrder = null);

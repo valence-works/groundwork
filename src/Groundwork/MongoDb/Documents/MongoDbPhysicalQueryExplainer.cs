@@ -146,12 +146,15 @@ internal sealed class MongoDbPhysicalQueryExplainer(
             IReadOnlyList<string> fieldIdentifiers)
         {
             var nativePlan = await ExplainCommandAsync(command, cancellationToken);
+            var shape = DescribeCommand(command, plan);
             commands.Add(new PhysicalDocumentQueryCommandExplanation(
                 kind,
                 identity,
                 "mongodb-json",
                 nativePlan.ToJson(),
-                fieldIdentifiers));
+                fieldIdentifiers,
+                shape.MaximumRows,
+                shape.Order));
         }
 
         async Task AddPrimaryHydrationAsync(IReadOnlyList<BsonDocument> linked)
@@ -171,7 +174,8 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 new BsonDocument
                 {
                     ["find"] = route.PrimaryStorage.Name.Identifier,
-                    ["filter"] = Render(primary, hydrationFilter)
+                    ["filter"] = Render(primary, hydrationFilter),
+                    ["limit"] = linked.Count
                 },
                 [MongoDbPhysicalStorageFields.Id, route.Envelope.Identity.ComparisonKey.Identifier]);
         }
@@ -253,7 +257,7 @@ internal sealed class MongoDbPhysicalQueryExplainer(
         DocumentQuery query,
         BsonDocument renderedFilter,
         SortDefinition<BsonDocument>? sort,
-        int? limit,
+        int limit,
         bool includeSort,
         bool includeSkip)
     {
@@ -266,8 +270,7 @@ internal sealed class MongoDbPhysicalQueryExplainer(
             command["sort"] = sort.Render(new RenderArgs<BsonDocument>(collection.DocumentSerializer, BsonSerializer.SerializerRegistry));
         if (includeSkip && query.Skip is { } skip)
             command["skip"] = skip;
-        if (limit is { } take)
-            command["limit"] = take;
+        command["limit"] = limit;
         return command;
     }
 
@@ -276,14 +279,67 @@ internal sealed class MongoDbPhysicalQueryExplainer(
         DocumentQuery query,
         FilterDefinition<BsonDocument> filter,
         SortDefinition<BsonDocument> sort,
-        int? limit,
+        int limit,
         CancellationToken cancellationToken)
     {
         var find = collection.Find(filter).Sort(sort).Skip(query.Skip ?? 0);
-        if (limit is { } take)
-            find = find.Limit(take);
+        find = find.Limit(limit);
         return await find.ToListAsync(cancellationToken);
     }
+
+    private static MongoDbPhysicalCommandShape DescribeCommand(
+        BsonDocument command,
+        PhysicalQueryPlan plan)
+    {
+        if (command.Contains("find"))
+        {
+            var findMaximumRows = command.TryGetValue("limit", out var limit)
+                ? (int?)limit.ToInt32()
+                : null;
+            var order = command.TryGetValue("sort", out var sort)
+                ? DescribeOrder(sort.AsBsonDocument, plan)
+                : [];
+            return new MongoDbPhysicalCommandShape(findMaximumRows, order);
+        }
+
+        var pipeline = command["pipeline"].AsBsonArray
+            .Select(stage => stage.AsBsonDocument)
+            .ToArray();
+        var appliedLimit = pipeline
+            .Where(stage => stage.Contains("$limit"))
+            .Select(stage => (int?)stage["$limit"].ToInt32())
+            .LastOrDefault();
+        var maximumRows = appliedLimit ??
+                          (pipeline.Any(stage => stage.Contains("$count")) ||
+                           pipeline.Any(stage =>
+                               stage.TryGetValue("$group", out var group) &&
+                               group.AsBsonDocument.TryGetValue("_id", out var identity) &&
+                               identity.IsInt32 &&
+                               identity.AsInt32 == 1)
+                              ? 1
+                              : null);
+        var renderedOrder = pipeline
+            .Where(stage => stage.Contains("$sort"))
+            .Select(stage => stage["$sort"].AsBsonDocument)
+            .LastOrDefault();
+        return new MongoDbPhysicalCommandShape(
+            maximumRows,
+            renderedOrder is null ? [] : DescribeOrder(renderedOrder, plan));
+    }
+
+    private static IReadOnlyList<PhysicalDocumentQueryCommandOrder> DescribeOrder(
+        BsonDocument renderedOrder,
+        PhysicalQueryPlan plan) =>
+        renderedOrder.Elements
+            .Select(element => new PhysicalDocumentQueryCommandOrder(
+                element.Name,
+                element.Value.ToInt32() == 1
+                    ? PhysicalSortDirection.Ascending
+                    : PhysicalSortDirection.Descending,
+                plan.Order.Any(order =>
+                    order.Field.Identifier == element.Name &&
+                    order.IsIdentityTieBreak)))
+            .ToArray();
 
     private static async Task<IReadOnlyList<BsonDocument>> ExecuteAggregateAsync(
         IMongoCollection<BsonDocument> collection,
@@ -305,4 +361,8 @@ internal sealed class MongoDbPhysicalQueryExplainer(
         IMongoCollection<BsonDocument> collection,
         FilterDefinition<BsonDocument> filter) =>
         filter.Render(new RenderArgs<BsonDocument>(collection.DocumentSerializer, BsonSerializer.SerializerRegistry));
+
+    private sealed record MongoDbPhysicalCommandShape(
+        int? MaximumRows,
+        IReadOnlyList<PhysicalDocumentQueryCommandOrder> Order);
 }

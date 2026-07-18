@@ -1186,7 +1186,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                 }
                 var find = collection.Find(session, pagePredicate.Filter).Sort(sort)
                     .Skip(plan.PagingSupport == QueryPagingSupport.Cursor ? 0 : query.Skip ?? 0);
-                if (PageReadLimit(query, plan) is { } limit) find = find.Limit(limit);
+                find = find.Limit(PageReadLimit(query, plan));
                 var found = (await find.ToListAsync(cancellationToken)).ToList();
                 await hooks.QueryPageRead(session, attempt, cancellationToken);
                 var hasMore = query.Take is { } take &&
@@ -1377,8 +1377,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
         var pipeline = LatestPerKeySelectionPipeline(renderedFilter, query, plan).ToList();
         if (query.Skip is { } skip && skip != 0)
             pipeline.Add(new BsonDocument("$skip", skip));
-        if (query.Take is { } take)
-            pipeline.Add(new BsonDocument("$limit", take));
+        pipeline.Add(new BsonDocument("$limit", PageReadLimit(query, plan)));
         return pipeline;
     }
 
@@ -1495,12 +1494,12 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                 Builders<BsonDocument>.Filter.Eq(field, BsonNull.Value));
     }
 
-    internal static int? PageReadLimit(DocumentQuery query, PhysicalQueryPlan plan) =>
+    internal static int PageReadLimit(DocumentQuery query, PhysicalQueryPlan plan) =>
         plan.PagingSupport == QueryPagingSupport.Cursor &&
         query.Take is { } take &&
         take < int.MaxValue
             ? take + 1
-            : query.Take;
+            : query.Take ?? int.MaxValue;
 
     private static IReadOnlyList<DocumentQueryContinuationValue> ReadContinuationValues(
         BsonDocument document,
@@ -1607,7 +1606,9 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             MongoDbPhysicalDocumentIdentity.PrimaryExactFilter(route, document));
         await hooks.QueryPrimaryHydrationStarting(session, attempt, cancellationToken);
         var primary = await database.GetCollection<BsonDocument>(route.PrimaryStorage.Name.Identifier)
-            .Find(session, Builders<BsonDocument>.Filter.Or(filters)).ToListAsync(cancellationToken);
+            .Find(session, Builders<BsonDocument>.Filter.Or(filters))
+            .Limit(linked.Count)
+            .ToListAsync(cancellationToken);
         var byKey = primary.ToDictionary(document => Key(
             document,
             route.Envelope.Identity,
