@@ -37,7 +37,8 @@ internal static class RelationalPhysicalStorageTestModels
         Func<PhysicalNameContext, string>? namePolicy = null,
         RelationalMutationScenarioOptions? mutationOptions = null,
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
-        QueryPagingSupport categoryPaging = QueryPagingSupport.Offset)
+        QueryPagingSupport categoryPaging = QueryPagingSupport.Offset,
+        bool includeLatestPerCategory = false)
     {
         mutationOptions ??= new RelationalMutationScenarioOptions();
         var typedTransitions = mutationOptions.TypedTransitions ?? new RelationalTypedTransitionTestOptions();
@@ -69,6 +70,8 @@ internal static class RelationalPhysicalStorageTestModels
                 priorityType,
                 Precision: priorityPrecision,
                 Scale: priorityScale));
+            if (includeLatestPerCategory)
+                columns.Add(new ProjectedColumnDefinition("visible", "visible", PortablePhysicalType.Boolean));
             var priorityIndexColumns = new List<PhysicalIndexColumnDefinition>();
             if (scoped)
                 priorityIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
@@ -154,6 +157,44 @@ internal static class RelationalPhysicalStorageTestModels
                     BoundedQueryResultOperation.Documents,
                     BoundedQueryResultOperation.Count
                 }));
+            if (includeLatestPerCategory)
+            {
+                boundedQueries.Add(new BoundedQueryDeclaration(
+                    "latest-by-category",
+                    compound.Identity,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    QuerySortSupport.Both,
+                    QueryPagingSupport.Offset,
+                    BoundedQueryExecutionClass.ScaleBearing,
+                    supportsTotalCount: true,
+                    sortFields:
+                    [
+                        new BoundedQuerySortField("category", PhysicalSortDirection.Ascending),
+                        new BoundedQuerySortField("priority", PhysicalSortDirection.Ascending)
+                    ],
+                    predicateFields:
+                    [
+                        new BoundedQueryPredicateField(
+                            "category",
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                    ],
+                    resultOperations: new HashSet<BoundedQueryResultOperation>
+                    {
+                        BoundedQueryResultOperation.Documents,
+                        BoundedQueryResultOperation.Count,
+                        BoundedQueryResultOperation.Any,
+                        BoundedQueryResultOperation.First
+                    },
+                    latestPerKeyPath: "category",
+                    residualPredicateFields:
+                    [
+                        new BoundedQueryResidualPredicateField(
+                            "visible",
+                            IndexValueKind.Boolean,
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                            isRequired: true)
+                    ]));
+            }
         }
         if (mutationOptions.IncludeTypedTransitions)
         {

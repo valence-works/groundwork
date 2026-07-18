@@ -70,7 +70,7 @@ public static class RelationalPhysicalQueryRuntime
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,
-            supportsLatestPerKey: false,
+            supportsLatestPerKey: true,
             sourceValueKinds: new Dictionary<PhysicalQuerySourceKind, IReadOnlySet<IndexValueKind>>
             {
                 [PhysicalQuerySourceKind.PrimaryCanonicalJson] = valueKinds

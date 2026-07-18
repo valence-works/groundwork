@@ -123,7 +123,7 @@ internal static class MongoDbPhysicalMutationCapabilities
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,
-            supportsLatestPerKey: false);
+            supportsLatestPerKey: true);
     }
 }
 

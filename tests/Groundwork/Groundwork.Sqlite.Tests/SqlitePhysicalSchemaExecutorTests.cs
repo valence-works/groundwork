@@ -1065,7 +1065,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         bool categoryNullable = false,
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
         QueryPagingSupport categoryPaging = QueryPagingSupport.Offset,
-        QueryPagingSupport compoundPaging = QueryPagingSupport.None)
+        QueryPagingSupport compoundPaging = QueryPagingSupport.None,
+        bool includeLatestPerCategory = false)
     {
         var template = SqliteTestManifests.MetadataManifest();
         var columns = new List<ProjectedColumnDefinition>
@@ -1097,6 +1098,8 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                 IsNullable: priorityNullable,
                 DefaultValue: priorityDefault,
                 Collation: priorityCollation));
+            if (includeLatestPerCategory)
+                columns.Add(new ProjectedColumnDefinition("visible", "visible", PortablePhysicalType.Boolean));
             var priorityIndexColumns = new List<PhysicalIndexColumnDefinition>();
             if (scoped)
                 priorityIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
@@ -1196,6 +1199,47 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                         BoundedQueryResultOperation.Documents,
                         BoundedQueryResultOperation.Count
                     }));
+            if (includeLatestPerCategory)
+            {
+                boundedQueries.Add(new BoundedQueryDeclaration(
+                    "latest-by-category",
+                    compound.Identity,
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.Equal
+                    },
+                    QuerySortSupport.Both,
+                    QueryPagingSupport.Offset,
+                    BoundedQueryExecutionClass.ScaleBearing,
+                    supportsTotalCount: true,
+                    sortFields:
+                    [
+                        new BoundedQuerySortField("category", PhysicalSortDirection.Ascending),
+                        new BoundedQuerySortField("priority", PhysicalSortDirection.Ascending)
+                    ],
+                    predicateFields:
+                    [
+                        new BoundedQueryPredicateField(
+                            "category",
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                    ],
+                    resultOperations: new HashSet<BoundedQueryResultOperation>
+                    {
+                        BoundedQueryResultOperation.Documents,
+                        BoundedQueryResultOperation.Count,
+                        BoundedQueryResultOperation.Any,
+                        BoundedQueryResultOperation.First
+                    },
+                    latestPerKeyPath: "category",
+                    residualPredicateFields:
+                    [
+                        new BoundedQueryResidualPredicateField(
+                            "visible",
+                            IndexValueKind.Boolean,
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                            isRequired: true)
+                    ]));
+            }
         }
         var definition = form switch
         {

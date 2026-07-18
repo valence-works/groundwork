@@ -1740,7 +1740,7 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
-    public void ScaleBearingResidualPredicateRejectsALinkedIndexRouteThatWouldFilterAfterHydration()
+    public void ScaleBearingResidualPredicateUsesALinkedProjectionBeforeHydration()
     {
         var logicalIndex = StimulusTypeIndex();
         var query = new BoundedQueryDeclaration(
@@ -1786,9 +1786,11 @@ public sealed class PhysicalQueryPlanCompilerTests
             fixture.Storage,
             Capabilities(PhysicalQuerySourceKind.LinkedIndex));
 
-        Assert.False(result.IsValid);
-        Assert.Empty(result.Plans);
-        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-QUERY-005");
+        var plan = AssertPlan(result);
+        Assert.Equal(PhysicalQueryAccessKind.LinkedIndexThenPrimary, plan.AccessKind);
+        Assert.Equal(
+            ExecutableStorageObjectRole.LinkedIndexStorage,
+            plan.Predicates.Single(predicate => predicate.Path == "status").Field.Target);
     }
 
     [Fact]
@@ -1983,6 +1985,80 @@ public sealed class PhysicalQueryPlanCompilerTests
         Assert.Empty(result.Plans);
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-QUERY-007");
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-QUERY-008");
+    }
+
+    [Fact]
+    public void LatestPerKeyRejectsCursorPagingEvenWhenTheProviderSupportsBothCapabilitiesSeparately()
+    {
+        var query = Query(
+            BoundedQueryExecutionClass.Ordinary,
+            pagingSupport: QueryPagingSupport.Cursor,
+            latestPerKeyPath: "stimulusType",
+            sortFields: [new BoundedQuerySortField("stimulusType", PhysicalSortDirection.Descending)]);
+        var fixture = CreateFixture(PhysicalStorageForm.DedicatedDocumentTable, query);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            CapabilitiesWithPaging(
+                supportsKeysetPaging: true,
+                supportsLatestPerKey: true,
+                sources: [PhysicalQuerySourceKind.PrimaryCanonicalJson]));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-008" &&
+            diagnostic.Message.Contains("cursor", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void LatestPerKeyRequiresTheGroupingPathToLeadTheDeclaredOrder()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-category-created-stimulus",
+            [
+                new IndexField("category"),
+                new IndexField("createdAt", IndexValueKind.DateTime),
+                new IndexField("stimulusType")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "latest-by-stimulus",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Both,
+            QueryPagingSupport.Offset,
+            BoundedQueryExecutionClass.Ordinary,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("stimulusType", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ],
+            latestPerKeyPath: "stimulusType");
+        var fixture = CreateEntityFixture(logicalIndex, query);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            CapabilitiesWithPaging(
+                supportsKeysetPaging: true,
+                supportsLatestPerKey: true,
+                sources: [PhysicalQuerySourceKind.PrimaryCanonicalJson]));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-008" &&
+            diagnostic.Message.Contains("lead", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

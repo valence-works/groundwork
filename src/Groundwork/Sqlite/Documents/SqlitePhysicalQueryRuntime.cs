@@ -80,7 +80,7 @@ public static class SqlitePhysicalQueryRuntime
             supportsCount: true,
             supportsAny: true,
             supportsFirst: true,
-            supportsLatestPerKey: false,
+            supportsLatestPerKey: true,
             sourceValueKinds: new Dictionary<PhysicalQuerySourceKind, IReadOnlySet<IndexValueKind>>
             {
                 [PhysicalQuerySourceKind.PrimaryCanonicalJson] = new HashSet<IndexValueKind>

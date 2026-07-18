@@ -1546,6 +1546,123 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.Contains("\"stage\" : \"LIMIT\"", pagePlan.NativePlan, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Latest_per_key_filters_before_grouping_and_pages_deterministic_representatives(
+        PhysicalStorageForm form)
+    {
+        var aggregateCommands = new ConcurrentQueue<BsonDocument>();
+        var settings = MongoClientSettings.FromConnectionString(container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(started =>
+        {
+            if (started.CommandName == "aggregate")
+                aggregateCommands.Enqueue(started.Command.DeepClone().AsBsonDocument);
+        });
+        using var client = new MongoClient(settings);
+        var database = client.GetDatabase($"groundwork_latest_{Guid.NewGuid():N}");
+        var model = LatestPerKeyModel(form);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "alpha-hidden", "1", """{"category":"alpha","priority":0,"visible":false}"""));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "alpha-low", "1", """{"category":"alpha","priority":1,"visible":true}"""));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "alpha-high", "1", """{"category":"alpha","priority":3,"visible":true}"""));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "beta-tie-b", "1", """{"category":"beta","priority":2,"visible":true}"""));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "beta-tie-a", "1", """{"category":"beta","priority":2,"visible":true}"""));
+        await store.SaveAsync(new SaveDocumentRequest(
+            "workItem", "gamma-hidden", "1", """{"category":"gamma","priority":1,"visible":false}"""));
+        var query = new DocumentQuery(
+            "workItem",
+            "latest-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("visible", "true"))],
+            [new DocumentQueryOrder("category"), new DocumentQueryOrder("priority")],
+            skip: 1,
+            take: 1,
+            latestPerKeyPath: "category");
+
+        aggregateCommands.Clear();
+        var page = await store.QueryAsync(query);
+        var pageAggregates = aggregateCommands.ToArray();
+        var pipelines = pageAggregates.Select(command => command["pipeline"].AsBsonArray).ToArray();
+        aggregateCommands.Clear();
+        var takeNone = await store.QueryAsync(query.Page(skip: null, take: 0));
+        var takeNoneAggregates = aggregateCommands.ToArray();
+        var count = await store.CountAsync(query.Select(BoundedQueryResultOperation.Count));
+        var first = await store.FirstOrDefaultAsync(
+            query.Page(0, 1).Select(BoundedQueryResultOperation.First));
+        var explanation = await store.ExplainAsync(query);
+        var countExplanation = await store.ExplainAsync(
+            query.Select(BoundedQueryResultOperation.Count));
+        var firstExplanation = await store.ExplainAsync(
+            query.Page(0, 1).Select(BoundedQueryResultOperation.First));
+        var takeNoneExplanation = await store.ExplainAsync(query.Page(skip: null, take: 0));
+
+        Assert.Equal(2, page.TotalCount);
+        Assert.Equal("beta-tie-a", Assert.Single(page.Documents).Id);
+        Assert.Equal(2, pageAggregates.Length);
+        Assert.DoesNotContain(
+            pipelines.SelectMany(pipeline => pipeline).Select(stage => stage.AsBsonDocument),
+            stage => stage.Contains("$facet"));
+        Assert.Contains(pipelines, pipeline => pipeline[^1].AsBsonDocument.Contains("$count"));
+        Assert.Contains(pipelines, pipeline =>
+            pipeline[^1].AsBsonDocument.Contains("$limit") &&
+            pipeline[^2].AsBsonDocument.Contains("$skip"));
+        Assert.Empty(takeNone.Documents);
+        Assert.Equal(2, takeNone.TotalCount);
+        Assert.Single(takeNoneAggregates);
+        Assert.True(takeNoneAggregates[0]["pipeline"].AsBsonArray[^1].AsBsonDocument.Contains("$count"));
+        Assert.Equal(2, count);
+        Assert.True(await store.AnyAsync(query.Select(BoundedQueryResultOperation.Any)));
+        Assert.Equal("alpha-low", first!.Id);
+        Assert.Equal(
+            form == PhysicalStorageForm.PhysicalEntityTable
+                ?
+                [
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.Page
+                ]
+                :
+                [
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.Page,
+                    PhysicalDocumentQueryCommandIdentities.PrimaryHydration
+                ],
+            explanation.Commands.Select(command => command.Identity));
+        Assert.Equal(
+            [PhysicalDocumentQueryCommandIdentities.Count],
+            countExplanation.Commands.Select(command => command.Identity));
+        Assert.Equal(
+            [PhysicalDocumentQueryCommandIdentities.Count],
+            takeNoneExplanation.Commands.Select(command => command.Identity));
+        Assert.Equal(
+            form == PhysicalStorageForm.PhysicalEntityTable
+                ?
+                [
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.First
+                ]
+                :
+                [
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.First,
+                    PhysicalDocumentQueryCommandIdentities.PrimaryHydration
+                ],
+            firstExplanation.Commands.Select(command => command.Identity));
+        Assert.DoesNotContain(
+            "COLLSCAN",
+            explanation.Commands.Single(command => command.Identity == PhysicalDocumentQueryCommandIdentities.Page).NativePlan,
+            StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Cursor_pages_apply_documented_live_view_mutation_semantics()
     {
@@ -2021,6 +2138,115 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         };
         var manifest = new StorageManifest(
             new StorageManifestIdentity($"mongo.{form}"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            [])
+        {
+            SharedDocumentStorages = form == PhysicalStorageForm.SharedDocuments
+                ? [new SharedDocumentStorageDefinition(binding, "documents", new DocumentEnvelopeDefinition())]
+                : []
+        };
+        return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel LatestPerKeyModel(PhysicalStorageForm form)
+    {
+        var binding = new SharedStorageBinding("runtime");
+        var columns = new ProjectedColumnDefinition[]
+        {
+            new("category", "category", PortablePhysicalType.String),
+            new("priority", "priority", PortablePhysicalType.Int32),
+            new("visible", "visible", PortablePhysicalType.Boolean)
+        };
+        var physicalIndex = new PhysicalIndexDefinition(
+            "by-category-priority",
+            [
+                new PhysicalIndexColumnDefinition("storage_scope", 0),
+                new PhysicalIndexColumnDefinition("category", 1),
+                new PhysicalIndexColumnDefinition("priority", 2)
+            ]);
+        var definition = form switch
+        {
+            PhysicalStorageForm.SharedDocuments => PhysicalTableDefinition.SharedDocuments(
+                binding,
+                columns,
+                [physicalIndex],
+                linkedProjectionLogicalName: "work_items_latest_lookup"),
+            PhysicalStorageForm.DedicatedDocumentTable => PhysicalTableDefinition.DedicatedDocumentTable(
+                "work_items_latest",
+                indexes: [physicalIndex],
+                linkedProjectedColumns: columns,
+                linkedProjectionLogicalName: "work_items_latest_lookup"),
+            PhysicalStorageForm.PhysicalEntityTable => PhysicalTableDefinition.PhysicalEntityTable(
+                "work_items_latest",
+                columns,
+                indexes: [physicalIndex]),
+            _ => throw new ArgumentOutOfRangeException(nameof(form), form, null)
+        };
+        var logical = new LogicalIndexDeclaration(
+            physicalIndex.LogicalName,
+            [new IndexField("category"), new IndexField("priority", IndexValueKind.Number)],
+            IndexValueKind.String,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "latest-by-category",
+            logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.Both,
+            QueryPagingSupport.Offset,
+            BoundedQueryExecutionClass.ScaleBearing,
+            supportsTotalCount: true,
+            sortFields:
+            [
+                new BoundedQuerySortField("category", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("priority", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ],
+            resultOperations: new HashSet<BoundedQueryResultOperation>
+            {
+                BoundedQueryResultOperation.Documents,
+                BoundedQueryResultOperation.Count,
+                BoundedQueryResultOperation.Any,
+                BoundedQueryResultOperation.First
+            },
+            latestPerKeyPath: "category",
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "visible",
+                    IndexValueKind.Boolean,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    isRequired: true)
+            ]);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"),
+            "Work item",
+            StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable,
+            IdentityPolicy.StringId(),
+            TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(),
+            SerializationPolicy.Json(),
+            [],
+            [],
+            PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logical],
+                [query])
+        };
+        var manifest = new StorageManifest(
+            new StorageManifestIdentity($"mongo.latest-per-key.{form}"),
             new StorageManifestOwner("tests"),
             new StorageManifestVersion("1"),
             [unit],

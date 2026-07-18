@@ -1122,7 +1122,7 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
     public bool SupportsCount => true;
     public bool SupportsAny => true;
     public bool SupportsFirst => true;
-    public bool SupportsLatestPerKey => false;
+    public bool SupportsLatestPerKey => true;
 
     public async Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
@@ -1145,6 +1145,35 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             try
             {
                 await hooks.QueryAttemptStarting(session, attempt, cancellationToken);
+                if (query.LatestPerKeyPath is not null)
+                {
+                    var renderedFilter = RenderFilter(collection, basePredicate.Filter);
+                    var latestTotal = await CountLatestPerKeyAsync(
+                        collection,
+                        session,
+                        renderedFilter,
+                        query,
+                        plan,
+                        cancellationToken);
+                    await hooks.QueryCountRead(session, attempt, cancellationToken);
+                    if (latestTotal == 0 || query.Take == 0)
+                    {
+                        await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                        return new DocumentQueryResult([], latestTotal);
+                    }
+
+                    var latestFound = await collection.Aggregate<BsonDocument>(
+                            session,
+                            LatestPerKeyPagePipeline(renderedFilter, query, plan).ToArray())
+                        .ToListAsync(cancellationToken);
+                    await hooks.QueryPageRead(session, attempt, cancellationToken);
+                    var latestDocuments = plan.RequiresPrimaryLookup
+                        ? await LoadPrimaryAsync(session, latestFound, attempt, cancellationToken)
+                        : latestFound.Select(document => MongoDbPhysicalDocumentStore.ReadEnvelope(route, document)).ToArray();
+                    await MongoDbPhysicalDocumentStore.AbortTransactionIgnoringFailureAsync(session);
+                    return new DocumentQueryResult(latestDocuments, latestTotal);
+                }
+
                 var total = await collection.CountDocumentsAsync(
                     session,
                     basePredicate.Filter,
@@ -1204,13 +1233,21 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
 
     public async Task<long> CountAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
+        var collection = database.GetCollection<BsonDocument>(plan.LookupObject.Identifier);
         var filter = BuildFilter(query, plan, scope(), storage, route);
         await transactionCapability.EnsureSupportedAsync(
             [route.StorageUnit.Value],
             "physical count query",
             cancellationToken);
-        return await database.GetCollection<BsonDocument>(plan.LookupObject.Identifier)
-            .CountDocumentsAsync(filter, cancellationToken: cancellationToken);
+        return query.LatestPerKeyPath is null
+            ? await collection.CountDocumentsAsync(filter, cancellationToken: cancellationToken)
+            : await CountLatestPerKeyAsync(
+                collection,
+                session: null,
+                RenderFilter(collection, filter),
+                query,
+                plan,
+                cancellationToken);
     }
 
     public async Task<DocumentEnvelope?> FirstOrDefaultAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
@@ -1330,6 +1367,91 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
             order.Direction == PhysicalSortDirection.Ascending
                 ? Builders<BsonDocument>.Sort.Ascending(order.Field.Identifier)
                 : Builders<BsonDocument>.Sort.Descending(order.Field.Identifier)));
+    }
+
+    internal static IReadOnlyList<BsonDocument> LatestPerKeyPagePipeline(
+        BsonDocument renderedFilter,
+        DocumentQuery query,
+        PhysicalQueryPlan plan)
+    {
+        var pipeline = LatestPerKeySelectionPipeline(renderedFilter, query, plan).ToList();
+        if (query.Skip is { } skip && skip != 0)
+            pipeline.Add(new BsonDocument("$skip", skip));
+        if (query.Take is { } take)
+            pipeline.Add(new BsonDocument("$limit", take));
+        return pipeline;
+    }
+
+    internal static IReadOnlyList<BsonDocument> LatestPerKeyCountPipeline(
+        BsonDocument renderedFilter,
+        DocumentQuery query,
+        PhysicalQueryPlan plan)
+    {
+        var group = LatestPerKeyField(query, plan);
+        return
+        [
+            new BsonDocument("$match", renderedFilter),
+            new BsonDocument("$group", new BsonDocument("_id", $"${group.Identifier}")),
+            new BsonDocument("$count", "value")
+        ];
+    }
+
+    private static IReadOnlyList<BsonDocument> LatestPerKeySelectionPipeline(
+        BsonDocument renderedFilter,
+        DocumentQuery query,
+        PhysicalQueryPlan plan)
+    {
+        var group = LatestPerKeyField(query, plan);
+        var sort = SortDocument(query, plan);
+        return
+        [
+            new BsonDocument("$match", renderedFilter),
+            new BsonDocument("$sort", sort),
+            new BsonDocument("$group", new BsonDocument
+            {
+                ["_id"] = $"${group.Identifier}",
+                ["document"] = new BsonDocument("$first", "$$ROOT")
+            }),
+            new BsonDocument("$replaceWith", "$document"),
+            new BsonDocument("$sort", sort)
+        ];
+    }
+
+    internal static BsonDocument SortDocument(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var sort = new BsonDocument();
+        foreach (var order in DocumentQueryOrderResolver.Resolve(query, plan))
+            sort[order.Field.Identifier] = order.Direction == PhysicalSortDirection.Ascending ? 1 : -1;
+        return sort;
+    }
+
+    private static PhysicalQueryField LatestPerKeyField(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var path = query.LatestPerKeyPath
+                   ?? throw new InvalidOperationException("Latest-per-key execution requires a grouping path.");
+        return plan.Order.Single(order => !order.IsIdentityTieBreak && order.Path == path).Field;
+    }
+
+    private static BsonDocument RenderFilter(
+        IMongoCollection<BsonDocument> collection,
+        FilterDefinition<BsonDocument> filter) =>
+        filter.Render(new RenderArgs<BsonDocument>(
+            collection.DocumentSerializer,
+            BsonSerializer.SerializerRegistry));
+
+    private static async Task<long> CountLatestPerKeyAsync(
+        IMongoCollection<BsonDocument> collection,
+        IClientSessionHandle? session,
+        BsonDocument renderedFilter,
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        CancellationToken cancellationToken)
+    {
+        var pipeline = LatestPerKeyCountPipeline(renderedFilter, query, plan);
+        var documents = session is null
+            ? await collection.Aggregate<BsonDocument>(pipeline.ToArray()).ToListAsync(cancellationToken)
+            : await collection.Aggregate<BsonDocument>(session, pipeline.ToArray()).ToListAsync(cancellationToken);
+        return documents.FirstOrDefault()?["value"].ToInt64() ?? 0L;
     }
 
     private static FilterDefinition<BsonDocument> ContinuationFilter(

@@ -162,6 +162,28 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                 DocumentStoreAccess.Global),
             "sqlserver");
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public Task Latest_per_key_filters_before_grouping_and_pages_deterministic_representatives(
+        PhysicalStorageForm form) =>
+        RelationalPhysicalServerAssertions.LatestPerKeyFiltersAndPagesAsync(
+            form,
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            () => new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            (store, manifest, route) => SqlServerPhysicalQueryRuntime.Create(
+                Assert.IsType<SqlServerPhysicalDocumentStore>(store),
+                manifest,
+                route,
+                SqlServerGroundworkCapabilities.Provider));
+
     [Fact]
     public async Task Public_query_explain_executes_exact_parameterized_reads_and_restores_the_pooled_session()
     {
