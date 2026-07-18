@@ -1555,6 +1555,304 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void ScaleBearingQueryPlansDeclaredResidualPredicatesOnTheIndexedPrimaryRoute()
+    {
+        var indexedPredicate = new BoundedQueryPredicateField(
+            "stimulusType",
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        var residualPredicate = new BoundedQueryResidualPredicateField(
+            "status",
+            IndexValueKind.Keyword,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.In
+            });
+        var query = new BoundedQueryDeclaration(
+            "list-by-stimulus-type",
+            "by-stimulus-type",
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.In
+            },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            predicateFields: [indexedPredicate],
+            residualPredicateFields: [residualPredicate]);
+        var fixture = CreateEntityFixture(StimulusTypeIndex(), query);
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+
+        Assert.Equal(PhysicalQueryAccessKind.PrimaryProjectedColumns, plan.AccessKind);
+        Assert.NotNull(plan.IndexName);
+        Assert.Empty(plan.RequiredEqualityPrefixPaths);
+        Assert.Collection(
+            plan.Predicates,
+            predicate =>
+            {
+                Assert.Equal("stimulusType", predicate.Path);
+                Assert.False(predicate.IsResidual);
+            },
+            predicate =>
+            {
+                Assert.Equal("status", predicate.Path);
+                Assert.True(predicate.IsResidual);
+                Assert.Equal(IndexValueKind.Keyword, predicate.Field.ValueKind);
+                Assert.Equal(
+                    new[] { PortableQueryOperation.Equal, PortableQueryOperation.In },
+                    predicate.Operations.Order());
+            });
+        Assert.Contains("\"residual\":true", PhysicalQueryPlanSerializer.Serialize(plan), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResidualPredicateShapeParticipatesInThePlanFingerprint()
+    {
+        PlanningFixture Fixture(IReadOnlySet<PortableQueryOperation> residualOperations)
+        {
+            var query = new BoundedQueryDeclaration(
+                "list-by-stimulus-type",
+                "by-stimulus-type",
+                new HashSet<PortableQueryOperation>
+                {
+                    PortableQueryOperation.Equal,
+                    PortableQueryOperation.In
+                },
+                QuerySortSupport.None,
+                QueryPagingSupport.None,
+                BoundedQueryExecutionClass.ScaleBearing,
+                predicateFields:
+                [
+                    new BoundedQueryPredicateField(
+                        "stimulusType",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ],
+                residualPredicateFields:
+                [
+                    new BoundedQueryResidualPredicateField(
+                        "status",
+                        IndexValueKind.Keyword,
+                        residualOperations)
+                ]);
+            return CreateEntityFixture(StimulusTypeIndex(), query);
+        }
+
+        var equalityFixture = Fixture(new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal });
+        var membershipFixture = Fixture(new HashSet<PortableQueryOperation>
+        {
+            PortableQueryOperation.Equal,
+            PortableQueryOperation.In
+        });
+        var equality = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            equalityFixture.Route,
+            equalityFixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+        var membership = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            membershipFixture.Route,
+            membershipFixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+
+        Assert.NotEqual(equality.Fingerprint, membership.Fingerprint);
+    }
+
+    [Fact]
+    public async Task RequiredResidualPredicateMustBeSuppliedBeforeHandlerDispatch()
+    {
+        var query = new BoundedQueryDeclaration(
+            "list-by-stimulus-type",
+            "by-stimulus-type",
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+                    isRequired: true)
+            ]);
+        var fixture = CreateEntityFixture(StimulusTypeIndex(), query);
+        var capabilities = Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns);
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            capabilities));
+        var handler = new RecordingHandler(
+            plan.HandlerIdentity,
+            PhysicalQuerySourceKind.PrimaryProjectedColumns,
+            certifications: [CertificationFor(plan)]);
+        var store = new PhysicalQueryDocumentStore(
+            fixture.Route,
+            fixture.Storage,
+            capabilities,
+            [handler]);
+        var missing = new DocumentQuery(
+            "workflowTriggerBinding",
+            query.Identity);
+        var supplied = missing.Where(DocumentQueryClause.Of(
+            DocumentQueryComparison.Equal("status", "ready")));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.QueryAsync(missing));
+        await store.QueryAsync(supplied);
+
+        Assert.Contains("status", exception.Message, StringComparison.Ordinal);
+        Assert.True(plan.Predicates.Single(predicate => predicate.Path == "status").IsRequired);
+        Assert.Equal(plan, handler.LastPlan);
+    }
+
+    [Fact]
+    public void ResidualEnvelopePredicateMustUseTheIntrinsicValueKind()
+    {
+        var query = new BoundedQueryDeclaration(
+            "list-by-stimulus-type",
+            "by-stimulus-type",
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.Ordinary,
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    PhysicalDocumentFieldPaths.Version,
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var fixture = CreateFixture(PhysicalStorageForm.DedicatedDocumentTable, query);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryCanonicalJson));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-010" &&
+            diagnostic.Message.Contains(PhysicalDocumentFieldPaths.Version, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ScaleBearingResidualPredicateRejectsALinkedIndexRouteThatWouldFilterAfterHydration()
+    {
+        var logicalIndex = StimulusTypeIndex();
+        var query = new BoundedQueryDeclaration(
+            "list-by-stimulus-type",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var definition = PhysicalTableDefinition.DedicatedDocumentTable(
+            "workflow_trigger_bindings",
+            indexes:
+            [
+                new PhysicalIndexDefinition(
+                    logicalIndex.Identity,
+                    [
+                        new PhysicalIndexColumnDefinition("storage_scope", 0),
+                        new PhysicalIndexColumnDefinition("stimulusType", 1)
+                    ])
+            ],
+            linkedProjectedColumns:
+            [
+                new ProjectedColumnDefinition("stimulusType", "stimulusType", PortablePhysicalType.String),
+                new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String)
+            ],
+            linkedProjectionLogicalName: "workflow_trigger_binding_index");
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Explicit(definition),
+            [logicalIndex],
+            [query]);
+        var fixture = Resolve(storage, null);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.LinkedIndex));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-QUERY-005");
+    }
+
+    [Fact]
+    public void BoundedMutationRejectsAQueryWithResidualPredicates()
+    {
+        var query = new BoundedQueryDeclaration(
+            "list-by-stimulus-type",
+            "by-stimulus-type",
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal },
+            QuerySortSupport.None,
+            QueryPagingSupport.None,
+            BoundedQueryExecutionClass.ScaleBearing,
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "stimulusType",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ],
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    "status",
+                    IndexValueKind.Keyword,
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+            ]);
+        var storage = new StorageUnitPhysicalStorage(
+            StorageUnitProvisioningMode.Declared,
+            PhysicalStoragePolicy.Explicit(PhysicalTableDefinition.PhysicalEntityTable(
+                "workflow_trigger_bindings",
+                [
+                    new ProjectedColumnDefinition("stimulusType", "stimulusType", PortablePhysicalType.String),
+                    new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String)
+                ],
+                indexes:
+                [
+                    new PhysicalIndexDefinition(
+                        "by-stimulus-type",
+                        [
+                            new PhysicalIndexColumnDefinition("storage_scope", 0),
+                            new PhysicalIndexColumnDefinition("stimulusType", 1)
+                        ])
+                ])),
+            [StimulusTypeIndex()],
+            [query],
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "delete-by-stimulus-type",
+                    query.Identity,
+                    BoundedMutationAction.Delete())
+            ]);
+        var fixture = Resolve(storage, null);
+
+        var result = PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-MUTATION-006");
+    }
+
+    [Fact]
     public void CompoundPrefixDirectionAndIdentityTieBreakAreDeterministic()
     {
         var logicalIndex = new LogicalIndexDeclaration(
@@ -2169,7 +2467,13 @@ public sealed class PhysicalQueryPlanCompilerTests
             .Select(field => new ProjectedColumnDefinition(
                 field.Path,
                 field.Path,
-                field.Path == "createdAt" ? PortablePhysicalType.DateTime : PortablePhysicalType.String))
+                ToPortableType(logicalIndex.GetValueKind(field))))
+            .Concat(query.ResidualPredicateFields.Select(field => new ProjectedColumnDefinition(
+                field.Path,
+                field.Path,
+                ToPortableType(field.ValueKind))))
+            .GroupBy(column => column.Path, StringComparer.Ordinal)
+            .Select(group => group.First())
             .ToArray();
         var columns = new List<PhysicalIndexColumnDefinition>
         {

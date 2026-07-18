@@ -91,10 +91,15 @@ internal static class MongoDbPhysicalMutationCapabilities
             ["schemaVersion"] = route.Envelope.SchemaVersion.Identifier
         };
         foreach (var path in storage.LogicalIndexes
-                     .SelectMany(index => index.Fields)
-                     .Select(field => field.Path)
+                     .SelectMany(index => index.Fields.Select(field => field.Path))
+                     .Concat(storage.BoundedQueries
+                         .SelectMany(query => query.ResidualPredicateFields)
+                         .Select(field => field.Path))
                      .Distinct(StringComparer.Ordinal))
         {
+            if (fields.ContainsKey(path))
+                continue;
+
             fields[path] = route.ProjectedColumns.SingleOrDefault(column =>
                     column.Target == ExecutableStorageObjectRole.PrimaryStorage &&
                     column.Definition.Path == path)?.Column.Identifier

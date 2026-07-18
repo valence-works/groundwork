@@ -349,6 +349,57 @@ public sealed class BoundedQueryPredicateField : IEquatable<BoundedQueryPredicat
     }
 }
 
+/// <summary>
+/// Declares an optional server-side predicate that is not part of the certified physical-index key.
+/// Residual predicates remain closed, typed query-plan fields and execute before result operations,
+/// paging limits, hydration, or materialization.
+/// </summary>
+public sealed class BoundedQueryResidualPredicateField : IEquatable<BoundedQueryResidualPredicateField>
+{
+    public BoundedQueryResidualPredicateField(
+        string path,
+        IndexValueKind valueKind,
+        IReadOnlySet<PortableQueryOperation> operations,
+        bool isRequired = false)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            throw new ArgumentException("A stable residual predicate path is required.", nameof(path));
+
+        Path = path;
+        ValueKind = valueKind;
+        Operations = (operations ?? throw new ArgumentNullException(nameof(operations))).ToFrozenSet();
+        IsRequired = isRequired;
+    }
+
+    public string Path { get; }
+
+    public IndexValueKind ValueKind { get; }
+
+    public IReadOnlySet<PortableQueryOperation> Operations { get; }
+
+    public bool IsRequired { get; }
+
+    public bool Equals(BoundedQueryResidualPredicateField? other) =>
+        other is not null &&
+        Path == other.Path &&
+        ValueKind == other.ValueKind &&
+        IsRequired == other.IsRequired &&
+        Operations.SetEquals(other.Operations);
+
+    public override bool Equals(object? obj) => Equals(obj as BoundedQueryResidualPredicateField);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Path, StringComparer.Ordinal);
+        hash.Add(ValueKind);
+        hash.Add(IsRequired);
+        foreach (var operation in Operations.Order())
+            hash.Add(operation);
+        return hash.ToHashCode();
+    }
+}
+
 /// <summary>The closed terminal operations a bounded document query may expose.</summary>
 public enum BoundedQueryResultOperation
 {
@@ -376,7 +427,8 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         IReadOnlyList<BoundedQuerySortField>? sortFields = null,
         IReadOnlyList<BoundedQueryPredicateField>? predicateFields = null,
         IReadOnlySet<BoundedQueryResultOperation>? resultOperations = null,
-        string? latestPerKeyPath = null)
+        string? latestPerKeyPath = null,
+        IReadOnlyList<BoundedQueryResidualPredicateField>? residualPredicateFields = null)
     {
         Identity = identity;
         IndexIdentity = indexIdentity;
@@ -388,6 +440,7 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         SupportsTotalCount = supportsTotalCount;
         SortFields = Array.AsReadOnly(sortFields?.ToArray() ?? []);
         PredicateFields = Array.AsReadOnly(predicateFields?.ToArray() ?? []);
+        ResidualPredicateFields = Array.AsReadOnly(residualPredicateFields?.ToArray() ?? []);
         ResultOperations = (resultOperations ?? DefaultResultOperations(supportsTotalCount)).ToFrozenSet();
         LatestPerKeyPath = latestPerKeyPath;
     }
@@ -416,6 +469,12 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
     /// </summary>
     public IReadOnlyList<BoundedQueryPredicateField> PredicateFields { get; }
 
+    /// <summary>
+    /// Optional typed predicate paths evaluated by the provider after indexed access selection and before
+    /// every terminal operation. They are not physical-index prefix fields.
+    /// </summary>
+    public IReadOnlyList<BoundedQueryResidualPredicateField> ResidualPredicateFields { get; }
+
     public IReadOnlySet<BoundedQueryResultOperation> ResultOperations { get; }
 
     public string? LatestPerKeyPath { get; }
@@ -432,6 +491,7 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
         SupportsTotalCount == other.SupportsTotalCount &&
         SortFields.SequenceEqual(other.SortFields) &&
         PredicateFields.SequenceEqual(other.PredicateFields) &&
+        ResidualPredicateFields.SequenceEqual(other.ResidualPredicateFields) &&
         ResultOperations.SetEquals(other.ResultOperations) &&
         LatestPerKeyPath == other.LatestPerKeyPath;
 
@@ -453,6 +513,8 @@ public sealed class BoundedQueryDeclaration : IEquatable<BoundedQueryDeclaration
             hash.Add(sortField);
         foreach (var predicateField in PredicateFields)
             hash.Add(predicateField);
+        foreach (var residualPredicateField in ResidualPredicateFields)
+            hash.Add(residualPredicateField);
         foreach (var operation in ResultOperations.Order())
             hash.Add(operation);
         hash.Add(LatestPerKeyPath, StringComparer.Ordinal);
@@ -487,6 +549,7 @@ public sealed record ScaleBearingPathDemand(
     bool SupportsDisjunction,
     bool SupportsTotalCount,
     IReadOnlyList<BoundedQueryPredicateField> PredicateFields,
+    IReadOnlyList<BoundedQueryResidualPredicateField> ResidualPredicateFields,
     IReadOnlyList<BoundedQueryResultOperation> ResultOperations,
     string? LatestPerKeyPath)
 {
@@ -505,6 +568,7 @@ public sealed record ScaleBearingPathDemand(
         SupportsDisjunction == other.SupportsDisjunction &&
         SupportsTotalCount == other.SupportsTotalCount &&
         PredicateFields.SequenceEqual(other.PredicateFields) &&
+        ResidualPredicateFields.SequenceEqual(other.ResidualPredicateFields) &&
         ResultOperations.Count == other.ResultOperations.Count &&
         ResultOperations.ToHashSet().SetEquals(other.ResultOperations) &&
         LatestPerKeyPath == other.LatestPerKeyPath;
@@ -526,6 +590,8 @@ public sealed record ScaleBearingPathDemand(
         hash.Add(SupportsTotalCount);
         foreach (var predicateField in PredicateFields)
             hash.Add(predicateField);
+        foreach (var residualPredicateField in ResidualPredicateFields)
+            hash.Add(residualPredicateField);
         foreach (var operation in ResultOperations.Order())
             hash.Add(operation);
         hash.Add(LatestPerKeyPath, StringComparer.Ordinal);

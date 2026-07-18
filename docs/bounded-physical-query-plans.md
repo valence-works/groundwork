@@ -1,7 +1,8 @@
 # Bounded physical query plans
 
-Tracking: [Groundwork #45](https://github.com/valence-works/Groundwork/issues/45), including the
-type-filtered lookup requested by [#24](https://github.com/valence-works/Groundwork/issues/24).
+Tracking: [Groundwork #45](https://github.com/valence-works/Groundwork/issues/45) and
+[Groundwork #94](https://github.com/valence-works/groundwork/issues/94), including the type-filtered
+lookup requested by [#24](https://github.com/valence-works/Groundwork/issues/24).
 
 Groundwork has one logical declaration/runtime-query family and one provider-selected diagnostic
 plan. Feature code declares a `BoundedQueryDeclaration` and submits a `DocumentQuery`; it never
@@ -41,6 +42,7 @@ A bounded declaration owns:
 
 - equality, inequality, membership, prefix/declared substring, and range operators;
 - explicit predicate paths for compound-prefix validation;
+- optional typed residual predicate paths that are not physical-index key fields;
 - per-path compound sort directions;
 - offset or cursor/keyset paging;
 - document, count, any, and first result operations;
@@ -58,6 +60,22 @@ index either forward or fully reversed. Runtime requests using that suffix must 
 standalone equality comparison for every skipped prefix field; an absent prefix or an equality inside
 a disjunction is rejected before dispatch. Every ordered plan appends the document identity as an
 ascending total-order tie-breaker.
+
+`BoundedQueryResidualPredicateField` declares an optional server-side filter without adding that
+path to the logical or physical index key. Residual paths remain closed and typed: each declares its
+allowed operations, participates in scale-bearing storage demand and physical-plan fingerprints,
+and is validated against provider capabilities and projected physical types. Providers apply
+requested residual comparisons before count, any, first, paging limits, continuation generation,
+hydration, or materialization. Runtime requests may omit optional residual comparisons; a residual
+field declared with `IsRequired` must appear in the runtime request before handler dispatch.
+
+A scale-bearing residual path must be physically available on the indexed primary route. Default
+resolution therefore synthesizes a projected column for it, while explicit physical definitions
+must declare a compatible projected column. A linked-index route cannot currently certify residual
+filtering because its side table does not contain the residual value and filtering after primary
+hydration would violate the execution order above. Use a physical entity table when a scale-bearing
+query needs residual predicates. Bounded mutations reject residual predicate queries until mutation
+semantics explicitly support them.
 
 Every compiled plan also owns one document-identity binding for its selected primary, linked, or
 native source. The binding carries the original, comparison-key, and lookup-key fields plus the

@@ -59,6 +59,7 @@ public static class PhysicalQueryPlanCompiler
         List<GroundworkDiagnostic> diagnostics)
     {
         var predicateDeclarations = ResolvePredicates(logicalIndex, query, target, diagnostics);
+        var residualPredicateDeclarations = ResolveResidualPredicates(query, logicalIndex, target, diagnostics);
         var hasMixedIdentityDemand = HasMixedIdentityDemand(predicateDeclarations);
         if (query.LatestPerKeyPath is not null &&
             logicalIndex.Fields.All(field => field.Path != query.LatestPerKeyPath))
@@ -69,15 +70,27 @@ public static class PhysicalQueryPlanCompiler
                 target));
         }
         ValidateOperations(predicateDeclarations, query, capabilities, target, diagnostics);
+        ValidateResidualOperations(residualPredicateDeclarations, query, capabilities, target, diagnostics);
         ValidateIdentityOperations(predicateDeclarations, query, hasMixedIdentityDemand, target, diagnostics);
-        ValidateShape(query, predicateDeclarations.Count, capabilities, target, diagnostics);
-        ValidateEnvelopeKinds(logicalIndex, target, diagnostics);
+        ValidateShape(
+            query,
+            predicateDeclarations.Count + residualPredicateDeclarations.Count,
+            capabilities,
+            target,
+            diagnostics);
+        ValidateEnvelopeKinds(logicalIndex, residualPredicateDeclarations, target, diagnostics);
         if (query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing && hasMixedIdentityDemand)
             return null;
 
         var physicalIndex = route.Indexes.SingleOrDefault(index => index.Identity == logicalIndex.Identity);
         var certifiedPhysicalIndex = hasMixedIdentityDemand ? null : physicalIndex;
-        var selectedSource = SelectSource(route, logicalIndex, physicalIndex, query, capabilities);
+        var selectedSource = SelectSource(
+            route,
+            logicalIndex,
+            physicalIndex,
+            query,
+            residualPredicateDeclarations,
+            capabilities);
         var hasBoundScalePath = route.CandidateQueryPaths.Any(path =>
             path.Kind == ExecutableQueryPathKind.PhysicalIndex &&
             path.Identity == logicalIndex.Identity &&
@@ -117,6 +130,12 @@ public static class PhysicalQueryPlanCompiler
                     predicate.Path,
                     logicalIndex.GetValueKind(predicate.Path)),
                 predicate.Operations.ToFrozenSet()))
+            .Concat(residualPredicateDeclarations.Select(predicate => new PhysicalQueryPredicate(
+                predicate.Path,
+                identityFields.Resolve(predicate.Path, predicate.ValueKind),
+                predicate.Operations.ToFrozenSet(),
+                IsResidual: true,
+                IsRequired: predicate.IsRequired)))
             .ToArray();
         ValidateExecutableCompatibility(route, predicates, target, diagnostics);
 
@@ -249,6 +268,35 @@ public static class PhysicalQueryPlanCompiler
         return predicates;
     }
 
+    private static IReadOnlyList<BoundedQueryResidualPredicateField> ResolveResidualPredicates(
+        BoundedQueryDeclaration query,
+        LogicalIndexDeclaration logicalIndex,
+        string target,
+        List<GroundworkDiagnostic> diagnostics)
+    {
+        var residual = query.ResidualPredicateFields.ToArray();
+        if (residual.Select(predicate => predicate.Path).Distinct(StringComparer.Ordinal).Count() != residual.Length)
+            diagnostics.Add(Error("GW-QUERY-013", "Residual predicate paths must be unique.", target));
+        if (residual.Any(predicate => predicate.Path == PhysicalDocumentFieldPaths.StorageScope))
+        {
+            diagnostics.Add(Error(
+                "GW-QUERY-013",
+                "Storage scope is injected by the session and cannot be a residual caller predicate.",
+                target));
+        }
+        var indexedPaths = logicalIndex.Fields.Select(field => field.Path).ToHashSet(StringComparer.Ordinal);
+        foreach (var predicate in residual.Where(predicate => indexedPaths.Contains(predicate.Path)))
+        {
+            diagnostics.Add(Error(
+                "GW-QUERY-013",
+                $"Predicate path '{predicate.Path}' cannot be both indexed and residual.",
+                target));
+        }
+        if (residual.Any(predicate => predicate.Operations.Count == 0))
+            diagnostics.Add(Error("GW-QUERY-013", "Every residual predicate path must declare at least one operation.", target));
+        return residual;
+    }
+
     private static void ValidateOperations(
         IReadOnlyList<BoundedQueryPredicateField> predicates,
         BoundedQueryDeclaration query,
@@ -272,6 +320,54 @@ public static class PhysicalQueryPlanCompiler
                 diagnostics.Add(Error(
                     "GW-QUERY-003",
                     $"Provider '{capabilities.Provider}' cannot execute operations: {string.Join(", ", unsupported)}.",
+                    target));
+            }
+        }
+    }
+
+    private static void ValidateResidualOperations(
+        IReadOnlyList<BoundedQueryResidualPredicateField> predicates,
+        BoundedQueryDeclaration query,
+        PhysicalQueryPlannerCapabilities capabilities,
+        string target,
+        List<GroundworkDiagnostic> diagnostics)
+    {
+        foreach (var predicate in predicates)
+        {
+            var outsideDeclaration = predicate.Operations.Except(query.Operations).ToArray();
+            var unsupported = predicate.Operations.Except(capabilities.SupportedOperations).ToArray();
+            if (outsideDeclaration.Length != 0)
+            {
+                diagnostics.Add(Error(
+                    "GW-QUERY-013",
+                    $"Residual predicate path '{predicate.Path}' requests undeclared operations: {string.Join(", ", outsideDeclaration)}.",
+                    target));
+            }
+            if (unsupported.Length != 0)
+            {
+                diagnostics.Add(Error(
+                    "GW-QUERY-003",
+                    $"Provider '{capabilities.Provider}' cannot execute residual operations: {string.Join(", ", unsupported)}.",
+                    target));
+            }
+            foreach (var operation in predicate.Operations)
+            {
+                if (predicate.Path == PhysicalDocumentFieldPaths.Id &&
+                    operation == PortableQueryOperation.Contains)
+                {
+                    diagnostics.Add(Error(
+                        "GW-QUERY-011",
+                        "Document identity does not support Contains because no bounded identity projection preserves substring semantics.",
+                        target));
+                    continue;
+                }
+
+                if (PortableQueryOperationCompatibility.Supports(predicate.ValueKind, operation))
+                    continue;
+
+                diagnostics.Add(Error(
+                    "GW-QUERY-009",
+                    $"Operation '{operation}' cannot execute against residual value kind '{predicate.ValueKind}' on path '{predicate.Path}'.",
                     target));
             }
         }
@@ -384,26 +480,33 @@ public static class PhysicalQueryPlanCompiler
         LogicalIndexDeclaration logicalIndex,
         ExecutablePhysicalIndexRoute? physicalIndex,
         BoundedQueryDeclaration query,
+        IReadOnlyList<BoundedQueryResidualPredicateField> residualPredicates,
         PhysicalQueryPlannerCapabilities capabilities)
     {
+        var requiredFields = logicalIndex.Fields
+            .Select(field => (field.Path, ValueKind: logicalIndex.GetValueKind(field)))
+            .Concat(residualPredicates.Select(field => (field.Path, field.ValueKind)))
+            .Distinct()
+            .ToArray();
         var available = new HashSet<PhysicalQuerySourceKind>();
-        if (physicalIndex?.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
+        if (residualPredicates.Count == 0 &&
+            physicalIndex?.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
             capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.LinkedIndex))
             available.Add(PhysicalQuerySourceKind.LinkedIndex);
         if (physicalIndex?.Target == ExecutableStorageObjectRole.PrimaryStorage)
         {
-            if (logicalIndex.Fields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
+            if (requiredFields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
                 capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryEnvelope))
                 available.Add(PhysicalQuerySourceKind.PrimaryEnvelope);
-            if (logicalIndex.Fields.Any(field => !PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
-                logicalIndex.Fields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path) ||
+            if (requiredFields.Any(field => !PhysicalDocumentFieldPaths.IsEnvelope(field.Path)) &&
+                requiredFields.All(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path) ||
                     route.ProjectedColumns.Any(column => column.Definition.Path == field.Path)) &&
                 capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryProjectedColumns))
                 available.Add(PhysicalQuerySourceKind.PrimaryProjectedColumns);
         }
         if (capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.PrimaryCanonicalJson))
             available.Add(PhysicalQuerySourceKind.PrimaryCanonicalJson);
-        var requiredNativePaths = logicalIndex.Fields.Select(field => field.Path)
+        var requiredNativePaths = requiredFields.Select(field => field.Path)
             .Concat([
                 PhysicalDocumentFieldPaths.Id,
                 PhysicalDocumentFieldPaths.StorageScope,
@@ -422,7 +525,7 @@ public static class PhysicalQueryPlanCompiler
         foreach (var source in candidates)
         {
             if (available.Contains(source) &&
-                logicalIndex.Fields.All(field => capabilities.Supports(source, logicalIndex.GetValueKind(field))))
+                requiredFields.All(field => capabilities.Supports(source, field.ValueKind)))
             {
                 return source;
             }
@@ -724,18 +827,24 @@ public static class PhysicalQueryPlanCompiler
 
     private static void ValidateEnvelopeKinds(
         LogicalIndexDeclaration logicalIndex,
+        IReadOnlyList<BoundedQueryResidualPredicateField> residualPredicates,
         string target,
         List<GroundworkDiagnostic> diagnostics)
     {
-        foreach (var field in logicalIndex.Fields.Where(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path)))
+        var declaredEnvelopeKinds = logicalIndex.Fields
+            .Where(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path))
+            .Select(field => (field.Path, ValueKind: logicalIndex.GetValueKind(field)))
+            .Concat(residualPredicates
+                .Where(field => PhysicalDocumentFieldPaths.IsEnvelope(field.Path))
+                .Select(field => (field.Path, field.ValueKind)));
+        foreach (var field in declaredEnvelopeKinds)
         {
-            var declared = logicalIndex.GetValueKind(field);
             var intrinsic = EnvelopeValueKind(field.Path);
-            if (declared == intrinsic)
+            if (field.ValueKind == intrinsic)
                 continue;
             diagnostics.Add(Error(
                 "GW-QUERY-010",
-                $"Envelope path '{field.Path}' has intrinsic value kind '{intrinsic}' and cannot be declared as '{declared}'.",
+                $"Envelope path '{field.Path}' has intrinsic value kind '{intrinsic}' and cannot be declared as '{field.ValueKind}'.",
                 target));
         }
     }

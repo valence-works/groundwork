@@ -338,6 +338,22 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysica
             }
         }
 
+        var suppliedPaths = query.Clauses
+            .SelectMany(clause => clause.Comparisons)
+            .Select(comparison => comparison.Path)
+            .ToHashSet(StringComparer.Ordinal);
+        var missingRequired = plan.Predicates
+            .Where(predicate => predicate.IsResidual && predicate.IsRequired)
+            .Select(predicate => predicate.Path)
+            .Where(path => !suppliedPaths.Contains(path))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (missingRequired.Length != 0)
+        {
+            throw new InvalidOperationException(
+                $"Document query '{query.QueryIdentity}' requires residual predicates: {string.Join(", ", missingRequired)}.");
+        }
+
         var plannedOrder = plan.Order.Where(order => !order.IsIdentityTieBreak).ToArray();
         if (query.Order.Count > plannedOrder.Length || query.Order.Where((order, index) =>
                 order.Path != plannedOrder[index].Path || order.Direction != plannedOrder[index].Direction).Any())

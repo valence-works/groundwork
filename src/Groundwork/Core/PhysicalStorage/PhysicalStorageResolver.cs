@@ -145,7 +145,10 @@ public static class PhysicalStorageResolver
             if (!ValidateDeclarations(unit, diagnostics))
                 continue;
 
+            var errorCount = diagnostics.Count(diagnostic => diagnostic.IsError);
             var demand = ResolveScaleBearingDemand(unit.PhysicalStorage, unit.Identity, diagnostics);
+            if (diagnostics.Count(diagnostic => diagnostic.IsError) != errorCount)
+                continue;
             var definition = ResolveDefinition(unit, manifest, demand, diagnostics);
             if (definition is null)
                 continue;
@@ -322,6 +325,59 @@ public static class PhysicalStorageResolver
                 valid = false;
             }
 
+            if (query.ResidualPredicateFields.Select(field => field.Path).Distinct(StringComparer.Ordinal).Count() !=
+                query.ResidualPredicateFields.Count)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-036",
+                    $"Bounded query '{query.Identity}' residual predicate paths must be unique.",
+                    $"{target}.boundedQueries.{query.Identity}.residualPredicateFields"));
+                valid = false;
+            }
+
+            var indexedPaths = matching is { Length: 1 }
+                ? matching[0].Fields.Select(field => field.Path)
+                : query.PredicateFields.Select(field => field.Path);
+            var overlappingPredicates = indexedPaths
+                .Intersect(
+                    query.ResidualPredicateFields.Select(field => field.Path),
+                    StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (overlappingPredicates.Length != 0)
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-036",
+                    $"Bounded query '{query.Identity}' cannot declare a logical-index path as residual: {string.Join(", ", overlappingPredicates)}.",
+                    $"{target}.boundedQueries.{query.Identity}.residualPredicateFields"));
+                valid = false;
+            }
+
+            foreach (var residual in query.ResidualPredicateFields)
+            {
+                if (residual.Path == PhysicalDocumentFieldPaths.StorageScope)
+                {
+                    diagnostics.Add(GroundworkDiagnostic.Error(
+                        "GW-PHYSICAL-036",
+                        $"Bounded query '{query.Identity}' cannot declare session-owned storage scope as a residual predicate.",
+                        $"{target}.boundedQueries.{query.Identity}.residualPredicateFields"));
+                    valid = false;
+                    continue;
+                }
+
+                if (residual.Operations.Count != 0 &&
+                    residual.Operations.IsSubsetOf(query.Operations))
+                {
+                    continue;
+                }
+
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-036",
+                    $"Residual predicate path '{residual.Path}' must declare operations included by bounded query '{query.Identity}'.",
+                    $"{target}.boundedQueries.{query.Identity}.residualPredicateFields"));
+                valid = false;
+            }
+
             if (query.ResultOperations.Count == 0 ||
                 query.SupportsTotalCount != query.ResultOperations.Contains(BoundedQueryResultOperation.Count))
             {
@@ -460,9 +516,26 @@ public static class PhysicalStorageResolver
                     query.SupportsDisjunction,
                     query.SupportsTotalCount,
                     Array.AsReadOnly(query.PredicateFields.ToArray()),
+                    Array.AsReadOnly(query.ResidualPredicateFields.ToArray()),
                     Array.AsReadOnly(query.ResultOperations.Order().ToArray()),
                     query.LatestPerKeyPath));
             }
+        }
+
+        var conflictingResidualKinds = storage.BoundedQueries
+            .Where(query => query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing)
+            .SelectMany(query => query.ResidualPredicateFields)
+            .GroupBy(field => field.Path, StringComparer.Ordinal)
+            .Where(group => group.Select(field => field.ValueKind).Distinct().Count() > 1)
+            .Select(group => group.Key)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (conflictingResidualKinds.Length != 0)
+        {
+            diagnostics.Add(GroundworkDiagnostic.Error(
+                "GW-PHYSICAL-036",
+                $"Scale-bearing residual predicate paths must have one value kind per storage unit: {string.Join(", ", conflictingResidualKinds)}.",
+                $"storageUnits.{unitIdentity.Value}.physicalStorage.boundedQueries"));
         }
 
         return demand
@@ -548,6 +621,9 @@ public static class PhysicalStorageResolver
     private static IReadOnlyList<ProjectedColumnDefinition> SynthesizeProjectedColumns(
         IReadOnlyList<ScaleBearingPathDemand> demand) =>
         demand
+            .SelectMany(x => new[] { new ProjectedPathDemand(x.Path, x.ValueKind) }
+                .Concat(x.ResidualPredicateFields.Select(residual =>
+                    new ProjectedPathDemand(residual.Path, residual.ValueKind))))
             .Where(x => !PhysicalDocumentFieldPaths.IsEnvelope(x.Path))
             .GroupBy(x => x.Path, StringComparer.Ordinal)
             .Select(group => new ProjectedColumnDefinition(
@@ -819,6 +895,31 @@ public static class PhysicalStorageResolver
                     valid = false;
                 }
             }
+
+            var residualKinds = unit.PhysicalStorage!.BoundedQueries
+                .Where(query => query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing)
+                .SelectMany(query => query.ResidualPredicateFields)
+                .GroupBy(field => field.Path, StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(field => field.ValueKind).Distinct().ToArray(),
+                    StringComparer.Ordinal);
+            foreach (var (path, kinds) in residualKinds)
+            {
+                if (kinds.Length != 1 ||
+                    !projectedByPath.TryGetValue(path, out var projection) ||
+                    PortableQueryOperationCompatibility.Supports(kinds[0], projection.Type))
+                {
+                    continue;
+                }
+
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-PHYSICAL-036",
+                    $"Residual predicate path '{path}' value kind '{kinds[0]}' cannot use projected physical type " +
+                    $"'{projection.Type}' without changing query semantics.",
+                    $"{target}.projectedColumns.{projection.LogicalName}"));
+                valid = false;
+            }
         }
 
         var envelopeColumnSet = envelopeColumns.ToHashSet(StringComparer.Ordinal);
@@ -934,8 +1035,9 @@ public static class PhysicalStorageResolver
 
         var projectedPaths = definition.ProjectedColumns.Select(x => x.Path).ToHashSet(StringComparer.Ordinal);
         var unmetDemand = demand
-            .Where(x => !PhysicalDocumentFieldPaths.IsEnvelope(x.Path) && !projectedPaths.Contains(x.Path))
-            .Select(x => x.Path)
+            .SelectMany(x => new[] { x.Path }.Concat(
+                x.ResidualPredicateFields.Select(residual => residual.Path)))
+            .Where(path => !PhysicalDocumentFieldPaths.IsEnvelope(path) && !projectedPaths.Contains(path))
             .Distinct(StringComparer.Ordinal)
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
@@ -1486,4 +1588,6 @@ public static class PhysicalStorageResolver
         IndexValueKind.DateTime => PortablePhysicalType.DateTime,
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
     };
+
+    private sealed record ProjectedPathDemand(string Path, IndexValueKind ValueKind);
 }

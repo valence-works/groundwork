@@ -75,6 +75,22 @@ public static class PhysicalStorageDefinitionSerializer
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
+                writer.WritePropertyName("residualPredicateFields");
+                writer.WriteStartArray();
+                foreach (var predicate in demand.ResidualPredicateFields)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("path", predicate.Path);
+                    writer.WriteString("valueKind", predicate.ValueKind.ToString());
+                    writer.WriteBoolean("required", predicate.IsRequired);
+                    writer.WritePropertyName("operations");
+                    writer.WriteStartArray();
+                    foreach (var operation in predicate.Operations.Order())
+                        writer.WriteStringValue(operation.ToString());
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
                 writer.WritePropertyName("resultOperations");
                 writer.WriteStartArray();
                 foreach (var operation in demand.ResultOperations.Order())

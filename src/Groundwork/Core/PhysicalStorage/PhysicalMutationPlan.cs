@@ -116,6 +116,14 @@ public static class PhysicalMutationPlanCompiler
                     $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}"));
                 continue;
             }
+            if (predicate.Predicates.Any(field => field.IsResidual))
+            {
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    "GW-MUTATION-006",
+                    $"Bounded mutation '{mutation.Identity}' cannot use predicate query '{predicate.QueryIdentity}' because residual predicates are query-only.",
+                    $"physicalMutations.{route.StorageUnit.Value}.{mutation.Identity}"));
+                continue;
+            }
 
             var action = CompileAction(mutation, predicate, route, diagnostics);
             if (action is not null)
