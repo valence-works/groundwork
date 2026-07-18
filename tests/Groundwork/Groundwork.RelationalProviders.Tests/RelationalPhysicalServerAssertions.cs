@@ -162,6 +162,19 @@ internal static class RelationalPhysicalServerAssertions
                 ],
             explanation.Commands.Select(command => command.Identity));
         Assert.All(explanation.Commands, command => Assert.False(string.IsNullOrWhiteSpace(command.NativePlan)));
+        Assert.All(explanation.Commands, command => Assert.Equal(1, command.ProviderAppliedMaximumRows));
+        var pageExplanation = explanation.Commands.Single(command =>
+            command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.Field.Identifier),
+            pageExplanation.ProviderAppliedOrder.Select(order => order.FieldIdentifier));
+        Assert.All(
+            pageExplanation.ProviderAppliedOrder,
+            order => Assert.Equal(PhysicalSortDirection.Ascending, order.Direction));
+        Assert.Equal(
+            explanation.Plan.Order.Select(order => order.IsIdentityTieBreak),
+            pageExplanation.ProviderAppliedOrder.Select(order => order.IsIdentityTieBreak));
+        Assert.Contains(pageExplanation.ProviderAppliedOrder, order => order.IsIdentityTieBreak);
 
         async Task SaveAsync(string id, string category, int priority, bool visible)
         {

@@ -24,6 +24,26 @@ public static class PhysicalDocumentQueryCommandIdentities
     public const string PrimaryHydration = "primary-hydration";
 }
 
+/// <summary>One provider-applied physical order term rendered into an exact database command.</summary>
+public sealed class PhysicalDocumentQueryCommandOrder
+{
+    public PhysicalDocumentQueryCommandOrder(
+        string fieldIdentifier,
+        PhysicalSortDirection direction,
+        bool isIdentityTieBreak)
+    {
+        FieldIdentifier = PhysicalDocumentQueryExplanation.RequireValue(
+            fieldIdentifier,
+            nameof(fieldIdentifier));
+        Direction = direction;
+        IsIdentityTieBreak = isIdentityTieBreak;
+    }
+
+    public string FieldIdentifier { get; }
+    public PhysicalSortDirection Direction { get; }
+    public bool IsIdentityTieBreak { get; }
+}
+
 /// <summary>Provider-native evidence for one exact database command in an invocation.</summary>
 public sealed class PhysicalDocumentQueryCommandExplanation
 {
@@ -32,7 +52,9 @@ public sealed class PhysicalDocumentQueryCommandExplanation
         string identity,
         string nativePlanFormat,
         string nativePlan,
-        IReadOnlyList<string> predicateFieldIdentifiers)
+        IReadOnlyList<string> predicateFieldIdentifiers,
+        int? providerAppliedMaximumRows = null,
+        IReadOnlyList<PhysicalDocumentQueryCommandOrder>? providerAppliedOrder = null)
     {
         Kind = kind;
         Identity = PhysicalDocumentQueryExplanation.RequireValue(identity, nameof(identity));
@@ -44,6 +66,12 @@ public sealed class PhysicalDocumentQueryCommandExplanation
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToArray());
+        if (providerAppliedMaximumRows is <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(providerAppliedMaximumRows),
+                "A provider-applied maximum row count must be positive.");
+        ProviderAppliedMaximumRows = providerAppliedMaximumRows;
+        ProviderAppliedOrder = Array.AsReadOnly((providerAppliedOrder ?? []).ToArray());
     }
 
     public PhysicalDocumentQueryCommandKind Kind { get; }
@@ -54,6 +82,15 @@ public sealed class PhysicalDocumentQueryCommandExplanation
     public string NativePlan { get; }
 
     public IReadOnlyList<string> PredicateFieldIdentifiers { get; }
+
+    /// <summary>
+    /// Finite maximum result rows enforced by the exact rendered provider command, or
+    /// <see langword="null"/> when that command does not apply a finite maximum.
+    /// </summary>
+    public int? ProviderAppliedMaximumRows { get; }
+
+    /// <summary>Ordered physical fields rendered into the exact provider command.</summary>
+    public IReadOnlyList<PhysicalDocumentQueryCommandOrder> ProviderAppliedOrder { get; }
 }
 
 /// <summary>Provider-native diagnostic evidence for one complete compiled bounded-query invocation.</summary>
