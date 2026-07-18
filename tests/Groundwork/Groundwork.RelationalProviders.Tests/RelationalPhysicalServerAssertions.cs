@@ -89,6 +89,93 @@ internal static class RelationalPhysicalServerAssertions
         Assert.Equal(5, final.TotalCount);
     }
 
+    public static async Task LatestPerKeyFiltersAndPagesAsync(
+        PhysicalStorageForm form,
+        ProviderIdentity provider,
+        IProviderPhysicalNameNormalizer normalizer,
+        Func<IPhysicalSchemaExecutor> createExecutor,
+        Func<
+            Groundwork.Core.Manifests.StorageManifest,
+            IReadOnlyList<ExecutableStorageRoute>,
+            RelationalPhysicalDocumentStore> createStore,
+        Func<
+            RelationalPhysicalDocumentStore,
+            Groundwork.Core.Manifests.StorageManifest,
+            ExecutableStorageRoute,
+            IBoundedDocumentStore> createRuntime)
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var model = RelationalPhysicalStorageTestModels.Create(
+            form,
+            provider,
+            includePriority: true,
+            normalizer: normalizer,
+            includeLatestPerCategory: true,
+            instance: instance,
+            namePolicy: context => context.FeatureDefaultLogicalName == "configuration_entities"
+                ? "groundwork_latest_candidates"
+                : $"gw_{instance}_{context.FeatureDefaultLogicalName}");
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, createExecutor());
+        var store = createStore(model.Manifest, model.Target.Routes);
+        await SaveAsync("alpha-hidden", "alpha", 0, false);
+        await SaveAsync("alpha-low", "alpha", 1, true);
+        await SaveAsync("alpha-high", "alpha", 3, true);
+        await SaveAsync("beta-tie-b", "beta", 2, true);
+        await SaveAsync("beta-tie-a", "beta", 2, true);
+        await SaveAsync("gamma-hidden", "gamma", 1, false);
+        var runtime = createRuntime(
+            store,
+            model.Manifest,
+            model.Target.Routes.Single());
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "latest-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("visible", "true"))],
+            [new DocumentQueryOrder("category"), new DocumentQueryOrder("priority")],
+            skip: 1,
+            take: 1,
+            latestPerKeyPath: "category");
+
+        var page = await runtime.QueryAsync(query);
+        var count = await runtime.CountAsync(query.Select(BoundedQueryResultOperation.Count));
+        var first = await runtime.FirstOrDefaultAsync(
+            query.Page(0, 1).Select(BoundedQueryResultOperation.First));
+        var explanation = await Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime)
+            .ExplainAsync(query);
+
+        Assert.Equal(2, page.TotalCount);
+        Assert.Equal("beta-tie-a", Assert.Single(page.Documents).Id);
+        Assert.Equal(2, count);
+        Assert.Equal("alpha-low", first!.Id);
+        Assert.Equal(
+            form == PhysicalStorageForm.PhysicalEntityTable
+                ?
+                [
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.Page
+                ]
+                :
+                [
+                    PhysicalDocumentQueryCommandIdentities.LinkedIdentityCollisionCheck,
+                    PhysicalDocumentQueryCommandIdentities.Count,
+                    PhysicalDocumentQueryCommandIdentities.Page
+                ],
+            explanation.Commands.Select(command => command.Identity));
+        Assert.All(explanation.Commands, command => Assert.False(string.IsNullOrWhiteSpace(command.NativePlan)));
+
+        async Task SaveAsync(string id, string category, int priority, bool visible)
+        {
+            var content = $$"""{"category":"{{category}}","priority":{{priority}},"visible":{{visible.ToString().ToLowerInvariant()}}}""";
+            Assert.Equal(
+                DocumentStoreWriteStatus.Saved,
+                (await store.SaveAsync(new SaveDocumentRequest(
+                    "configurationDocument",
+                    id,
+                    "1",
+                    content))).Status);
+        }
+    }
+
     public static async Task LostOperationLockCannotPublishEvidenceAsync(
         ProviderIdentity provider,
         IProviderPhysicalNameNormalizer normalizer,

@@ -219,6 +219,47 @@ public sealed class SqlitePhysicalQueryRuntimeTests
             await ExplainCategoryLookupAsync(connection, route));
     }
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Latest_per_key_filters_before_grouping_and_pages_deterministic_representatives(
+        PhysicalStorageForm form)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            form,
+            includePriority: true,
+            includeLatestPerCategory: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("alpha-low", "alpha", 1, true));
+        await writer.SaveAsync(Save("alpha-high", "alpha", 3, true));
+        await writer.SaveAsync(Save("beta-tie-b", "beta", 2, true));
+        await writer.SaveAsync(Save("beta-tie-a", "beta", 2, true));
+        await writer.SaveAsync(Save("gamma-low", "gamma", 1, false));
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, route, target.Provider);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "latest-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("visible", "true"))],
+            [new DocumentQueryOrder("category"), new DocumentQueryOrder("priority")],
+            skip: 1,
+            take: 1,
+            latestPerKeyPath: "category");
+
+        var page = await queries.QueryAsync(query);
+        var count = await queries.CountAsync(query.Select(BoundedQueryResultOperation.Count));
+        var first = await queries.FirstOrDefaultAsync(query.Page(0, 1).Select(BoundedQueryResultOperation.First));
+
+        Assert.Equal(2, page.TotalCount);
+        Assert.Equal("beta-tie-a", Assert.Single(page.Documents).Id);
+        Assert.Equal(2, count);
+        Assert.Equal("alpha-low", first!.Id);
+    }
+
     [Fact]
     public async Task Cursor_pages_use_the_compiled_identity_tie_break_and_bind_the_token_to_the_query()
     {
@@ -910,7 +951,18 @@ public sealed class SqlitePhysicalQueryRuntimeTests
     }
 
     private static SaveDocumentRequest Save(string id, string category) =>
-        new("configurationDocument", id, "1", $"{{\"category\":\"{category}\",\"priority\":1}}", 0);
+        Save(id, category, 1);
+
+    private static SaveDocumentRequest Save(string id, string category, int priority) =>
+        new("configurationDocument", id, "1", $"{{\"category\":\"{category}\",\"priority\":{priority}}}", 0);
+
+    private static SaveDocumentRequest Save(string id, string category, int priority, bool visible) =>
+        new(
+            "configurationDocument",
+            id,
+            "1",
+            $"{{\"category\":\"{category}\",\"priority\":{priority},\"visible\":{visible.ToString().ToLowerInvariant()}}}",
+            0);
 
     private static SaveDocumentRequest HistorySave(string id, string status, string createdAt) =>
         new(

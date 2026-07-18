@@ -69,6 +69,24 @@ public static class PhysicalQueryPlanCompiler
                 $"Latest-per-key path '{query.LatestPerKeyPath}' is not part of logical index '{logicalIndex.Identity}'.",
                 target));
         }
+        if (query.LatestPerKeyPath is not null)
+        {
+            if (query.PagingSupport == QueryPagingSupport.Cursor)
+            {
+                diagnostics.Add(Error(
+                    "GW-QUERY-008",
+                    $"Latest-per-key query '{query.Identity}' cannot use cursor paging until a provider certifies the combined grouped-continuation shape.",
+                    target));
+            }
+            if (query.SortFields.Count == 0 ||
+                query.SortFields[0].Path != query.LatestPerKeyPath)
+            {
+                diagnostics.Add(Error(
+                    "GW-QUERY-008",
+                    $"Latest-per-key path '{query.LatestPerKeyPath}' must lead the declared order for query '{query.Identity}'.",
+                    target));
+            }
+        }
         ValidateOperations(predicateDeclarations, query, capabilities, target, diagnostics);
         ValidateResidualOperations(residualPredicateDeclarations, query, capabilities, target, diagnostics);
         ValidateIdentityOperations(predicateDeclarations, query, hasMixedIdentityDemand, target, diagnostics);
@@ -489,8 +507,10 @@ public static class PhysicalQueryPlanCompiler
             .Distinct()
             .ToArray();
         var available = new HashSet<PhysicalQuerySourceKind>();
-        if (residualPredicates.Count == 0 &&
-            physicalIndex?.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
+        if (physicalIndex?.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
+            residualPredicates.All(predicate => route.ProjectedColumns.Any(column =>
+                column.Target == ExecutableStorageObjectRole.LinkedIndexStorage &&
+                column.Definition.Path == predicate.Path)) &&
             capabilities.HandlerIdentities.ContainsKey(PhysicalQuerySourceKind.LinkedIndex))
             available.Add(PhysicalQuerySourceKind.LinkedIndex);
         if (physicalIndex?.Target == ExecutableStorageObjectRole.PrimaryStorage)

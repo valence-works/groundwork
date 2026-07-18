@@ -161,6 +161,28 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 DocumentStoreAccess.Global),
             "postgresql");
 
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public Task Latest_per_key_filters_before_grouping_and_pages_deterministic_representatives(
+        PhysicalStorageForm form) =>
+        RelationalPhysicalServerAssertions.LatestPerKeyFiltersAndPagesAsync(
+            form,
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            () => new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()),
+            (manifest, routes) => new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(),
+                manifest,
+                routes,
+                DocumentStoreAccess.Global),
+            (store, manifest, route) => PostgreSqlPhysicalQueryRuntime.Create(
+                Assert.IsType<PostgreSqlPhysicalDocumentStore>(store),
+                manifest,
+                route,
+                PostgreSqlGroundworkCapabilities.Provider));
+
     [Fact]
     public async Task Bounded_mutation_ledger_supports_unbounded_operation_identity()
     {

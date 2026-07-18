@@ -62,7 +62,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     public bool SupportsCount => true;
     public bool SupportsAny => true;
     public bool SupportsFirst => true;
-    public bool SupportsLatestPerKey => false;
+    public bool SupportsLatestPerKey => true;
 
     public Task<DocumentQueryResult> QueryAsync(DocumentQuery query, PhysicalQueryPlan plan, CancellationToken cancellationToken)
     {
@@ -246,6 +246,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         RelationalPhysicalQueryPredicate built,
         ExecutableStorageRoute route)
     {
+        if (query.LatestPerKeyPath is not null)
+            return RenderLatestPerKeyPage(query, plan, built, route, PageReadLimit(query, plan), query.Skip ?? 0);
+
         var parameters = built.Parameters
             .Concat(new[]
             {
@@ -341,7 +344,12 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
         DocumentScopeSelection scope) =>
-        RenderCount(Build(query, plan, route, requiresPrimaryLookup: false, fixedScope: scope));
+        query.LatestPerKeyPath is null
+            ? RenderCount(Build(query, plan, route, requiresPrimaryLookup: false, fixedScope: scope))
+            : RenderLatestPerKeyCount(
+                query,
+                plan,
+                Build(query, plan, route, requiresPrimaryLookup: false, fixedScope: scope));
 
     private RelationalPhysicalQueryCommand BuildQueryCommand(
         DocumentQuery query,
@@ -368,6 +376,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         DocumentScopeSelection scope)
     {
         var built = Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope);
+        if (query.LatestPerKeyPath is not null)
+            return RenderLatestPerKeyPage(query, plan, built, route, take: 1, skip: query.Skip ?? 0);
+
         return new RelationalPhysicalQueryCommand(
             store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(query, plan)}"),
             built.Parameters,
@@ -426,6 +437,83 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
     private static RelationalPhysicalQueryCommand RenderCount(RelationalPhysicalQueryPredicate built) =>
         new($"SELECT COUNT(*) {built.FromAndWhere};", built.Parameters, built.PredicateFieldIdentifiers);
 
+    private RelationalPhysicalQueryCommand RenderLatestPerKeyCount(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        RelationalPhysicalQueryPredicate built)
+    {
+        var group = LatestPerKeyField(query, plan);
+        return new RelationalPhysicalQueryCommand(
+            $"SELECT COUNT(*) FROM (SELECT 1 AS {store.Q("groundwork_latest_group")} {built.FromAndWhere} GROUP BY {Field(group)}) AS {store.Q("groundwork_latest_groups")};",
+            built.Parameters,
+            built.PredicateFieldIdentifiers
+                .Append(group.Identifier)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    private RelationalPhysicalQueryCommand RenderLatestPerKeyPage(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        RelationalPhysicalQueryPredicate built,
+        ExecutableStorageRoute route,
+        int take,
+        int skip)
+    {
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        var group = LatestPerKeyField(query, plan);
+        var envelopeColumns = RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route);
+        var envelopeSelection = envelopeColumns
+            .Select((column, index) =>
+                $"p.{store.Q(column)} AS {store.Q(LatestEnvelopeAlias(index))}")
+            .ToArray();
+        var orderSelection = order
+            .Select((item, index) =>
+                $"{Field(item.Field)} AS {store.Q(LatestOrderAlias(index))}")
+            .ToArray();
+        var winnerOrder = string.Join(", ", order.Select(item =>
+            store.OrderPhysicalQueryExpression(Field(item.Field), item.Direction)));
+        var pageOrder = string.Join(", ", order.Select((item, index) =>
+            store.OrderPhysicalQueryExpression(store.Q(LatestOrderAlias(index)), item.Direction)));
+        var rows = store.Q("groundwork_latest_rows");
+        var rank = store.Q("groundwork_latest_rank");
+        var select = $"""
+            SELECT {string.Join(", ", envelopeColumns.Select((_, index) => store.Q(LatestEnvelopeAlias(index))))}
+            FROM (
+                SELECT {string.Join(", ", envelopeSelection.Concat(orderSelection))},
+                       ROW_NUMBER() OVER (PARTITION BY {Field(group)} ORDER BY {winnerOrder}) AS {rank}
+                {built.FromAndWhere}
+            ) AS {rows}
+            WHERE {rank} = 1
+            ORDER BY {pageOrder}
+            """;
+        var parameters = built.Parameters
+            .Concat(new[]
+            {
+                ("take", (object?)take),
+                ("skip", (object?)skip)
+            })
+            .ToArray();
+        return new RelationalPhysicalQueryCommand(
+            store.ApplyOffsetPage(select, store.P("take"), store.P("skip")),
+            parameters,
+            built.PredicateFieldIdentifiers
+                .Concat(order.Select(item => item.Field.Identifier))
+                .Append(group.Identifier)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    private static PhysicalQueryField LatestPerKeyField(DocumentQuery query, PhysicalQueryPlan plan)
+    {
+        var path = query.LatestPerKeyPath
+                   ?? throw new InvalidOperationException("Latest-per-key execution requires a grouping path.");
+        return plan.Order.Single(order => !order.IsIdentityTieBreak && order.Path == path).Field;
+    }
+
+    private static string LatestEnvelopeAlias(int index) => $"groundwork_envelope_{index}";
+    private static string LatestOrderAlias(int index) => $"groundwork_order_{index}";
+
     private RelationalPhysicalQueryPredicate Build(
         DocumentQuery query,
         PhysicalQueryPlan plan,
@@ -435,9 +523,6 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         bool detectIdentityCollision = false,
         IReadOnlyList<DocumentQueryContinuationValue>? continuation = null)
     {
-        if (query.LatestPerKeyPath is not null)
-            throw new NotSupportedException("This relational handler profile does not certify latest-per-key selection.");
-
         var linked = plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary;
         var needsPrimaryJoin = linked && (detectIdentityCollision || requiresPrimaryLookup || PredicateFields(plan)
             .Any(field => field.Target == ExecutableStorageObjectRole.PrimaryStorage));

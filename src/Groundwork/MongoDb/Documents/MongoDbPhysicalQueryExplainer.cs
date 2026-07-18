@@ -45,6 +45,19 @@ internal sealed class MongoDbPhysicalQueryExplainer(
         switch (query.ResultOperation)
         {
             case BoundedQueryResultOperation.Documents:
+                if (query.LatestPerKeyPath is not null)
+                {
+                    await AddLatestCountAsync();
+                    if (query.Take != 0)
+                    {
+                        await AddLatestPageAsync(
+                            query,
+                            PhysicalDocumentQueryCommandKind.Page,
+                            PhysicalDocumentQueryCommandIdentities.Page);
+                    }
+                    break;
+                }
+
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
@@ -69,6 +82,12 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 }
                 break;
             case BoundedQueryResultOperation.Count:
+                if (query.LatestPerKeyPath is not null)
+                {
+                    await AddLatestCountAsync();
+                    break;
+                }
+
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
@@ -76,6 +95,16 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                     basePredicate.FieldIdentifiers);
                 break;
             case BoundedQueryResultOperation.First:
+                if (query.LatestPerKeyPath is not null)
+                {
+                    await AddLatestCountAsync();
+                    await AddLatestPageAsync(
+                        query.Page(query.Skip, 1),
+                        PhysicalDocumentQueryCommandKind.First,
+                        PhysicalDocumentQueryCommandIdentities.First);
+                    break;
+                }
+
                 await AddAsync(
                     PhysicalDocumentQueryCommandKind.Count,
                     PhysicalDocumentQueryCommandIdentities.Count,
@@ -146,6 +175,40 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                 },
                 [MongoDbPhysicalStorageFields.Id, route.Envelope.Identity.ComparisonKey.Identifier]);
         }
+
+        async Task AddLatestCountAsync()
+        {
+            var pipeline = MongoDbPhysicalQueryHandler.LatestPerKeyCountPipeline(
+                renderedBaseFilter,
+                query,
+                plan);
+            await AddAsync(
+                PhysicalDocumentQueryCommandKind.Count,
+                PhysicalDocumentQueryCommandIdentities.Count,
+                AggregateCommand(plan.LookupObject.Identifier, pipeline),
+                LatestPerKeyFieldIdentifiers(basePredicate, query, plan));
+        }
+
+        async Task AddLatestPageAsync(
+            DocumentQuery executionQuery,
+            PhysicalDocumentQueryCommandKind kind,
+            string identity)
+        {
+            var pipeline = MongoDbPhysicalQueryHandler.LatestPerKeyPagePipeline(
+                renderedBaseFilter,
+                executionQuery,
+                plan);
+            await AddAsync(
+                kind,
+                identity,
+                AggregateCommand(plan.LookupObject.Identifier, pipeline),
+                LatestPerKeyFieldIdentifiers(basePredicate, executionQuery, plan));
+            if (!plan.RequiresPrimaryLookup)
+                return;
+
+            var linked = await ExecuteAggregateAsync(lookup, pipeline, cancellationToken);
+            await AddPrimaryHydrationAsync(linked);
+        }
     }
 
     private async Task<BsonDocument> ExplainCommandAsync(
@@ -172,6 +235,16 @@ internal sealed class MongoDbPhysicalQueryExplainer(
                     ["n"] = new BsonDocument("$sum", 1)
                 })
             },
+            ["cursor"] = new BsonDocument()
+        };
+
+    private static BsonDocument AggregateCommand(
+        string collection,
+        IReadOnlyList<BsonDocument> pipeline) =>
+        new()
+        {
+            ["aggregate"] = collection,
+            ["pipeline"] = new BsonArray(pipeline),
             ["cursor"] = new BsonDocument()
         };
 
@@ -211,6 +284,22 @@ internal sealed class MongoDbPhysicalQueryExplainer(
             find = find.Limit(take);
         return await find.ToListAsync(cancellationToken);
     }
+
+    private static async Task<IReadOnlyList<BsonDocument>> ExecuteAggregateAsync(
+        IMongoCollection<BsonDocument> collection,
+        IReadOnlyList<BsonDocument> pipeline,
+        CancellationToken cancellationToken) =>
+        await collection.Aggregate<BsonDocument>(pipeline.ToArray()).ToListAsync(cancellationToken);
+
+    private static IReadOnlyList<string> LatestPerKeyFieldIdentifiers(
+        MongoDbPhysicalQueryPredicate predicate,
+        DocumentQuery query,
+        PhysicalQueryPlan plan) =>
+        predicate.FieldIdentifiers
+            .Concat(DocumentQueryOrderResolver.Resolve(query, plan).Select(order => order.Field.Identifier))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
     private static BsonDocument Render(
         IMongoCollection<BsonDocument> collection,
