@@ -36,7 +36,8 @@ public sealed class ClosedQueryCapabilityTests
                     {
                         PortableQueryOperation.Equal,
                         PortableQueryOperation.In,
-                        PortableQueryOperation.Contains
+                        PortableQueryOperation.Contains,
+                        PortableQueryOperation.NotContains
                     }),
                 new IndexDeclaration(
                     "by-color",
@@ -55,7 +56,8 @@ public sealed class ClosedQueryCapabilityTests
                     {
                         PortableQueryOperation.Equal,
                         PortableQueryOperation.In,
-                        PortableQueryOperation.Contains
+                        PortableQueryOperation.Contains,
+                        PortableQueryOperation.NotContains
                     },
                     QuerySortSupport.Both,
                     paging,
@@ -71,6 +73,7 @@ public sealed class ClosedQueryCapabilityTests
 
         Assert.True(support.SupportsOperator("by-name", PortableQueryOperation.In));
         Assert.True(support.SupportsOperator("by-name", PortableQueryOperation.Contains));
+        Assert.True(support.SupportsOperator("by-name", PortableQueryOperation.NotContains));
         Assert.False(support.SupportsOperator("by-color", PortableQueryOperation.In));
         Assert.True(support.SupportsOrderBy("by-name"));
         Assert.True(support.SupportsOrderBy("by-name", descending: true));
@@ -170,7 +173,7 @@ public sealed class ClosedQueryCapabilityTests
         var query = new PortableDocumentQuery("widget")
             .Where(QueryClause.AnyOf(
                 QueryComparison.In("by-name", new[] { "a", "b" }),
-                QueryComparison.Contains("by-name", "c")))
+                QueryComparison.NotContains("by-name", "c")))
             .OrderBy(new QueryOrder("by-name"))
             .Page(0, 10);
 

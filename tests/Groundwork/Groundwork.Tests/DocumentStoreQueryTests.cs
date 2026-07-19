@@ -1,3 +1,4 @@
+using Groundwork.Core.Indexing;
 using Groundwork.Documents.Store;
 using Xunit;
 
@@ -5,6 +6,15 @@ namespace Groundwork.Tests;
 
 public sealed class DocumentStoreQueryTests
 {
+    [Fact]
+    public void NotContains_appends_to_public_enums_without_reinterpreting_existing_values()
+    {
+        Assert.Equal(8, (int)PortableQueryOperation.In);
+        Assert.Equal(9, (int)PortableQueryOperation.NotContains);
+        Assert.Equal(8, (int)QueryComparisonOperator.LessThanOrEqual);
+        Assert.Equal(9, (int)QueryComparisonOperator.NotContains);
+    }
+
     [Fact]
     public void DocumentQueryIsTheImmutableRuntimeContractForOneBoundedDeclaration()
     {
@@ -64,6 +74,7 @@ public sealed class DocumentStoreQueryTests
                     DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http")),
                     DocumentQueryClause.Of(DocumentQueryComparison.In("stimulusType", ["http", "timer"])),
                     DocumentQueryClause.Of(DocumentQueryComparison.Contains("stimulusType", "ttp")),
+                    DocumentQueryClause.Of(DocumentQueryComparison.NotContains("stimulusType", "signal")),
                     DocumentQueryClause.Of(DocumentQueryComparison.NotEqual("stimulusType", "signal")),
                     DocumentQueryClause.Of(DocumentQueryComparison.GreaterThanOrEqual("stimulusType", "http")),
                     DocumentQueryClause.Of(DocumentQueryComparison.StartsWith("stimulusType", "route")),

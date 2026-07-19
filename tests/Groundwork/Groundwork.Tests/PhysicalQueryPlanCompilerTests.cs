@@ -325,16 +325,22 @@ public sealed class PhysicalQueryPlanCompilerTests
 
     [Theory]
     [InlineData(false, IndexValueKind.Number, PortableQueryOperation.Contains)]
+    [InlineData(false, IndexValueKind.Number, PortableQueryOperation.NotContains)]
     [InlineData(false, IndexValueKind.Number, PortableQueryOperation.StartsWith)]
     [InlineData(false, IndexValueKind.Boolean, PortableQueryOperation.Contains)]
+    [InlineData(false, IndexValueKind.Boolean, PortableQueryOperation.NotContains)]
     [InlineData(false, IndexValueKind.Boolean, PortableQueryOperation.StartsWith)]
     [InlineData(false, IndexValueKind.DateTime, PortableQueryOperation.Contains)]
+    [InlineData(false, IndexValueKind.DateTime, PortableQueryOperation.NotContains)]
     [InlineData(false, IndexValueKind.DateTime, PortableQueryOperation.StartsWith)]
     [InlineData(true, IndexValueKind.Number, PortableQueryOperation.Contains)]
+    [InlineData(true, IndexValueKind.Number, PortableQueryOperation.NotContains)]
     [InlineData(true, IndexValueKind.Number, PortableQueryOperation.StartsWith)]
     [InlineData(true, IndexValueKind.Boolean, PortableQueryOperation.Contains)]
+    [InlineData(true, IndexValueKind.Boolean, PortableQueryOperation.NotContains)]
     [InlineData(true, IndexValueKind.Boolean, PortableQueryOperation.StartsWith)]
     [InlineData(true, IndexValueKind.DateTime, PortableQueryOperation.Contains)]
+    [InlineData(true, IndexValueKind.DateTime, PortableQueryOperation.NotContains)]
     [InlineData(true, IndexValueKind.DateTime, PortableQueryOperation.StartsWith)]
     public void TextOperationsCannotBeCertifiedForNonTextCanonicalOrProjectedValues(
         bool projected,
@@ -361,8 +367,10 @@ public sealed class PhysicalQueryPlanCompilerTests
 
     [Theory]
     [InlineData(false, IndexValueKind.String, PortableQueryOperation.Contains)]
+    [InlineData(false, IndexValueKind.String, PortableQueryOperation.NotContains)]
     [InlineData(false, IndexValueKind.Keyword, PortableQueryOperation.StartsWith)]
     [InlineData(true, IndexValueKind.String, PortableQueryOperation.Contains)]
+    [InlineData(true, IndexValueKind.String, PortableQueryOperation.NotContains)]
     [InlineData(true, IndexValueKind.Keyword, PortableQueryOperation.StartsWith)]
     public void TextOperationsRemainExecutableForTextCanonicalAndProjectedValues(
         bool projected,
@@ -385,10 +393,13 @@ public sealed class PhysicalQueryPlanCompilerTests
 
     [Theory]
     [InlineData(PortablePhysicalType.Guid, PortableQueryOperation.Contains)]
+    [InlineData(PortablePhysicalType.Guid, PortableQueryOperation.NotContains)]
     [InlineData(PortablePhysicalType.Guid, PortableQueryOperation.StartsWith)]
     [InlineData(PortablePhysicalType.Json, PortableQueryOperation.Contains)]
+    [InlineData(PortablePhysicalType.Json, PortableQueryOperation.NotContains)]
     [InlineData(PortablePhysicalType.Json, PortableQueryOperation.StartsWith)]
     [InlineData(PortablePhysicalType.Binary, PortableQueryOperation.Contains)]
+    [InlineData(PortablePhysicalType.Binary, PortableQueryOperation.NotContains)]
     [InlineData(PortablePhysicalType.Binary, PortableQueryOperation.StartsWith)]
     public void TextOperationsCannotBeCertifiedForOtherNonStringProjectedTypes(
         PortablePhysicalType physicalType,
@@ -719,6 +730,16 @@ public sealed class PhysicalQueryPlanCompilerTests
             query.DocumentKind,
             query.QueryIdentity,
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "different"))],
+            query.Order,
+            query.Skip,
+            query.Take,
+            query.Continuation,
+            query.LatestPerKeyPath,
+            query.ResultOperation), plan, scoped));
+        Assert.NotEqual(fingerprint, PhysicalDocumentQueryInvocationFingerprint.Compute(new DocumentQuery(
+            query.DocumentKind,
+            query.QueryIdentity,
+            [DocumentQueryClause.Of(DocumentQueryComparison.NotContains("stimulusType", sensitiveValue))],
             query.Order,
             query.Skip,
             query.Take,

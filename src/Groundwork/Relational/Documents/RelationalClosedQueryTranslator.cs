@@ -93,6 +93,7 @@ internal sealed class RelationalClosedQueryTranslator
             QueryComparisonOperator.Equal => BuildEqual(comparison, indexParameter),
             QueryComparisonOperator.In => BuildIn(comparison, indexParameter),
             QueryComparisonOperator.Contains => BuildContains(comparison, indexParameter),
+            QueryComparisonOperator.NotContains => BuildNotContains(comparison, indexParameter),
             _ => throw new ArgumentOutOfRangeException(nameof(comparison), comparison.Operator, "Unsupported operator.")
         };
     }
@@ -132,6 +133,19 @@ internal sealed class RelationalClosedQueryTranslator
         return $"({Exists(indexParameter, predicate)})";
     }
 
+    private string BuildNotContains(QueryComparison comparison, string indexParameter)
+    {
+        var value = comparison.Values.Count > 0 ? comparison.Values[0] : null;
+        if (value is null)
+            throw new InvalidOperationException("NotContains requires a non-null value.");
+
+        var alias = aliasCounter;
+        var pattern = AddParameter(ContainsPattern.Build(value));
+        var predicate = dialect.ContainsPredicate($"x{alias}.index_value", ParameterNameOf(pattern));
+        // The complement includes a missing/null projected value: no matching index row is a match.
+        return $"({NotExists(indexParameter, predicate)})";
+    }
+
     private string BuildOrder(StorageUnit unit, PortableDocumentQuery query, bool acrossScopes)
     {
         if (query.Order is null)
@@ -162,7 +176,7 @@ internal sealed class RelationalClosedQueryTranslator
             $"AND {dialect.ExactEqualityPredicate($"{alias}.index_name", indexParameter)} AND {valuePredicate})";
     }
 
-    private string NotExists(string indexParameter)
+    private string NotExists(string indexParameter, string? valuePredicate = null)
     {
         var alias = $"x{aliasCounter++}";
         return
@@ -170,7 +184,8 @@ internal sealed class RelationalClosedQueryTranslator
             $"WHERE {dialect.ExactJoinPredicate($"{alias}.document_kind", "d.document_kind")} " +
             $"AND {dialect.ExactJoinPredicate($"{alias}.storage_scope", "d.storage_scope")} " +
             $"AND {dialect.ExactJoinPredicate($"{alias}.document_id", "d.id")} " +
-            $"AND {dialect.ExactEqualityPredicate($"{alias}.index_name", indexParameter)})";
+            $"AND {dialect.ExactEqualityPredicate($"{alias}.index_name", indexParameter)}" +
+            (valuePredicate is null ? ")" : $" AND {valuePredicate})");
     }
 
     private string Alias() => $"x{aliasCounter}";

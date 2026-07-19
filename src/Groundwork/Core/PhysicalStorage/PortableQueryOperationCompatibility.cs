@@ -37,6 +37,7 @@ public static class PortableQueryOperationCompatibility
         PortableQueryOperation.NotEqual or
         PortableQueryOperation.In => true,
         PortableQueryOperation.Contains or
+        PortableQueryOperation.NotContains or
         PortableQueryOperation.StartsWith => valueKind is IndexValueKind.String or IndexValueKind.Keyword,
         PortableQueryOperation.GreaterThan or
         PortableQueryOperation.GreaterThanOrEqual or

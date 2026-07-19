@@ -60,6 +60,20 @@ public sealed class SqliteClosedQueryTests
     }
 
     [Fact]
+    public async Task NotContainsIsCaseInsensitiveAndIncludesMissingFields()
+    {
+        await using var harness = await WidgetHarness.Create();
+
+        var result = await harness.Store.QueryAsync(new PortableDocumentQuery(
+            "widget",
+            [QueryClause.Of(QueryComparison.NotContains("by-name", "ALPHA"))]));
+
+        // w2 and w3 do not contain alpha; w5 has no name and is therefore also in the complement.
+        Assert.Equal(new[] { "w2", "w3", "w5" }, Ids(result));
+        Assert.Equal(3, result.TotalCount);
+    }
+
+    [Fact]
     public async Task OrComposesComparisonsWithinAClause()
     {
         await using var harness = await WidgetHarness.Create();

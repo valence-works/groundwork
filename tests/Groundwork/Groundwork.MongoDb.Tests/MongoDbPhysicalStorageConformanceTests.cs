@@ -1871,12 +1871,15 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         Assert.Equal([PhysicalDocumentQueryCommandIdentities.Count], takeNone.Commands.Select(command => command.Identity));
     }
 
-    [Fact]
-    public void Scale_bearing_case_insensitive_substring_query_is_rejected_before_traffic()
+    [Theory]
+    [InlineData(PortableQueryOperation.Contains)]
+    [InlineData(PortableQueryOperation.NotContains)]
+    public void Scale_bearing_case_insensitive_substring_query_is_rejected_before_traffic(
+        PortableQueryOperation operation)
     {
         var model = Model(
             PhysicalStorageForm.PhysicalEntityTable,
-            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            new HashSet<PortableQueryOperation> { operation },
             BoundedQueryExecutionClass.ScaleBearing);
 
         var exception = Assert.Throws<InvalidOperationException>(() => new MongoDbPhysicalDocumentStore(
@@ -1884,16 +1887,19 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             model,
             DocumentStoreAccess.Scoped(new("tenant-a"))));
 
-        Assert.Contains("Contains", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(operation.ToString(), exception.Message, StringComparison.Ordinal);
         Assert.Contains("indexed", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public void Ordinary_case_insensitive_substring_query_remains_server_side()
+    [Theory]
+    [InlineData(PortableQueryOperation.Contains)]
+    [InlineData(PortableQueryOperation.NotContains)]
+    public void Ordinary_case_insensitive_substring_query_remains_server_side(
+        PortableQueryOperation operation)
     {
         var model = Model(
             PhysicalStorageForm.PhysicalEntityTable,
-            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            new HashSet<PortableQueryOperation> { operation },
             BoundedQueryExecutionClass.Ordinary);
 
         var store = new MongoDbPhysicalDocumentStore(

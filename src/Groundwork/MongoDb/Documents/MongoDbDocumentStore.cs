@@ -329,6 +329,7 @@ public sealed class MongoDbDocumentStore : IDocumentStore
             QueryComparisonOperator.Equal => BuildEqualFilter(index, path, comparison),
             QueryComparisonOperator.In => BuildInFilter(index, path, comparison),
             QueryComparisonOperator.Contains => BuildContainsFilter(path, comparison),
+            QueryComparisonOperator.NotContains => BuildNotContainsFilter(path, comparison),
             _ => throw new ArgumentOutOfRangeException(nameof(comparison), comparison.Operator, "Unsupported operator.")
         };
     }
@@ -363,6 +364,17 @@ public sealed class MongoDbDocumentStore : IDocumentStore
 
         var pattern = new BsonRegularExpression(Regex.Escape(value), "i");
         return Builders<BsonDocument>.Filter.Regex(path, pattern);
+    }
+
+    private static FilterDefinition<BsonDocument> BuildNotContainsFilter(string path, QueryComparison comparison)
+    {
+        var value = comparison.Values.Count > 0 ? comparison.Values[0] : null;
+        if (value is null)
+            throw new InvalidOperationException("NotContains requires a non-null value.");
+
+        // MongoDB $not also matches documents where the field is missing, preserving the portable complement contract.
+        return Builders<BsonDocument>.Filter.Not(
+            Builders<BsonDocument>.Filter.Regex(path, new BsonRegularExpression(Regex.Escape(value), "i")));
     }
 
     private static SortDefinition<BsonDocument> BuildSort(StorageUnit unit, QueryOrder? order)

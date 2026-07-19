@@ -31,7 +31,7 @@ internal static class MongoDbTestManifests
                             true,
                             true,
                             MissingValueBehavior.Excluded,
-                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains }),
+                            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains, PortableQueryOperation.NotContains }),
                         new IndexDeclaration(
                             "by-category",
                             [new IndexField("category")],
