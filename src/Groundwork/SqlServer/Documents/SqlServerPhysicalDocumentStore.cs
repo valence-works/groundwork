@@ -101,6 +101,8 @@ internal sealed class SqlServerPhysicalDocumentDialect : RelationalPhysicalDocum
     public override string QuoteIdentifier(string identifier) => $"[{identifier.Replace("]", "]]", StringComparison.Ordinal)}]";
     public override bool IsUniqueConstraintException(DbException exception) =>
         exception is SqlException { Number: 2601 or 2627 };
+    public override bool IsWriteConflictException(DbException exception) =>
+        exception is SqlException { Number: 1205 };
     public override string InsertPrimaryIfAbsent(
         string tableIdentifier,
         IReadOnlyList<string> columns,
