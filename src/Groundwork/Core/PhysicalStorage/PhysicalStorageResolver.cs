@@ -335,10 +335,11 @@ public static class PhysicalStorageResolver
                 valid = false;
             }
 
-            var indexedPaths = matching is { Length: 1 }
-                ? matching[0].Fields.Select(field => field.Path)
+            var resolvedPredicatePaths = matching is { Length: 1 }
+                ? BoundedQueryPredicateResolver.Resolve(query, matching[0])
+                    .Select(field => field.Path)
                 : query.PredicateFields.Select(field => field.Path);
-            var overlappingPredicates = indexedPaths
+            var overlappingPredicates = resolvedPredicatePaths
                 .Intersect(
                     query.ResidualPredicateFields.Select(field => field.Path),
                     StringComparer.Ordinal)
@@ -348,7 +349,7 @@ public static class PhysicalStorageResolver
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-036",
-                    $"Bounded query '{query.Identity}' cannot declare a logical-index path as residual: {string.Join(", ", overlappingPredicates)}.",
+                    $"Bounded query '{query.Identity}' cannot declare an index-prefix predicate path as residual: {string.Join(", ", overlappingPredicates)}.",
                     $"{target}.boundedQueries.{query.Identity}.residualPredicateFields"));
                 valid = false;
             }
@@ -447,13 +448,11 @@ public static class PhysicalStorageResolver
 
             if (mutation.Action is not BoundedTransitionMutationAction transition)
                 continue;
-            var effectivePredicates = query.PredicateFields.Count != 0
-                ? query.PredicateFields
-                : indexGroups.TryGetValue(query.IndexIdentity, out var mutationIndexes) && mutationIndexes.Length == 1
-                    ? mutationIndexes[0].Fields.Take(1)
-                        .Select(field => new BoundedQueryPredicateField(field.Path, query.Operations))
-                        .ToArray()
-                    : [];
+            var effectivePredicates =
+                indexGroups.TryGetValue(query.IndexIdentity, out var mutationIndexes) &&
+                mutationIndexes.Length == 1
+                    ? BoundedQueryPredicateResolver.Resolve(query, mutationIndexes[0])
+                    : query.PredicateFields;
             var transitionPredicate = effectivePredicates.SingleOrDefault(field => field.Path == transition.Path);
             if (transitionPredicate is null ||
                 !transitionPredicate.Operations.Contains(PortableQueryOperation.Equal) &&
@@ -1418,9 +1417,9 @@ public static class PhysicalStorageResolver
         LogicalIndexDeclaration index)
     {
         var indexPaths = index.Fields.Select(field => field.Path).ToArray();
-        var predicatePaths = query.PredicateFields.Count == 0
-            ? indexPaths.Take(1).ToArray()
-            : query.PredicateFields.Select(field => field.Path).ToArray();
+        var predicatePaths = BoundedQueryPredicateResolver.Resolve(query, index)
+            .Select(field => field.Path)
+            .ToArray();
         if (!indexPaths.Take(predicatePaths.Length).SequenceEqual(predicatePaths))
             return false;
 

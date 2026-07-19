@@ -264,11 +264,7 @@ public static class PhysicalQueryPlanCompiler
         string target,
         List<GroundworkDiagnostic> diagnostics)
     {
-        var predicates = query.PredicateFields.Count == 0
-            ? logicalIndex.Fields.Take(1)
-                .Select(field => new BoundedQueryPredicateField(field.Path, query.Operations))
-                .ToArray()
-            : query.PredicateFields.ToArray();
+        var predicates = BoundedQueryPredicateResolver.Resolve(query, logicalIndex).ToArray();
         var declaredPaths = logicalIndex.Fields.Select(field => field.Path).ToHashSet(StringComparer.Ordinal);
         foreach (var predicate in predicates.Where(predicate => !declaredPaths.Contains(predicate.Path)))
         {
@@ -302,12 +298,14 @@ public static class PhysicalQueryPlanCompiler
                 "Storage scope is injected by the session and cannot be a residual caller predicate.",
                 target));
         }
-        var indexedPaths = logicalIndex.Fields.Select(field => field.Path).ToHashSet(StringComparer.Ordinal);
-        foreach (var predicate in residual.Where(predicate => indexedPaths.Contains(predicate.Path)))
+        var predicatePaths = BoundedQueryPredicateResolver.Resolve(query, logicalIndex)
+            .Select(field => field.Path)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var predicate in residual.Where(predicate => predicatePaths.Contains(predicate.Path)))
         {
             diagnostics.Add(Error(
                 "GW-QUERY-013",
-                $"Predicate path '{predicate.Path}' cannot be both indexed and residual.",
+                $"Predicate path '{predicate.Path}' cannot be both an index-prefix predicate and residual.",
                 target));
         }
         if (residual.Any(predicate => predicate.Operations.Count == 0))

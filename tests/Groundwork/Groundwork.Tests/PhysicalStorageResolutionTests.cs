@@ -1263,6 +1263,83 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
+    public void SortOnlyLogicalIndexPathCanAlsoBeAResidualPredicate()
+    {
+        var (index, query) = SortResidualDeclarations("definitionId");
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [index],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        var definition = Assert.Single(result.Definitions).Definition;
+        Assert.Equal(
+            ["definitionId", "lastModifiedAt"],
+            definition.ProjectedColumns.Select(column => column.Path).Order(StringComparer.Ordinal));
+        Assert.Equal(
+            ["storage_scope", "lastModifiedAt", "definitionId", "id_lookup_key"],
+            Assert.Single(definition.Indexes).Columns.Select(column => column.ColumnLogicalName));
+    }
+
+    [Fact]
+    public void PredicatePrefixLogicalIndexPathCannotAlsoBeAResidualPredicate()
+    {
+        var (index, query) = SortResidualDeclarations("lastModifiedAt");
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [index],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-PHYSICAL-036" &&
+            diagnostic.Message.Contains("lastModifiedAt", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ImplicitFirstIndexPredicateCannotAlsoBeAResidualPredicate()
+    {
+        var (index, query) = SortResidualDeclarations(
+            "lastModifiedAt",
+            useImplicitPredicate: true);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [index],
+                [query]));
+
+        var result = PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-PHYSICAL-036" &&
+            diagnostic.Message.Contains("lastModifiedAt", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ExplicitScaleBearingResidualProjectionMustPreserveItsDeclaredValueKind()
     {
         var index = new LogicalIndexDeclaration(
@@ -1786,6 +1863,61 @@ public sealed class PhysicalStorageResolutionTests
         {
             StorageUnits = [manifest.StorageUnits.Single() with { PhysicalStorage = physicalStorage }]
         };
+
+    private static (LogicalIndexDeclaration Index, BoundedQueryDeclaration Query)
+        SortResidualDeclarations(
+            string residualPath,
+            bool useImplicitPredicate = false)
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-last-modified-definition",
+            [
+                new IndexField("lastModifiedAt", IndexValueKind.DateTime),
+                new IndexField("definitionId")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "browse-definitions",
+            index.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.Contains
+            },
+            QuerySortSupport.Both,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("lastModifiedAt", PhysicalSortDirection.Descending),
+                new BoundedQuerySortField("definitionId", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields: useImplicitPredicate
+                ? null
+                :
+                [
+                    new BoundedQueryPredicateField(
+                        "lastModifiedAt",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ],
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    residualPath,
+                    residualPath == "lastModifiedAt"
+                        ? IndexValueKind.DateTime
+                        : IndexValueKind.String,
+                    new HashSet<PortableQueryOperation>
+                    {
+                        residualPath == "lastModifiedAt"
+                            ? PortableQueryOperation.Equal
+                            : PortableQueryOperation.Contains
+                    })
+            ]);
+        return (index, query);
+    }
 
     private static PhysicalStorageResolutionResult ResolveExplicitIdentityIndex(
         IReadOnlyList<PortableQueryOperation> operations,

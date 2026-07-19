@@ -15,6 +15,36 @@ namespace Groundwork.Sqlite.Tests;
 
 public sealed class SqliteRelationalPhysicalStorageConformanceTests : RelationalPhysicalStorageConformance
 {
+    [Fact]
+    public async Task Sort_only_index_field_residual_filters_before_cursor_limit_and_binds_continuation()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var manifest = SortOnlyResidualPredicateConformance.CreateManifest(instance);
+        var target = SortOnlyResidualPredicateConformance.CreateTarget(
+            manifest,
+            SqliteTestManifests.Provider,
+            ProviderPhysicalNameNormalizer.Identity,
+            instance);
+        await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(
+            connection,
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        var runtime = SqlitePhysicalQueryRuntime.Create(
+            store,
+            manifest,
+            route,
+            target.Provider);
+
+        await SortOnlyResidualPredicateConformance.VerifyAsync(store, runtime);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]

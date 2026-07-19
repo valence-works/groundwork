@@ -31,13 +31,9 @@ internal static class PhysicalQueryIdentityDemand
         LogicalIndexDeclaration logicalIndex,
         BoundedQueryDeclaration query)
     {
-        var predicate = query.PredicateFields.Count == 0
-            ? logicalIndex.Fields.FirstOrDefault()?.Path == PhysicalDocumentFieldPaths.Id
-                ? query.Operations
-                : null
-            : query.PredicateFields
-                .SingleOrDefault(field => field.Path == PhysicalDocumentFieldPaths.Id)?
-                .Operations;
+        var predicate = BoundedQueryPredicateResolver.Resolve(query, logicalIndex)
+            .SingleOrDefault(field => field.Path == PhysicalDocumentFieldPaths.Id)?
+            .Operations;
         if (predicate is not null)
             return Resolve(predicate);
 
