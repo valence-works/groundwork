@@ -65,6 +65,18 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         if (!rejects)
         {
             await PhysicalSchemaApplication.ApplyAsync(additive.Target, new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+            var route = additive.Target.Routes.Single();
+            var evolved = new SqlServerPhysicalDocumentStore(
+                container.GetConnectionString(), additive.Manifest, additive.Target.Routes, DocumentStoreAccess.Global);
+            var result = await SqlServerPhysicalQueryRuntime.Create(evolved, additive.Manifest, route, additive.Target.Provider)
+                .QueryAsync(new DocumentQuery(
+                    "configurationDocument",
+                    "find-by-category-priority",
+                    [
+                        DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools")),
+                        DocumentQueryClause.Of(DocumentQueryComparison.Equal("priority", value))
+                    ]));
+            Assert.Equal("preexisting", Assert.Single(result.Documents).Id);
             return;
         }
 
@@ -72,6 +84,10 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             PhysicalSchemaApplication.ApplyAsync(additive.Target, new SqlServerPhysicalSchemaExecutor(container.GetConnectionString())));
         Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
         Assert.Contains(value, (await documents.LoadAsync("configurationDocument", "preexisting"))!.ContentJson);
+        var inspection = await new SqlServerPhysicalSchemaExecutor(container.GetConnectionString())
+            .InspectHistoryAsync(additive.Target, CancellationToken.None);
+        Assert.Equal(initial.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        Assert.NotEqual(additive.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
     }
 
     [Fact]

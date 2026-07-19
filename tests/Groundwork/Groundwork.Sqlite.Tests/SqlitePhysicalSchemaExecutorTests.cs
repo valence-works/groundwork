@@ -257,6 +257,11 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         if (!rejects)
         {
             await PhysicalSchemaApplication.ApplyAsync(additive.Target, executor);
+            var projection = additive.Target.Routes.Single().ProjectedColumns.Single(column =>
+                column.Definition.LogicalName == "priority");
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"SELECT \"{projection.Column.Identifier}\" FROM \"{additive.Target.Routes.Single().LinkedIndexStorage!.Name.Identifier}\";";
+            Assert.Equal(value, await command.ExecuteScalarAsync());
             return;
         }
 
@@ -265,6 +270,40 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
         Assert.Contains("priority", exception.Diagnostic.Target);
         Assert.Contains(value, (await documents.LoadAsync("configurationDocument", "preexisting"))!.ContentJson);
+        var inspection = await executor.InspectHistoryAsync(additive.Target, CancellationToken.None);
+        Assert.Equal(initial.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        Assert.NotEqual(additive.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+    }
+
+    [Theory]
+    [InlineData(128, false)]
+    [InlineData(129, true)]
+    public async Task String_projection_default_length_is_validated_before_sqlite_target_admission(
+        int valueLength,
+        bool rejects)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var target = CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true,
+            priorityType: PortablePhysicalType.String,
+            priorityLength: 128,
+            priorityDefault: new string('a', valueLength)).Target;
+        var executor = new SqlitePhysicalSchemaExecutor(connection);
+
+        if (!rejects)
+        {
+            await PhysicalSchemaApplication.ApplyAsync(target, executor);
+            Assert.Equal(target.Fingerprint, (await executor.InspectHistoryAsync(target, CancellationToken.None))
+                .History.AppliedState?.TargetFingerprint);
+            return;
+        }
+
+        var exception = await Assert.ThrowsAsync<PhysicalProjectionValueValidationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, executor));
+        Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
+        Assert.Null((await executor.InspectHistoryAsync(target, CancellationToken.None)).History.AppliedState);
     }
 
     [Theory]

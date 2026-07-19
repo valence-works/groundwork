@@ -52,6 +52,12 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         if (!rejects)
         {
             await PhysicalSchemaApplication.ApplyAsync(additive.Target, new MongoDbPhysicalSchemaExecutor(database));
+            var route = additive.Target.Routes.Single();
+            var projection = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+            var linked = await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+                .Find(Builders<BsonDocument>.Filter.Empty)
+                .SingleAsync();
+            Assert.Equal(value, linked[projection.Column.Identifier].AsString);
             return;
         }
 
@@ -59,6 +65,10 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             PhysicalSchemaApplication.ApplyAsync(additive.Target, new MongoDbPhysicalSchemaExecutor(database)));
         Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
         Assert.Contains(value, (await documents.LoadAsync("workItem", "preexisting"))!.ContentJson);
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(additive.Target, CancellationToken.None);
+        Assert.Equal(initial.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        Assert.NotEqual(additive.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
     }
 
     [Theory]

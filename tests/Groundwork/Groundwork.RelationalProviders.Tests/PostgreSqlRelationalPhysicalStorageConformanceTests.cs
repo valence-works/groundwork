@@ -68,6 +68,18 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
         if (!rejects)
         {
             await PhysicalSchemaApplication.ApplyAsync(additive.Target, new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+            var route = additive.Target.Routes.Single();
+            var evolved = new PostgreSqlPhysicalDocumentStore(
+                container.GetConnectionString(), additive.Manifest, additive.Target.Routes, DocumentStoreAccess.Global);
+            var result = await PostgreSqlPhysicalQueryRuntime.Create(evolved, additive.Manifest, route, additive.Target.Provider)
+                .QueryAsync(new DocumentQuery(
+                    "configurationDocument",
+                    "find-by-category-priority",
+                    [
+                        DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools")),
+                        DocumentQueryClause.Of(DocumentQueryComparison.Equal("priority", value))
+                    ]));
+            Assert.Equal("preexisting", Assert.Single(result.Documents).Id);
             return;
         }
 
@@ -75,6 +87,10 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             PhysicalSchemaApplication.ApplyAsync(additive.Target, new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString())));
         Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
         Assert.Contains(value, (await documents.LoadAsync("configurationDocument", "preexisting"))!.ContentJson);
+        var inspection = await new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString())
+            .InspectHistoryAsync(additive.Target, CancellationToken.None);
+        Assert.Equal(initial.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        Assert.NotEqual(additive.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
     }
 
     [Fact]
