@@ -5,6 +5,20 @@ namespace Groundwork.MongoDb.DiagnosticRecords;
 
 public static class MongoDbDiagnosticRecordStoreFactory
 {
+    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(
+        string connectionString,
+        string databaseName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
+        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
+        {
+            var handle = await CreateAsync(connectionString, databaseName, definition, cancellationToken: cancellationToken);
+            return new DiagnosticRecordStoreLease(handle.Store, handle);
+        });
+    }
+
     public static async Task<MongoDbDiagnosticRecordStoreHandle> CreateAsync(
         string connectionString,
         string databaseName,

@@ -17,8 +17,43 @@ internal sealed record SchemaToolReport(
     IReadOnlyList<PhysicalSchemaOperation> PendingOperations,
     IReadOnlyList<PhysicalSchemaAppliedOperation> AppliedOperations,
     IReadOnlyList<GroundworkDiagnostic> Diagnostics,
-    bool Mutated)
+    bool Mutated,
+    DiagnosticRecordDeploymentStatus? DiagnosticRecords = null)
 {
+    public SchemaToolReport WithDiagnosticRecords(
+        DiagnosticRecordDeploymentStatus status,
+        bool inspectionWasLive,
+        bool diagnosticRecordsMutated = false)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        var diagnostics = Diagnostics.Concat(status.Diagnostics).ToArray();
+        var outcome = Outcome;
+        if (diagnostics.Any(item => item.IsError))
+            outcome = "blocked";
+        else if (inspectionWasLive && !status.IsApplied)
+        {
+            outcome = Command switch
+            {
+                "validate" => "blocked",
+                "apply" => "blocked",
+                _ => "pending"
+            };
+        }
+        else if (Command == "apply" && diagnosticRecordsMutated && outcome == "ready")
+        {
+            outcome = "applied";
+        }
+
+        return this with
+        {
+            Outcome = outcome,
+            PlanFingerprint = CombineFingerprints(PlanFingerprint, status.Fingerprint),
+            Diagnostics = diagnostics,
+            Mutated = Mutated || diagnosticRecordsMutated,
+            DiagnosticRecords = status
+        };
+    }
+
     public static SchemaToolReport Validate(
         PhysicalSchemaTarget? target,
         IReadOnlyList<GroundworkDiagnostic> diagnostics,
@@ -122,6 +157,14 @@ internal sealed record SchemaToolReport(
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', parts))))
             .ToLowerInvariant();
     }
+
+    private static string? CombineFingerprints(string? documentFingerprint, string diagnosticFingerprint)
+    {
+        if (documentFingerprint is null)
+            return null;
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"groundwork-combined-deployment-v1\n{documentFingerprint}\n{diagnosticFingerprint}"))).ToLowerInvariant();
+    }
 }
 
 internal static class SchemaToolReportWriter
@@ -157,6 +200,12 @@ internal static class SchemaToolReportWriter
         }
         await writer.WriteLineAsync($"Pending operations: {report.PendingOperations.Count}");
         await writer.WriteLineAsync($"Applied operations: {report.AppliedOperations.Count}");
+        if (report.DiagnosticRecords is not null)
+        {
+            await writer.WriteLineAsync($"Diagnostic streams: {report.DiagnosticRecords.DeclaredStreams.Count}");
+            await writer.WriteLineAsync($"Pending diagnostic streams: {report.DiagnosticRecords.PendingStreams.Count}");
+            await writer.WriteLineAsync($"Diagnostic deployment fingerprint: {report.DiagnosticRecords.Fingerprint}");
+        }
         foreach (var diagnostic in report.Diagnostics)
             await writer.WriteLineAsync($"{diagnostic.Severity.ToString().ToLowerInvariant()} {diagnostic.Code}: {diagnostic.Message} ({diagnostic.Target ?? "target"})");
     }
@@ -200,6 +249,7 @@ internal static class SchemaToolReportWriter
         WritePending(writer, report.PendingOperations);
         WriteApplied(writer, report.AppliedOperations);
         WriteAuthorization(writer, report);
+        WriteDiagnosticRecords(writer, report.DiagnosticRecords);
         WriteDiagnostics(writer, report.Diagnostics);
         writer.WriteBoolean("targetMutated", report.Mutated);
         writer.WriteEndObject();
@@ -339,6 +389,29 @@ internal static class SchemaToolReportWriter
             writer.WriteEndObject();
         }
         writer.WriteEndArray();
+    }
+
+    private static void WriteDiagnosticRecords(Utf8JsonWriter writer, DiagnosticRecordDeploymentStatus? status)
+    {
+        writer.WritePropertyName("diagnosticRecords");
+        if (status is null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+        writer.WriteStartObject();
+        writer.WriteString("fingerprint", status.Fingerprint);
+        writer.WritePropertyName("declaredStreams");
+        writer.WriteStartArray();
+        foreach (var stream in status.DeclaredStreams.OrderBy(value => value, StringComparer.Ordinal))
+            writer.WriteStringValue(stream);
+        writer.WriteEndArray();
+        writer.WritePropertyName("pendingStreams");
+        writer.WriteStartArray();
+        foreach (var stream in status.PendingStreams.OrderBy(value => value, StringComparer.Ordinal))
+            writer.WriteStringValue(stream);
+        writer.WriteEndArray();
+        writer.WriteEndObject();
     }
 
     private static void WriteNullable(Utf8JsonWriter writer, string name, string? value)

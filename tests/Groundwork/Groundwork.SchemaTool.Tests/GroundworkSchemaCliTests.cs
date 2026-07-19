@@ -12,6 +12,7 @@ using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Scoping;
 using Groundwork.SchemaTool;
 using Groundwork.Sqlite;
+using Groundwork.DiagnosticRecords;
 using Microsoft.Data.Sqlite;
 using Xunit;
 
@@ -272,6 +273,50 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal(first.RootElement.GetProperty("appliedTargetFingerprint").GetString(),
             second.RootElement.GetProperty("appliedTargetFingerprint").GetString());
         Assert.Equal(string.Empty, error.ToString());
+    }
+
+    [Fact]
+    public async Task One_source_deploys_document_storage_and_declared_diagnostic_streams()
+    {
+        var database = Path.Combine(directory, "combined-deployment.db");
+        var source = typeof(DiagnosticDeploymentManifestSource);
+
+        var planExit = await GroundworkSchemaCli.RunAsync(Arguments("plan", database, source), output, error);
+        using var plan = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, planExit);
+        Assert.Equal("diagnostic-events", Assert.Single(plan.RootElement
+            .GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()).GetString());
+
+        var applyExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database, source).Concat(["--safe"]).ToArray(), output, error);
+        using var applied = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, applyExit);
+        Assert.True(applied.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Empty(applied.RootElement.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray());
+        Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_records"));
+        Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_append_operations"));
+        Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_trim_operations"));
+
+        var validateExit = await GroundworkSchemaCli.RunAsync(Arguments("validate", database, source), output, error);
+        using var validation = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, validateExit);
+        Assert.Equal("ready", validation.RootElement.GetProperty("outcome").GetString());
+        Assert.Empty(validation.RootElement.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray());
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var drop = connection.CreateCommand();
+            drop.CommandText = "DROP TABLE groundwork_diagnostic_trim_operations;";
+            await drop.ExecuteNonQueryAsync();
+        }
+        var driftExit = await GroundworkSchemaCli.RunAsync(Arguments("validate", database, source), output, error);
+        using var drift = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, driftExit);
+        Assert.Equal("blocked", drift.RootElement.GetProperty("outcome").GetString());
+        Assert.Contains(
+            drift.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            item => item.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-001");
     }
 
     [Fact]
@@ -721,6 +766,28 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         public StorageManifest CreateManifest() => CreateTestManifest();
     }
 
+    public sealed class DiagnosticDeploymentManifestSource : IDiagnosticRecordDeploymentManifestSource
+    {
+        public StorageManifest CreateManifest() => CreateTestManifest();
+
+        public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+            CreateTestManifest(),
+            [new DiagnosticRecordStreamDefinition(
+                new DiagnosticStreamId("diagnostic-events"),
+                1,
+                "diagnostic_events",
+                [new DiagnosticFieldDefinition(
+                    "category",
+                    DiagnosticFieldType.String,
+                    DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal },
+                    MaxStringBytes: 256)],
+                new DiagnosticRecordLimits(),
+                TimeSpan.Zero,
+                TimeSpan.FromMinutes(10),
+                TimeSpan.FromMinutes(10))]);
+    }
+
     public sealed class AuthorizationManifestSource : IPhysicalSchemaManifestSource
     {
         public StorageManifest CreateManifest() => CreateTestManifest(
@@ -770,7 +837,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
                         missingValueBehavior: MissingValueBehavior.Excluded)
             ],
             evolution: evolution);
-        var unit = new StorageUnit(
+        var unit = StorageUnit.Create(
             new StorageUnitIdentity("documents"),
             "document",
             StorageIntent.PortableDocument(),
@@ -779,14 +846,9 @@ public sealed class GroundworkSchemaCliTests : IDisposable
             TenancyPolicy.Scoped,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
-            [],
-            [],
-            PhysicalizationPolicy.Portable)
-        {
-            PhysicalStorage = new StorageUnitPhysicalStorage(
+            new StorageUnitPhysicalStorage(
                 StorageUnitProvisioningMode.Declared,
-                PhysicalStoragePolicy.Explicit(definition))
-        };
+                PhysicalStoragePolicy.Explicit(definition)));
         return new StorageManifest(
                 new StorageManifestIdentity("schema-tool-tests"),
                 new StorageManifestOwner("tests"),

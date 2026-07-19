@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Validation;
+using Groundwork.DiagnosticRecords;
 
 namespace Groundwork.SchemaTool;
 
@@ -73,9 +74,18 @@ public static class GroundworkSchemaCli
             var source = ManifestSourceLoader.Load(parsedOptions.ManifestAssembly, parsedOptions.ManifestType);
             var manifest = source.CreateManifest()
                 ?? throw new SchemaToolConfigurationException("GW-CLI-004", "Manifest source returned null.");
+            var diagnosticSource = source as IDiagnosticRecordDeploymentManifestSource;
+            var deployment = diagnosticSource?.CreateDeploymentManifest()
+                ?? new DiagnosticRecordDeploymentManifest(manifest);
+            if (!manifest.HasSameDefinitionAs(deployment.Storage))
+            {
+                throw new SchemaToolConfigurationException(
+                    "GW-CLI-013",
+                    "The diagnostic deployment source must return the same document manifest from both source contracts.");
+            }
             var namePolicy = source.CreateNamePolicy()
                 ?? throw new SchemaToolConfigurationException("GW-CLI-004", "Manifest source returned a null naming policy.");
-            var compilation = SchemaToolTargetCompiler.Compile(manifest, namePolicy, parsedOptions.Provider);
+            var compilation = SchemaToolTargetCompiler.Compile(deployment.Storage, namePolicy, parsedOptions.Provider);
             if (!compilation.IsValid)
             {
                 var invalid = SchemaToolReport.Validate(
@@ -102,6 +112,10 @@ public static class GroundworkSchemaCli
                     compilation.Diagnostics,
                     PhysicalSchemaHistoryState.Empty,
                     "offline");
+                if (diagnosticSource is not null)
+                    offline = offline.WithDiagnosticRecords(
+                        DiagnosticRecordDeploymentStatus.Ready(deployment),
+                        inspectionWasLive: false);
                 await SchemaToolReportWriter.WriteAsync(offline, parsedOptions.Output, output);
                 return offline.Diagnostics.Any(item => item.IsError)
                     ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
@@ -146,8 +160,18 @@ public static class GroundworkSchemaCli
                     inspectionDiagnostics,
                     inspection.History,
                     "live");
+                if (diagnosticSource is not null)
+                {
+                    var diagnostics = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
+                        parsedOptions.Provider,
+                        connectionString,
+                        parsedOptions.Database,
+                        deployment,
+                        cancellationToken);
+                    validation = validation.WithDiagnosticRecords(diagnostics, inspectionWasLive: true);
+                }
                 await SchemaToolReportWriter.WriteAsync(validation, parsedOptions.Output, output);
-                return validation.Diagnostics.Any(item => item.IsError)
+                return validation.Diagnostics.Any(item => item.IsError) || validation.Outcome != "ready"
                     ? Finish(SchemaToolExitCodes.ValidationFailed, "blocked")
                     : Finish(SchemaToolExitCodes.Success, "ready");
             }
@@ -163,6 +187,26 @@ public static class GroundworkSchemaCli
                         parsedOptions),
                     cancellationToken: cancellationToken);
                 var applied = SchemaToolReport.FromApplication(application);
+                if (application.Outcome is not PhysicalSchemaApplicationOutcome.Rejected and
+                    not PhysicalSchemaApplicationOutcome.AuthorizationRequired && diagnosticSource is not null)
+                {
+                    await DiagnosticRecordDeploymentCoordinator.ApplyAsync(
+                        parsedOptions.Provider,
+                        connectionString,
+                        parsedOptions.Database,
+                        deployment,
+                        cancellationToken);
+                    var diagnostics = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
+                        parsedOptions.Provider,
+                        connectionString,
+                        parsedOptions.Database,
+                        deployment,
+                        cancellationToken);
+                    applied = applied.WithDiagnosticRecords(
+                        diagnostics,
+                        inspectionWasLive: true,
+                        diagnosticRecordsMutated: deployment.Streams.Count != 0);
+                }
                 await SchemaToolReportWriter.WriteAsync(applied, parsedOptions.Output, output);
                 return application.Outcome switch
                 {
@@ -170,6 +214,8 @@ public static class GroundworkSchemaCli
                         Finish(SchemaToolExitCodes.ValidationFailed, "blocked"),
                     PhysicalSchemaApplicationOutcome.AuthorizationRequired =>
                         Finish(SchemaToolExitCodes.AuthorizationRequired, "authorization-required"),
+                    _ when applied.Diagnostics.Any(item => item.IsError) || applied.Outcome == "blocked" =>
+                        Finish(SchemaToolExitCodes.ValidationFailed, "blocked"),
                     _ => Finish(SchemaToolExitCodes.Success, applied.Outcome)
                 };
             }
@@ -185,12 +231,42 @@ public static class GroundworkSchemaCli
                 planInspection.History,
                 plan,
                 planInspection.IsAppliedSchemaValid ? [] : [AppliedSchemaDriftDiagnostic()]);
+            if (diagnosticSource is not null)
+            {
+                var diagnostics = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
+                    parsedOptions.Provider,
+                    connectionString,
+                    parsedOptions.Database,
+                    deployment,
+                    cancellationToken);
+                report = report.WithDiagnosticRecords(diagnostics, inspectionWasLive: true);
+            }
             await SchemaToolReportWriter.WriteAsync(report, parsedOptions.Output, output);
             if (report.Diagnostics.Any(item => item.IsError))
                 return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
-            return plan.Operations.Count == 0
+            return report.Outcome == "ready"
                 ? Finish(SchemaToolExitCodes.Success, "ready")
                 : Finish(SchemaToolExitCodes.PendingChanges, "pending");
+        }
+        catch (DiagnosticRecordDeploymentManifestException)
+        {
+            var report = SchemaToolReport.Error(
+                parsedOptions.Command.ToString().ToLowerInvariant(),
+                "invalid",
+                "GW-CLI-013",
+                "Diagnostic-record deployment declarations are invalid.");
+            await SchemaToolReportWriter.WriteAsync(report, parsedOptions.Output, output);
+            return Finish(SchemaToolExitCodes.InvalidInvocation, "invalid");
+        }
+        catch (DiagnosticRecordValidationException)
+        {
+            var report = SchemaToolReport.Error(
+                parsedOptions.Command.ToString().ToLowerInvariant(),
+                "invalid",
+                "GW-CLI-013",
+                "Diagnostic-record deployment declarations are invalid.");
+            await SchemaToolReportWriter.WriteAsync(report, parsedOptions.Output, output);
+            return Finish(SchemaToolExitCodes.InvalidInvocation, "invalid");
         }
         catch (SchemaToolConfigurationException exception)
         {

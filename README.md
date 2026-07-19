@@ -82,7 +82,7 @@ The sample also accepts `PostgreSql`, `SqlServer`, and `MongoDb` as `Groundwork_
 
 ## Use Groundwork
 
-Groundwork starts with a provider-neutral `StorageManifest`. The manifest below declares a support-ticket document/table shape with string IDs, JSON content, optimistic concurrency, a unique ticket-number index, and queryable customer/status/assignee/priority indexes.
+Groundwork starts with a provider-neutral `StorageManifest`. The manifest below declares a support-ticket document/table shape with string IDs, JSON content, optimistic concurrency, a unique ticket-number index, and queryable customer/status/assignee/priority indexes. Applications that also use immutable diagnostic records compose those stream definitions through `DiagnosticRecordDeploymentManifest`; streams are not document storage units. The `Groundwork.Tool` deployment commands then plan, inspect, validate, and apply both declarations from one application source. See [the schema-tool guide](docs/schema-tool.md).
 
 ```csharp
 using Groundwork.Core.Indexing;

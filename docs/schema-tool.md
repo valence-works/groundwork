@@ -36,7 +36,11 @@ tool/package match before loading application code.
 ## Expose the provider-neutral manifest
 
 The application assembly implements the Core-only `IPhysicalSchemaManifestSource`. It does not
-choose a provider, accept a connection, or reference a provider SDK:
+choose a provider, accept a connection, or reference a provider SDK. Existing sources remain
+document-only deployments. When an application also declares immutable diagnostic-record streams,
+implement `IDiagnosticRecordDeploymentManifestSource` from `Groundwork.DiagnosticRecords`; the
+tool treats the document manifest and stream snapshots as one deployment input while keeping the
+streams outside `StorageUnit`:
 
 ```csharp
 using Groundwork.Core.Manifests;
@@ -51,6 +55,24 @@ public sealed class ApplicationSchema : IPhysicalSchemaManifestSource
         new DelegatePhysicalNamePolicy(context => $"app_{context.FeatureDefaultLogicalName}");
 }
 ```
+
+```csharp
+using Groundwork.DiagnosticRecords;
+
+public sealed class ApplicationDeployment : IDiagnosticRecordDeploymentManifestSource
+{
+    public StorageManifest CreateManifest() => ApplicationManifests.Storage;
+
+    public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+        ApplicationManifests.Storage,
+        ApplicationManifests.DiagnosticStreams);
+}
+```
+
+The two manifest methods must describe the same document manifest. The combined deployment
+fingerprint is deterministic and includes each stream's canonical definition fingerprint. A
+duplicate stream identity or an incompatible persisted stream definition blocks deployment; no
+connection string, exception detail, tenant, or record payload is included in CLI output.
 
 Build the application before invoking the tool. Supply `--manifest-type` when the assembly contains
 more than one concrete source.
@@ -150,6 +172,8 @@ provider-neutral semantic migration exists.
 
 - command, outcome, and live/offline inspection mode when validating;
 - exact provider name/version and manifest target identity/version/fingerprint;
+- a `diagnosticRecords` section when the source declares streams, including the deterministic
+  combined stream fingerprint plus declared and pending stream identities;
 - deterministic plan fingerprint and previously applied target fingerprint;
 - deterministically ordered resolved physical names;
 - pending and applied operation identities, fingerprints, kinds, storage units, and subjects;
@@ -192,3 +216,13 @@ dotnet groundwork apply ... --safe --output json > groundwork-apply.json
 Grant the deployment identity only the provider permissions required for the declared target plus
 Groundwork's lock, operation-evidence, and applied-state infrastructure. Application-specific
 orchestration, EF migrations, and implicit host-startup application remain outside the tool.
+
+## Runtime sessions
+
+`IDiagnosticRecordStoreSessionFactory` is the provider-neutral host boundary for declared
+diagnostic streams. Provider packages expose `CreateSessionFactory` helpers; a host opens a session
+with the combined deployment and one `DiagnosticStorageScope`, then opens only a declared stream.
+The returned store rejects a different scope or stream, and the session owns deterministic async
+disposal of provider resources. Provider SDK types, connection strings, and topology checks remain
+inside the provider package. MongoDB's session factory preserves the replica-set/sharded topology
+gate before it creates or materializes a stream.

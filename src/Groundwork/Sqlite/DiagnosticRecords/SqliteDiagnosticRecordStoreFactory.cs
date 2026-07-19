@@ -6,6 +6,14 @@ namespace Groundwork.Sqlite.DiagnosticRecords;
 
 public static class SqliteDiagnosticRecordStoreFactory
 {
+    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
+            new DiagnosticRecordStoreLease(await CreateAsync(connectionString, definition, cancellationToken)));
+    }
+
     public static async Task<SqliteDiagnosticRecordStore> CreateAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
