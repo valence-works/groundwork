@@ -395,6 +395,7 @@ internal static class DocumentQueryOperations
         QueryComparisonOperator.Equal => PortableQueryOperation.Equal,
         QueryComparisonOperator.In => PortableQueryOperation.In,
         QueryComparisonOperator.Contains => PortableQueryOperation.Contains,
+        QueryComparisonOperator.NotContains => PortableQueryOperation.NotContains,
         QueryComparisonOperator.NotEqual => PortableQueryOperation.NotEqual,
         QueryComparisonOperator.StartsWith => PortableQueryOperation.StartsWith,
         QueryComparisonOperator.GreaterThan => PortableQueryOperation.GreaterThan,
@@ -439,7 +440,8 @@ public sealed class LegacyPortableDocumentQueryHandler : IPhysicalDocumentQueryH
         {
             PortableQueryOperation.Equal,
             PortableQueryOperation.In,
-            PortableQueryOperation.Contains
+            PortableQueryOperation.Contains,
+            PortableQueryOperation.NotContains
         }.ToFrozenSet();
     public IReadOnlyDictionary<string, string> NativeFieldIdentifiers { get; } =
         FrozenDictionary<string, string>.Empty;

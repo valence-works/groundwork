@@ -194,7 +194,7 @@ internal static class MongoDbScaleBearingOperationValidation
         return predicates
             .SelectMany(predicate => predicate.Operations.Select(operation => (predicate.Path, Operation: operation)))
             .Where(item => item.Path != PhysicalDocumentFieldPaths.Id &&
-                           item.Operation is PortableQueryOperation.Contains or PortableQueryOperation.StartsWith)
+                           item.Operation is PortableQueryOperation.Contains or PortableQueryOperation.NotContains or PortableQueryOperation.StartsWith)
             .Select(item => item.Operation)
             .Distinct()
             .Order()

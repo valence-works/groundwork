@@ -840,7 +840,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         var name = $"q{parameterIndex++}";
         object parameterValue = operation switch
         {
-            QueryComparisonOperator.Contains => ContainsPattern.Build((string)value),
+            QueryComparisonOperator.Contains or QueryComparisonOperator.NotContains => ContainsPattern.Build((string)value),
             QueryComparisonOperator.StartsWith => ContainsPattern.BuildStartsWith((string)value),
             _ => value
         };
@@ -857,6 +857,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             QueryComparisonOperator.LessThan => $"{field} < {parameter}",
             QueryComparisonOperator.LessThanOrEqual => $"{field} <= {parameter}",
             QueryComparisonOperator.Contains => store.Contains(field, parameter),
+            QueryComparisonOperator.NotContains => $"({field} IS NULL OR NOT ({store.Contains(field, parameter)}))",
             QueryComparisonOperator.StartsWith => store.StartsWith(field, parameter),
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
         };

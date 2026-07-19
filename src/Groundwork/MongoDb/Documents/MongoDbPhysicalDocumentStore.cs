@@ -1653,6 +1653,8 @@ internal sealed class MongoDbPhysicalQueryHandler : IPhysicalDocumentQueryHandle
                 ? Builders<BsonDocument>.Filter.Eq("_groundwork_match_none", true)
                 : Builders<BsonDocument>.Filter.In(field, comparison.Values.Select(ToValue).ToArray()),
             QueryComparisonOperator.Contains => Builders<BsonDocument>.Filter.Regex(field, new BsonRegularExpression(Regex.Escape(comparison.Values[0]!), "i")),
+            QueryComparisonOperator.NotContains => Builders<BsonDocument>.Filter.Not(
+                Builders<BsonDocument>.Filter.Regex(field, new BsonRegularExpression(Regex.Escape(comparison.Values[0]!), "i"))),
             QueryComparisonOperator.StartsWith => Builders<BsonDocument>.Filter.Regex(field, new BsonRegularExpression("^" + Regex.Escape(comparison.Values[0]!), "i")),
             QueryComparisonOperator.GreaterThan => Builders<BsonDocument>.Filter.Gt(field, value),
             QueryComparisonOperator.GreaterThanOrEqual => Builders<BsonDocument>.Filter.Gte(field, value),

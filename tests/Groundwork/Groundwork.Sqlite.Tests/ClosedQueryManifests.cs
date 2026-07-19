@@ -25,7 +25,7 @@ internal static class ClosedQueryManifests
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
-                        Index("by-name", "name", sortable: true, PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains),
+                        Index("by-name", "name", sortable: true, PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains, PortableQueryOperation.NotContains),
                         Index("by-category", "category", sortable: false, PortableQueryOperation.Equal, PortableQueryOperation.In),
                         Index("by-color", "color", sortable: false, PortableQueryOperation.Equal),
                         Index("by-sort-key", "sortKey", sortable: true, PortableQueryOperation.Equal)
@@ -52,7 +52,7 @@ internal static class ClosedQueryManifests
                     ConcurrencyPolicy.Optimistic(),
                     SerializationPolicy.Json(),
                     [
-                        Index("by-name", "name", sortable: true, PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains)
+                        Index("by-name", "name", sortable: true, PortableQueryOperation.Equal, PortableQueryOperation.In, PortableQueryOperation.Contains, PortableQueryOperation.NotContains)
                     ],
                     [],
                     PhysicalizationPolicy.Portable)

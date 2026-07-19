@@ -269,8 +269,8 @@ public sealed record PhysicalQueryDocumentIdentityBinding(
                 PortableQueryOperation.LessThan or
                 PortableQueryOperation.LessThanOrEqual => new PhysicalQueryIdentityValue.Ordered(
                     projection.ComparisonKey),
-            PortableQueryOperation.Contains => throw new NotSupportedException(
-                "Document identity does not support Contains because no bounded identity projection preserves substring semantics."),
+            PortableQueryOperation.Contains or PortableQueryOperation.NotContains => throw new NotSupportedException(
+                "Document identity does not support Contains or NotContains because no bounded identity projection preserves substring semantics."),
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null)
         };
     }

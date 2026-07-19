@@ -623,6 +623,12 @@ public abstract class RelationalProviderContractTests
             [tagClause, QueryClause.Of(QueryComparison.Contains("by-key", "ALPHA"))]));
         Assert.Equal(new[] { c1, c3 }.OrderBy(x => x), contains.Documents.Select(d => d.Id).OrderBy(x => x));
 
+        // NotContains is the case-insensitive complement and stays entirely server-side.
+        var notContains = await store.QueryAsync(new PortableDocumentQuery(
+            "configurationDocument",
+            [tagClause, QueryClause.Of(QueryComparison.NotContains("by-key", "ALPHA"))]));
+        Assert.Equal(new[] { c2, c4 }.OrderBy(x => x), notContains.Documents.Select(d => d.Id).OrderBy(x => x));
+
         // OR within a clause, AND across clauses.
         var orResult = await store.QueryAsync(new PortableDocumentQuery(
             "configurationDocument",

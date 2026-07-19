@@ -15,12 +15,16 @@ public enum QueryComparisonOperator
 
     /// <summary>Case-insensitive substring match (SQL <c>LIKE '%v%'</c>). A null/absent field yields no match.</summary>
     Contains,
+
     NotEqual,
     StartsWith,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
-    LessThanOrEqual
+    LessThanOrEqual,
+
+    /// <summary>Case-insensitive complement of <see cref="Contains"/>. A null/absent field matches.</summary>
+    NotContains
 }
 
 /// <summary>
@@ -40,7 +44,7 @@ public sealed record QueryComparison
         {
             case not QueryComparisonOperator.In when values.Count != 1:
                 throw new ArgumentException($"{@operator} requires exactly one value.", nameof(values));
-            case QueryComparisonOperator.Contains or QueryComparisonOperator.StartsWith or
+            case QueryComparisonOperator.Contains or QueryComparisonOperator.NotContains or QueryComparisonOperator.StartsWith or
                 QueryComparisonOperator.GreaterThan or QueryComparisonOperator.GreaterThanOrEqual or
                 QueryComparisonOperator.LessThan or QueryComparisonOperator.LessThanOrEqual when values[0] is null:
                 throw new ArgumentException($"{@operator} does not accept a null value.", nameof(values));
@@ -66,6 +70,10 @@ public sealed record QueryComparison
     /// <summary>Case-insensitive, null-field-safe substring match.</summary>
     public static QueryComparison Contains(string indexName, string value) =>
         new(indexName, QueryComparisonOperator.Contains, new[] { value ?? throw new ArgumentNullException(nameof(value)) });
+
+    /// <summary>Case-insensitive substring complement; null/absent fields match.</summary>
+    public static QueryComparison NotContains(string indexName, string value) =>
+        new(indexName, QueryComparisonOperator.NotContains, new[] { value ?? throw new ArgumentNullException(nameof(value)) });
 
     public static QueryComparison NotEqual(string indexName, string? value) =>
         new(indexName, QueryComparisonOperator.NotEqual, [value]);
@@ -118,7 +126,7 @@ public sealed class DocumentQueryComparison
         ArgumentNullException.ThrowIfNull(values);
         if (@operator != QueryComparisonOperator.In && values.Count != 1)
             throw new ArgumentException($"{@operator} requires exactly one value.", nameof(values));
-        if (@operator is QueryComparisonOperator.Contains or QueryComparisonOperator.StartsWith or
+        if (@operator is QueryComparisonOperator.Contains or QueryComparisonOperator.NotContains or QueryComparisonOperator.StartsWith or
             QueryComparisonOperator.GreaterThan or QueryComparisonOperator.GreaterThanOrEqual or
             QueryComparisonOperator.LessThan or QueryComparisonOperator.LessThanOrEqual && values[0] is null)
         {
@@ -138,6 +146,7 @@ public sealed class DocumentQueryComparison
     public static DocumentQueryComparison In(string path, IEnumerable<string?> values) =>
         new(path, QueryComparisonOperator.In, (values ?? throw new ArgumentNullException(nameof(values))).ToArray());
     public static DocumentQueryComparison Contains(string path, string value) => new(path, QueryComparisonOperator.Contains, [value]);
+    public static DocumentQueryComparison NotContains(string path, string value) => new(path, QueryComparisonOperator.NotContains, [value]);
     public static DocumentQueryComparison NotEqual(string path, string? value) => new(path, QueryComparisonOperator.NotEqual, [value]);
     public static DocumentQueryComparison StartsWith(string path, string value) => new(path, QueryComparisonOperator.StartsWith, [value]);
     public static DocumentQueryComparison GreaterThan(string path, string value) => new(path, QueryComparisonOperator.GreaterThan, [value]);
@@ -260,7 +269,7 @@ public sealed class DocumentQuery
             Continuation is not null ||
             LatestPerKeyPath is not null ||
             comparisons.Any(comparison => comparison.Operator is not (
-                QueryComparisonOperator.Equal or QueryComparisonOperator.In or QueryComparisonOperator.Contains)))
+                QueryComparisonOperator.Equal or QueryComparisonOperator.In or QueryComparisonOperator.Contains or QueryComparisonOperator.NotContains)))
         {
             throw new NotSupportedException(
                 "The legacy provider bridge cannot represent this DocumentQuery shape; execute it through a bound physical query plan handler.");

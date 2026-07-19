@@ -41,6 +41,10 @@ public sealed class MongoDbClosedQueryTests : IAsyncLifetime
             "configurationDocument", [QueryClause.Of(QueryComparison.Contains("by-key", "ALPHA"))]));
         Assert.Equal(new[] { "w1", "w4" }, contains.Documents.Select(d => d.Id).OrderBy(x => x));
 
+        var notContains = await store.QueryAsync(new PortableDocumentQuery(
+            "configurationDocument", [QueryClause.Of(QueryComparison.NotContains("by-key", "ALPHA"))]));
+        Assert.Equal(new[] { "w2", "w3" }, notContains.Documents.Select(d => d.Id).OrderBy(x => x));
+
         // OR within clause; AND across clauses.
         var orAnd = await store.QueryAsync(new PortableDocumentQuery(
             "configurationDocument",

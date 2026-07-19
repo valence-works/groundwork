@@ -26,7 +26,8 @@ public static class ClosedQueryCapabilityModel
         {
             PortableQueryOperation.Equal,
             PortableQueryOperation.In,
-            PortableQueryOperation.Contains
+            PortableQueryOperation.Contains,
+            PortableQueryOperation.NotContains
         };
 
     /// <summary>Builds the per-index closed-query support profile for a storage unit from its declarations.</summary>

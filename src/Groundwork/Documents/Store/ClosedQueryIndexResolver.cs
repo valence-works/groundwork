@@ -46,6 +46,7 @@ public static class ClosedQueryIndexResolver
             QueryComparisonOperator.Equal => PortableQueryOperation.Equal,
             QueryComparisonOperator.In => PortableQueryOperation.In,
             QueryComparisonOperator.Contains => PortableQueryOperation.Contains,
+            QueryComparisonOperator.NotContains => PortableQueryOperation.NotContains,
             _ => throw new ArgumentOutOfRangeException(nameof(@operator), @operator, "Unsupported comparison operator.")
         };
 }

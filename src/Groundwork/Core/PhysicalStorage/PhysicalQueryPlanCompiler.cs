@@ -369,11 +369,11 @@ public static class PhysicalQueryPlanCompiler
             foreach (var operation in predicate.Operations)
             {
                 if (predicate.Path == PhysicalDocumentFieldPaths.Id &&
-                    operation == PortableQueryOperation.Contains)
+                    operation is PortableQueryOperation.Contains or PortableQueryOperation.NotContains)
                 {
                     diagnostics.Add(Error(
                         "GW-QUERY-011",
-                        "Document identity does not support Contains because no bounded identity projection preserves substring semantics.",
+                        "Document identity does not support Contains or NotContains because no bounded identity projection preserves substring semantics.",
                         target));
                     continue;
                 }
@@ -425,11 +425,12 @@ public static class PhysicalQueryPlanCompiler
     {
         if (predicates.Any(predicate =>
                 predicate.Path == PhysicalDocumentFieldPaths.Id &&
-                predicate.Operations.Contains(PortableQueryOperation.Contains)))
+                (predicate.Operations.Contains(PortableQueryOperation.Contains) ||
+                 predicate.Operations.Contains(PortableQueryOperation.NotContains))))
         {
             diagnostics.Add(Error(
                 "GW-QUERY-011",
-                "Document identity does not support Contains because no bounded identity projection preserves substring semantics.",
+                "Document identity does not support Contains or NotContains because no bounded identity projection preserves substring semantics.",
                 target));
         }
         if (query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing && hasMixedIdentityDemand)

@@ -622,6 +622,37 @@ public sealed class SqlitePhysicalQueryRuntimeTests
     }
 
     [Fact]
+    public async Task NotContainsUsesTheLiteralSubstringComplementIncludingMissingProjectedValues()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var operations = new HashSet<PortableQueryOperation>
+        {
+            PortableQueryOperation.Equal,
+            PortableQueryOperation.NotContains
+        };
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: true,
+            categoryOperations: operations,
+            categoryNullable: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var writer = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        await writer.SaveAsync(Save("literal", "100%_ready"));
+        await writer.SaveAsync(Save("wildcard-match", "100xxready"));
+        await writer.SaveAsync(new SaveDocumentRequest("configurationDocument", "missing", "1", "{\"category\":null}", 0));
+        var queries = SqlitePhysicalQueryRuntime.Create(writer, manifest, target.Routes.Single(), target.Provider);
+
+        var result = await queries.QueryAsync(new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.NotContains("category", "%_"))]));
+
+        Assert.Equal(["missing", "wildcard-match"], result.Documents.Select(document => document.Id).Order());
+        Assert.Equal(2, result.TotalCount);
+    }
+
+    [Fact]
     public async Task OversizedMembershipFailsBeforeDispatchInsteadOfExceedingProviderParameters()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
