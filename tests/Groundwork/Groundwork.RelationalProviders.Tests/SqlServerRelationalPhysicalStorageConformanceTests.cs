@@ -5,6 +5,7 @@ using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
 using Groundwork.Documents.Store;
+using Groundwork.Documents.UnitOfWork;
 using Groundwork.Provider.Relational;
 using Groundwork.Relational.Documents;
 using Groundwork.SqlServer;
@@ -32,6 +33,92 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     : RelationalServerPhysicalIdentityConformance, IClassFixture<SqlServerPhysicalStorageContainer>
 {
     private readonly MsSqlContainer container = fixture.Container;
+
+    [Fact]
+    public async Task Deadlock_victim_unit_of_work_save_returns_a_portable_concurrency_conflict()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            categoryUnique: true,
+            instance: Guid.NewGuid().ToString("N")[..8],
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames);
+        var connectionString = container.GetConnectionString();
+        var probeTable = $"groundwork_deadlock_probe_{Guid.NewGuid():N}";
+        await PhysicalSchemaApplication.ApplyAsync(model.Target, new SqlServerPhysicalSchemaExecutor(connectionString));
+
+        await using (var connection = new SqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"CREATE TABLE [{probeTable}] (id int NOT NULL PRIMARY KEY); INSERT INTO [{probeTable}] (id) VALUES (1), (2);";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var store = new SqlServerPhysicalDocumentStore(
+            connectionString,
+            model.Manifest,
+            model.Target.Routes,
+            DocumentStoreAccess.Global);
+        var bothRowsLocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var arrivals = 0;
+        store.WriteInterceptor = async (point, operation, connection, transaction, cancellationToken) =>
+        {
+            if (point != RelationalPhysicalWriteExecutionPoint.BeforePrimaryLock ||
+                operation != RelationalPhysicalWriteOperation.Save)
+                return;
+
+            var firstRow = Interlocked.Increment(ref arrivals);
+            var secondRow = firstRow == 1 ? 2 : 1;
+            await LockProbeRowAsync(connection, transaction, firstRow, cancellationToken);
+            if (firstRow == 2)
+                bothRowsLocked.TrySetResult();
+            await bothRowsLocked.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+            await LockProbeRowAsync(connection, transaction, secondRow, cancellationToken);
+        };
+
+        try
+        {
+            var results = await Task.WhenAll(
+                SaveInUnitOfWorkAsync("deadlock-first"),
+                SaveInUnitOfWorkAsync("deadlock-second"));
+
+            Assert.Equal(1, results.Count(result => result.Status == DocumentStoreWriteStatus.Saved));
+            Assert.Equal(1, results.Count(result => result.Status == DocumentStoreWriteStatus.ConcurrencyConflict));
+            Assert.Single(new[]
+            {
+                await store.LoadAsync("configurationDocument", "deadlock-first"),
+                await store.LoadAsync("configurationDocument", "deadlock-second")
+            }.Where(document => document is not null));
+        }
+        finally
+        {
+            store.WriteInterceptor = null;
+        }
+
+        async Task LockProbeRowAsync(
+            System.Data.Common.DbConnection connection,
+            System.Data.Common.DbTransaction transaction,
+            int rowId,
+            CancellationToken cancellationToken)
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"SELECT id FROM [{probeTable}] WITH (UPDLOCK, HOLDLOCK) WHERE id = {rowId};";
+            await command.ExecuteScalarAsync(cancellationToken);
+        }
+
+        async Task<DocumentStoreWriteResult> SaveInUnitOfWorkAsync(string id)
+        {
+            await using var unitOfWork = await store.BeginAsync(DocumentCommitScope.Of("configurationDocument"));
+            var result = await unitOfWork.SaveAsync(new SaveDocumentRequest(
+                "configurationDocument", id, "1", "{\"category\":\"shared\"}", 0));
+            if (result.Status == DocumentStoreWriteStatus.Saved)
+                await unitOfWork.CommitAsync();
+            return result;
+        }
+    }
 
     [Theory]
     [InlineData(128, false)]

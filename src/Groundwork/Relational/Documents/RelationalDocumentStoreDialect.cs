@@ -42,6 +42,9 @@ public class RelationalDocumentStoreDialect
 
     public virtual bool IsWriteDependencyException(DbException exception) => false;
 
+    /// <summary>Returns whether a provider exception proves that the active write transaction lost a concurrent race.</summary>
+    public virtual bool IsWriteConflictException(DbException exception) => false;
+
     public virtual string InsertDocumentSql => $$"""
         INSERT INTO groundwork_documents
         (document_kind, storage_scope, id, id_comparison_key, id_lookup_key, schema_version, version, content_json, created_utc, updated_utc)

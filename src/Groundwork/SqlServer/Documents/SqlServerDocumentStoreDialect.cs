@@ -169,6 +169,9 @@ internal sealed class SqlServerDocumentStoreDialect : RelationalDocumentStoreDia
     public override bool IsWriteDependencyException(DbException exception) =>
         exception is SqlException { Number: 547 };
 
+    public override bool IsWriteConflictException(DbException exception) =>
+        exception is SqlException { Number: 1205 };
+
     private static string HashParameter(string parameterReference) =>
         $"CONVERT(BINARY(32), HASHBYTES('SHA2_256', CONVERT(VARBINARY(900), {parameterReference})))";
 }
