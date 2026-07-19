@@ -583,10 +583,13 @@ public static class PhysicalQueryPlanCompiler
         var sortPaths = query.SortFields
             .Select(field => identityFields.ResolveOrderPath(field.Path))
             .ToArray();
-        var start = paths.Take(sortPaths.Length).SequenceEqual(sortPaths)
-            ? 0
-            : predicatePaths.Length;
-        if (!paths.Skip(start).Take(sortPaths.Length).SequenceEqual(sortPaths))
+        if (!CompoundIndexOrdering.TryResolveSortStart(
+                paths,
+                predicatePaths,
+                predicates,
+                sortPaths,
+                out var start,
+                out var requiredEqualityPredicateCount))
         {
             diagnostics.Add(Error(
                 "GW-QUERY-006",
@@ -595,9 +598,7 @@ public static class PhysicalQueryPlanCompiler
             return false;
         }
 
-        if (start != 0 && predicates.Any(predicate =>
-                predicate.Operations.Count != 1 ||
-                !predicate.Operations.Contains(PortableQueryOperation.Equal)))
+        if (!CompoundIndexOrdering.AreSingleValueEqualities(predicates, requiredEqualityPredicateCount))
         {
             diagnostics.Add(Error(
                 "GW-QUERY-006",
@@ -605,9 +606,9 @@ public static class PhysicalQueryPlanCompiler
                 target));
             return false;
         }
-        if (start != 0)
+        if (requiredEqualityPredicateCount != 0)
             requiredEqualityPrefixPaths = Array.AsReadOnly(
-                predicates.Select(predicate => predicate.Path).ToArray());
+                predicates.Take(requiredEqualityPredicateCount).Select(predicate => predicate.Path).ToArray());
 
         var indexDirections = physicalIndex.Columns
             .Where(column => paths.Contains(

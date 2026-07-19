@@ -460,6 +460,26 @@ public sealed class PhysicalStorageResolutionTests
     }
 
     [Fact]
+    public void ScaleBearingOrderedRangeBoundaryAcceptsEqualityPrefixAndOverlappingOrder()
+    {
+        var result = ResolveOrderedRangeBoundary(PortableQueryOperation.Equal);
+
+        Assert.True(result.IsValid, string.Join("; ", result.Diagnostics.Select(x => x.Message)));
+        Assert.Single(result.Definitions);
+        Assert.DoesNotContain(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-027");
+    }
+
+    [Fact]
+    public void ScaleBearingOrderedRangeBoundaryRejectsNonEqualityPrefix()
+    {
+        var result = ResolveOrderedRangeBoundary(PortableQueryOperation.GreaterThan);
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Definitions);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-027");
+    }
+
+    [Fact]
     public void ScaleBearingCompoundDemandSynthesizesMixedSortDirections()
     {
         var physicalStorage = new StorageUnitPhysicalStorage(
@@ -1954,6 +1974,67 @@ public sealed class PhysicalStorageResolutionTests
                 StorageUnitProvisioningMode.Declared,
                 PhysicalStoragePolicy.Explicit(definition),
                 [logicalIndex],
+                [query]));
+
+        return PhysicalStorageResolver.Resolve(
+            manifest,
+            PhysicalNamePolicy.Identity,
+            ProviderPhysicalNameNormalizer.Identity);
+    }
+
+    private static PhysicalStorageResolutionResult ResolveOrderedRangeBoundary(
+        PortableQueryOperation tenantOperation)
+    {
+        var index = new LogicalIndexDeclaration(
+            "by-tenant-category-created-id",
+            [
+                new IndexField("tenant"),
+                new IndexField("category"),
+                new IndexField("createdAt", IndexValueKind.DateTime),
+                new IndexField("itemId")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "page-by-tenant-category-created",
+            index.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan,
+                PortableQueryOperation.LessThanOrEqual
+            },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("itemId", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "tenant",
+                    new HashSet<PortableQueryOperation> { tenantOperation }),
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "createdAt",
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.GreaterThan,
+                        PortableQueryOperation.LessThanOrEqual
+                    })
+            ]);
+        var manifest = WithPhysicalStorage(
+            SampleManifests.MetadataManifest(),
+            new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Default(),
+                [index],
                 [query]));
 
         return PhysicalStorageResolver.Resolve(
