@@ -390,6 +390,35 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Apply_does_not_report_mutation_when_no_document_work_exists_and_diagnostic_materialization_fails()
+    {
+        var database = Path.Combine(directory, "combined-incomplete-no-document-work.db");
+        var documentApply = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var documentReport = ParseOutput();
+
+        var exit = await GroundworkSchemaCli.RunWithDiagnosticApplyAsync(
+            Arguments("apply", database, typeof(DiagnosticDeploymentManifestSource))
+                .Concat(["--safe"])
+                .ToArray(),
+            output,
+            error,
+            (_, _, _, _, _) => Task.FromException(
+                new InvalidOperationException("injected second-stage failure before mutation")));
+        using var report = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.Success, documentApply);
+        Assert.True(documentReport.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal(SchemaToolExitCodes.ExecutionFailed, exit);
+        Assert.Equal("incomplete", report.RootElement.GetProperty("outcome").GetString());
+        Assert.False(report.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.True(await TableExistsAsync(database, "schema_tool_documents"));
+        Assert.False(await TableExistsAsync(database, "groundwork_diagnostic_records"));
+    }
+
+    [Fact]
     public async Task Live_validate_reports_physical_drift_without_repairing_it()
     {
         var database = Path.Combine(directory, "drift.db");

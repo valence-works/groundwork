@@ -71,7 +71,6 @@ internal sealed record SchemaToolReport(
         return updated with
         {
             Outcome = "incomplete",
-            Mutated = true,
             Diagnostics = updated.Diagnostics.Append(
                 GroundworkDiagnostic.Error(
                     "GW-DIAG-DEPLOY-004",
