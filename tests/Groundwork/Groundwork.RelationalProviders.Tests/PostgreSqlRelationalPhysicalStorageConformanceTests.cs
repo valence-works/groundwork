@@ -36,6 +36,47 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
 {
     private readonly PostgreSqlContainer container = fixture.Container;
 
+    [Theory]
+    [InlineData(128, false)]
+    [InlineData(129, true)]
+    public async Task Additive_linked_string_projection_length_is_validated_before_postgresql_backfill(
+        int valueLength,
+        bool rejects)
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var initial = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: instance,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        var additive = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: true,
+            priorityType: PortablePhysicalType.String,
+            priorityLength: 128,
+            instance: instance,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var documents = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), initial.Manifest, initial.Target.Routes, DocumentStoreAccess.Global);
+        var value = new string('a', valueLength);
+        await documents.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "preexisting", "1", $"{{\"category\":\"tools\",\"priority\":\"{value}\"}}", 0));
+
+        if (!rejects)
+        {
+            await PhysicalSchemaApplication.ApplyAsync(additive.Target, new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+            return;
+        }
+
+        var exception = await Assert.ThrowsAsync<PhysicalProjectionValueValidationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(additive.Target, new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString())));
+        Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
+        Assert.Contains(value, (await documents.LoadAsync("configurationDocument", "preexisting"))!.ContentJson);
+    }
+
     [Fact]
     public async Task Physical_factory_auto_applies_safe_schema_when_enabled()
     {

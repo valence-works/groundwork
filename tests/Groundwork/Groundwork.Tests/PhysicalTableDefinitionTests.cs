@@ -9,6 +9,29 @@ namespace Groundwork.Tests;
 public sealed class PhysicalTableDefinitionTests
 {
     [Fact]
+    public void Declared_string_length_has_a_provider_neutral_structured_failure()
+    {
+        var definition = new ProjectedColumnDefinition("label", "label", PortablePhysicalType.String, Length: 128);
+
+        PhysicalProjectionValueValidation.ValidateStringLength(new string('a', 128), definition);
+        var exception = Assert.Throws<PhysicalProjectionValueValidationException>(() =>
+            PhysicalProjectionValueValidation.ValidateStringLength(new string('a', 129), definition));
+
+        Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
+        Assert.Equal("projectedColumns.label", exception.Diagnostic.Target);
+    }
+
+    [Fact]
+    public void Declared_string_length_counts_utf16_code_units()
+    {
+        var definition = new ProjectedColumnDefinition("label", "label", PortablePhysicalType.String, Length: 128);
+
+        PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 64)), definition);
+        Assert.Throws<PhysicalProjectionValueValidationException>(() =>
+            PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 65)), definition));
+    }
+
+    [Fact]
     public void PhysicalStorageFormContainsExactlyTheThreeRatifiedForms()
     {
         Assert.Equal(

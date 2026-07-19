@@ -229,6 +229,45 @@ public sealed class SqlitePhysicalSchemaExecutorTests
     }
 
     [Theory]
+    [InlineData(128, false)]
+    [InlineData(129, true)]
+    public async Task Additive_linked_string_projection_length_is_validated_before_sqlite_backfill(
+        int valueLength,
+        bool rejects)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var initial = CreateModel(PhysicalStorageForm.SharedDocuments, includePriority: false);
+        var additive = CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true,
+            priorityType: PortablePhysicalType.String,
+            priorityLength: 128);
+        var executor = new SqlitePhysicalSchemaExecutor(connection);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, executor);
+        var documents = new SqlitePhysicalDocumentStore(
+            connection,
+            initial.Manifest,
+            initial.Target.Routes,
+            DocumentStoreAccess.Global);
+        var value = new string('a', valueLength);
+        await documents.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "preexisting", "1", $"{{\"category\":\"tools\",\"priority\":\"{value}\"}}", 0));
+
+        if (!rejects)
+        {
+            await PhysicalSchemaApplication.ApplyAsync(additive.Target, executor);
+            return;
+        }
+
+        var exception = await Assert.ThrowsAsync<PhysicalProjectionValueValidationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(additive.Target, executor));
+        Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
+        Assert.Contains("priority", exception.Diagnostic.Target);
+        Assert.Contains(value, (await documents.LoadAsync("configurationDocument", "preexisting"))!.ContentJson);
+    }
+
+    [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
@@ -1058,6 +1097,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         PortablePhysicalType priorityType = PortablePhysicalType.Int32,
         int? priorityPrecision = null,
         int? priorityScale = null,
+        int? priorityLength = null,
         bool priorityNullable = true,
         string? priorityDefault = null,
         IProviderPhysicalNameNormalizer? normalizer = null,
@@ -1093,6 +1133,7 @@ public sealed class SqlitePhysicalSchemaExecutorTests
                 "priority",
                 "priority",
                 priorityType,
+                Length: priorityLength,
                 Precision: priorityPrecision,
                 Scale: priorityScale,
                 IsNullable: priorityNullable,

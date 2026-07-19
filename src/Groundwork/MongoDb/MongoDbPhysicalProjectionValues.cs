@@ -62,7 +62,8 @@ internal static class MongoDbPhysicalProjectionValues
             };
             return new(true, Normalize(projection, value));
         }
-        catch (Exception exception) when (exception is FormatException or OverflowException or InvalidOperationException)
+        catch (Exception exception) when (exception is (FormatException or OverflowException or InvalidOperationException) &&
+                                         exception is not PhysicalProjectionValueValidationException)
         {
             throw Invalid(projection, $"cannot be converted to {projection.Definition.Type}", exception);
         }
@@ -168,8 +169,7 @@ internal static class MongoDbPhysicalProjectionValues
     {
         if (!value.IsString)
             throw new FormatException("A string projection requires a JSON string.");
-        if (projection.Definition.Length is { } length && value.AsString.Length > length)
-            throw new FormatException($"String length exceeds declared maximum {length}.");
+        PhysicalProjectionValueValidation.ValidateStringLength(value.AsString, projection.Definition);
         return value;
     }
 
