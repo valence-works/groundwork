@@ -83,6 +83,23 @@ public class RelationalDocumentStore : IDocumentStore
         DbTransaction transaction,
         CancellationToken ct)
     {
+        try
+        {
+            return await SaveCoreWithoutWriteConflictTranslationAsync(request, unit, scope, transaction, ct);
+        }
+        catch (DbException exception) when (dialect.IsWriteConflictException(exception))
+        {
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+        }
+    }
+
+    private async Task<DocumentStoreWriteResult> SaveCoreWithoutWriteConflictTranslationAsync(
+        SaveDocumentRequest request,
+        StorageUnit unit,
+        DocumentScopeSelection scope,
+        DbTransaction transaction,
+        CancellationToken ct)
+    {
         var identity = identityBindings[request.DocumentKind];
         var requestedIdentity = identity.Project(request.Id);
         var existing = await LoadCoreAsync(
@@ -224,6 +241,23 @@ public class RelationalDocumentStore : IDocumentStore
     }
 
     private async Task<DocumentStoreWriteResult> DeleteCoreAsync(
+        DeleteDocumentRequest request,
+        StorageUnit unit,
+        DocumentScopeSelection scope,
+        DbTransaction transaction,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await DeleteCoreWithoutWriteConflictTranslationAsync(request, unit, scope, transaction, ct);
+        }
+        catch (DbException exception) when (dialect.IsWriteConflictException(exception))
+        {
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+        }
+    }
+
+    private async Task<DocumentStoreWriteResult> DeleteCoreWithoutWriteConflictTranslationAsync(
         DeleteDocumentRequest request,
         StorageUnit unit,
         DocumentScopeSelection scope,

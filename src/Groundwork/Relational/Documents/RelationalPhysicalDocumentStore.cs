@@ -108,6 +108,8 @@ public abstract class RelationalPhysicalDocumentDialect
     public virtual string Parameter(string name) => $"@{name}";
     public abstract int MaxParameters { get; }
     public abstract bool IsUniqueConstraintException(DbException exception);
+    /// <summary>Returns whether a provider exception proves that the active write transaction lost a concurrent race.</summary>
+    public virtual bool IsWriteConflictException(DbException exception) => false;
     public abstract string JsonValue(string canonicalJsonExpression, string stablePath);
     public virtual string SetJsonValue(
         string canonicalJsonExpression,
@@ -659,6 +661,18 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task<DocumentStoreWriteResult> SaveCoreAsync(SaveDocumentRequest request, DbTransaction transaction, CancellationToken ct)
     {
+        try
+        {
+            return await SaveCoreWithoutWriteConflictTranslationAsync(request, transaction, ct);
+        }
+        catch (DbException exception) when (dialect.IsWriteConflictException(exception))
+        {
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+        }
+    }
+
+    private async Task<DocumentStoreWriteResult> SaveCoreWithoutWriteConflictTranslationAsync(SaveDocumentRequest request, DbTransaction transaction, CancellationToken ct)
+    {
         var unit = GetUnit(request.DocumentKind);
         var route = GetRoute(request.DocumentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Save);
@@ -724,6 +738,18 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     }
 
     private async Task<DocumentStoreWriteResult> DeleteCoreAsync(DeleteDocumentRequest request, DbTransaction transaction, CancellationToken ct)
+    {
+        try
+        {
+            return await DeleteCoreWithoutWriteConflictTranslationAsync(request, transaction, ct);
+        }
+        catch (DbException exception) when (dialect.IsWriteConflictException(exception))
+        {
+            return DocumentStoreWriteResult.ConcurrencyConflict;
+        }
+    }
+
+    private async Task<DocumentStoreWriteResult> DeleteCoreWithoutWriteConflictTranslationAsync(DeleteDocumentRequest request, DbTransaction transaction, CancellationToken ct)
     {
         var unit = GetUnit(request.DocumentKind);
         var route = GetRoute(request.DocumentKind);
