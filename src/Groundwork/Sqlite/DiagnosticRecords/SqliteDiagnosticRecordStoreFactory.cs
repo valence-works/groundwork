@@ -74,7 +74,7 @@ public static class SqliteDiagnosticRecordStoreFactory
         string field,
         CancellationToken cancellationToken = default)
     {
-        await using var connection = new SqliteConnection(connectionString);
+        await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT comparison_key FROM {RelationalDiagnosticRecordSchema.FieldsTable} WHERE tenant_id = @tenant AND scope_id = @scope AND stream_id = @stream AND field_name = @field ORDER BY cursor, value_ordinal;";
@@ -97,7 +97,7 @@ public static class SqliteDiagnosticRecordStoreFactory
         var table = kind == DiagnosticOperationKind.Append
             ? RelationalDiagnosticRecordSchema.AppendOperationsTable
             : RelationalDiagnosticRecordSchema.TrimOperationsTable;
-        await using var connection = new SqliteConnection(connectionString);
+        await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT COUNT(*) FROM {table};";
@@ -109,7 +109,7 @@ public static class SqliteDiagnosticRecordStoreFactory
         RelationalDiagnosticCommand diagnosticCommand,
         CancellationToken cancellationToken)
     {
-        await using var connection = new SqliteConnection(connectionString);
+        await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using (var analyze = connection.CreateCommand())
         {
@@ -133,7 +133,7 @@ public static class SqliteDiagnosticRecordStoreFactory
         DiagnosticStreamId stream,
         CancellationToken cancellationToken)
     {
-        await using var connection = new SqliteConnection(connectionString);
+        await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT next_cursor FROM {RelationalDiagnosticRecordSchema.StreamsTable} WHERE tenant_id = @tenant AND scope_id = @scope AND stream_id = @stream;";

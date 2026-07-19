@@ -66,7 +66,7 @@ public static class SqliteDocumentStoreFactory
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(access);
         SqliteRelationalSessions.ValidateStatelessConnectionString(connectionString);
-        await using var admissionConnection = new SqliteConnection(connectionString);
+        await using var admissionConnection = SqliteConnectionFactory.Create(connectionString);
         var target = await AdmitPhysicalAsync(
             admissionConnection,
             manifest,
@@ -138,8 +138,8 @@ public static class SqliteDocumentStoreFactory
             connectionString,
             manifest,
             provider,
-            () => new SqliteConnection(connectionString),
-            () => new SqliteConnection(connectionString),
+            () => SqliteConnectionFactory.Create(connectionString),
+            () => SqliteConnectionFactory.Create(connectionString),
             access,
             scopeObserver,
             cancellationToken);
@@ -157,7 +157,7 @@ public static class SqliteDocumentStoreFactory
             manifest,
             provider,
             createMaterializationConnection,
-            () => new SqliteConnection(connectionString),
+            () => SqliteConnectionFactory.Create(connectionString),
             access,
             scopeObserver,
             cancellationToken);

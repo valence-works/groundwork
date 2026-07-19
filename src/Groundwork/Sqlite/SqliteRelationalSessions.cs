@@ -9,7 +9,7 @@ internal static class SqliteRelationalSessions
     {
         ValidateStatelessConnectionString(connectionString);
 
-        return RelationalSessionFactory.Serialized(() => new SqliteConnection(connectionString));
+        return RelationalSessionFactory.Serialized(() => SqliteConnectionFactory.Create(connectionString));
     }
 
     public static RelationalSessionFactory CreateSerializedImmediate(string connectionString) =>
@@ -22,7 +22,7 @@ internal static class SqliteRelationalSessions
         ValidateStatelessConnectionString(connectionString);
 
         return RelationalSessionFactory.Serialized(
-            () => new SqliteConnection(connectionString),
+            () => SqliteConnectionFactory.Create(connectionString),
             (connection, cancellationToken) =>
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -38,7 +38,7 @@ internal static class SqliteRelationalSessions
         ValidateStatelessConnectionString(connectionString);
 
         return RelationalSessionFactory.Serialized(
-            () => new SqliteConnection(connectionString),
+            () => SqliteConnectionFactory.Create(connectionString),
             (connection, cancellationToken) =>
             {
                 cancellationToken.ThrowIfCancellationRequested();

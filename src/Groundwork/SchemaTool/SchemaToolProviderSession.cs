@@ -2,6 +2,7 @@ using Groundwork.Core.SchemaEvolution;
 using Groundwork.MongoDb.Materialization;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.SqlServer.PhysicalStorage;
+using Groundwork.Sqlite;
 using Groundwork.Sqlite.PhysicalStorage;
 using Microsoft.Data.Sqlite;
 using MongoDB.Driver;
@@ -33,7 +34,7 @@ internal sealed class SchemaToolProviderSession : IAsyncDisposable
         switch (provider.ToLowerInvariant())
         {
             case "sqlite":
-                var connection = new SqliteConnection(connectionString);
+                var connection = SqliteConnectionFactory.Create(connectionString);
                 return new SchemaToolProviderSession(new SqlitePhysicalSchemaExecutor(connection), connection);
             case "sqlserver":
                 return new SchemaToolProviderSession(
