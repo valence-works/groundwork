@@ -13,6 +13,7 @@ using Groundwork.Documents.Store;
 using Groundwork.Documents.UnitOfWork;
 using Groundwork.MongoDb.Documents;
 using Groundwork.MongoDb.Materialization;
+using Groundwork.TestInfrastructure;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Events;
@@ -2063,6 +2064,22 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
                 .Indexes.ListAsync()).ToListAsync())
             .Single(document => document["name"].AsString == index.Name.Identifier);
         Assert.False(actual.Contains("partialFilterExpression"));
+    }
+
+    [Fact]
+    public async Task Sort_only_index_field_residual_filters_before_cursor_limit_and_binds_continuation()
+    {
+        var database = Database();
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var manifest = SortOnlyResidualPredicateConformance.CreateManifest(instance);
+        var model = MongoDbPhysicalStorageModel.Compile(manifest);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Global);
+
+        await SortOnlyResidualPredicateConformance.VerifyAsync(store, store);
     }
 
     private IMongoDatabase Database() =>

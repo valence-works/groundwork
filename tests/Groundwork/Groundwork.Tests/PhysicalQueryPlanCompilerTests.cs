@@ -1611,6 +1611,76 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void SortOnlyLogicalIndexPathCompilesAsAResidualPredicate()
+    {
+        var logicalIndex = SortResidualIndex();
+        var query = SortResidualQuery(logicalIndex, "definitionId");
+        var fixture = CreateEntityFixture(logicalIndex, query);
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+
+        var residual = Assert.Single(plan.Predicates, predicate => predicate.IsResidual);
+        Assert.Equal("definitionId", residual.Path);
+        Assert.Contains(PortableQueryOperation.Contains, residual.Operations);
+        Assert.Equal(
+            ["lastModifiedAt", "definitionId", "storageScope", "id"],
+            plan.Order.Select(order => order.Path));
+    }
+
+    [Fact]
+    public void PredicatePrefixLogicalIndexPathDoesNotCompileAsAResidualPredicate()
+    {
+        var logicalIndex = SortResidualIndex();
+        var fixture = CreateEntityFixture(
+            logicalIndex,
+            SortResidualQuery(logicalIndex, "definitionId"));
+        var invalidStorage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [SortResidualQuery(logicalIndex, "lastModifiedAt")]);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            invalidStorage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-013" &&
+            diagnostic.Message.Contains("lastModifiedAt", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ImplicitFirstIndexPredicateDoesNotCompileAsAResidualPredicate()
+    {
+        var logicalIndex = SortResidualIndex();
+        var fixture = CreateEntityFixture(
+            logicalIndex,
+            SortResidualQuery(logicalIndex, "definitionId"));
+        var invalidStorage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [SortResidualQuery(logicalIndex, "lastModifiedAt", useImplicitPredicate: true)]);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            invalidStorage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-013" &&
+            diagnostic.Message.Contains("lastModifiedAt", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ResidualPredicateShapeParticipatesInThePlanFingerprint()
     {
         PlanningFixture Fixture(IReadOnlySet<PortableQueryOperation> residualOperations)
@@ -2703,6 +2773,60 @@ public sealed class PhysicalQueryPlanCompilerTests
             IndexValueKind.Keyword,
             false,
             MissingValueBehavior.Excluded);
+
+    private static LogicalIndexDeclaration SortResidualIndex() =>
+        new(
+            "by-last-modified-definition",
+            [
+                new IndexField("lastModifiedAt", IndexValueKind.DateTime),
+                new IndexField("definitionId")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+
+    private static BoundedQueryDeclaration SortResidualQuery(
+        LogicalIndexDeclaration logicalIndex,
+        string residualPath,
+        bool useImplicitPredicate = false) =>
+        new(
+            "browse-definitions",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.Contains
+            },
+            QuerySortSupport.Both,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("lastModifiedAt", PhysicalSortDirection.Descending),
+                new BoundedQuerySortField("definitionId", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields: useImplicitPredicate
+                ? null
+                :
+                [
+                    new BoundedQueryPredicateField(
+                        "lastModifiedAt",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ],
+            residualPredicateFields:
+            [
+                new BoundedQueryResidualPredicateField(
+                    residualPath,
+                    residualPath == "lastModifiedAt"
+                        ? IndexValueKind.DateTime
+                        : IndexValueKind.String,
+                    new HashSet<PortableQueryOperation>
+                    {
+                        residualPath == "lastModifiedAt"
+                            ? PortableQueryOperation.Equal
+                            : PortableQueryOperation.Contains
+                    })
+            ]);
 
     private static BoundedQueryDeclaration Query(
         BoundedQueryExecutionClass executionClass,

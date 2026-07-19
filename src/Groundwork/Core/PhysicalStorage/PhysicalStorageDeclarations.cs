@@ -350,9 +350,9 @@ public sealed class BoundedQueryPredicateField : IEquatable<BoundedQueryPredicat
 }
 
 /// <summary>
-/// Declares an optional server-side predicate that is not part of the certified physical-index key.
-/// Residual predicates remain closed, typed query-plan fields and execute before result operations,
-/// paging limits, hydration, or materialization.
+/// Declares an optional server-side predicate that does not contribute physical-index predicate-prefix
+/// evidence. Its path may independently supply certified order. Residual predicates remain closed,
+/// typed query-plan fields and execute before result operations, paging limits, hydration, or materialization.
 /// </summary>
 public sealed class BoundedQueryResidualPredicateField : IEquatable<BoundedQueryResidualPredicateField>
 {

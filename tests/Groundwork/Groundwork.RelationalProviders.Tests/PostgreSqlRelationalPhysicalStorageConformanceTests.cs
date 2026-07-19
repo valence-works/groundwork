@@ -161,6 +161,34 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
                 DocumentStoreAccess.Global),
             "postgresql");
 
+    [Fact]
+    public async Task Sort_only_index_field_residual_filters_before_cursor_limit_and_binds_continuation()
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var manifest = SortOnlyResidualPredicateConformance.CreateManifest(instance);
+        var target = SortOnlyResidualPredicateConformance.CreateTarget(
+            manifest,
+            PostgreSqlGroundworkCapabilities.Provider,
+            PostgreSqlGroundworkCapabilities.PhysicalNames,
+            instance);
+        await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(),
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        var runtime = PostgreSqlPhysicalQueryRuntime.Create(
+            store,
+            manifest,
+            route,
+            target.Provider);
+
+        await SortOnlyResidualPredicateConformance.VerifyAsync(store, runtime);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
