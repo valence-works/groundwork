@@ -8,14 +8,18 @@ internal static class SchemaToolAuthorization
     public static PhysicalSchemaPlanAuthorization Evaluate(
         PhysicalSchemaTarget target,
         PhysicalSchemaDiffPlan plan,
-        SchemaToolOptions options)
+        SchemaToolOptions options,
+        DiagnosticRecordDeploymentStatus? diagnosticRecords = null)
     {
         if (options.ExpectedPlanFingerprint is not null)
         {
-            var actual = SchemaToolReport.Fingerprint(
+            var documentFingerprint = SchemaToolReport.Fingerprint(
                 target,
                 plan.ExpectedAppliedTargetFingerprint,
                 plan.Operations);
+            var actual = diagnosticRecords is null
+                ? documentFingerprint
+                : SchemaToolReport.CombinePlanFingerprint(documentFingerprint, diagnosticRecords);
             if (!string.Equals(actual, options.ExpectedPlanFingerprint, StringComparison.OrdinalIgnoreCase))
             {
                 return PhysicalSchemaPlanAuthorization.Deny(

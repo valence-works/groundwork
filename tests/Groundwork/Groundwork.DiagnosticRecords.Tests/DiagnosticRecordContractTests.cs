@@ -1,4 +1,7 @@
 using Groundwork.Core.Text;
+using Groundwork.Core.Intents;
+using Groundwork.Core.Manifests;
+using Groundwork.Core.PhysicalStorage;
 using Groundwork.DiagnosticRecords;
 using Xunit;
 
@@ -6,6 +9,108 @@ namespace Groundwork.DiagnosticRecords.Tests;
 
 public abstract class DiagnosticRecordContractTests
 {
+    [Fact]
+    public void Deployment_manifest_snapshots_streams_and_has_a_deterministic_combined_fingerprint()
+    {
+        var streams = new List<DiagnosticRecordStreamDefinition>
+        {
+            Definition() with { Stream = new("z") },
+            Definition() with { Stream = new("a") }
+        };
+
+        var first = new DiagnosticRecordDeploymentManifest(StorageManifest(), streams);
+        streams[0] = streams[0] with { LogicalStorageName = "mutated-after-capture" };
+        var second = new DiagnosticRecordDeploymentManifest(StorageManifest(), streams.AsEnumerable().Reverse().ToArray());
+
+        Assert.Equal(["a", "z"], first.Streams.Select(stream => stream.Stream.Value));
+        Assert.NotEqual(first.DiagnosticFingerprint, second.DiagnosticFingerprint);
+        Assert.Equal(first.DiagnosticFingerprint, new DiagnosticRecordDeploymentManifest(
+            StorageManifest(),
+            [Definition() with { Stream = new("a") }, Definition() with { Stream = new("z") }]).DiagnosticFingerprint);
+    }
+
+    [Fact]
+    public void Deployment_manifest_rejects_duplicate_stream_identity()
+    {
+        var exception = Assert.Throws<DiagnosticRecordDeploymentManifestException>(() =>
+            new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition(), Definition()]));
+
+        Assert.Equal("deployment.stream.duplicate", exception.Code);
+    }
+
+    [Fact]
+    public async Task Session_factory_admits_only_declared_streams_and_enforces_scope_isolation()
+    {
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory((_, _) =>
+            ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore())));
+        await using var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+
+        var store = await session.OpenStoreAsync(Definition().Stream);
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await store.InspectAsync(new(new("tenant-b", "shell-a"), Definition().Stream)));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await store.Handlers.Inspect.InspectAsync(new(new("tenant-b", "shell-a"), Definition().Stream)));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await store.Handlers.Inspect.InspectAsync(new(session.Scope, new("other-stream"))));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await session.OpenStoreAsync(new("undeclared")));
+    }
+
+    [Fact]
+    public async Task Session_factory_opens_each_stream_once_under_concurrency_and_disposes_one_lease()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var opens = 0;
+        var resource = new CountingResource();
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
+        {
+            Interlocked.Increment(ref opens);
+            entered.SetResult();
+            await release.Task;
+            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+        });
+        var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+
+        var stores = Enumerable.Range(0, 16)
+            .Select(_ => session.OpenStoreAsync(Definition().Stream).AsTask())
+            .ToArray();
+        await entered.Task;
+        release.SetResult();
+        await Task.WhenAll(stores);
+        await session.DisposeAsync();
+
+        Assert.Equal(1, opens);
+        Assert.Equal(1, resource.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Session_disposal_waits_for_an_in_flight_open_and_disposes_its_late_lease()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resource = new CountingResource();
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
+        {
+            entered.SetResult();
+            await release.Task;
+            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+        });
+        var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+        var open = session.OpenStoreAsync(Definition().Stream).AsTask();
+        await entered.Task;
+
+        var dispose = session.DisposeAsync().AsTask();
+        release.SetResult();
+        await dispose;
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => open);
+        Assert.Equal(1, resource.DisposeCount);
+    }
+
     [Fact]
     public void Scale_bearing_query_rejects_an_operator_the_executable_handler_cannot_run()
     {
@@ -589,6 +694,23 @@ public abstract class DiagnosticRecordContractTests
         AppendIdempotencyWindow: TimeSpan.FromMinutes(10),
         TrimIdempotencyWindow: TimeSpan.FromMinutes(10));
 
+    private static StorageManifest StorageManifest() => new(
+        new("diagnostic-deployment-tests"),
+        new("tests"),
+        new("1"),
+        [StorageUnit.Create(
+            new("documents"),
+            "Documents",
+            StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable,
+            IdentityPolicy.StringId(),
+            TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(),
+            SerializationPolicy.Json(),
+            new(StorageUnitProvisioningMode.Declared, PhysicalStoragePolicy.Default()))],
+        new HashSet<string>(),
+        []);
+
     private static StubQueryHandler QueryHandler(params DiagnosticPredicateOperator[] predicates) => new(new(
         predicates.ToHashSet(),
         SupportsCursorOrder: true,
@@ -639,5 +761,16 @@ public abstract class DiagnosticRecordContractTests
 
         public ValueTask<DiagnosticTrimResult> TrimAsync(DiagnosticTrimRequest request, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class CountingResource : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
     }
 }

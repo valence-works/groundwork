@@ -8,6 +8,41 @@ namespace Groundwork.SqlServer.DiagnosticRecords;
 
 public static class SqlServerDiagnosticRecordStoreFactory
 {
+    public static void ValidateDefinition(DiagnosticRecordStreamDefinition definition) =>
+        SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+
+    public static async Task ValidateAdmissionAsync(
+        string connectionString,
+        IReadOnlyList<DiagnosticRecordStreamDefinition> definitions,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentNullException.ThrowIfNull(definitions);
+        foreach (var definition in definitions)
+            ValidateDefinition(definition);
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE database_id = DB_ID();";
+        var enabled = Convert.ToInt32(
+            await command.ExecuteScalarAsync(cancellationToken),
+            CultureInfo.InvariantCulture) == 1;
+        if (!enabled)
+        {
+            throw new InvalidOperationException(
+                "SQL Server diagnostic records require READ_COMMITTED_SNAPSHOT ON.");
+        }
+    }
+
+    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
+            new DiagnosticRecordStoreLease(await CreateAsync(connectionString, definition, cancellationToken)));
+    }
+
     public static async Task<SqlServerDiagnosticRecordStore> CreateAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,

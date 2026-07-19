@@ -12,7 +12,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Groundwork.SchemaTool.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Core\Groundwork.Core.csproj" />
+    <ProjectReference Include="..\DiagnosticRecords\Groundwork.DiagnosticRecords.csproj" />
+    <ProjectReference Include="..\DiagnosticRecords.Relational\Groundwork.DiagnosticRecords.Relational.csproj" />
     <ProjectReference Include="..\MongoDb\Groundwork.MongoDb.csproj" />
     <ProjectReference Include="..\PostgreSql\Groundwork.PostgreSql.csproj" />
     <ProjectReference Include="..\SqlServer\Groundwork.SqlServer.csproj" />

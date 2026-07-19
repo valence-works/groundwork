@@ -24,7 +24,7 @@ public sealed class SchemaToolDependencyBoundaryTests
     }
 
     [Fact]
-    public void Tool_is_the_only_composition_root_and_references_all_available_providers_without_ef()
+    public void Tool_is_the_only_composition_root_and_references_all_available_providers_and_deployment_contracts_without_ef()
     {
         var project = Load("src/Groundwork/SchemaTool/Groundwork.SchemaTool.csproj");
         var actual = References(project, "ProjectReference")
@@ -36,6 +36,8 @@ public sealed class SchemaToolDependencyBoundaryTests
             new[]
             {
                 "Groundwork.Core",
+                "Groundwork.DiagnosticRecords",
+                "Groundwork.DiagnosticRecords.Relational",
                 "Groundwork.MongoDb",
                 "Groundwork.PostgreSql",
                 "Groundwork.SqlServer",

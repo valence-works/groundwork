@@ -318,6 +318,30 @@ public sealed class PhysicalSchemaApplicationTests
     }
 
     [Fact]
+    public async Task Async_plan_authorization_rechecks_external_admission_under_the_same_lock()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+        PhysicalSchemaDiffPlan? authorizedPlan = null;
+
+        var result = await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            executor,
+            planAuthorizationAsync: async (plan, cancellationToken) =>
+            {
+                await Task.Yield();
+                cancellationToken.ThrowIfCancellationRequested();
+                Assert.True(executor.IsLockHeld);
+                authorizedPlan = plan;
+                return PhysicalSchemaPlanAuthorization.Allow;
+            });
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Outcome);
+        Assert.Same(result.Plan, authorizedPlan);
+        Assert.Equal(1, executor.LockAcquisitionCount);
+    }
+
+    [Fact]
     public async Task Rejected_plan_authorization_runs_under_lock_and_applies_nothing()
     {
         var target = CreateTarget(includeSecondProjection: false);

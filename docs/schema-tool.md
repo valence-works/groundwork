@@ -36,7 +36,11 @@ tool/package match before loading application code.
 ## Expose the provider-neutral manifest
 
 The application assembly implements the Core-only `IPhysicalSchemaManifestSource`. It does not
-choose a provider, accept a connection, or reference a provider SDK:
+choose a provider, accept a connection, or reference a provider SDK. Existing sources remain
+document-only deployments. When an application also declares immutable diagnostic-record streams,
+implement `IDiagnosticRecordDeploymentManifestSource` from `Groundwork.DiagnosticRecords`; the
+tool treats the document manifest and stream snapshots as one deployment input while keeping the
+streams outside `StorageUnit`:
 
 ```csharp
 using Groundwork.Core.Manifests;
@@ -51,6 +55,42 @@ public sealed class ApplicationSchema : IPhysicalSchemaManifestSource
         new DelegatePhysicalNamePolicy(context => $"app_{context.FeatureDefaultLogicalName}");
 }
 ```
+
+```csharp
+using Groundwork.DiagnosticRecords;
+
+public sealed class ApplicationDeployment : IDiagnosticRecordDeploymentManifestSource
+{
+    public StorageManifest CreateManifest() => ApplicationManifests.Storage;
+
+    public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+        ApplicationManifests.Storage,
+        ApplicationManifests.DiagnosticStreams);
+}
+```
+
+The two manifest methods must describe the same document manifest.
+`DiagnosticRecordDeploymentManifest.DiagnosticFingerprint` is deliberately diagnostic-only and
+includes each stream's canonical definition fingerprint. The tool combines it with the compiled
+provider-specific document target and the exact pending diagnostic physical operations when it
+creates the plan fingerprint. A same-version change to physical document storage therefore changes
+the combined plan without pretending the provider-neutral diagnostic manifest compiled that target.
+A duplicate stream identity or an incompatible persisted stream definition blocks deployment; no
+connection string, exception detail, tenant, or record payload is included in CLI output.
+
+Combined deployment is intentionally a **convergent two-resource protocol**, not a distributed
+transaction. Document physical-schema application and diagnostic-stream materialization each use
+their provider's own durable, idempotent protocol, but providers do not offer one portable atomic
+commit spanning both resource families. Every command validates all stream definitions against the
+selected provider; live commands also admit required topology capabilities before any document lock
+or mutation. `apply` first rejects incompatible diagnostic definition drift without changing either
+resource, then repeats admission and diagnostic inspection while holding the document application
+lock before it authorizes the combined plan. For a missing diagnostic schema, it applies the
+document target and then materializes the declared streams. If that second step fails, the command
+reports outcome `incomplete`, `targetMutated: true`, and `GW-DIAG-DEPLOY-004`; the next
+`plan`/`status`/`validate` reports the unfinished diagnostic work and rerunning `apply` converges
+safely. Deployment pipelines must therefore treat a non-zero apply result as incomplete, not assume
+rollback of already-applied document work.
 
 Build the application before invoking the tool. Supply `--manifest-type` when the assembly contains
 more than one concrete source.
@@ -139,7 +179,9 @@ dotnet groundwork apply ... \
 
 `--allow-destructive` and `--allow-semantic` are repeatable and match exact identities. A stale
 `--expected-plan` is rejected after the provider lock is acquired and before any target operation;
-approval can never authorize a different plan observed after an unlocked preflight. Authorization
+approval can never authorize a different plan observed after an unlocked preflight. For combined
+deployments, this exact plan includes each pending diagnostic table or collection, physical index,
+operational ledger, and stream-definition registration—not only the stream count. Authorization
 does not turn an unsupported transform into a supported one: a projected field declared
 `SemanticMigrationRequired` remains the blocking `GW-SCHEMA-005` diagnostic until an authored
 provider-neutral semantic migration exists.
@@ -150,9 +192,12 @@ provider-neutral semantic migration exists.
 
 - command, outcome, and live/offline inspection mode when validating;
 - exact provider name/version and manifest target identity/version/fingerprint;
+- a `diagnosticRecords` section when the source declares streams, including the deterministic
+  provider-specific diagnostic target fingerprint plus declared and pending stream identities;
 - deterministic plan fingerprint and previously applied target fingerprint;
 - deterministically ordered resolved physical names;
-- pending and applied operation identities, fingerprints, kinds, storage units, and subjects;
+- pending and applied operation identities, fingerprints, kinds, storage units, and subjects,
+  including diagnostic tables/collections, indexes, ledgers, and stream metadata;
 - exact destructive operation and semantic migration identities requiring authorization;
 - blocking diagnostics; and
 - `targetMutated`, which is true only when this invocation applied target work.
@@ -192,3 +237,14 @@ dotnet groundwork apply ... --safe --output json > groundwork-apply.json
 Grant the deployment identity only the provider permissions required for the declared target plus
 Groundwork's lock, operation-evidence, and applied-state infrastructure. Application-specific
 orchestration, EF migrations, and implicit host-startup application remain outside the tool.
+
+## Runtime sessions
+
+`IDiagnosticRecordStoreSessionFactory` is the provider-neutral host boundary for declared
+diagnostic streams. Provider packages expose `CreateSessionFactory` helpers; a host opens a session
+with the combined deployment and one `DiagnosticStorageScope`, then opens only a declared stream.
+The returned store and every handler exposed through `Handlers` reject a different scope or stream.
+Concurrent opens of the same stream share one provider lease; session disposal coordinates with
+in-flight opens and disposes every successfully created lease exactly once. Provider SDK types,
+connection strings, and topology checks remain inside the provider package. MongoDB's session
+factory preserves the replica-set/sharded topology gate before it creates or materializes a stream.
