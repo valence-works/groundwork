@@ -162,6 +162,34 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
                 DocumentStoreAccess.Global),
             "sqlserver");
 
+    [Fact]
+    public async Task Sort_only_index_field_residual_filters_before_cursor_limit_and_binds_continuation()
+    {
+        var instance = Guid.NewGuid().ToString("N")[..8];
+        var manifest = SortOnlyResidualPredicateConformance.CreateManifest(instance);
+        var target = SortOnlyResidualPredicateConformance.CreateTarget(
+            manifest,
+            SqlServerGroundworkCapabilities.Provider,
+            SqlServerGroundworkCapabilities.PhysicalNames,
+            instance);
+        await PhysicalSchemaApplication.ApplyAsync(
+            target,
+            new SqlServerPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = target.Routes.Single();
+        var store = new SqlServerPhysicalDocumentStore(
+            container.GetConnectionString(),
+            manifest,
+            target.Routes,
+            DocumentStoreAccess.Global);
+        var runtime = SqlServerPhysicalQueryRuntime.Create(
+            store,
+            manifest,
+            route,
+            target.Provider);
+
+        await SortOnlyResidualPredicateConformance.VerifyAsync(store, runtime);
+    }
+
     [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
