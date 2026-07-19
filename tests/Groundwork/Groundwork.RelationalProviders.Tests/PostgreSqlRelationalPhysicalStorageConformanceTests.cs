@@ -429,6 +429,44 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
     }
 
     [Fact]
+    public async Task Linked_page_limits_one_thousand_matches_before_hydrating_one_hundred_thousand_primary_rows()
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.SharedDocuments,
+            PostgreSqlGroundworkCapabilities.Provider,
+            includePriority: false,
+            normalizer: PostgreSqlGroundworkCapabilities.PhysicalNames);
+        await PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new PostgreSqlPhysicalSchemaExecutor(container.GetConnectionString()));
+        var route = model.Target.Routes.Single();
+        var store = new PostgreSqlPhysicalDocumentStore(
+            container.GetConnectionString(), model.Manifest, model.Target.Routes, DocumentStoreAccess.Global);
+        Assert.Equal(DocumentStoreWriteStatus.Saved, (await store.SaveAsync(new SaveDocumentRequest(
+            "configurationDocument", "bounded-hydration-source", "1", "{\"category\":\"pending\"}"))).Status);
+        await SeedBoundedHydrationEvidenceAsync(route);
+        await AnalyzeRouteAsync(route);
+        var runtime = PostgreSqlPhysicalQueryRuntime.Create(store, model.Manifest, route, model.Target.Provider);
+        var query = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "pending"))],
+            take: 16);
+
+        var result = await runtime.QueryAsync(query);
+        var explanation = await Assert.IsAssignableFrom<IPhysicalDocumentQueryExplainer>(runtime).ExplainAsync(query);
+        var page = explanation.Commands.Single(command =>
+            command.Identity == PhysicalDocumentQueryCommandIdentities.Page);
+
+        Assert.Equal(1_000, result.TotalCount);
+        Assert.Equal(16, result.Documents.Count);
+        Assert.Contains("\"Node Type\": \"Limit\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.Contains(route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier, page.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"Node Type\": \"Hash Join\"", page.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"Node Type\": \"Seq Scan\"", page.NativePlan, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Concurrent_distinct_targets_can_bootstrap_a_clean_schema()
     {
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -998,6 +1036,91 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             """;
         seed.Parameters.AddWithValue("category", "tools");
         await seed.ExecuteNonQueryAsync();
+    }
+
+    private async Task SeedBoundedHydrationEvidenceAsync(ExecutableStorageRoute route)
+    {
+        await using var connection = new NpgsqlConnection(container.GetConnectionString());
+        await connection.OpenAsync();
+        await CopyRowsAsync(
+            connection,
+            route.LinkedIndexStorage!.Name.Identifier,
+            route.LinkedRelationship!.DocumentId.Identifier,
+            route.LinkedRelationship.Identity.ComparisonKey.Identifier,
+            route.LinkedRelationship.Identity.LookupKey.Identifier,
+            "match",
+            999);
+        await CopyRowsAsync(
+            connection,
+            route.PrimaryStorage.Name.Identifier,
+            route.Envelope.Id.Identifier,
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            route.Envelope.Identity.LookupKey.Identifier,
+            "match",
+            999);
+        await CopyRowsAsync(
+            connection,
+            route.LinkedIndexStorage.Name.Identifier,
+            route.LinkedRelationship.DocumentId.Identifier,
+            route.LinkedRelationship.Identity.ComparisonKey.Identifier,
+            route.LinkedRelationship.Identity.LookupKey.Identifier,
+            "primary-noise",
+            99_000,
+            route.ProjectedColumns.Single(column => column.Definition.LogicalName == "category").Column.Identifier,
+            "noise");
+        await CopyRowsAsync(
+            connection,
+            route.PrimaryStorage.Name.Identifier,
+            route.Envelope.Id.Identifier,
+            route.Envelope.Identity.ComparisonKey.Identifier,
+            route.Envelope.Identity.LookupKey.Identifier,
+            "primary-noise",
+            99_000);
+    }
+
+    private static async Task CopyRowsAsync(
+        NpgsqlConnection connection,
+        string table,
+        string idColumn,
+        string comparisonColumn,
+        string lookupColumn,
+        string prefix,
+        int count,
+        string? overrideColumn = null,
+        string? overrideValue = null)
+    {
+        var columns = new List<string>();
+        await using (var metadata = connection.CreateCommand())
+        {
+            metadata.CommandText = """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = @table AND is_generated = 'NEVER'
+                ORDER BY ordinal_position;
+                """;
+            metadata.Parameters.AddWithValue("table", table);
+            await using var reader = await metadata.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                columns.Add(reader.GetString(0));
+        }
+        await using var copy = connection.CreateCommand();
+        copy.CommandText = $"""
+            WITH source AS (
+                SELECT * FROM {Q(table)} LIMIT 1
+            )
+            INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))})
+            SELECT {string.Join(", ", columns.Select(column => column switch
+            {
+                var value when value == idColumn => $"'{prefix}-id-' || n::text",
+                var value when value == comparisonColumn => $"'{prefix}-comparison-' || n::text",
+                var value when value == lookupColumn => $"'{prefix}-lookup-' || n::text",
+                var value when value == overrideColumn => $"'{overrideValue}'",
+                _ => $"s.{Q(column)}"
+            }))}
+            FROM source s CROSS JOIN generate_series(1, @count) AS n;
+            """;
+        copy.Parameters.AddWithValue("count", count);
+        await copy.ExecuteNonQueryAsync();
     }
 
     private async Task CorruptPrimaryLookupAsync(ExecutableStorageRoute route, string lookupKey)

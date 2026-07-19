@@ -86,12 +86,7 @@ public static class RelationalPhysicalQueryRuntime
         DocumentQuery query,
         IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
     {
-        ArgumentNullException.ThrowIfNull(query);
-        var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds, null);
-        var plan = runtime.Compilation.Plans.Single(candidate => candidate.QueryIdentity == query.QueryIdentity);
-        var handler = runtime.Handlers
-            .OfType<RelationalPhysicalDocumentQueryHandler>()
-            .Single(candidate => candidate.Identity == plan.HandlerIdentity);
+        var (handler, plan) = BuildHandler(store, manifest, route, provider, handlerPrefix, query, canonicalJsonValueKinds);
         return handler.BuildCountCommand(query, plan);
     }
 
@@ -104,13 +99,52 @@ public static class RelationalPhysicalQueryRuntime
         DocumentQuery query,
         IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
     {
+        var (handler, plan) = BuildHandler(store, manifest, route, provider, handlerPrefix, query, canonicalJsonValueKinds);
+        return handler.BuildQueryCommand(query, plan);
+    }
+
+    internal static RelationalPhysicalQueryCommand BuildFirstCommand(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        DocumentQuery query,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        var (handler, plan) = BuildHandler(store, manifest, route, provider, handlerPrefix, query, canonicalJsonValueKinds);
+        return handler.BuildFirstCommand(query, plan, route, store.ResolveQueryScope(query.DocumentKind));
+    }
+
+    internal static RelationalPhysicalQueryCommand BuildAnyCommand(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        DocumentQuery query,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        var (handler, plan) = BuildHandler(store, manifest, route, provider, handlerPrefix, query, canonicalJsonValueKinds);
+        return handler.BuildAnyCommand(query, plan, route, store.ResolveQueryScope(query.DocumentKind));
+    }
+
+    private static (RelationalPhysicalDocumentQueryHandler Handler, PhysicalQueryPlan Plan) BuildHandler(
+        RelationalPhysicalDocumentStore store,
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        DocumentQuery query,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds)
+    {
         ArgumentNullException.ThrowIfNull(query);
         var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds, null);
         var plan = runtime.Compilation.Plans.Single(candidate => candidate.QueryIdentity == query.QueryIdentity);
         var handler = runtime.Handlers
             .OfType<RelationalPhysicalDocumentQueryHandler>()
             .Single(candidate => candidate.Identity == plan.HandlerIdentity);
-        return handler.BuildQueryCommand(query, plan);
+        return (handler, plan);
     }
 
     private static RuntimeComponents BuildRuntime(

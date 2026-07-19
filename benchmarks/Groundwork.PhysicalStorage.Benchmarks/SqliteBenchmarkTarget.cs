@@ -105,7 +105,8 @@ public sealed class SqliteBenchmarkTarget(
             var plan = string.Join(Environment.NewLine, lines);
             if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
                 !plan.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) ||
-                plan.Contains("SCAN ", StringComparison.OrdinalIgnoreCase))
+                plan.Contains("SCAN l", StringComparison.OrdinalIgnoreCase) ||
+                plan.Contains("SCAN p", StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(
                     $"SQLite native-plan gate rejected {request.Workload}/{request.Operation}. Expected index '{indexName}'.{Environment.NewLine}{plan}");
@@ -121,7 +122,7 @@ public sealed class SqliteBenchmarkTarget(
                 [
                     "indexed SEARCH is present",
                     $"index {indexName} is selected",
-                    "full SCAN is absent",
+                    "linked and primary full-table SCAN stages are absent",
                     plan.Contains("USE TEMP B-TREE", StringComparison.OrdinalIgnoreCase)
                         ? "ordering remains server-side with a temporary B-tree for the stable identity suffix"
                         : "ordering is satisfied directly by the selected index"

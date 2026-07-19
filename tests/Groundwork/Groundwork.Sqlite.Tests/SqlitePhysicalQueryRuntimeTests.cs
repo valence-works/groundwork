@@ -64,7 +64,8 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         {
             Assert.Equal("sqlite-query-plan", command.NativePlanFormat);
             Assert.Contains("SEARCH", command.NativePlan, StringComparison.OrdinalIgnoreCase);
-            Assert.DoesNotContain("SCAN", command.NativePlan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("SCAN l", command.NativePlan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("SCAN p", command.NativePlan, StringComparison.OrdinalIgnoreCase);
             Assert.Contains(explanation.Plan.Discriminator.Identifier, command.PredicateFieldIdentifiers);
             Assert.Contains(Assert.Single(explanation.Plan.Predicates).Field.Identifier, command.PredicateFieldIdentifiers);
         });
@@ -189,6 +190,51 @@ public sealed class SqlitePhysicalQueryRuntimeTests
 
         Assert.Contains(route.LinkedIndexStorage!.Name.Identifier, rendered.CommandText, StringComparison.Ordinal);
         Assert.DoesNotContain(route.PrimaryStorage.Name.Identifier, rendered.CommandText, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Linked_pages_bound_lookup_rows_before_primary_hydration_with_identity_tie_break()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var (manifest, target) = SqlitePhysicalSchemaExecutorTests.CreateModel(
+            PhysicalStorageForm.SharedDocuments,
+            includePriority: true,
+            includeLatestPerCategory: true);
+        await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var route = target.Routes.Single();
+        var store = new SqlitePhysicalDocumentStore(connection, manifest, target.Routes, DocumentStoreAccess.Global);
+        var pageQuery = new DocumentQuery(
+            "configurationDocument",
+            "list-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("category", "tools"))],
+            take: 16);
+        var latestQuery = new DocumentQuery(
+            "configurationDocument",
+            "latest-by-category",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("visible", "true"))],
+            [new DocumentQueryOrder("category"), new DocumentQueryOrder("priority")],
+            take: 16,
+            latestPerKeyPath: "category");
+
+        var page = RelationalPhysicalQueryRuntime.BuildQueryCommand(
+            store, manifest, route, target.Provider, "sqlite", pageQuery);
+        var latest = RelationalPhysicalQueryRuntime.BuildQueryCommand(
+            store, manifest, route, target.Provider, "sqlite", latestQuery);
+        var first = RelationalPhysicalQueryRuntime.BuildFirstCommand(
+            store, manifest, route, target.Provider, "sqlite",
+            pageQuery.Page(0, 1).Select(BoundedQueryResultOperation.First));
+        var any = RelationalPhysicalQueryRuntime.BuildAnyCommand(
+            store, manifest, route, target.Provider, "sqlite",
+            pageQuery.Select(BoundedQueryResultOperation.Any));
+
+        AssertBoundedBeforeHydration(page.CommandText, route);
+        AssertBoundedBeforeHydration(latest.CommandText, route);
+        AssertBoundedBeforeHydration(first.CommandText, route);
+        Assert.Contains(route.LinkedRelationship!.Identity.LookupKey.Identifier, page.CommandText, StringComparison.Ordinal);
+        Assert.DoesNotContain($"s.\"{route.Envelope.Identity.LookupKey.Identifier}\"", page.CommandText, StringComparison.Ordinal);
+        Assert.Contains("ROW_NUMBER() OVER", latest.CommandText, StringComparison.Ordinal);
+        Assert.DoesNotContain(route.PrimaryStorage.Name.Identifier, any.CommandText, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -1270,6 +1316,15 @@ public sealed class SqlitePhysicalQueryRuntimeTests
         while (await reader.ReadAsync())
             details.Add(reader.GetString(3));
         return string.Join(Environment.NewLine, details);
+    }
+
+    private static void AssertBoundedBeforeHydration(string sql, ExecutableStorageRoute route)
+    {
+        var limit = sql.IndexOf("LIMIT @take", StringComparison.Ordinal);
+        var hydration = sql.IndexOf($"JOIN \"{route.PrimaryStorage.Name.Identifier}\"", StringComparison.Ordinal);
+
+        Assert.True(limit >= 0, sql);
+        Assert.True(hydration > limit, sql);
     }
 
     private static async Task<string> RunCursorProbeAsync(
