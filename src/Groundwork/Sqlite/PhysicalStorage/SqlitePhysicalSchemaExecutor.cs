@@ -89,7 +89,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         }
 
         builder.Mode = SqliteOpenMode.ReadOnly;
-        await using var inspection = new SqliteConnection(builder.ConnectionString);
+        await using var inspection = SqliteConnectionFactory.Create(builder.ConnectionString);
         try
         {
             await inspection.OpenAsync(cancellationToken);

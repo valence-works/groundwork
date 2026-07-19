@@ -15,7 +15,7 @@ public static class SqliteDiagnosticRecordMaterializer
         try
         {
             if (await RelationalDiagnosticRecordAdmissionState.ValidateIfPresentAsync(
-                    () => new SqliteConnection(connectionString),
+                    () => SqliteConnectionFactory.Create(connectionString),
                     definition,
                     "SQLite",
                     cancellationToken))
@@ -56,7 +56,7 @@ public static class SqliteDiagnosticRecordMaterializer
         schema ??= RelationalDiagnosticRecordSchema.Standard;
         RelationalDiagnosticRecordSchemaValidator.ValidateAndThrow(schema);
         SqliteRelationalSessions.ValidateStatelessConnectionString(connectionString);
-        await using var connection = new SqliteConnection(connectionString);
+        await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await using var transaction = connection.BeginTransaction(deferred: false);
