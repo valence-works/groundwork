@@ -178,6 +178,31 @@ public static class GroundworkSchemaCli
 
             if (parsedOptions.Command == SchemaToolCommand.Apply)
             {
+                DiagnosticRecordDeploymentStatus? diagnosticPreflight = null;
+                if (diagnosticSource is not null)
+                {
+                    diagnosticPreflight = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
+                        parsedOptions.Provider,
+                        connectionString,
+                        parsedOptions.Database,
+                        deployment,
+                        cancellationToken);
+                    if (diagnosticPreflight.Diagnostics.Any(item => item.IsError))
+                    {
+                        var blocked = SchemaToolReport.Validate(
+                            compilation.Target,
+                            [],
+                            PhysicalSchemaHistoryState.Empty,
+                            "live") with
+                        {
+                            Command = "apply",
+                            InspectionMode = null
+                        };
+                        blocked = blocked.WithDiagnosticRecords(diagnosticPreflight, inspectionWasLive: true);
+                        await SchemaToolReportWriter.WriteAsync(blocked, parsedOptions.Output, output);
+                        return Finish(SchemaToolExitCodes.ValidationFailed, "blocked");
+                    }
+                }
                 var application = await PhysicalSchemaApplication.ApplyAsync(
                     compilation.Target!,
                     provider.Executor,
@@ -190,12 +215,15 @@ public static class GroundworkSchemaCli
                 if (application.Outcome is not PhysicalSchemaApplicationOutcome.Rejected and
                     not PhysicalSchemaApplicationOutcome.AuthorizationRequired && diagnosticSource is not null)
                 {
-                    await DiagnosticRecordDeploymentCoordinator.ApplyAsync(
-                        parsedOptions.Provider,
-                        connectionString,
-                        parsedOptions.Database,
-                        deployment,
-                        cancellationToken);
+                    if (!diagnosticPreflight!.IsApplied)
+                    {
+                        await DiagnosticRecordDeploymentCoordinator.ApplyAsync(
+                            parsedOptions.Provider,
+                            connectionString,
+                            parsedOptions.Database,
+                            deployment,
+                            cancellationToken);
+                    }
                     var diagnostics = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
                         parsedOptions.Provider,
                         connectionString,
@@ -205,7 +233,7 @@ public static class GroundworkSchemaCli
                     applied = applied.WithDiagnosticRecords(
                         diagnostics,
                         inspectionWasLive: true,
-                        diagnosticRecordsMutated: deployment.Streams.Count != 0);
+                        diagnosticRecordsMutated: !diagnosticPreflight.IsApplied);
                 }
                 await SchemaToolReportWriter.WriteAsync(applied, parsedOptions.Output, output);
                 return application.Outcome switch

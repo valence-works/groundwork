@@ -74,6 +74,16 @@ fingerprint is deterministic and includes each stream's canonical definition fin
 duplicate stream identity or an incompatible persisted stream definition blocks deployment; no
 connection string, exception detail, tenant, or record payload is included in CLI output.
 
+Combined deployment is intentionally a **convergent two-resource protocol**, not a distributed
+transaction. Document physical-schema application and diagnostic-stream materialization each use
+their provider's own durable, idempotent protocol, but providers do not offer one portable atomic
+commit spanning both resource families. `apply` first rejects incompatible diagnostic definition
+drift without changing either resource. For a missing diagnostic schema, it applies the document
+target and then materializes the declared streams. If that second step fails, the command fails and
+the next `plan`/`status`/`validate` reports the unfinished diagnostic work; rerunning `apply`
+converges safely. Deployment pipelines must therefore treat a non-zero apply result as incomplete,
+not assume rollback of already-applied document work.
+
 Build the application before invoking the tool. Supply `--manifest-type` when the assembly contains
 more than one concrete source.
 

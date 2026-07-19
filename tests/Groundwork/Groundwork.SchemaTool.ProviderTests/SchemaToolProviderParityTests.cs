@@ -6,6 +6,7 @@ using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Core.Scoping;
+using Groundwork.DiagnosticRecords;
 using Groundwork.PostgreSql;
 using Groundwork.SchemaTool;
 using Microsoft.Data.SqlClient;
@@ -27,6 +28,55 @@ public sealed class SchemaToolProviderParityCollection
 [Collection(SchemaToolProviderParityCollection.Name)]
 public sealed class SchemaToolProviderParityTests
 {
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
+    public async Task SqlServer_combined_diagnostic_deployment_is_live_restart_safe_and_detects_drift()
+    {
+        await using var container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04").Build();
+        await container.StartAsync();
+        var connection = await CreateSqlServerDiagnosticDatabaseAsync(container.GetConnectionString());
+        await ExerciseDiagnosticDeploymentAsync(
+            "sqlserver",
+            connection,
+            database: null,
+            () => DriftSqlServerDiagnosticDefinitionAsync(connection));
+    }
+
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
+    public async Task PostgreSql_combined_diagnostic_deployment_is_live_restart_safe_and_detects_drift()
+    {
+        await using var container = new PostgreSqlBuilder("postgres:17.6-alpine3.22")
+            .WithDatabase("groundwork")
+            .WithUsername("groundwork")
+            .WithPassword("groundwork")
+            .Build();
+        await container.StartAsync();
+        var connection = container.GetConnectionString();
+        await ExerciseDiagnosticDeploymentAsync(
+            "postgresql",
+            connection,
+            database: null,
+            () => DriftPostgreSqlDiagnosticDefinitionAsync(connection));
+    }
+
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
+    public async Task MongoDb_combined_diagnostic_deployment_is_live_restart_safe_and_detects_drift()
+    {
+        await using var container = new MongoDbBuilder("mongo:7.0.24")
+            .WithReplicaSet("groundwork-diag-rs")
+            .Build();
+        await container.StartAsync();
+        var connection = container.GetConnectionString();
+        const string database = "groundwork_schema_tool_diagnostic_tests";
+        await ExerciseDiagnosticDeploymentAsync(
+            "mongodb",
+            connection,
+            database,
+            () => DriftMongoDbDiagnosticDefinitionAsync(connection, database));
+    }
+
     [Fact]
     [Trait("Category", "SchemaToolProviderParity")]
     public async Task SqlServer_cli_lifecycle_is_live_restart_safe_authorized_and_secret_safe()
@@ -264,6 +314,59 @@ public sealed class SchemaToolProviderParityTests
         Assert.Equal(string.Empty, failure.Error);
     }
 
+    private static async Task ExerciseDiagnosticDeploymentAsync(
+        string provider,
+        string connection,
+        string? database,
+        Func<Task> driftDiagnosticSchema)
+    {
+        var source = typeof(DiagnosticDeploymentManifestSource);
+        var validate = await RunAsync("validate", provider, connection, database, source);
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, validate.ExitCode);
+        Assert.False(validate.Report.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal("diagnostic-events", Assert.Single(
+            validate.Report.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()).GetString());
+
+        var plan = await RunAsync("plan", provider, connection, database, source);
+        var status = await RunAsync("status", provider, connection, database, source);
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, plan.ExitCode);
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, status.ExitCode);
+        Assert.Equal(
+            plan.Report.GetProperty("planFingerprint").GetString(),
+            status.Report.GetProperty("planFingerprint").GetString());
+        Assert.Equal("diagnostic-events", Assert.Single(
+            plan.Report.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()).GetString());
+
+        var concurrentApplies = await Task.WhenAll(
+            RunAsync("apply", provider, connection, database, source, "--safe"),
+            RunAsync("apply", provider, connection, database, source, "--safe"));
+        Assert.All(concurrentApplies, apply => Assert.Equal(SchemaToolExitCodes.Success, apply.ExitCode));
+        Assert.Contains(concurrentApplies, apply => apply.Report.GetProperty("targetMutated").GetBoolean());
+        Assert.All(concurrentApplies, apply =>
+            Assert.Empty(apply.Report.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()));
+
+        var restartValidate = await RunAsync("validate", provider, connection, database, source);
+        var restartStatus = await RunAsync("status", provider, connection, database, source);
+        var restartApply = await RunAsync("apply", provider, connection, database, source, "--safe");
+        Assert.Equal(SchemaToolExitCodes.Success, restartValidate.ExitCode);
+        Assert.Equal(SchemaToolExitCodes.Success, restartStatus.ExitCode);
+        Assert.Equal(SchemaToolExitCodes.Success, restartApply.ExitCode);
+        Assert.Equal("ready", restartStatus.Report.GetProperty("outcome").GetString());
+        Assert.Equal("ready", restartApply.Report.GetProperty("outcome").GetString());
+
+        await driftDiagnosticSchema();
+        var drift = await RunAsync("validate", provider, connection, database, source);
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, drift.ExitCode);
+        Assert.False(drift.Report.GetProperty("targetMutated").GetBoolean());
+        Assert.Contains(
+            drift.Report.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() is "GW-DIAG-DEPLOY-001" or "GW-DIAG-DEPLOY-002");
+
+        var blockedApply = await RunAsync("apply", provider, connection, database, source, "--safe");
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, blockedApply.ExitCode);
+        Assert.False(blockedApply.Report.GetProperty("targetMutated").GetBoolean());
+    }
+
     private static async Task<CliResult> RunAsync(
         string command,
         string provider,
@@ -400,6 +503,48 @@ public sealed class SchemaToolProviderParityTests
         await collection.Indexes.DropOneAsync("schema_tool_provider_documents-by-category");
     }
 
+    private static async Task DriftSqlServerDiagnosticDefinitionAsync(string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE groundwork_diagnostic_definitions SET definition_fingerprint = 'drift' WHERE stream_id = 'diagnostic-events';";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task DriftPostgreSqlDiagnosticDefinitionAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE groundwork_diagnostic_definitions SET definition_fingerprint = 'drift' WHERE stream_id = 'diagnostic-events';";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task DriftMongoDbDiagnosticDefinitionAsync(string connectionString, string database)
+    {
+        var collection = new MongoClient(connectionString)
+            .GetDatabase(database)
+            .GetCollection<MongoDB.Bson.BsonDocument>("groundwork_diagnostic_stream_definitions");
+        await collection.UpdateOneAsync(
+            MongoDB.Driver.Builders<MongoDB.Bson.BsonDocument>.Filter.Empty,
+            MongoDB.Driver.Builders<MongoDB.Bson.BsonDocument>.Update.Set("fingerprint", "drift"));
+    }
+
+    private static async Task<string> CreateSqlServerDiagnosticDatabaseAsync(string connectionString)
+    {
+        var database = $"groundwork_diag_cli_{Guid.NewGuid():N}";
+        await using var connection = new SqlConnection(new SqlConnectionStringBuilder(connectionString)
+        {
+            InitialCatalog = "master"
+        }.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"CREATE DATABASE [{database}]; ALTER DATABASE [{database}] SET READ_COMMITTED_SNAPSHOT ON;";
+        await command.ExecuteNonQueryAsync();
+        return new SqlConnectionStringBuilder(connectionString) { InitialCatalog = database }.ConnectionString;
+    }
+
     private static async Task<(bool AppliedIndexExists, bool PendingIndexExists)> ReadMongoDbIndexStateAsync(
         string connectionString,
         string database)
@@ -420,6 +565,30 @@ public sealed class SchemaToolProviderParityTests
         public StorageManifest CreateManifest() => SchemaToolProviderParityTests.CreateManifest(
             "schema-tool-provider-tests",
             "schema_tool_provider_documents");
+    }
+
+    public sealed class DiagnosticDeploymentManifestSource : IDiagnosticRecordDeploymentManifestSource
+    {
+        public StorageManifest CreateManifest() => SchemaToolProviderParityTests.CreateManifest(
+            "schema-tool-provider-diagnostic-tests",
+            "schema_tool_provider_diagnostic_documents");
+
+        public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+            CreateManifest(),
+            [new DiagnosticRecordStreamDefinition(
+                new("diagnostic-events"),
+                1,
+                "diagnostic_events",
+                [new DiagnosticFieldDefinition(
+                    "category",
+                    DiagnosticFieldType.String,
+                    DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal },
+                    MaxStringBytes: 256)],
+                new DiagnosticRecordLimits(MaxRecordIdBytes: 128),
+                TimeSpan.Zero,
+                TimeSpan.FromMinutes(10),
+                TimeSpan.FromMinutes(10))]);
     }
 
     public sealed class AuthorizedManifestSource : IPhysicalSchemaManifestSource
@@ -528,7 +697,7 @@ public sealed class SchemaToolProviderParityTests
             columns,
             indexes: indexes,
             evolution: evolution);
-        var unit = new StorageUnit(
+        var unit = StorageUnit.Create(
             new StorageUnitIdentity("documents"),
             "document",
             StorageIntent.PortableDocument(),
@@ -537,14 +706,9 @@ public sealed class SchemaToolProviderParityTests
             TenancyPolicy.Scoped,
             ConcurrencyPolicy.Optimistic(),
             SerializationPolicy.Json(),
-            [],
-            [],
-            PhysicalizationPolicy.Portable)
-        {
-            PhysicalStorage = new StorageUnitPhysicalStorage(
+            new StorageUnitPhysicalStorage(
                 StorageUnitProvisioningMode.Declared,
-                PhysicalStoragePolicy.Explicit(definition))
-        };
+                PhysicalStoragePolicy.Explicit(definition)));
         return new StorageManifest(
             new StorageManifestIdentity(identity),
             new StorageManifestOwner("tests"),
