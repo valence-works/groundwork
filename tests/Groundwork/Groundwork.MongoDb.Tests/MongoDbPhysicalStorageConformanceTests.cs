@@ -33,6 +33,45 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     public Task DisposeAsync() => container.DisposeAsync().AsTask();
 
     [Theory]
+    [InlineData(128, false)]
+    [InlineData(129, true)]
+    public async Task Additive_linked_string_projection_length_is_validated_before_mongodb_backfill(
+        int valueLength,
+        bool rejects)
+    {
+        var database = Database();
+        var initial = SharedProjectionEvolutionModel(includeStatus: false);
+        await PhysicalSchemaApplication.ApplyAsync(initial.Target, new MongoDbPhysicalSchemaExecutor(database));
+        var documents = new MongoDbPhysicalDocumentStore(
+            database, initial, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var value = new string('a', valueLength);
+        await documents.SaveAsync(new SaveDocumentRequest(
+            "workItem", "preexisting", "1", $"{{\"rank\":7,\"status\":\"{value}\"}}", 0));
+        var additive = SharedProjectionEvolutionModel(includeStatus: true, statusLength: 128);
+
+        if (!rejects)
+        {
+            await PhysicalSchemaApplication.ApplyAsync(additive.Target, new MongoDbPhysicalSchemaExecutor(database));
+            var route = additive.Target.Routes.Single();
+            var projection = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "status");
+            var linked = await database.GetCollection<BsonDocument>(route.LinkedIndexStorage!.Name.Identifier)
+                .Find(Builders<BsonDocument>.Filter.Empty)
+                .SingleAsync();
+            Assert.Equal(value, linked[projection.Column.Identifier].AsString);
+            return;
+        }
+
+        var exception = await Assert.ThrowsAsync<PhysicalProjectionValueValidationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(additive.Target, new MongoDbPhysicalSchemaExecutor(database)));
+        Assert.Equal("GW-PHYSICAL-037", exception.Diagnostic.Code);
+        Assert.Contains(value, (await documents.LoadAsync("workItem", "preexisting"))!.ContentJson);
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(additive.Target, CancellationToken.None);
+        Assert.Equal(initial.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+        Assert.NotEqual(additive.Target.Fingerprint, inspection.History.AppliedState?.TargetFingerprint);
+    }
+
+    [Theory]
     [InlineData(PhysicalStorageForm.SharedDocuments)]
     [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
     [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
@@ -2445,11 +2484,12 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             []));
     }
 
-    private static MongoDbPhysicalStorageModel SharedProjectionEvolutionModel(bool includeStatus)
+    private static MongoDbPhysicalStorageModel SharedProjectionEvolutionModel(bool includeStatus, int? statusLength = null)
     {
         var binding = new SharedStorageBinding("runtime");
         var rank = new ProjectedColumnDefinition("rank", "rank", PortablePhysicalType.Int32, IsNullable: false);
-        var status = new ProjectedColumnDefinition("status", "status", PortablePhysicalType.String, IsNullable: false);
+        var status = new ProjectedColumnDefinition(
+            "status", "status", PortablePhysicalType.String, Length: statusLength, IsNullable: false);
         var definition = PhysicalTableDefinition.SharedDocuments(
             binding,
             includeStatus ? [rank, status] : [rank],

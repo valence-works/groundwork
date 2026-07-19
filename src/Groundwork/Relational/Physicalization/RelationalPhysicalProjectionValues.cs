@@ -53,12 +53,15 @@ public static class RelationalPhysicalProjectionValues
         ArgumentNullException.ThrowIfNull(definition);
         try
         {
-            return definition.Type == PortablePhysicalType.Decimal
+            var converted = definition.Type == PortablePhysicalType.Decimal
                 ? ExactNumericLiteral.Parse(value).ToDecimal(
                     definition.Precision ?? throw new InvalidOperationException("A Decimal projection requires declared precision."),
                     definition.Scale ?? throw new InvalidOperationException("A Decimal projection requires declared scale."),
                     definition.LogicalName)
                 : ConvertScalar(value, definition.Type);
+            if (converted is string text && definition.Type == PortablePhysicalType.String)
+                PhysicalProjectionValueValidation.ValidateStringLength(text, definition);
+            return converted;
         }
         catch (Exception exception) when (exception is FormatException or OverflowException)
         {
@@ -157,7 +160,7 @@ public static class RelationalPhysicalProjectionValues
 
         try
         {
-            return definition.Type switch
+            var value = definition.Type switch
             {
                 PortablePhysicalType.String => element.ValueKind == JsonValueKind.String
                     ? element.GetString()
@@ -171,8 +174,12 @@ public static class RelationalPhysicalProjectionValues
                 PortablePhysicalType.Json => element.GetRawText(),
                 _ => throw new ArgumentOutOfRangeException(nameof(definition), definition.Type, null)
             };
+            if (value is string text && definition.Type == PortablePhysicalType.String)
+                PhysicalProjectionValueValidation.ValidateStringLength(text, definition);
+            return value;
         }
-        catch (Exception exception) when (exception is FormatException or InvalidOperationException or OverflowException)
+        catch (Exception exception) when (exception is (FormatException or InvalidOperationException or OverflowException) &&
+                                         exception is not PhysicalProjectionValueValidationException)
         {
             throw new InvalidDataException(
                 $"Canonical JSON path '{definition.Path}' cannot be converted to '{definition.Type}'.",

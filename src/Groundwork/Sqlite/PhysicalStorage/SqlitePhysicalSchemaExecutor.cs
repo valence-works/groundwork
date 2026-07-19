@@ -1140,7 +1140,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         var value = definition.DefaultValue;
         return definition.Type switch
         {
-            PortablePhysicalType.String or PortablePhysicalType.Guid or PortablePhysicalType.Json => SqlLiteral(value),
+            PortablePhysicalType.String => SqlLiteral((string)RelationalPhysicalProjectionValues.ConvertScalar(value, definition)),
+            PortablePhysicalType.Guid or PortablePhysicalType.Json => SqlLiteral(value),
             PortablePhysicalType.Int32 or PortablePhysicalType.Int64 =>
                 Convert.ToString(
                     RelationalPhysicalProjectionValues.ConvertScalar(value, definition.Type),

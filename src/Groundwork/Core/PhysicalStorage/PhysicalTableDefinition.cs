@@ -55,8 +55,9 @@ public sealed record PhysicalEvolutionMetadata(
 
 /// <summary>
 /// A rebuildable provider-native projection of one stable serialized path. Decimal projections
-/// require explicit total <see cref="Precision"/> and fractional <see cref="Scale"/>. DateTime
-/// projections represent explicitly offset UTC instants at 100ns tick precision.
+/// require explicit total <see cref="Precision"/> and fractional <see cref="Scale"/>. For String
+/// projections, <see cref="Length"/> is a maximum count of UTF-16 code units. DateTime projections
+/// represent explicitly offset UTC instants at 100ns tick precision.
 /// </summary>
 public sealed record ProjectedColumnDefinition(
     string LogicalName,

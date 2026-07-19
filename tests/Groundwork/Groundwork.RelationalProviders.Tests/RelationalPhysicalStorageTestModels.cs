@@ -29,6 +29,7 @@ internal static class RelationalPhysicalStorageTestModels
         PortablePhysicalType priorityType = PortablePhysicalType.Int32,
         int? priorityPrecision = null,
         int? priorityScale = null,
+        int? priorityLength = null,
         string? instance = null,
         IProviderPhysicalNameNormalizer? normalizer = null,
         bool categoryUnique = false,
@@ -68,6 +69,7 @@ internal static class RelationalPhysicalStorageTestModels
                 "priority",
                 "priority",
                 priorityType,
+                Length: priorityLength,
                 Precision: priorityPrecision,
                 Scale: priorityScale));
             if (includeLatestPerCategory)
