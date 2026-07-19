@@ -251,6 +251,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         if (query.LatestPerKeyPath is not null)
             return RenderLatestPerKeyPage(query, plan, built, route, PageReadLimit(query, plan), query.Skip ?? 0);
 
+        if (CanBoundLinkedProjection(route, plan))
+            return RenderBoundedLinkedPage(query, plan, route, PageReadLimit(query, plan));
+
         var parameters = built.Parameters
             .Concat(new[]
             {
@@ -273,6 +276,56 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             parameters,
             built.PredicateFieldIdentifiers,
             PageReadLimit(query, plan),
+            ProviderAppliedOrder(query, plan));
+    }
+
+    /// <summary>
+    /// Limits the linked projection before reading canonical documents.  The outer order is still
+    /// required because a relational join does not preserve the order of the bounded selection.
+    /// </summary>
+    private RelationalPhysicalQueryCommand RenderBoundedLinkedPage(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        int take)
+    {
+        var scope = store.ResolveQueryScope(query.DocumentKind);
+        var continuation = query.Continuation is null
+            ? null
+            : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
+        var lookup = Build(
+            query,
+            plan,
+            route,
+            requiresPrimaryLookup: false,
+            fixedScope: scope,
+            continuation: continuation);
+        var parameters = lookup.Parameters
+            .Concat(new[]
+            {
+                ("take", (object?)take),
+                ("skip", (object?)(plan.PagingSupport == QueryPagingSupport.Cursor ? 0 : query.Skip ?? 0))
+            })
+            .ToArray();
+        var limitedLookup = WithoutTerminator(store.ApplyOffsetPage(
+            $"SELECT l.* {lookup.FromAndWhere} {LinkedOrderBy(query, plan, route, "l")}",
+            store.P("take"),
+            store.P("skip")));
+        var selection = EnvelopeSelection(route);
+        if (plan.PagingSupport == QueryPagingSupport.Cursor)
+        {
+            selection += ", " + string.Join(
+                ", ",
+                DocumentQueryOrderResolver.Resolve(query, plan).Select(order => LinkedField(route, order.Field, "s")));
+        }
+        return new RelationalPhysicalQueryCommand(
+            $"SELECT {selection} FROM ({limitedLookup}) AS s " +
+            $"JOIN {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", null)} ON " +
+            store.ExactPhysicalIdentityJoin(LinkedPrimaryJoin(route, lookupOnly: false, linkedAlias: "s")) +
+            $" {LinkedOrderBy(query, plan, route, "s")};",
+            parameters,
+            lookup.PredicateFieldIdentifiers,
+            take,
             ProviderAppliedOrder(query, plan));
     }
 
@@ -373,7 +426,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 continuation: continuation),
             route);
 
-    private RelationalPhysicalQueryCommand BuildFirstCommand(
+    internal RelationalPhysicalQueryCommand BuildFirstCommand(
         DocumentQuery query,
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
@@ -383,6 +436,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         if (query.LatestPerKeyPath is not null)
             return RenderLatestPerKeyPage(query, plan, built, route, take: 1, skip: query.Skip ?? 0);
 
+        if (CanBoundLinkedProjection(route, plan))
+            return RenderBoundedLinkedPage(query, plan, route, take: 1);
+
         return new RelationalPhysicalQueryCommand(
             store.ApplyFirst($"SELECT {EnvelopeSelection(route)} {built.FromAndWhere} {OrderBy(query, plan)}"),
             built.Parameters,
@@ -391,13 +447,13 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             ProviderAppliedOrder(query, plan));
     }
 
-    private RelationalPhysicalQueryCommand BuildAnyCommand(
+    internal RelationalPhysicalQueryCommand BuildAnyCommand(
         DocumentQuery query,
         PhysicalQueryPlan plan,
         ExecutableStorageRoute route,
         DocumentScopeSelection scope)
     {
-        var built = Build(query, plan, route, requiresPrimaryLookup: true, fixedScope: scope);
+        var built = Build(query, plan, route, requiresPrimaryLookup: false, fixedScope: scope);
         return new RelationalPhysicalQueryCommand(
             store.ApplyFirst($"SELECT 1 {built.FromAndWhere}"),
             built.Parameters,
@@ -473,6 +529,9 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         int take,
         int skip)
     {
+        if (CanBoundLinkedProjection(route, plan))
+            return RenderBoundedLinkedLatestPerKeyPage(query, plan, route, take, skip);
+
         var order = DocumentQueryOrderResolver.Resolve(query, plan);
         var group = LatestPerKeyField(query, plan);
         var envelopeColumns = RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route);
@@ -511,6 +570,56 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             store.ApplyOffsetPage(select, store.P("take"), store.P("skip")),
             parameters,
             built.PredicateFieldIdentifiers
+                .Concat(order.Select(item => item.Field.Identifier))
+                .Append(group.Identifier)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray(),
+            take,
+            ProviderAppliedOrder(order));
+    }
+
+    private RelationalPhysicalQueryCommand RenderBoundedLinkedLatestPerKeyPage(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        int take,
+        int skip)
+    {
+        var scope = store.ResolveQueryScope(query.DocumentKind);
+        var continuation = query.Continuation is null
+            ? null
+            : DocumentQueryContinuationCodec.Decode(query.Continuation, query, plan, scope);
+        var lookup = Build(
+            query,
+            plan,
+            route,
+            requiresPrimaryLookup: false,
+            fixedScope: scope,
+            continuation: continuation);
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        var group = LatestPerKeyField(query, plan);
+        var rows = store.Q("groundwork_latest_rows");
+        var winnerOrder = string.Join(", ", order.Select(item =>
+            store.OrderPhysicalQueryExpression(LinkedField(route, item.Field, "l"), item.Direction)));
+        var pageOrder = string.Join(", ", order.Select(item =>
+            store.OrderPhysicalQueryExpression(LinkedField(route, item.Field, rows), item.Direction)));
+        var rank = store.Q("groundwork_latest_rank");
+        var winners = WithoutTerminator(store.ApplyOffsetPage(
+            $"SELECT {rows}.* FROM (SELECT l.*, ROW_NUMBER() OVER (PARTITION BY {LinkedField(route, group, "l")} ORDER BY {winnerOrder}) AS {rank} {lookup.FromAndWhere}) AS {rows} " +
+            $"WHERE {rank} = 1 ORDER BY {pageOrder}",
+            store.P("take"),
+            store.P("skip")));
+        var outerOrder = string.Join(", ", order.Select(item =>
+            store.OrderPhysicalQueryExpression(LinkedField(route, item.Field, "s"), item.Direction)));
+        return new RelationalPhysicalQueryCommand(
+            $"SELECT {EnvelopeSelection(route)} FROM ({winners}) AS s " +
+            $"JOIN {store.PhysicalQuerySource(route.PrimaryStorage.Name.Identifier, "p", null)} ON " +
+            store.ExactPhysicalIdentityJoin(LinkedPrimaryJoin(route, lookupOnly: false, linkedAlias: "s")) +
+            $" ORDER BY {outerOrder};",
+            lookup.Parameters
+                .Concat(new[] { ("take", (object?)take), ("skip", (object?)skip) })
+                .ToArray(),
+            lookup.PredicateFieldIdentifiers
                 .Concat(order.Select(item => item.Field.Identifier))
                 .Append(group.Identifier)
                 .Distinct(StringComparer.Ordinal)
@@ -628,14 +737,15 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
 
     private static IReadOnlyList<RelationalPhysicalIdentityJoinPart> LinkedPrimaryJoin(
         ExecutableStorageRoute route,
-        bool lookupOnly)
+        bool lookupOnly,
+        string linkedAlias = "l")
     {
         var relationship = route.LinkedRelationship!;
         var identityJoin = new List<RelationalPhysicalIdentityJoinPart>
         {
-            new(route.Envelope.DocumentKind.Identifier, "p", relationship.DocumentKind.Identifier, "l"),
-            new(route.Envelope.StorageScope.Identifier, "p", relationship.StorageScope.Identifier, "l"),
-            new(route.Envelope.Identity.LookupKey.Identifier, "p", relationship.Identity.LookupKey.Identifier, "l")
+            new(route.Envelope.DocumentKind.Identifier, "p", relationship.DocumentKind.Identifier, linkedAlias),
+            new(route.Envelope.StorageScope.Identifier, "p", relationship.StorageScope.Identifier, linkedAlias),
+            new(route.Envelope.Identity.LookupKey.Identifier, "p", relationship.Identity.LookupKey.Identifier, linkedAlias)
         };
         if (!lookupOnly)
         {
@@ -643,7 +753,7 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
                 route.Envelope.Identity.ComparisonKey.Identifier,
                 "p",
                 relationship.Identity.ComparisonKey.Identifier,
-                "l"));
+                linkedAlias));
         }
         return identityJoin;
     }
@@ -895,10 +1005,10 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
         }
     }
 
-    private string Field(PhysicalQueryField field)
+    private string Field(PhysicalQueryField field, string? alias = null)
     {
-        var alias = Alias(field);
-        var expression = $"{alias}.{store.Q(field.Identifier)}";
+        var resolvedAlias = alias ?? Alias(field);
+        var expression = $"{resolvedAlias}.{store.Q(field.Identifier)}";
         var value = field.Source == PhysicalQueryFieldSource.CanonicalJsonPath
             ? store.JsonValue(expression, field.Path)
             : expression;
@@ -913,14 +1023,59 @@ public class RelationalPhysicalDocumentQueryHandler : IPhysicalDocumentQueryHand
             PhysicalDocumentIdentityFieldPaths.Comparison or
             PhysicalDocumentIdentityFieldPaths.Lookup;
 
-    private string OrderBy(DocumentQuery query, PhysicalQueryPlan plan)
+    private string OrderBy(DocumentQuery query, PhysicalQueryPlan plan, string? alias = null)
     {
         var order = DocumentQueryOrderResolver.Resolve(query, plan);
         return order.Count == 0
             ? string.Empty
             : "ORDER BY " + string.Join(", ", order.Select(item =>
-                store.OrderPhysicalQueryExpression(Field(item.Field), item.Direction)));
+                store.OrderPhysicalQueryExpression(Field(item.Field, alias), item.Direction)));
     }
+
+    private static bool CanBoundLinkedProjection(ExecutableStorageRoute route, PhysicalQueryPlan plan) =>
+        plan.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary &&
+        PredicateFields(plan).All(field => field.Target == ExecutableStorageObjectRole.LinkedIndexStorage) &&
+        plan.Order.All(item => CanProjectFromLinkedProjection(route, item.Field));
+
+    private static bool CanProjectFromLinkedProjection(ExecutableStorageRoute route, PhysicalQueryField field) =>
+        field.Target == ExecutableStorageObjectRole.LinkedIndexStorage ||
+        field.Identifier == route.Envelope.Id.Identifier ||
+        field.Identifier == route.Envelope.Identity.ComparisonKey.Identifier ||
+        field.Identifier == route.Envelope.Identity.LookupKey.Identifier;
+
+    private string LinkedField(ExecutableStorageRoute route, PhysicalQueryField field, string alias)
+    {
+        var identifier = field.Target == ExecutableStorageObjectRole.LinkedIndexStorage
+            ? field.Identifier
+            : field.Identifier == route.Envelope.Id.Identifier
+                ? route.LinkedRelationship!.DocumentId.Identifier
+                : field.Identifier == route.Envelope.Identity.ComparisonKey.Identifier
+                    ? route.LinkedRelationship!.Identity.ComparisonKey.Identifier
+                    : field.Identifier == route.Envelope.Identity.LookupKey.Identifier
+                        ? route.LinkedRelationship!.Identity.LookupKey.Identifier
+                        : throw new InvalidOperationException(
+                            $"Linked projection cannot provide physical query field '{field.Path}'.");
+        var expression = $"{alias}.{store.Q(identifier)}";
+        var value = field.Source == PhysicalQueryFieldSource.CanonicalJsonPath
+            ? store.JsonValue(expression, field.Path)
+            : expression;
+        return store.NormalizeQueryExpression(value, field.Source, field.ValueKind);
+    }
+
+    private string LinkedOrderBy(
+        DocumentQuery query,
+        PhysicalQueryPlan plan,
+        ExecutableStorageRoute route,
+        string alias)
+    {
+        var order = DocumentQueryOrderResolver.Resolve(query, plan);
+        return order.Count == 0
+            ? string.Empty
+            : "ORDER BY " + string.Join(", ", order.Select(item =>
+                store.OrderPhysicalQueryExpression(LinkedField(route, item.Field, alias), item.Direction)));
+    }
+
+    private static string WithoutTerminator(string sql) => sql.TrimEnd().TrimEnd(';');
 
     private string EnvelopeSelection(ExecutableStorageRoute route) => string.Join(", ",
         RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route)
