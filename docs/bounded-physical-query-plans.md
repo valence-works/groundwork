@@ -42,7 +42,7 @@ A bounded declaration owns:
 
 - equality, inequality, membership, prefix/declared substring, and range operators;
 - explicit predicate paths for compound-prefix validation;
-- optional typed residual predicate paths that are not physical-index key fields;
+- optional typed residual predicate paths that do not add physical-index predicate-prefix evidence;
 - per-path compound sort directions;
 - offset or cursor/keyset paging;
 - document, count, any, and first result operations;
@@ -61,9 +61,11 @@ standalone equality comparison for every skipped prefix field; an absent prefix 
 a disjunction is rejected before dispatch. Every ordered plan appends the document identity as an
 ascending total-order tie-breaker.
 
-`BoundedQueryResidualPredicateField` declares an optional server-side filter without adding that
-path to the logical or physical index key. Residual paths remain closed and typed: each declares its
-allowed operations, participates in scale-bearing storage demand and physical-plan fingerprints,
+`BoundedQueryResidualPredicateField` declares an optional server-side filter without independently
+adding its path to the logical or physical index key or contributing predicate-prefix evidence.
+The same path may already be a sort-only logical and physical index key field for the query; it may
+not also be a resolved predicate-prefix field. Residual paths remain closed and typed: each declares
+its allowed operations, participates in scale-bearing storage demand and physical-plan fingerprints,
 and is validated against provider capabilities and projected physical types. Providers apply
 requested residual comparisons before count, any, first, paging limits, continuation generation,
 hydration, or materialization. Runtime requests may omit optional residual comparisons; a residual

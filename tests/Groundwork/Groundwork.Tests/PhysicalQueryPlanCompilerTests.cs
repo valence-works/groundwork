@@ -1656,6 +1656,31 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void ImplicitFirstIndexPredicateDoesNotCompileAsAResidualPredicate()
+    {
+        var logicalIndex = SortResidualIndex();
+        var fixture = CreateEntityFixture(
+            logicalIndex,
+            SortResidualQuery(logicalIndex, "definitionId"));
+        var invalidStorage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [SortResidualQuery(logicalIndex, "lastModifiedAt", useImplicitPredicate: true)]);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            invalidStorage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic =>
+            diagnostic.Code == "GW-QUERY-013" &&
+            diagnostic.Message.Contains("lastModifiedAt", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ResidualPredicateShapeParticipatesInThePlanFingerprint()
     {
         PlanningFixture Fixture(IReadOnlySet<PortableQueryOperation> residualOperations)
@@ -2762,7 +2787,8 @@ public sealed class PhysicalQueryPlanCompilerTests
 
     private static BoundedQueryDeclaration SortResidualQuery(
         LogicalIndexDeclaration logicalIndex,
-        string residualPath) =>
+        string residualPath,
+        bool useImplicitPredicate = false) =>
         new(
             "browse-definitions",
             logicalIndex.Identity,
@@ -2779,12 +2805,14 @@ public sealed class PhysicalQueryPlanCompilerTests
                 new BoundedQuerySortField("lastModifiedAt", PhysicalSortDirection.Descending),
                 new BoundedQuerySortField("definitionId", PhysicalSortDirection.Ascending)
             ],
-            predicateFields:
-            [
-                new BoundedQueryPredicateField(
-                    "lastModifiedAt",
-                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
-            ],
+            predicateFields: useImplicitPredicate
+                ? null
+                :
+                [
+                    new BoundedQueryPredicateField(
+                        "lastModifiedAt",
+                        new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal })
+                ],
             residualPredicateFields:
             [
                 new BoundedQueryResidualPredicateField(
