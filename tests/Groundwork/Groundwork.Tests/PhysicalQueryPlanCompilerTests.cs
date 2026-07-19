@@ -2293,6 +2293,152 @@ public sealed class PhysicalQueryPlanCompilerTests
     }
 
     [Fact]
+    public void OrderedCompoundRangeBoundaryAcceptsEqualityPrefixAndRequiresOnlyThatPrefix()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-tenant-category-created-id",
+            [
+                new IndexField("tenant"),
+                new IndexField("category"),
+                new IndexField("createdAt", IndexValueKind.DateTime),
+                new IndexField("itemId")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            "page-by-tenant-category-created",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan,
+                PortableQueryOperation.LessThanOrEqual
+            },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("itemId", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "tenant",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "createdAt",
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.GreaterThan,
+                        PortableQueryOperation.LessThanOrEqual
+                    })
+            ]);
+        var fixture = CreateEntityFixture(logicalIndex, query);
+
+        var plan = AssertPlan(PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            fixture.Storage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns)));
+
+        Assert.Equal(["tenant", "category"], plan.RequiredEqualityPrefixPaths);
+        Assert.Equal(["createdAt", "itemId"], plan.Order.Take(2).Select(order => order.Path));
+    }
+
+    [Fact]
+    public void OrderedCompoundRangeBoundaryRejectsNonEqualityBeforeTheOverlap()
+    {
+        var logicalIndex = new LogicalIndexDeclaration(
+            "by-tenant-category-created-id",
+            [
+                new IndexField("tenant"),
+                new IndexField("category"),
+                new IndexField("createdAt", IndexValueKind.DateTime),
+                new IndexField("itemId")
+            ],
+            IndexValueKind.Keyword,
+            false,
+            MissingValueBehavior.Excluded);
+        var validQuery = new BoundedQueryDeclaration(
+            "page-by-tenant-category-created",
+            logicalIndex.Identity,
+            new HashSet<PortableQueryOperation>
+            {
+                PortableQueryOperation.Equal,
+                PortableQueryOperation.GreaterThan,
+                PortableQueryOperation.LessThanOrEqual
+            },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Cursor,
+            BoundedQueryExecutionClass.ScaleBearing,
+            sortFields:
+            [
+                new BoundedQuerySortField("createdAt", PhysicalSortDirection.Ascending),
+                new BoundedQuerySortField("itemId", PhysicalSortDirection.Ascending)
+            ],
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "tenant",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "createdAt",
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.GreaterThan,
+                        PortableQueryOperation.LessThanOrEqual
+                    })
+            ]);
+        var fixture = CreateEntityFixture(logicalIndex, validQuery);
+        var invalidQuery = new BoundedQueryDeclaration(
+            validQuery.Identity,
+            validQuery.IndexIdentity,
+            validQuery.Operations,
+            validQuery.SortSupport,
+            validQuery.PagingSupport,
+            validQuery.ExecutionClass,
+            sortFields: validQuery.SortFields,
+            predicateFields:
+            [
+                new BoundedQueryPredicateField(
+                    "tenant",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.GreaterThan }),
+                new BoundedQueryPredicateField(
+                    "category",
+                    new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal }),
+                new BoundedQueryPredicateField(
+                    "createdAt",
+                    new HashSet<PortableQueryOperation>
+                    {
+                        PortableQueryOperation.GreaterThan,
+                        PortableQueryOperation.LessThanOrEqual
+                    })
+            ]);
+        var invalidStorage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            [invalidQuery]);
+
+        var result = PhysicalQueryPlanCompiler.Compile(
+            fixture.Route,
+            invalidStorage,
+            Capabilities(PhysicalQuerySourceKind.PrimaryProjectedColumns));
+
+        Assert.False(result.IsValid);
+        Assert.Empty(result.Plans);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-QUERY-006");
+    }
+
+    [Fact]
     public async Task RuntimeSuffixOrderingRequiresOneStandaloneEqualityForEverySkippedPrefix()
     {
         var logicalIndex = new LogicalIndexDeclaration(

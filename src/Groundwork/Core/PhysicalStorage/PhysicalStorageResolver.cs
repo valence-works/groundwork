@@ -1417,13 +1417,12 @@ public static class PhysicalStorageResolver
         LogicalIndexDeclaration index)
     {
         var indexPaths = index.Fields.Select(field => field.Path).ToArray();
-        var predicatePaths = BoundedQueryPredicateResolver.Resolve(query, index)
-            .Select(field => field.Path)
-            .ToArray();
+        var predicates = BoundedQueryPredicateResolver.Resolve(query, index).ToArray();
+        var predicatePaths = predicates.Select(field => field.Path).ToArray();
         if (!indexPaths.Take(predicatePaths.Length).SequenceEqual(predicatePaths))
             return false;
 
-        if (query.PredicateFields.Any(field =>
+        if (predicates.Any(field =>
                 field.Operations.Count == 0 ||
                 !field.Operations.IsSubsetOf(query.Operations)))
         {
@@ -1442,8 +1441,14 @@ public static class PhysicalStorageResolver
             return false;
 
         var sortPaths = query.SortFields.Select(field => field.Path).ToArray();
-        return indexPaths.Take(sortPaths.Length).SequenceEqual(sortPaths) ||
-               indexPaths.Skip(predicatePaths.Length).Take(sortPaths.Length).SequenceEqual(sortPaths);
+        return CompoundIndexOrdering.TryResolveSortStart(
+                   indexPaths,
+                   predicatePaths,
+                   predicates,
+                   sortPaths,
+                   out _,
+                   out var requiredEqualityPredicateCount) &&
+               CompoundIndexOrdering.AreSingleValueEqualities(predicates, requiredEqualityPredicateCount);
     }
 
     private static IReadOnlyList<PhysicalSortDirection> ResolveCanonicalSortDirections(
