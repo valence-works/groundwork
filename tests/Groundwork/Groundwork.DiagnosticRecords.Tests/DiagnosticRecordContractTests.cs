@@ -23,10 +23,10 @@ public abstract class DiagnosticRecordContractTests
         var second = new DiagnosticRecordDeploymentManifest(StorageManifest(), streams.AsEnumerable().Reverse().ToArray());
 
         Assert.Equal(["a", "z"], first.Streams.Select(stream => stream.Stream.Value));
-        Assert.NotEqual(first.Fingerprint, second.Fingerprint);
-        Assert.Equal(first.Fingerprint, new DiagnosticRecordDeploymentManifest(
+        Assert.NotEqual(first.DiagnosticFingerprint, second.DiagnosticFingerprint);
+        Assert.Equal(first.DiagnosticFingerprint, new DiagnosticRecordDeploymentManifest(
             StorageManifest(),
-            [Definition() with { Stream = new("a") }, Definition() with { Stream = new("z") }]).Fingerprint);
+            [Definition() with { Stream = new("a") }, Definition() with { Stream = new("z") }]).DiagnosticFingerprint);
     }
 
     [Fact]
@@ -50,7 +50,65 @@ public abstract class DiagnosticRecordContractTests
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await store.InspectAsync(new(new("tenant-b", "shell-a"), Definition().Stream)));
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await store.Handlers.Inspect.InspectAsync(new(new("tenant-b", "shell-a"), Definition().Stream)));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await store.Handlers.Inspect.InspectAsync(new(session.Scope, new("other-stream"))));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await session.OpenStoreAsync(new("undeclared")));
+    }
+
+    [Fact]
+    public async Task Session_factory_opens_each_stream_once_under_concurrency_and_disposes_one_lease()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var opens = 0;
+        var resource = new CountingResource();
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
+        {
+            Interlocked.Increment(ref opens);
+            entered.SetResult();
+            await release.Task;
+            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+        });
+        var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+
+        var stores = Enumerable.Range(0, 16)
+            .Select(_ => session.OpenStoreAsync(Definition().Stream).AsTask())
+            .ToArray();
+        await entered.Task;
+        release.SetResult();
+        await Task.WhenAll(stores);
+        await session.DisposeAsync();
+
+        Assert.Equal(1, opens);
+        Assert.Equal(1, resource.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Session_disposal_waits_for_an_in_flight_open_and_disposes_its_late_lease()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resource = new CountingResource();
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
+        {
+            entered.SetResult();
+            await release.Task;
+            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+        });
+        var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+        var open = session.OpenStoreAsync(Definition().Stream).AsTask();
+        await entered.Task;
+
+        var dispose = session.DisposeAsync().AsTask();
+        release.SetResult();
+        await dispose;
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => open);
+        Assert.Equal(1, resource.DisposeCount);
     }
 
     [Fact]
@@ -703,5 +761,16 @@ public abstract class DiagnosticRecordContractTests
 
         public ValueTask<DiagnosticTrimResult> TrimAsync(DiagnosticTrimRequest request, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class CountingResource : IAsyncDisposable
+    {
+        public int DisposeCount { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
     }
 }

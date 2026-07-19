@@ -6,8 +6,8 @@ using Groundwork.Core.SchemaEvolution;
 namespace Groundwork.DiagnosticRecords;
 
 /// <summary>
-/// Immutable provider-neutral deployment input. It composes the application's physical document
-/// storage declaration with the immutable diagnostic-record streams that share the same provider
+/// Provider-neutral deployment input. It composes the application's physical document storage
+/// declaration with immutable diagnostic-record stream snapshots that share the same provider
 /// deployment boundary. Diagnostic streams deliberately remain distinct from document units: a
 /// stream is an append/trim log with provider-owned operational ledgers, not a document table.
 /// </summary>
@@ -23,7 +23,7 @@ public sealed class DiagnosticRecordDeploymentManifest
             .OrderBy(stream => stream.Stream.Value, StringComparer.Ordinal)
             .ToArray());
         Validate();
-        Fingerprint = CreateFingerprint(Storage, Streams);
+        DiagnosticFingerprint = CreateFingerprint(Streams);
     }
 
     /// <summary>The physical document-storage declaration deployed beside the diagnostic streams.</summary>
@@ -33,10 +33,10 @@ public sealed class DiagnosticRecordDeploymentManifest
     public IReadOnlyList<DiagnosticRecordStreamDefinition> Streams { get; }
 
     /// <summary>
-    /// Deterministic deployment identity. It changes when the document manifest version or any
-    /// diagnostic stream's canonical physical definition changes, and contains no connection data.
+    /// Deterministic diagnostic-side identity. The compiled physical-schema target provides the
+    /// independent document-side identity when the schema tool builds a combined plan.
     /// </summary>
-    public string Fingerprint { get; }
+    public string DiagnosticFingerprint { get; }
 
     public static DiagnosticRecordDeploymentManifest Capture(
         StorageManifest storage,
@@ -61,19 +61,11 @@ public sealed class DiagnosticRecordDeploymentManifest
             DiagnosticRecordStreamDefinitionValidator.ValidateAndThrow(stream);
     }
 
-    private static string CreateFingerprint(
-        StorageManifest storage,
-        IReadOnlyList<DiagnosticRecordStreamDefinition> streams)
+    private static string CreateFingerprint(IReadOnlyList<DiagnosticRecordStreamDefinition> streams)
     {
-        // The physical target compiler is the canonical document-side fingerprint boundary. A
-        // manifest has no provider-neutral route fingerprint, so retain its stable identity and
-        // use the stream's already-canonical physical-schema snapshot for the diagnostic side.
         var parts = new List<string>
         {
-            "groundwork-diagnostic-record-deployment-manifest-v1",
-            storage.Identity.Value,
-            storage.Owner.Value,
-            storage.Version.Value
+            "groundwork-diagnostic-record-deployment-manifest-v2"
         };
         parts.AddRange(streams.Select(stream =>
         {
@@ -152,7 +144,9 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
         Func<DiagnosticRecordStreamDefinition, CancellationToken, ValueTask<DiagnosticRecordStoreLease>> openStoreAsync)
         : IDiagnosticRecordStoreSession
     {
-        private readonly Dictionary<string, DiagnosticRecordStoreLease> leases = new(StringComparer.Ordinal);
+        private readonly SemaphoreSlim gate = new(1, 1);
+        private readonly CancellationTokenSource lifetime = new();
+        private readonly Dictionary<string, Task<DiagnosticRecordStoreLease>> leases = new(StringComparer.Ordinal);
         private bool disposed;
 
         public DiagnosticStorageScope Scope { get; } = scope;
@@ -161,27 +155,81 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
             DiagnosticStreamId stream,
             CancellationToken cancellationToken = default)
         {
-            ObjectDisposedException.ThrowIf(disposed, this);
             var definition = deployment.Streams.SingleOrDefault(item =>
                 StringComparer.Ordinal.Equals(item.Stream.Value, stream.Value));
             if (definition is null)
                 throw new InvalidOperationException($"Diagnostic stream '{stream.Value}' is not declared by this deployment.");
-            if (!leases.TryGetValue(stream.Value, out var lease))
+
+            Task<DiagnosticRecordStoreLease> open;
+            await gate.WaitAsync(cancellationToken);
+            try
             {
-                lease = await openStoreAsync(definition, cancellationToken);
-                leases.Add(stream.Value, lease);
+                ObjectDisposedException.ThrowIf(disposed, this);
+                if (!leases.TryGetValue(stream.Value, out open!))
+                {
+                    open = openStoreAsync(definition, lifetime.Token).AsTask();
+                    leases.Add(stream.Value, open);
+                }
+            }
+            finally
+            {
+                gate.Release();
+            }
+
+            var lease = await open.WaitAsync(cancellationToken);
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                ObjectDisposedException.ThrowIf(disposed, this);
+            }
+            finally
+            {
+                gate.Release();
             }
             return new ScopeBoundDiagnosticRecordStore(lease.Store, Scope, stream);
         }
 
         public async ValueTask DisposeAsync()
         {
-            if (disposed)
-                return;
-            disposed = true;
-            foreach (var lease in leases.OrderByDescending(item => item.Key, StringComparer.Ordinal).Select(item => item.Value))
-                await lease.DisposeAsync();
-            leases.Clear();
+            Task<DiagnosticRecordStoreLease>[] opens;
+            await gate.WaitAsync();
+            try
+            {
+                if (disposed)
+                    return;
+                disposed = true;
+                lifetime.Cancel();
+                opens = leases.OrderByDescending(item => item.Key, StringComparer.Ordinal)
+                    .Select(item => item.Value)
+                    .ToArray();
+                leases.Clear();
+            }
+            finally
+            {
+                gate.Release();
+            }
+
+            var failures = new List<Exception>();
+            foreach (var open in opens)
+            {
+                try
+                {
+                    await (await open).DisposeAsync();
+                }
+                catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+                {
+                    // An in-flight open observed session disposal and never produced a lease.
+                }
+                catch (Exception exception)
+                {
+                    failures.Add(exception);
+                }
+            }
+            lifetime.Dispose();
+            if (failures.Count == 1)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+            if (failures.Count > 1)
+                throw new AggregateException("One or more diagnostic-record leases failed to dispose.", failures);
         }
     }
 }
@@ -194,12 +242,31 @@ public sealed class DiagnosticRecordStoreLease(IDiagnosticRecordStore store, IAs
     public ValueTask DisposeAsync() => resource?.DisposeAsync() ?? ValueTask.CompletedTask;
 }
 
-internal sealed class ScopeBoundDiagnosticRecordStore(
-    IDiagnosticRecordStore inner,
-    DiagnosticStorageScope scope,
-    DiagnosticStreamId stream) : IDiagnosticRecordStore
+internal sealed class ScopeBoundDiagnosticRecordStore :
+    IDiagnosticRecordStore,
+    IDiagnosticAppendHandler,
+    IDiagnosticQueryHandler,
+    IDiagnosticInspectHandler,
+    IDiagnosticTrimHandler
 {
-    public DiagnosticRecordStoreHandlers Handlers => inner.Handlers;
+    private readonly IDiagnosticRecordStore inner;
+    private readonly DiagnosticStorageScope scope;
+    private readonly DiagnosticStreamId stream;
+
+    public ScopeBoundDiagnosticRecordStore(
+        IDiagnosticRecordStore inner,
+        DiagnosticStorageScope scope,
+        DiagnosticStreamId stream)
+    {
+        this.inner = inner;
+        this.scope = scope;
+        this.stream = stream;
+        Handlers = new(this, this, this, this);
+    }
+
+    public DiagnosticRecordStoreHandlers Handlers { get; }
+
+    public DiagnosticQueryHandlerCapabilities Capabilities => inner.Handlers.Query.Capabilities;
 
     public ValueTask<DiagnosticAppendResult> AppendAsync(DiagnosticRecordBatch batch, CancellationToken cancellationToken = default)
     {

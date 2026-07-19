@@ -105,7 +105,8 @@ public static class PhysicalSchemaApplication
         TimeProvider? timeProvider = null,
         LegacyPhysicalSchemaHistoryPolicy legacyHistoryPolicy = LegacyPhysicalSchemaHistoryPolicy.RejectEntriesWithoutAppliedSnapshot,
         Func<PhysicalSchemaDiffPlan, PhysicalSchemaPlanAuthorization>? planAuthorization = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<PhysicalSchemaDiffPlan, CancellationToken, ValueTask<PhysicalSchemaPlanAuthorization>>? planAuthorizationAsync = null)
     {
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(executor);
@@ -132,7 +133,11 @@ public static class PhysicalSchemaApplication
             legacyHistoryPolicy);
         if (!plan.IsApplicable)
             return new PhysicalSchemaApplicationResult(PhysicalSchemaApplicationOutcome.Rejected, plan, null);
-        var authorization = planAuthorization?.Invoke(plan) ?? PhysicalSchemaPlanAuthorization.Allow;
+        if (planAuthorization is not null && planAuthorizationAsync is not null)
+            throw new ArgumentException("Only one physical-schema plan authorization callback can be configured.");
+        var authorization = planAuthorizationAsync is not null
+            ? await planAuthorizationAsync(plan, applicationToken)
+            : planAuthorization?.Invoke(plan) ?? PhysicalSchemaPlanAuthorization.Allow;
         if (!authorization.IsAuthorized)
         {
             return new PhysicalSchemaApplicationResult(

@@ -5,6 +5,37 @@ namespace Groundwork.MongoDb.DiagnosticRecords;
 
 public static class MongoDbDiagnosticRecordStoreFactory
 {
+    public static void ValidateDefinition(DiagnosticRecordStreamDefinition definition) =>
+        MongoDbDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+
+    public static async Task ValidateAdmissionAsync(
+        string connectionString,
+        string databaseName,
+        IReadOnlyList<DiagnosticRecordStreamDefinition> definitions,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
+        ArgumentNullException.ThrowIfNull(definitions);
+        foreach (var definition in definitions)
+            ValidateDefinition(definition);
+
+        var client = new MongoClient(connectionString);
+        try
+        {
+            var database = client.GetDatabase(databaseName);
+            if (!await MongoDbTransactionTopology.SupportsTransactionsAsync(database, cancellationToken))
+            {
+                throw new NotSupportedException(
+                    "MongoDB diagnostic records require a replica set or sharded cluster.");
+            }
+        }
+        finally
+        {
+            (client as IDisposable)?.Dispose();
+        }
+    }
+
     /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(
         string connectionString,

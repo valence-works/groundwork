@@ -79,6 +79,55 @@ public sealed class SchemaToolProviderParityTests
 
     [Fact]
     [Trait("Category", "SchemaToolProviderParity")]
+    public async Task SqlServer_invalid_diagnostic_bounds_fail_preflight_without_document_mutation()
+    {
+        await using var container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04").Build();
+        await container.StartAsync();
+        var connection = await CreateSqlServerDiagnosticDatabaseAsync(container.GetConnectionString());
+
+        var apply = await RunAsync(
+            "apply",
+            "sqlserver",
+            connection,
+            database: null,
+            typeof(SqlServerInvalidDiagnosticDeploymentManifestSource),
+            "--safe");
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, apply.ExitCode);
+        Assert.Contains(
+            apply.Report.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-003");
+        Assert.False(apply.Report.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal(0, await CountSqlServerAllUserTablesAsync(connection));
+    }
+
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
+    public async Task MongoDb_standalone_topology_fails_preflight_without_creating_locks_or_collections()
+    {
+        await using var container = new MongoDbBuilder("mongo:7.0.24").Build();
+        await container.StartAsync();
+        var connection = container.GetConnectionString();
+        const string database = "groundwork_schema_tool_standalone_rejection";
+
+        var apply = await RunAsync(
+            "apply",
+            "mongodb",
+            connection,
+            database,
+            typeof(DiagnosticDeploymentManifestSource),
+            "--safe");
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, apply.ExitCode);
+        Assert.Contains(
+            apply.Report.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-003");
+        Assert.False(apply.Report.GetProperty("targetMutated").GetBoolean());
+        Assert.Empty(await ReadMongoCollectionsAsync(connection, database));
+    }
+
+    [Fact]
+    [Trait("Category", "SchemaToolProviderParity")]
     public async Task SqlServer_cli_lifecycle_is_live_restart_safe_authorized_and_secret_safe()
     {
         await using var container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04").Build();
@@ -336,6 +385,19 @@ public sealed class SchemaToolProviderParityTests
             status.Report.GetProperty("planFingerprint").GetString());
         Assert.Equal("diagnostic-events", Assert.Single(
             plan.Report.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()).GetString());
+        Assert.Contains(
+            plan.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "RegisterDiagnosticStream" &&
+                         operation.GetProperty("subjectIdentity").GetString() == "diagnostic-events");
+        Assert.Contains(
+            plan.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() ==
+                         (provider == "mongodb" ? "CreateDiagnosticCollection" : "CreateDiagnosticTable") &&
+                         operation.GetProperty("subjectIdentity").GetString() ==
+                         "groundwork_diagnostic_append_operations");
+        Assert.Contains(
+            plan.Report.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "CreateDiagnosticIndex");
 
         var concurrentApplies = await Task.WhenAll(
             RunAsync("apply", provider, connection, database, source, "--safe"),
@@ -353,6 +415,10 @@ public sealed class SchemaToolProviderParityTests
         Assert.Equal(SchemaToolExitCodes.Success, restartApply.ExitCode);
         Assert.Equal("ready", restartStatus.Report.GetProperty("outcome").GetString());
         Assert.Equal("ready", restartApply.Report.GetProperty("outcome").GetString());
+        Assert.Contains(
+            restartApply.Report.GetProperty("appliedOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "RegisterDiagnosticStream" &&
+                         operation.GetProperty("subjectIdentity").GetString() == "diagnostic-events");
 
         await driftDiagnosticSchema();
         var drift = await RunAsync("validate", provider, connection, database, source);
@@ -405,6 +471,23 @@ public sealed class SchemaToolProviderParityTests
         command.CommandText = "SELECT COUNT(*) FROM sys.tables WHERE name LIKE 'groundwork_physical_schema_%';";
         return Convert.ToInt32(await command.ExecuteScalarAsync());
     }
+
+    private static async Task<int> CountSqlServerAllUserTablesAsync(string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sys.tables;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadMongoCollectionsAsync(
+        string connectionString,
+        string database) =>
+        await (await new MongoClient(connectionString)
+                .GetDatabase(database)
+                .ListCollectionNamesAsync())
+            .ToListAsync();
 
     private static async Task<int> CountPostgreSqlInfrastructureAsync(string connectionString)
     {
@@ -586,6 +669,30 @@ public sealed class SchemaToolProviderParityTests
                     new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal },
                     MaxStringBytes: 256)],
                 new DiagnosticRecordLimits(MaxRecordIdBytes: 128),
+                TimeSpan.Zero,
+                TimeSpan.FromMinutes(10),
+                TimeSpan.FromMinutes(10))]);
+    }
+
+    public sealed class SqlServerInvalidDiagnosticDeploymentManifestSource : IDiagnosticRecordDeploymentManifestSource
+    {
+        public StorageManifest CreateManifest() => SchemaToolProviderParityTests.CreateManifest(
+            "schema-tool-provider-invalid-diagnostic-tests",
+            "schema_tool_provider_invalid_diagnostic_documents");
+
+        public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+            CreateManifest(),
+            [new DiagnosticRecordStreamDefinition(
+                new("diagnostic-events"),
+                1,
+                "diagnostic_events",
+                [new DiagnosticFieldDefinition(
+                    "category",
+                    DiagnosticFieldType.String,
+                    DiagnosticFieldCardinality.Scalar,
+                    new HashSet<DiagnosticPredicateOperator> { DiagnosticPredicateOperator.Equal },
+                    MaxStringBytes: 256)],
+                new DiagnosticRecordLimits(MaxRecordIdBytes: 129),
                 TimeSpan.Zero,
                 TimeSpan.FromMinutes(10),
                 TimeSpan.FromMinutes(10))]);

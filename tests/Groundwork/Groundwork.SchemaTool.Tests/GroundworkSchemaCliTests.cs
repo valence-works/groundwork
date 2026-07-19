@@ -286,16 +286,35 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Equal(SchemaToolExitCodes.PendingChanges, planExit);
         Assert.Equal("diagnostic-events", Assert.Single(plan.RootElement
             .GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray()).GetString());
+        Assert.Contains(
+            plan.RootElement.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "CreateDiagnosticTable" &&
+                         operation.GetProperty("subjectIdentity").GetString() == "groundwork_diagnostic_append_operations");
+        Assert.Contains(
+            plan.RootElement.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "CreateDiagnosticIndex");
+        Assert.Contains(
+            plan.RootElement.GetProperty("pendingOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "RegisterDiagnosticStream" &&
+                         operation.GetProperty("subjectIdentity").GetString() == "diagnostic-events");
 
         var applyExit = await GroundworkSchemaCli.RunAsync(
-            Arguments("apply", database, source).Concat(["--safe"]).ToArray(), output, error);
+            Arguments("apply", database, source).Concat([
+                "--expected-plan", plan.RootElement.GetProperty("planFingerprint").GetString()!
+            ]).ToArray(), output, error);
         using var applied = ParseOutput();
         Assert.Equal(SchemaToolExitCodes.Success, applyExit);
         Assert.True(applied.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Equal(
+            plan.RootElement.GetProperty("planFingerprint").GetString(),
+            applied.RootElement.GetProperty("planFingerprint").GetString());
         Assert.Empty(applied.RootElement.GetProperty("diagnosticRecords").GetProperty("pendingStreams").EnumerateArray());
         Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_records"));
         Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_append_operations"));
         Assert.True(await TableExistsAsync(database, "groundwork_diagnostic_trim_operations"));
+        Assert.Contains(
+            applied.RootElement.GetProperty("appliedOperations").EnumerateArray(),
+            operation => operation.GetProperty("kind").GetString() == "RegisterDiagnosticStream");
 
         var validateExit = await GroundworkSchemaCli.RunAsync(Arguments("validate", database, source), output, error);
         using var validation = ParseOutput();
@@ -317,6 +336,57 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.Contains(
             drift.RootElement.GetProperty("diagnostics").EnumerateArray(),
             item => item.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-001");
+    }
+
+    [Fact]
+    public async Task Combined_plan_uses_the_compiled_document_target_when_same_version_storage_changes()
+    {
+        var firstDatabase = Path.Combine(directory, "combined-fingerprint-a.db");
+        var secondDatabase = Path.Combine(directory, "combined-fingerprint-b.db");
+
+        var firstExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("plan", firstDatabase, typeof(DiagnosticDeploymentManifestSource)),
+            output,
+            error);
+        using var first = ParseOutput();
+        var secondExit = await GroundworkSchemaCli.RunAsync(
+            Arguments("plan", secondDatabase, typeof(ChangedDocumentDiagnosticDeploymentManifestSource)),
+            output,
+            error);
+        using var second = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, firstExit);
+        Assert.Equal(SchemaToolExitCodes.PendingChanges, secondExit);
+        Assert.Equal(
+            first.RootElement.GetProperty("diagnosticRecords").GetProperty("fingerprint").GetString(),
+            second.RootElement.GetProperty("diagnosticRecords").GetProperty("fingerprint").GetString());
+        Assert.NotEqual(
+            first.RootElement.GetProperty("planFingerprint").GetString(),
+            second.RootElement.GetProperty("planFingerprint").GetString());
+    }
+
+    [Fact]
+    public async Task Apply_reports_incomplete_state_when_diagnostic_materialization_fails_after_document_apply()
+    {
+        var database = Path.Combine(directory, "combined-incomplete.db");
+        var exit = await GroundworkSchemaCli.RunWithDiagnosticApplyAsync(
+            Arguments("apply", database, typeof(DiagnosticDeploymentManifestSource))
+                .Concat(["--safe"])
+                .ToArray(),
+            output,
+            error,
+            (_, _, _, _, _) => Task.FromException(
+                new InvalidOperationException("injected second-stage failure")));
+        using var report = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.ExecutionFailed, exit);
+        Assert.Equal("incomplete", report.RootElement.GetProperty("outcome").GetString());
+        Assert.True(report.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Contains(
+            report.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-004");
+        Assert.True(await TableExistsAsync(database, "schema_tool_documents"));
+        Assert.False(await TableExistsAsync(database, "groundwork_diagnostic_records"));
     }
 
     [Fact]
@@ -788,6 +858,15 @@ public sealed class GroundworkSchemaCliTests : IDisposable
                 TimeSpan.FromMinutes(10))]);
     }
 
+    public sealed class ChangedDocumentDiagnosticDeploymentManifestSource : IDiagnosticRecordDeploymentManifestSource
+    {
+        public StorageManifest CreateManifest() => CreateTestManifest(physicalTableName: "schema_tool_documents_changed");
+
+        public DiagnosticRecordDeploymentManifest CreateDeploymentManifest() => new(
+            CreateManifest(),
+            new DiagnosticDeploymentManifestSource().CreateDeploymentManifest().Streams);
+    }
+
     public sealed class AuthorizationManifestSource : IPhysicalSchemaManifestSource
     {
         public StorageManifest CreateManifest() => CreateTestManifest(
@@ -813,7 +892,8 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         PhysicalEvolutionMetadata? evolution = null,
         ProjectionRebuildMode rebuildMode = ProjectionRebuildMode.FromCanonicalJson,
         string manifestVersion = "1",
-        bool includePriority = false)
+        bool includePriority = false,
+        string physicalTableName = "schema_tool_documents")
     {
         var columns = new List<ProjectedColumnDefinition>
         {
@@ -827,7 +907,7 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         if (includePriority)
             columns.Add(new ProjectedColumnDefinition("priority", "priority", PortablePhysicalType.Int32));
         var definition = PhysicalTableDefinition.PhysicalEntityTable(
-            "schema_tool_documents",
+            physicalTableName,
             columns,
             indexes:
             [

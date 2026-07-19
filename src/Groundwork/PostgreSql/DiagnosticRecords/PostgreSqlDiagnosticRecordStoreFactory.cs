@@ -8,6 +8,9 @@ namespace Groundwork.PostgreSql.DiagnosticRecords;
 
 public static class PostgreSqlDiagnosticRecordStoreFactory
 {
+    public static void ValidateDefinition(DiagnosticRecordStreamDefinition definition) =>
+        PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+
     /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
     {
