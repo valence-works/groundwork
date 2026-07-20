@@ -8,12 +8,16 @@ public sealed class PhysicalDocumentMutationSelectorEvidence
     public PhysicalDocumentMutationSelectorEvidence(
         ExecutableStorageObjectRole target,
         ProviderPhysicalObjectName storageObject,
-        ProviderPhysicalObjectName index,
+        ProviderPhysicalObjectName? index,
+        string observedStorageObjectIdentifier,
         string observedIndexIdentifier)
     {
         Target = target;
         StorageObject = storageObject ?? throw new ArgumentNullException(nameof(storageObject));
-        Index = index ?? throw new ArgumentNullException(nameof(index));
+        Index = index;
+        ObservedStorageObjectIdentifier = PhysicalDocumentQueryExplanation.RequireValue(
+            observedStorageObjectIdentifier,
+            nameof(observedStorageObjectIdentifier));
         ObservedIndexIdentifier = PhysicalDocumentQueryExplanation.RequireValue(
             observedIndexIdentifier,
             nameof(observedIndexIdentifier));
@@ -21,7 +25,10 @@ public sealed class PhysicalDocumentMutationSelectorEvidence
 
     public ExecutableStorageObjectRole Target { get; }
     public ProviderPhysicalObjectName StorageObject { get; }
-    public ProviderPhysicalObjectName Index { get; }
+    public ProviderPhysicalObjectName? Index { get; }
+
+    /// <summary>The storage-object identifier read from provider-native evidence.</summary>
+    public string ObservedStorageObjectIdentifier { get; }
 
     /// <summary>The index identifier read from the provider-native plan, never inferred from the declaration.</summary>
     public string ObservedIndexIdentifier { get; }
@@ -49,8 +56,6 @@ public sealed class PhysicalDocumentMutationExplanation
         NativePlan = PhysicalDocumentQueryExplanation.RequireValue(nativePlan, nameof(nativePlan));
         RenderedCommand = string.IsNullOrWhiteSpace(renderedCommand) ? null : renderedCommand;
         ArgumentNullException.ThrowIfNull(selectors);
-        if (selectors.Count == 0)
-            throw new ArgumentException("At least one observed mutation selector is required.", nameof(selectors));
         Selectors = Array.AsReadOnly(selectors.ToArray());
     }
 
@@ -92,3 +97,7 @@ public delegate Task<PhysicalDocumentMutationExplanation> PhysicalDocumentMutati
     DocumentMutation mutation,
     PhysicalMutationPlan plan,
     CancellationToken cancellationToken);
+
+public delegate string PhysicalDocumentMutationInvocationFingerprintResolver(
+    DocumentMutation mutation,
+    PhysicalMutationPlan plan);

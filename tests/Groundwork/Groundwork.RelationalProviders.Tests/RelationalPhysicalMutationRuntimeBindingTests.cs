@@ -13,6 +13,83 @@ namespace Groundwork.RelationalProviders.Tests;
 public sealed class RelationalPhysicalMutationRuntimeBindingTests
 {
     [Theory]
+    [InlineData("postgresql", "wrong-target")]
+    [InlineData("postgresql", "wrong-index")]
+    [InlineData("postgresql", "missing-primary")]
+    [InlineData("sqlserver", "wrong-target")]
+    [InlineData("sqlserver", "wrong-index")]
+    [InlineData("sqlserver", "missing-primary")]
+    public void Native_mutation_plan_inspector_fails_closed_on_target_or_index_drift(
+        string provider,
+        string drift)
+    {
+        var fixture = Create(provider, PhysicalStorageForm.DedicatedDocumentTable);
+        var route = fixture.Model.Target.Routes.Single();
+        var storage = fixture.Model.Manifest.StorageUnits.Single().PhysicalStorage!;
+        var plan = PhysicalMutationPlanCompiler.Compile(
+                route,
+                storage,
+                RelationalPhysicalQueryRuntime.Capabilities(fixture.Provider, provider))
+            .Plans.Single(candidate => candidate.MutationIdentity == "revoke-pending");
+        var primary = drift == "wrong-target"
+            ? "wrong_primary"
+            : route.PrimaryStorage.Name.Identifier;
+        var linkedIndex = drift == "wrong-index"
+            ? "wrong_index"
+            : plan.Predicate.IndexName!.Identifier;
+        var includePrimary = drift != "missing-primary";
+
+        if (provider == "postgresql")
+        {
+            var nodes = new List<Dictionary<string, object?>>();
+            if (includePrimary)
+            {
+                nodes.Add(new Dictionary<string, object?>
+                {
+                    ["Node Type"] = "Index Scan",
+                    ["Relation Name"] = primary,
+                    ["Index Name"] = "primary_identity_index"
+                });
+            }
+            nodes.Add(new Dictionary<string, object?>
+            {
+                ["Node Type"] = "Index Scan",
+                ["Relation Name"] = route.LinkedIndexStorage!.Name.Identifier,
+                ["Index Name"] = linkedIndex
+            });
+            var content = System.Text.Json.JsonSerializer.Serialize(new object[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["Plan"] = new Dictionary<string, object?>
+                    {
+                        ["Node Type"] = "Nested Loop",
+                        ["Plans"] = nodes
+                    }
+                }
+            });
+            Assert.Throws<InvalidOperationException>(() =>
+                PostgreSqlNativeMutationPlanInspector.Inspect(
+                    new RelationalPhysicalNativeQueryPlan("postgresql-json", content),
+                    plan,
+                    route));
+        }
+        else
+        {
+            var primaryNode = includePrimary
+                ? $"""<RelOp PhysicalOp="Index Seek"><Object Table="[{primary}]" Index="[primary_identity_index]" /></RelOp>"""
+                : string.Empty;
+            var content =
+                $"""<ShowPlanXML><BatchSequence><Batch><Statements><StmtSimple><QueryPlan>{primaryNode}<RelOp PhysicalOp="Index Seek"><Object Table="[{route.LinkedIndexStorage!.Name.Identifier}]" Index="[{linkedIndex}]" /></RelOp></QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>""";
+            Assert.Throws<InvalidOperationException>(() =>
+                SqlServerNativeMutationPlanInspector.Inspect(
+                    new RelationalPhysicalNativeQueryPlan("sqlserver-statistics-xml", content),
+                    plan,
+                    route));
+        }
+    }
+
+    [Theory]
     [InlineData("sqlserver")]
     [InlineData("postgresql")]
     public void Provider_runtime_rejects_a_manifest_from_another_store_before_io(string provider)

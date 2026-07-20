@@ -37,12 +37,60 @@ public sealed class SqliteBoundedMutationTests
 
         Assert.Equal(plan, evidence.Plan);
         Assert.Equal("sqlite-query-plan", evidence.NativePlanFormat);
-        var selector = Assert.Single(evidence.Selectors);
-        Assert.Equal(plan.Predicate.LookupObject, selector.StorageObject);
-        Assert.Equal(plan.Predicate.IndexName, selector.Index);
-        Assert.Equal(plan.Predicate.IndexName!.Identifier, selector.ObservedIndexIdentifier);
-        Assert.Contains(selector.Index.Identifier, evidence.NativePlan, StringComparison.Ordinal);
-        Assert.Contains(selector.StorageObject.Identifier, evidence.RenderedCommand, StringComparison.Ordinal);
+        Assert.Equal(2, evidence.Selectors.Count);
+        var primary = evidence.Selectors.Single(selector =>
+            selector.Target == ExecutableStorageObjectRole.PrimaryStorage);
+        var linked = evidence.Selectors.Single(selector =>
+            selector.Target == ExecutableStorageObjectRole.LinkedIndexStorage);
+        Assert.Equal(plan.Predicate.PrimaryObject, primary.StorageObject);
+        Assert.Equal(plan.Predicate.LookupObject, linked.StorageObject);
+        Assert.Null(primary.Index);
+        Assert.Equal(plan.Predicate.IndexName, linked.Index);
+        Assert.Equal(plan.Predicate.IndexName!.Identifier, linked.ObservedIndexIdentifier);
+        Assert.Contains(linked.Index!.Identifier, evidence.NativePlan, StringComparison.Ordinal);
+        Assert.Contains(linked.StorageObject.Identifier, evidence.RenderedCommand, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("wrong-target")]
+    [InlineData("wrong-storage")]
+    [InlineData("wrong-index")]
+    [InlineData("missing-primary")]
+    public void Native_plan_inspector_fails_closed_on_target_or_index_drift(string drift)
+    {
+        var (manifest, target) = CreateModel();
+        var route = target.Routes.Single();
+        var storage = manifest.StorageUnits.Single().PhysicalStorage!;
+        var plan = PhysicalMutationPlanCompiler.Compile(
+                route,
+                storage,
+                SqlitePhysicalQueryRuntime.Capabilities(target.Provider))
+            .Plans.Single(candidate => candidate.MutationIdentity == "prune-by-category");
+        var primaryTarget = drift == "wrong-target" ? "x" : "p";
+        var linkedIndex = drift == "wrong-index" ? "wrong_index" : plan.Predicate.IndexName!.Identifier;
+        var primary = drift == "missing-primary"
+            ? string.Empty
+            : $"SEARCH {primaryTarget} USING INDEX primary_identity_index (storage_scope=?)";
+        var content = string.Join(
+            Environment.NewLine,
+            new[]
+            {
+                $"SEARCH l USING INDEX {linkedIndex} (category=?)",
+                primary
+            }.Where(line => line.Length != 0));
+        var primaryStorage = drift == "wrong-storage"
+            ? "wrong_primary"
+            : route.PrimaryStorage.Name.Identifier;
+        var rendered =
+            $"SELECT * FROM \"{route.LinkedIndexStorage!.Name.Identifier}\" AS l " +
+            $"JOIN \"{primaryStorage}\" p ON 1 = 1;";
+
+        Assert.Throws<InvalidOperationException>(() =>
+            SqliteNativeMutationPlanInspector.Inspect(
+                rendered,
+                new RelationalPhysicalNativeQueryPlan("sqlite-query-plan", content),
+                plan,
+                route));
     }
 
     [Fact]

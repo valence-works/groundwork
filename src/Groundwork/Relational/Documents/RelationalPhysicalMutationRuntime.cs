@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
@@ -19,6 +20,22 @@ internal sealed record RelationalPhysicalMutationRuntimeContext(
     string HandlerPrefix,
     IReadOnlySet<IndexValueKind>? CanonicalJsonValueKinds = null);
 
+internal sealed record RelationalPhysicalNativeMutationSelector(
+    ExecutableStorageObjectRole Target,
+    string ObservedStorageObjectIdentifier,
+    string ObservedIndexIdentifier);
+
+internal sealed record RelationalPhysicalNativeMutationPlan(
+    string Format,
+    string Content,
+    IReadOnlyList<RelationalPhysicalNativeMutationSelector> Selectors);
+
+internal delegate Task<RelationalPhysicalNativeMutationPlan> RelationalPhysicalMutationExplainExecutor(
+    DbCommand command,
+    PhysicalMutationPlan plan,
+    ExecutableStorageRoute route,
+    CancellationToken cancellationToken);
+
 /// <summary>Builds a certified bounded-mutation runtime over the shared relational execution kernel.</summary>
 internal static class RelationalPhysicalMutationRuntime
 {
@@ -27,7 +44,7 @@ internal static class RelationalPhysicalMutationRuntime
     internal static IBoundedDocumentMutationStore Create(
         RelationalPhysicalMutationRuntimeContext context,
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null,
-        RelationalPhysicalQueryExplainExecutor? explain = null) =>
+        RelationalPhysicalMutationExplainExecutor? explain = null) =>
         CreateCore(
             context,
             intercept is null ? null : (point, _, _, _) => intercept(point),
@@ -44,7 +61,7 @@ internal static class RelationalPhysicalMutationRuntime
     private static IBoundedDocumentMutationStore CreateCore(
         RelationalPhysicalMutationRuntimeContext context,
         RelationalPhysicalMutationInterceptor? intercept,
-        RelationalPhysicalQueryExplainExecutor? explain)
+        RelationalPhysicalMutationExplainExecutor? explain)
     {
         ArgumentNullException.ThrowIfNull(context);
         var runtime = BuildRuntime(context);
@@ -67,7 +84,9 @@ internal static class RelationalPhysicalMutationRuntime
             runtime.Capabilities,
             handlers,
             explain is null ? null : (mutation, plan, cancellationToken) =>
-                ExplainAsync(context, mutation, plan, explain, cancellationToken));
+                ExplainAsync(context, mutation, plan, explain, cancellationToken),
+            explain is null ? null : (mutation, plan) =>
+                InvocationFingerprint(context.Store, mutation, plan));
     }
 
     internal static RelationalPhysicalQueryCommand BuildSelectionCommand(
@@ -102,7 +121,7 @@ internal static class RelationalPhysicalMutationRuntime
         RelationalPhysicalMutationRuntimeContext context,
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
-        RelationalPhysicalQueryExplainExecutor explain,
+        RelationalPhysicalMutationExplainExecutor explain,
         CancellationToken cancellationToken)
     {
         var runtime = BuildRuntime(context);
@@ -118,26 +137,42 @@ internal static class RelationalPhysicalMutationRuntime
             await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, selection.CommandText);
             foreach (var (name, value) in selection.Parameters)
                 context.Store.AddPhysicalParameter(command, name, value);
-            var native = await explain(command, ct);
-            NativeMutationPlanEvidence.Validate(plan, native.Content, selection.CommandText);
+            var native = await explain(command, plan, context.Route, ct);
             return new PhysicalDocumentMutationExplanation(
                 plan,
                 BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey),
                 native.Format,
                 native.Content,
-                [new PhysicalDocumentMutationSelectorEvidence(
-                    Target(plan),
-                    plan.Predicate.LookupObject,
-                    plan.Predicate.IndexName!,
-                    plan.Predicate.IndexName!.Identifier)],
+                native.Selectors.Select(selector => new PhysicalDocumentMutationSelectorEvidence(
+                    selector.Target,
+                    selector.Target == ExecutableStorageObjectRole.PrimaryStorage
+                        ? plan.Predicate.PrimaryObject
+                        : plan.Predicate.LookupObject,
+                    ExpectedIndex(plan, selector.Target),
+                    selector.ObservedStorageObjectIdentifier,
+                    selector.ObservedIndexIdentifier)).ToArray(),
                 selection.CommandText);
         }, cancellationToken);
     }
 
-    private static ExecutableStorageObjectRole Target(PhysicalMutationPlan plan) =>
+    private static ProviderPhysicalObjectName? ExpectedIndex(
+        PhysicalMutationPlan plan,
+        ExecutableStorageObjectRole target) =>
+        target == ExecutableStorageObjectRole.PrimaryStorage &&
         plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
-            ? ExecutableStorageObjectRole.LinkedIndexStorage
-            : ExecutableStorageObjectRole.PrimaryStorage;
+            ? null
+            : plan.Predicate.IndexName;
+
+    private static string InvocationFingerprint(
+        RelationalPhysicalDocumentStore store,
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan)
+    {
+        var scope = store.ResolveMutationScope(mutation.DocumentKind);
+        if (scope.AcrossScopes || scope.StorageKey is null)
+            throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
+        return BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey);
+    }
 
     private static (RelationalPhysicalDocumentMutationHandler Handler, PhysicalMutationPlan Plan) ResolveCommandHandler(
         RelationalPhysicalDocumentStore store,
@@ -270,19 +305,4 @@ internal static class RelationalPhysicalMutationRuntime
         StorageUnitPhysicalStorage Storage,
         PhysicalQueryPlannerCapabilities Capabilities,
         PhysicalMutationPlanCompilationResult Compilation);
-}
-
-internal static class NativeMutationPlanEvidence
-{
-    internal static void Validate(PhysicalMutationPlan plan, string nativePlan, string renderedCommand)
-    {
-        if (string.IsNullOrWhiteSpace(nativePlan) || plan.Predicate.IndexName is null ||
-            !nativePlan.Contains(plan.Predicate.IndexName.Identifier, StringComparison.Ordinal) ||
-            !renderedCommand.Contains(plan.Predicate.LookupObject.Identifier, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                $"Provider-native mutation plan for '{plan.MutationIdentity}' did not use declared target " +
-                $"'{plan.Predicate.LookupObject.Identifier}' and index '{plan.Predicate.IndexName?.Identifier ?? "<none>"}'.");
-        }
-    }
 }

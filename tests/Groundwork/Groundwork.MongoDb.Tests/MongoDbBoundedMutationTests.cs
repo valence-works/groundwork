@@ -98,7 +98,7 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
         Assert.Equal("mongodb-query-planner", evidence.NativePlanFormat);
         Assert.Contains("winningPlan", evidence.NativePlan, StringComparison.Ordinal);
         Assert.All(evidence.Selectors, selector =>
-            Assert.Equal(selector.Index.Identifier, selector.ObservedIndexIdentifier));
+            Assert.Equal(selector.Index!.Identifier, selector.ObservedIndexIdentifier));
     }
 
     [Fact]

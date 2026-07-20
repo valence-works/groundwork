@@ -1139,6 +1139,56 @@ public sealed class PhysicalQueryPlanCompilerTests
             "prune-by-stimulus-type",
             "missing-evidence",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))])));
+
+        var request = new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "fingerprint-request",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))]);
+        var drifted = new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "fingerprint-request",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "timer"))]);
+        var primary = new PhysicalDocumentMutationSelectorEvidence(
+            ExecutableStorageObjectRole.PrimaryStorage,
+            plan.Predicate.PrimaryObject,
+            plan.Predicate.IndexName!,
+            plan.Predicate.PrimaryObject.Identifier,
+            plan.Predicate.IndexName!.Identifier);
+        PhysicalMutationDocumentStore EvidenceRuntime(
+            DocumentMutation fingerprintSource,
+            IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> selectors) =>
+            new(
+                fixture.Route,
+                storage,
+                capabilities,
+                [handler],
+                (_, admitted, _) => Task.FromResult(new PhysicalDocumentMutationExplanation(
+                    admitted,
+                    BoundedMutationRequestFingerprint.Create(fingerprintSource, admitted, "scope-a"),
+                    "test-plan",
+                    "native-plan",
+                    selectors)),
+                (mutation, admitted) => BoundedMutationRequestFingerprint.Create(mutation, admitted, "scope-a"));
+
+        Assert.Equal(plan, (await EvidenceRuntime(request, [primary]).ExplainAsync(request)).Plan);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            EvidenceRuntime(drifted, [primary]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            EvidenceRuntime(request, []).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            EvidenceRuntime(request, [primary, primary]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            EvidenceRuntime(request,
+            [
+                new PhysicalDocumentMutationSelectorEvidence(
+                    ExecutableStorageObjectRole.LinkedIndexStorage,
+                    plan.Predicate.PrimaryObject,
+                    plan.Predicate.IndexName!,
+                    plan.Predicate.PrimaryObject.Identifier,
+                    plan.Predicate.IndexName!.Identifier)
+            ]).ExplainAsync(request));
         await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(new DocumentMutation(
             "workflowTriggerBinding",
             "undeclared-prune",
@@ -1149,6 +1199,73 @@ public sealed class PhysicalQueryPlanCompilerTests
             "operation-3",
             [DocumentQueryClause.Of(DocumentQueryComparison.Equal("undeclaredPath", "http"))])));
         Assert.Equal(1, handler.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task LinkedMutationEvidenceRequiresExactlyPrimaryAndLinkedSelectors()
+    {
+        var fixture = CreateFixture(
+            PhysicalStorageForm.DedicatedDocumentTable,
+            BoundedQueryExecutionClass.ScaleBearing);
+        var storage = new StorageUnitPhysicalStorage(
+            fixture.Storage.ProvisioningMode,
+            fixture.Storage.Policy,
+            fixture.Storage.LogicalIndexes,
+            fixture.Storage.BoundedQueries,
+            fixture.Storage.NameOverrides,
+            boundedMutations:
+            [
+                new BoundedMutationDeclaration(
+                    "prune-by-stimulus-type",
+                    "list-by-stimulus-type",
+                    BoundedMutationAction.Delete())
+            ]);
+        var capabilities = Capabilities(PhysicalQuerySourceKind.LinkedIndex);
+        var plan = Assert.Single(PhysicalMutationPlanCompiler.Compile(
+            fixture.Route,
+            storage,
+            capabilities).Plans);
+        var handler = new RecordingMutationHandler(
+            plan.HandlerIdentity,
+            PhysicalQuerySourceKind.LinkedIndex,
+            [new PhysicalMutationHandlerCertification(plan)]);
+        var request = new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "linked-evidence",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))]);
+        var primary = new PhysicalDocumentMutationSelectorEvidence(
+            ExecutableStorageObjectRole.PrimaryStorage,
+            plan.Predicate.PrimaryObject,
+            index: null,
+            plan.Predicate.PrimaryObject.Identifier,
+            "provider-primary-index");
+        var linked = new PhysicalDocumentMutationSelectorEvidence(
+            ExecutableStorageObjectRole.LinkedIndexStorage,
+            plan.Predicate.LookupObject,
+            plan.Predicate.IndexName!,
+            plan.Predicate.LookupObject.Identifier,
+            plan.Predicate.IndexName!.Identifier);
+        PhysicalMutationDocumentStore Runtime(
+            IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> selectors) =>
+            new(
+                fixture.Route,
+                storage,
+                capabilities,
+                [handler],
+                (_, admitted, _) => Task.FromResult(new PhysicalDocumentMutationExplanation(
+                    admitted,
+                    BoundedMutationRequestFingerprint.Create(request, admitted, "scope-a"),
+                    "test-plan",
+                    "native-plan",
+                    selectors)),
+                (mutation, admitted) => BoundedMutationRequestFingerprint.Create(mutation, admitted, "scope-a"));
+
+        Assert.Equal(2, (await Runtime([primary, linked]).ExplainAsync(request)).Selectors.Count);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Runtime([primary]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Runtime([linked]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Runtime([primary, linked, linked]).ExplainAsync(request));
     }
 
     [Fact]

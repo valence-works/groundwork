@@ -333,7 +333,7 @@ public abstract class DocumentIdentityAcceptanceConformance
             : ExecutableStorageObjectRole.PrimaryStorage;
         var selector = Assert.Single(evidence.Selectors.Where(item => item.Target == target));
         Assert.Equal(plan.Predicate.LookupObject, selector.StorageObject);
-        Assert.Equal(selector.Index.Identifier, selector.ObservedIndexIdentifier);
+        Assert.Equal(selector.Index!.Identifier, selector.ObservedIndexIdentifier);
     }
 }
 

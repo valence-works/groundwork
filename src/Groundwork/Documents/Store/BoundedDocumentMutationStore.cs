@@ -226,12 +226,12 @@ public sealed class PhysicalMutationSelectorCertification
     public PhysicalMutationSelectorCertification(
         ExecutableStorageObjectRole target,
         ProviderPhysicalObjectName storageObject,
-        ProviderPhysicalObjectName index,
+        ProviderPhysicalObjectName? index,
         IReadOnlyDictionary<string, string> fieldIdentifiers)
     {
         Target = target;
         StorageObject = storageObject ?? throw new ArgumentNullException(nameof(storageObject));
-        Index = index ?? throw new ArgumentNullException(nameof(index));
+        Index = index;
         FieldIdentifiers = (fieldIdentifiers ?? throw new ArgumentNullException(nameof(fieldIdentifiers)))
             .ToFrozenDictionary(StringComparer.Ordinal);
     }
@@ -240,7 +240,7 @@ public sealed class PhysicalMutationSelectorCertification
 
     public ProviderPhysicalObjectName StorageObject { get; }
 
-    public ProviderPhysicalObjectName Index { get; }
+    public ProviderPhysicalObjectName? Index { get; }
 
     public IReadOnlyDictionary<string, string> FieldIdentifiers { get; }
 }
@@ -398,18 +398,25 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
     private readonly IReadOnlyDictionary<string, PhysicalMutationPlan> plans;
     private readonly IReadOnlyDictionary<string, IPhysicalDocumentMutationHandler> handlers;
     private readonly PhysicalDocumentMutationExplainExecutor? explain;
+    private readonly PhysicalDocumentMutationInvocationFingerprintResolver? invocationFingerprint;
 
     public PhysicalMutationDocumentStore(
         ExecutableStorageRoute route,
         StorageUnitPhysicalStorage storage,
         PhysicalQueryPlannerCapabilities predicateCapabilities,
         IReadOnlyList<IPhysicalDocumentMutationHandler> handlers,
-        PhysicalDocumentMutationExplainExecutor? explain = null)
+        PhysicalDocumentMutationExplainExecutor? explain = null,
+        PhysicalDocumentMutationInvocationFingerprintResolver? invocationFingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(route);
         ArgumentNullException.ThrowIfNull(storage);
         ArgumentNullException.ThrowIfNull(predicateCapabilities);
         ArgumentNullException.ThrowIfNull(handlers);
+        if ((explain is null) != (invocationFingerprint is null))
+        {
+            throw new ArgumentException(
+                "Provider-native mutation explanation and invocation fingerprint resolution must be configured together.");
+        }
 
         var byIdentity = handlers
             .GroupBy(handler => handler.Identity, StringComparer.Ordinal)
@@ -453,6 +460,7 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
         plans = compilation.Plans.ToFrozenDictionary(plan => plan.MutationIdentity, StringComparer.Ordinal);
         this.handlers = byIdentity.ToFrozenDictionary(group => group.Key, group => group.Value[0], StringComparer.Ordinal);
         this.explain = explain;
+        this.invocationFingerprint = invocationFingerprint;
     }
 
     public Task<BoundedMutationResult> ExecuteAsync(
@@ -497,29 +505,90 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
         var evidence = await explain(mutation, plan, cancellationToken);
         if (!ReferenceEquals(evidence.Plan, plan) && !evidence.Plan.Equals(plan))
             throw new InvalidOperationException("Provider-native mutation evidence returned a different admitted plan.");
-        ValidateEvidence(plan, evidence);
+        var expectedFingerprint = invocationFingerprint!(mutation, plan);
+        if (!string.Equals(
+                evidence.RuntimeInvocationFingerprint,
+                expectedFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' returned a different invocation fingerprint.");
+        }
+        ValidateEvidence(plan, handlers[plan.HandlerIdentity], evidence);
         return evidence;
     }
 
-    private static void ValidateEvidence(PhysicalMutationPlan plan, PhysicalDocumentMutationExplanation evidence)
+    private static void ValidateEvidence(
+        PhysicalMutationPlan plan,
+        IPhysicalDocumentMutationHandler handler,
+        PhysicalDocumentMutationExplanation evidence)
     {
         if (plan.Predicate.IndexName is null)
         {
             throw new InvalidOperationException(
                 $"Bounded mutation '{plan.MutationIdentity}' has no declared physical index.");
         }
-        var target = plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
-            ? ExecutableStorageObjectRole.LinkedIndexStorage
-            : ExecutableStorageObjectRole.PrimaryStorage;
-        var observed = evidence.Selectors.SingleOrDefault(candidate => candidate.Target == target);
-        if (observed is null ||
-            observed.StorageObject != plan.Predicate.LookupObject ||
-            !string.Equals(observed.ObservedIndexIdentifier, observed.Index.Identifier, StringComparison.Ordinal))
+        var certification = handler.Certifications.Single(candidate => candidate.Certifies(plan));
+        var expected = ExpectedSelectors(plan, certification.Execution);
+        if (evidence.Selectors.Count != expected.Count ||
+            evidence.Selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
         {
             throw new InvalidOperationException(
-                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not prove declared target " +
-                $"'{plan.Predicate.LookupObject.Identifier}' and its declared physical index.");
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not return the exact certified selector set.");
         }
+        foreach (var selector in expected)
+        {
+            var observed = evidence.Selectors.SingleOrDefault(candidate => candidate.Target == selector.Target);
+            if (observed is null ||
+                observed.StorageObject != selector.StorageObject ||
+                observed.Index != selector.Index ||
+                !string.Equals(
+                    observed.ObservedStorageObjectIdentifier,
+                    selector.StorageObject.Identifier,
+                    StringComparison.Ordinal) ||
+                (selector.Index is not null &&
+                 !string.Equals(
+                     observed.ObservedIndexIdentifier,
+                     selector.Index.Identifier,
+                     StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException(
+                    $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not prove certified selector " +
+                    $"'{selector.Target}/{selector.StorageObject.Identifier}/{selector.Index?.Identifier ?? "<provider-owned>"}'.");
+            }
+        }
+    }
+
+    private static IReadOnlyList<PhysicalMutationSelectorCertification> ExpectedSelectors(
+        PhysicalMutationPlan plan,
+        PhysicalMutationExecutionCertification? execution)
+    {
+        if (execution is not null)
+        {
+            return execution.Linked is null
+                ? [execution.Primary]
+                : [execution.Primary, execution.Linked];
+        }
+
+        var selectors = new List<PhysicalMutationSelectorCertification>
+        {
+            new(
+                ExecutableStorageObjectRole.PrimaryStorage,
+                plan.Predicate.PrimaryObject,
+                plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+                    ? null
+                    : plan.Predicate.IndexName,
+                new Dictionary<string, string>())
+        };
+        if (plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+        {
+            selectors.Add(new PhysicalMutationSelectorCertification(
+                ExecutableStorageObjectRole.LinkedIndexStorage,
+                plan.Predicate.LookupObject,
+                plan.Predicate.IndexName!,
+                new Dictionary<string, string>()));
+        }
+        return selectors;
     }
 
     private static bool SupportsProfile(
