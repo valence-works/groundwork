@@ -456,7 +456,7 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     }
 
     [Fact]
-    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    public async Task Bounded_mutation_explains_the_exact_execution_stages_with_the_declared_physical_index()
     {
         var model = RelationalPhysicalStorageTestModels.Create(
             PhysicalStorageForm.PhysicalEntityTable,
@@ -482,15 +482,29 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
             model.Target.Provider,
             SqlServerGroundworkCapabilities.Provider.Name,
             "sqlserver");
-        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+        var request = new DocumentMutation("configurationDocument", "revoke-pending", "explain");
+        var evidence = await SqlServerPhysicalMutationRuntime
+            .Create(store, model.Manifest, route, model.Target.Provider)
+            .ExplainAsync(request);
+        var executed = new List<(string Identity, string CommandText)>();
+        var execution = RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
             mutationContext,
-            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
-
-        var plan = await ExplainAsync(selection, route);
+            (identity, command) =>
+            {
+                executed.Add((identity, command.CommandText));
+                return ValueTask.CompletedTask;
+            });
 
         var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
-        Assert.Contains(expectedIndex, plan, StringComparison.Ordinal);
-        Assert.Contains("Index Seek", plan, StringComparison.Ordinal);
+        Assert.Equal(BoundedMutationStatus.Completed, (await execution.ExecuteAsync(request)).Status);
+        Assert.Equal(
+            evidence.Commands.Select(command => (command.Identity, command.RenderedCommand!)),
+            executed);
+        Assert.All(evidence.Commands, command =>
+        {
+            Assert.Contains(expectedIndex, command.NativePlan, StringComparison.Ordinal);
+            Assert.Contains("Index Seek", command.NativePlan, StringComparison.Ordinal);
+        });
     }
 
     [Fact]

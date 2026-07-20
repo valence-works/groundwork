@@ -7,6 +7,7 @@ using Groundwork.Core.Indexing;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Documents.Store;
+using Groundwork.Provider.Relational;
 using Groundwork.Relational.Physicalization;
 
 namespace Groundwork.Relational.Documents;
@@ -34,6 +35,7 @@ internal delegate Task<RelationalPhysicalNativeMutationPlan> RelationalPhysicalM
     DbCommand command,
     PhysicalMutationPlan plan,
     ExecutableStorageRoute route,
+    IReadOnlyList<ExecutableStorageObjectRole> selectors,
     CancellationToken cancellationToken);
 
 /// <summary>Builds a certified bounded-mutation runtime over the shared relational execution kernel.</summary>
@@ -48,6 +50,7 @@ internal static class RelationalPhysicalMutationRuntime
         CreateCore(
             context,
             intercept is null ? null : (point, _, _, _) => intercept(point),
+            selectionObserver: null,
             explain);
 
     internal static IBoundedDocumentMutationStore CreateWithInterceptor(
@@ -56,11 +59,22 @@ internal static class RelationalPhysicalMutationRuntime
         CreateCore(
             context,
             intercept ?? throw new ArgumentNullException(nameof(intercept)),
+            selectionObserver: null,
+            explain: null);
+
+    internal static IBoundedDocumentMutationStore CreateWithSelectionObserver(
+        RelationalPhysicalMutationRuntimeContext context,
+        RelationalPhysicalMutationSelectionObserver selectionObserver) =>
+        CreateCore(
+            context,
+            intercept: null,
+            selectionObserver ?? throw new ArgumentNullException(nameof(selectionObserver)),
             explain: null);
 
     private static IBoundedDocumentMutationStore CreateCore(
         RelationalPhysicalMutationRuntimeContext context,
         RelationalPhysicalMutationInterceptor? intercept,
+        RelationalPhysicalMutationSelectionObserver? selectionObserver,
         RelationalPhysicalMutationExplainExecutor? explain)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -76,7 +90,8 @@ internal static class RelationalPhysicalMutationRuntime
                 registration.Key,
                 context.Store,
                 certifications,
-                intercept);
+                intercept,
+                selectionObserver);
         }).ToArray();
         return new PhysicalMutationDocumentStore(
             context.Route,
@@ -131,27 +146,84 @@ internal static class RelationalPhysicalMutationRuntime
         var scope = context.Store.ResolveMutationScope(mutation.DocumentKind);
         if (scope.AcrossScopes || scope.StorageKey is null)
             throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
-        var selection = handler.BuildSelectionCommand(mutation, plan, scope);
+        var stages = handler.BuildSelectionStages(mutation, plan, scope);
         return context.Store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, selection.CommandText);
-            foreach (var (name, value) in selection.Parameters)
-                context.Store.AddPhysicalParameter(command, name, value);
-            var native = await explain(command, plan, context.Route, ct);
-            return new PhysicalDocumentMutationExplanation(
-                plan,
-                BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey),
-                native.Format,
-                native.Content,
-                native.Selectors.Select(selector => new PhysicalDocumentMutationSelectorEvidence(
-                    selector.Target,
-                    selector.Target == ExecutableStorageObjectRole.PrimaryStorage
-                        ? plan.Predicate.PrimaryObject
-                        : plan.Predicate.LookupObject,
-                    ExpectedIndex(plan, selector.Target),
-                    selector.ObservedStorageObjectIdentifier,
-                    selector.ObservedIndexIdentifier)).ToArray(),
-                selection.CommandText);
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await handler.PrepareSelectionStageExplanationAsync(connection, transaction, ct);
+            Exception? primaryFailure = null;
+            try
+            {
+                var commands = new List<PhysicalDocumentMutationCommandExplanation>();
+                foreach (var stage in stages)
+                {
+                    await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
+                        connection,
+                        stage.Command.CommandText,
+                        transaction);
+                    foreach (var (name, value) in stage.Command.Parameters)
+                        context.Store.AddPhysicalParameter(command, name, value);
+                    var native = await explain(command, plan, context.Route, stage.Selectors, ct);
+                    commands.Add(new PhysicalDocumentMutationCommandExplanation(
+                        stage.Kind,
+                        stage.Identity,
+                        native.Format,
+                        native.Content,
+                        native.Selectors.Select(selector => new PhysicalDocumentMutationSelectorEvidence(
+                            selector.Target,
+                            selector.Target == ExecutableStorageObjectRole.PrimaryStorage
+                                ? plan.Predicate.PrimaryObject
+                                : plan.Predicate.LookupObject,
+                            ExpectedIndex(plan, selector.Target),
+                            selector.ObservedStorageObjectIdentifier,
+                            selector.ObservedIndexIdentifier)).ToArray(),
+                        stage.Command.CommandText));
+                }
+                return new PhysicalDocumentMutationExplanation(
+                    plan,
+                    BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey),
+                    commands);
+            }
+            catch (Exception exception)
+            {
+                primaryFailure = exception;
+                throw;
+            }
+            finally
+            {
+                Exception? cleanupFailure = null;
+                try
+                {
+                    await handler.CleanupSelectionStageExplanationAsync(
+                        connection,
+                        transaction,
+                        CancellationToken.None);
+                }
+                catch (Exception exception)
+                {
+                    cleanupFailure = exception;
+                }
+                try
+                {
+                    await transaction.RollbackAsync(CancellationToken.None);
+                }
+                catch (Exception exception)
+                {
+                    if (cleanupFailure is null)
+                        cleanupFailure = exception;
+                    else
+                        RelationalCleanupFailures.Attach(cleanupFailure, exception);
+                }
+                finally
+                {
+                    if (cleanupFailure is not null)
+                    {
+                        if (primaryFailure is null)
+                            throw cleanupFailure;
+                        RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+                    }
+                }
+            }
         }, cancellationToken);
     }
 

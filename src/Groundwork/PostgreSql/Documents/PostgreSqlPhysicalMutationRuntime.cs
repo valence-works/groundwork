@@ -29,10 +29,11 @@ public static class PostgreSqlPhysicalMutationRuntime
         DbCommand command,
         PhysicalMutationPlan plan,
         ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole> selectors,
         CancellationToken cancellationToken)
     {
         var native = await PostgreSqlPhysicalQueryRuntime.ExplainAsync(command, cancellationToken);
-        return PostgreSqlNativeMutationPlanInspector.Inspect(native, plan, route);
+        return PostgreSqlNativeMutationPlanInspector.Inspect(native, plan, route, selectors);
     }
 }
 
@@ -41,12 +42,14 @@ internal static class PostgreSqlNativeMutationPlanInspector
     internal static RelationalPhysicalNativeMutationPlan Inspect(
         RelationalPhysicalNativeQueryPlan native,
         PhysicalMutationPlan plan,
-        ExecutableStorageRoute route)
+        ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole>? selectors = null)
     {
         using var document = JsonDocument.Parse(native.Content);
         var accesses = new List<(string StorageObject, string Index)>();
         Visit(document.RootElement[0].GetProperty("Plan"), null, accesses);
-        var selectors = ExpectedTargets(plan, route)
+        var observedSelectors = ExpectedTargets(plan, route)
+            .Where(expected => selectors is null || selectors.Contains(expected.Target))
             .Select(expected =>
             {
                 var matches = accesses.Where(access =>
@@ -61,7 +64,7 @@ internal static class PostgreSqlNativeMutationPlanInspector
                     matches[0].Index);
             })
             .ToArray();
-        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, selectors);
+        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, observedSelectors);
     }
 
     private static void Visit(

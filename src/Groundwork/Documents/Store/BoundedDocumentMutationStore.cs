@@ -530,31 +530,72 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
         }
         var certification = handler.Certifications.Single(candidate => candidate.Certifies(plan));
         var expected = ExpectedSelectors(plan, certification.Execution);
-        if (evidence.Selectors.Count != expected.Count ||
-            evidence.Selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
+        var commandStamps = evidence.Commands.Select(command => (command.Kind, command.Identity)).ToArray();
+        (PhysicalDocumentMutationCommandKind Kind, string Identity)[] expectedCommandStamps =
+            commandStamps.Any(command =>
+                command.Identity == PhysicalDocumentMutationCommandIdentities.CandidateDiscovery)
+            ?
+            [
+                (
+                    PhysicalDocumentMutationCommandKind.CandidateDiscovery,
+                    PhysicalDocumentMutationCommandIdentities.CandidateDiscovery),
+                (
+                    PhysicalDocumentMutationCommandKind.PredicateRecheck,
+                    PhysicalDocumentMutationCommandIdentities.PredicateRecheck)
+            ]
+            :
+            [
+                (
+                    PhysicalDocumentMutationCommandKind.Selection,
+                    PhysicalDocumentMutationCommandIdentities.Selection)
+            ];
+        if (!commandStamps.SequenceEqual(expectedCommandStamps))
         {
             throw new InvalidOperationException(
-                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not return the exact certified selector set.");
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not return the exact selector command sequence.");
         }
-        foreach (var selector in expected)
+        foreach (var command in evidence.Commands)
         {
-            var observed = evidence.Selectors.SingleOrDefault(candidate => candidate.Target == selector.Target);
-            if (observed is null ||
-                observed.StorageObject != selector.StorageObject ||
-                observed.Index != selector.Index ||
-                !string.Equals(
-                    observed.ObservedStorageObjectIdentifier,
-                    selector.StorageObject.Identifier,
-                    StringComparison.Ordinal) ||
-                (selector.Index is not null &&
-                 !string.Equals(
-                     observed.ObservedIndexIdentifier,
-                     selector.Index.Identifier,
-                     StringComparison.Ordinal)))
+            if (command.Kind != PhysicalDocumentMutationCommandKind.Selection &&
+                string.IsNullOrWhiteSpace(command.RenderedCommand))
             {
                 throw new InvalidOperationException(
-                    $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not prove certified selector " +
-                    $"'{selector.Target}/{selector.StorageObject.Identifier}/{selector.Index?.Identifier ?? "<provider-owned>"}'.");
+                    $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not stamp " +
+                    "the exact rendered execution-stage command.");
+            }
+            var expectedForCommand = command.Identity == PhysicalDocumentMutationCommandIdentities.CandidateDiscovery &&
+                                     plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+                ? expected.Where(selector =>
+                    selector.Target == ExecutableStorageObjectRole.LinkedIndexStorage).ToArray()
+                : expected;
+            if (command.Selectors.Count != expectedForCommand.Count ||
+                command.Selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
+            {
+                throw new InvalidOperationException(
+                    $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not return " +
+                    "the exact certified selector set.");
+            }
+            foreach (var selector in expectedForCommand)
+            {
+                var observed = command.Selectors.SingleOrDefault(candidate => candidate.Target == selector.Target);
+                if (observed is null ||
+                    observed.StorageObject != selector.StorageObject ||
+                    observed.Index != selector.Index ||
+                    !string.Equals(
+                        observed.ObservedStorageObjectIdentifier,
+                        selector.StorageObject.Identifier,
+                        StringComparison.Ordinal) ||
+                    (selector.Index is not null &&
+                     !string.Equals(
+                         observed.ObservedIndexIdentifier,
+                         selector.Index.Identifier,
+                         StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not prove " +
+                        $"certified selector '{selector.Target}/{selector.StorageObject.Identifier}/" +
+                        $"{selector.Index?.Identifier ?? "<provider-owned>"}'.");
+                }
             }
         }
     }

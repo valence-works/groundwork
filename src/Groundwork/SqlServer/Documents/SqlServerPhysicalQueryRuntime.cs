@@ -56,7 +56,7 @@ public static class SqlServerPhysicalQueryRuntime
         Exception? primaryFailure = null;
         try
         {
-            await SetStatisticsXmlAsync(connection, enabled: true, cancellationToken);
+            await SetStatisticsXmlAsync(connection, command.Transaction, enabled: true, cancellationToken);
             await InvokeAsync(hooks.AfterEnableAcknowledged, cancellationToken);
             await InvokeAsync(hooks.BeforeRead, command, cancellationToken);
             var plans = await ExecuteAndReadPlansAsync(command, cancellationToken);
@@ -75,7 +75,7 @@ public static class SqlServerPhysicalQueryRuntime
             try
             {
                 await InvokeAsync(hooks.BeforeDisable, CancellationToken.None);
-                await SetStatisticsXmlAsync(connection, enabled: false, CancellationToken.None);
+                await SetStatisticsXmlAsync(connection, command.Transaction, enabled: false, CancellationToken.None);
             }
             catch (Exception cleanupFailure)
             {
@@ -120,10 +120,12 @@ public static class SqlServerPhysicalQueryRuntime
 
     private static async Task SetStatisticsXmlAsync(
         DbConnection connection,
+        DbTransaction? transaction,
         bool enabled,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = $"SET STATISTICS XML {(enabled ? "ON" : "OFF")};";
         await command.ExecuteNonQueryAsync(cancellationToken);
     }

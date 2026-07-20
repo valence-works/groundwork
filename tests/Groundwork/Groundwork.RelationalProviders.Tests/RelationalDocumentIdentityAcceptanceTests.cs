@@ -340,7 +340,20 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
                 ? PostgreSqlPhysicalMutationRuntime.Create(documents, manifest, route, target.Provider)
                 : null,
             query => ExplainQueryAsync(documents, manifest, target, route, query),
-            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
+            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation),
+            observer => RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    documents,
+                    manifest,
+                    route,
+                    target.Provider,
+                    PostgreSqlGroundworkCapabilities.Provider.Name,
+                    "postgresql"),
+                (identity, command) =>
+                {
+                    observer(identity, command.CommandText);
+                    return ValueTask.CompletedTask;
+                }));
     }
 
     internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(
@@ -506,7 +519,20 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
                 ? SqlServerPhysicalMutationRuntime.Create(documents, manifest, route, target.Provider)
                 : null,
             query => ExplainQueryAsync(documents, manifest, target, route, query),
-            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
+            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation),
+            observer => RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    documents,
+                    manifest,
+                    route,
+                    target.Provider,
+                    SqlServerGroundworkCapabilities.Provider.Name,
+                    "sqlserver"),
+                (identity, command) =>
+                {
+                    observer(identity, command.CommandText);
+                    return ValueTask.CompletedTask;
+                }));
     }
 
     internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(

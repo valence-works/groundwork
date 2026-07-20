@@ -43,11 +43,12 @@ public static class SqlitePhysicalMutationRuntime
         DbCommand command,
         PhysicalMutationPlan plan,
         ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole> selectors,
         CancellationToken cancellationToken)
     {
         var renderedCommand = command.CommandText;
         var native = await SqlitePhysicalQueryRuntime.ExplainAsync(command, cancellationToken);
-        return SqliteNativeMutationPlanInspector.Inspect(renderedCommand, native, plan, route);
+        return SqliteNativeMutationPlanInspector.Inspect(renderedCommand, native, plan, route, selectors);
     }
 
     internal static async Task<string> ExplainAsync(
@@ -96,7 +97,7 @@ public static class SqlitePhysicalMutationRuntime
 internal static partial class SqliteNativeMutationPlanInspector
 {
     [GeneratedRegex(
-        @"^(?:SEARCH|SCAN)\s+(?<target>\S+)(?:\s+USING\s+(?:COVERING\s+)?INDEX\s+(?<index>\S+))?",
+        @"^(?<operation>SEARCH|SCAN)\s+(?<target>\S+)(?:\s+USING\s+(?:COVERING\s+)?INDEX\s+(?<index>\S+))?",
         RegexOptions.CultureInvariant)]
     private static partial Regex AccessPattern();
 
@@ -109,12 +110,14 @@ internal static partial class SqliteNativeMutationPlanInspector
         string renderedCommand,
         RelationalPhysicalNativeQueryPlan native,
         PhysicalMutationPlan plan,
-        ExecutableStorageRoute route)
+        ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole>? selectors = null)
     {
         var accesses = native.Content.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
             .Select(line => AccessPattern().Match(line))
             .Where(match => match.Success)
             .Select(match => (
+                Operation: match.Groups["operation"].Value,
                 Target: match.Groups["target"].Value,
                 Index: match.Groups["index"].Success ? match.Groups["index"].Value : null))
             .ToArray();
@@ -124,12 +127,14 @@ internal static partial class SqliteNativeMutationPlanInspector
                 StorageObject: match.Groups["storage"].Value.Replace("\"\"", "\"", StringComparison.Ordinal)))
             .GroupBy(binding => binding.Alias, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Select(binding => binding.StorageObject).ToArray(), StringComparer.Ordinal);
-        var selectors = ExpectedTargets(plan, route)
+        var observedSelectors = ExpectedTargets(plan, route)
+            .Where(expected => selectors is null || selectors.Contains(expected.Target))
             .Select(expected =>
             {
                 var alias = expected.Target == ExecutableStorageObjectRole.PrimaryStorage ? "p" : "l";
                 var access = accesses.SingleOrDefault(candidate => candidate.Target == alias);
                 if (access == default ||
+                    access.Operation != "SEARCH" ||
                     string.IsNullOrWhiteSpace(access.Index) ||
                     (expected.Index is not null &&
                      !string.Equals(access.Index, expected.Index.Identifier, StringComparison.Ordinal)) ||
@@ -147,7 +152,7 @@ internal static partial class SqliteNativeMutationPlanInspector
                     access.Index);
             })
             .ToArray();
-        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, selectors);
+        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, observedSelectors);
     }
 
     private static IReadOnlyList<(

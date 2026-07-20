@@ -1266,6 +1266,48 @@ public sealed class PhysicalQueryPlanCompilerTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => Runtime([linked]).ExplainAsync(request));
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             Runtime([primary, linked, linked]).ExplainAsync(request));
+
+        PhysicalDocumentMutationCommandExplanation Command(
+            string identity,
+            IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> selectors) =>
+            new(
+                identity == PhysicalDocumentMutationCommandIdentities.CandidateDiscovery
+                    ? PhysicalDocumentMutationCommandKind.CandidateDiscovery
+                    : PhysicalDocumentMutationCommandKind.PredicateRecheck,
+                identity,
+                "test-plan",
+                "native-plan",
+                selectors,
+                $"SELECT /* {identity} */");
+        PhysicalMutationDocumentStore StagedRuntime(
+            IReadOnlyList<PhysicalDocumentMutationCommandExplanation> commands) =>
+            new(
+                fixture.Route,
+                storage,
+                capabilities,
+                [handler],
+                (_, admitted, _) => Task.FromResult(new PhysicalDocumentMutationExplanation(
+                    admitted,
+                    BoundedMutationRequestFingerprint.Create(request, admitted, "scope-a"),
+                    commands)),
+                (mutation, admitted) => BoundedMutationRequestFingerprint.Create(mutation, admitted, "scope-a"));
+        var discovery = Command(
+            PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+            [linked]);
+        var recheck = Command(
+            PhysicalDocumentMutationCommandIdentities.PredicateRecheck,
+            [primary, linked]);
+
+        Assert.Equal(2, (await StagedRuntime([discovery, recheck]).ExplainAsync(request)).Commands.Count);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            StagedRuntime([discovery]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            StagedRuntime([recheck, discovery]).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            StagedRuntime([
+                Command(PhysicalDocumentMutationCommandIdentities.CandidateDiscovery, [primary]),
+                recheck
+            ]).ExplainAsync(request));
     }
 
     [Fact]

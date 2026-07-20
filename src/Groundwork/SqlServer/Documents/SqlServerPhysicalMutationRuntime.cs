@@ -30,10 +30,11 @@ public static class SqlServerPhysicalMutationRuntime
         DbCommand command,
         PhysicalMutationPlan plan,
         ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole> selectors,
         CancellationToken cancellationToken)
     {
         var native = await SqlServerPhysicalQueryRuntime.ExplainAsync(command, cancellationToken);
-        return SqlServerNativeMutationPlanInspector.Inspect(native, plan, route);
+        return SqlServerNativeMutationPlanInspector.Inspect(native, plan, route, selectors);
     }
 }
 
@@ -45,7 +46,8 @@ internal static partial class SqlServerNativeMutationPlanInspector
     internal static RelationalPhysicalNativeMutationPlan Inspect(
         RelationalPhysicalNativeQueryPlan native,
         PhysicalMutationPlan plan,
-        ExecutableStorageRoute route)
+        ExecutableStorageRoute route,
+        IReadOnlyList<ExecutableStorageObjectRole>? selectors = null)
     {
         var document = XDocument.Parse(native.Content);
         var accesses = document.Descendants()
@@ -58,7 +60,8 @@ internal static partial class SqlServerNativeMutationPlanInspector
             .Where(access => access.StorageObject is not null && access.Index is not null)
             .Select(access => (access.StorageObject!, access.Index!))
             .ToArray();
-        var selectors = ExpectedTargets(plan, route)
+        var observedSelectors = ExpectedTargets(plan, route)
+            .Where(expected => selectors is null || selectors.Contains(expected.Target))
             .Select(expected =>
             {
                 var matches = accesses.Where(access =>
@@ -73,7 +76,7 @@ internal static partial class SqlServerNativeMutationPlanInspector
                     matches[0].Item2);
             })
             .ToArray();
-        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, selectors);
+        return new RelationalPhysicalNativeMutationPlan(native.Format, native.Content, observedSelectors);
     }
 
     private static string? Normalize(string? identifier)

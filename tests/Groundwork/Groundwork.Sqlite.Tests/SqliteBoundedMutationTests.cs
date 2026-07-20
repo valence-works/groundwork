@@ -36,19 +36,41 @@ public sealed class SqliteBoundedMutationTests
         var evidence = await mutations.ExplainAsync(request);
 
         Assert.Equal(plan, evidence.Plan);
-        Assert.Equal("sqlite-query-plan", evidence.NativePlanFormat);
-        Assert.Equal(2, evidence.Selectors.Count);
-        var primary = evidence.Selectors.Single(selector =>
+        Assert.Equal(
+            [
+                PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+                PhysicalDocumentMutationCommandIdentities.PredicateRecheck
+            ],
+            evidence.Commands.Select(command => command.Identity));
+        Assert.All(evidence.Commands, command => Assert.Equal("sqlite-query-plan", command.NativePlanFormat));
+        var selectors = evidence.Commands
+            .SelectMany(command => command.Selectors)
+            .DistinctBy(selector => selector.Target)
+            .ToArray();
+        Assert.Equal(2, selectors.Length);
+        var primary = selectors.Single(selector =>
             selector.Target == ExecutableStorageObjectRole.PrimaryStorage);
-        var linked = evidence.Selectors.Single(selector =>
+        var linked = selectors.Single(selector =>
             selector.Target == ExecutableStorageObjectRole.LinkedIndexStorage);
         Assert.Equal(plan.Predicate.PrimaryObject, primary.StorageObject);
         Assert.Equal(plan.Predicate.LookupObject, linked.StorageObject);
         Assert.Null(primary.Index);
         Assert.Equal(plan.Predicate.IndexName, linked.Index);
         Assert.Equal(plan.Predicate.IndexName!.Identifier, linked.ObservedIndexIdentifier);
-        Assert.Contains(linked.Index!.Identifier, evidence.NativePlan, StringComparison.Ordinal);
-        Assert.Contains(linked.StorageObject.Identifier, evidence.RenderedCommand, StringComparison.Ordinal);
+        Assert.All(
+            evidence.Commands,
+            command => Assert.Contains(linked.Index!.Identifier, command.NativePlan, StringComparison.Ordinal));
+
+        var executed = new List<(string Identity, string CommandText)>();
+        var executionRuntime = fixture.CreateObservedMutationRuntime((identity, command) =>
+        {
+            executed.Add((identity, command.CommandText));
+            return ValueTask.CompletedTask;
+        });
+        Assert.Equal(BoundedMutationStatus.Completed, (await executionRuntime.ExecuteAsync(request)).Status);
+        Assert.Equal(
+            evidence.Commands.Select(command => (command.Identity, command.RenderedCommand!)),
+            executed);
     }
 
     [Theory]
@@ -56,6 +78,8 @@ public sealed class SqliteBoundedMutationTests
     [InlineData("wrong-storage")]
     [InlineData("wrong-index")]
     [InlineData("missing-primary")]
+    [InlineData("scan-linked")]
+    [InlineData("scan-primary")]
     public void Native_plan_inspector_fails_closed_on_target_or_index_drift(string drift)
     {
         var (manifest, target) = CreateModel();
@@ -68,14 +92,16 @@ public sealed class SqliteBoundedMutationTests
             .Plans.Single(candidate => candidate.MutationIdentity == "prune-by-category");
         var primaryTarget = drift == "wrong-target" ? "x" : "p";
         var linkedIndex = drift == "wrong-index" ? "wrong_index" : plan.Predicate.IndexName!.Identifier;
+        var primaryOperation = drift == "scan-primary" ? "SCAN" : "SEARCH";
+        var linkedOperation = drift == "scan-linked" ? "SCAN" : "SEARCH";
         var primary = drift == "missing-primary"
             ? string.Empty
-            : $"SEARCH {primaryTarget} USING INDEX primary_identity_index (storage_scope=?)";
+            : $"{primaryOperation} {primaryTarget} USING INDEX primary_identity_index (storage_scope=?)";
         var content = string.Join(
             Environment.NewLine,
             new[]
             {
-                $"SEARCH l USING INDEX {linkedIndex} (category=?)",
+                $"{linkedOperation} l USING INDEX {linkedIndex} (category=?)",
                 primary
             }.Where(line => line.Length != 0));
         var primaryStorage = drift == "wrong-storage"
@@ -916,6 +942,18 @@ public sealed class SqliteBoundedMutationTests
                     target.Provider.Name,
                     "sqlite"),
                 intercept);
+
+        public IBoundedDocumentMutationStore CreateObservedMutationRuntime(
+            RelationalPhysicalMutationSelectionObserver observer) =>
+            RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    Documents,
+                    manifest,
+                    Route,
+                    target.Provider,
+                    target.Provider.Name,
+                    "sqlite"),
+                observer);
 
         public async Task<long> CountAsync(string category)
         {
