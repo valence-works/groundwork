@@ -54,12 +54,18 @@ public static class SqlServerDiagnosticRecordStoreFactory
     /// as sensitive diagnostic evidence.
     /// </summary>
     public static IDiagnosticRecordPlanInspector CreatePlanInspector(string connectionString)
+        => CreatePlanInspector(connectionString, new SqlServerDiagnosticRecordPlanExplainHooks());
+
+    internal static IDiagnosticRecordPlanInspector CreatePlanInspector(
+        string connectionString,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentNullException.ThrowIfNull(hooks);
         return new DelegatingDiagnosticRecordPlanInspector(
             new SqlServerDiagnosticRecordDeploymentInspector(connectionString),
-            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, cancellationToken),
-            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, cancellationToken));
+            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, hooks, cancellationToken),
+            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, hooks, cancellationToken));
     }
 
     public static async Task<SqlServerDiagnosticRecordStore> CreateAsync(
@@ -111,28 +117,25 @@ public static class SqlServerDiagnosticRecordStoreFactory
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
         DiagnosticRecordQuery query,
-        CancellationToken cancellationToken = default)
-    {
-        DiagnosticRecordQueryValidator.Validate(query, definition, CapabilityOnlyQueryHandler.Instance);
-        SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(query.Scope, query.Stream);
-        var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
-        var snapshot = query.Continuation is null
-            ? await ReadCursorHighWaterAsync(connectionString, query.Scope, query.Stream, cancellationToken)
-            : long.Parse(query.Continuation.SnapshotHighWater.Value, CultureInfo.InvariantCulture);
-        return await ExplainAsync(connectionString, store.Inner.BuildQueryCommand(query, snapshot), cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        await ExplainQueryAsync(
+            connectionString,
+            definition,
+            query,
+            new SqlServerDiagnosticRecordPlanExplainHooks(),
+            cancellationToken);
 
     internal static async ValueTask<IReadOnlyList<string>> ExplainTrimAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
         DiagnosticTrimRequest request,
-        CancellationToken cancellationToken = default)
-    {
-        DiagnosticRecordRequestValidator.Validate(request, definition);
-        SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
-        var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
-        return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        await ExplainTrimAsync(
+            connectionString,
+            definition,
+            request,
+            new SqlServerDiagnosticRecordPlanExplainHooks(),
+            cancellationToken);
 
     internal static async ValueTask<IReadOnlyList<string>> ReadComparisonKeysAsync(
         string connectionString,
@@ -174,47 +177,107 @@ public static class SqlServerDiagnosticRecordStoreFactory
     private static async ValueTask<IReadOnlyList<string>> ExplainAsync(
         string connectionString,
         RelationalDiagnosticCommand diagnosticCommand,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
         CancellationToken cancellationToken)
     {
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = $"SET STATISTICS XML ON; {diagnosticCommand.CommandText} SET STATISTICS XML OFF;";
-        foreach (var item in diagnosticCommand.Parameters)
-            AddParameter(command, item.Key, item.Value);
-        var plans = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        do
+        Exception? primaryFailure = null;
+        try
         {
-            while (await reader.ReadAsync(cancellationToken))
+            await SetStatisticsXmlAsync(connection, enabled: true, cancellationToken);
+            await InvokeAsync(hooks.AfterEnableAcknowledged, cancellationToken);
+            await InvokeAsync(hooks.BeforeRead, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = diagnosticCommand.CommandText;
+            foreach (var item in diagnosticCommand.Parameters)
+                AddParameter(command, item.Key, item.Value);
+            var plans = new List<string>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            do
             {
-                if (reader.FieldCount != 1)
-                    continue;
-                var value = reader.GetValue(0);
-                if (value is System.Data.SqlTypes.SqlXml xml)
-                    plans.Add(xml.Value);
-                else if (value is string text && text.Contains("ShowPlanXML", StringComparison.Ordinal))
-                    plans.Add(text);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    if (reader.FieldCount != 1)
+                        continue;
+                    var value = reader.GetValue(0);
+                    if (value is System.Data.SqlTypes.SqlXml xml)
+                        plans.Add(xml.Value);
+                    else if (value is string text && text.Contains("ShowPlanXML", StringComparison.Ordinal))
+                        plans.Add(text);
+                }
+            } while (await reader.NextResultAsync(cancellationToken));
+            return plans;
+        }
+        catch (Exception exception)
+        {
+            primaryFailure = exception;
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                await InvokeAsync(hooks.BeforeDisable, CancellationToken.None);
+                await SetStatisticsXmlAsync(connection, enabled: false, CancellationToken.None);
             }
-        } while (await reader.NextResultAsync(cancellationToken));
-        return plans;
+            catch (Exception cleanupFailure)
+            {
+                await QuarantineAsync(connection, cleanupFailure);
+                if (primaryFailure is not null)
+                    RelationalCleanupFailures.Attach(primaryFailure, cleanupFailure);
+                else
+                    throw;
+            }
+        }
     }
 
     private static async ValueTask<DiagnosticRecordNativePlan> InspectQueryPlanAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
         DiagnosticRecordQuery query,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
         CancellationToken cancellationToken) =>
         new("sqlserver", DiagnosticRecordPlanOperation.Query, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
-            await ExplainQueryAsync(connectionString, definition, query, cancellationToken));
+            await ExplainQueryAsync(connectionString, definition, query, hooks, cancellationToken));
 
     private static async ValueTask<DiagnosticRecordNativePlan> InspectTrimPlanAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
         DiagnosticTrimRequest request,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
         CancellationToken cancellationToken) =>
         new("sqlserver", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
-            await ExplainTrimAsync(connectionString, definition, request, cancellationToken));
+            await ExplainTrimAsync(connectionString, definition, request, hooks, cancellationToken));
+
+    private static async ValueTask<IReadOnlyList<string>> ExplainQueryAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
+        CancellationToken cancellationToken)
+    {
+        DiagnosticRecordQueryValidator.Validate(query, definition, CapabilityOnlyQueryHandler.Instance);
+        SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(query.Scope, query.Stream);
+        var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
+        var snapshot = query.Continuation is null
+            ? await ReadCursorHighWaterAsync(connectionString, query.Scope, query.Stream, cancellationToken)
+            : long.Parse(query.Continuation.SnapshotHighWater.Value, CultureInfo.InvariantCulture);
+        return await ExplainAsync(connectionString, store.Inner.BuildQueryCommand(query, snapshot), hooks, cancellationToken);
+    }
+
+    private static async ValueTask<IReadOnlyList<string>> ExplainTrimAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
+        CancellationToken cancellationToken)
+    {
+        DiagnosticRecordRequestValidator.Validate(request, definition);
+        SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
+        var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
+        return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), hooks, cancellationToken);
+    }
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(
         string connectionString,
@@ -259,4 +322,44 @@ public static class SqlServerDiagnosticRecordStoreFactory
                 : Math.Max(1, System.Text.Encoding.UTF8.GetByteCount(text));
         }
     }
+
+    private static async ValueTask SetStatisticsXmlAsync(
+        SqlConnection connection,
+        bool enabled,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SET STATISTICS XML {(enabled ? "ON" : "OFF")};";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task QuarantineAsync(SqlConnection connection, Exception cleanupFailure)
+    {
+        try
+        {
+            SqlConnection.ClearPool(connection);
+        }
+        catch (Exception quarantineFailure)
+        {
+            RelationalCleanupFailures.Attach(cleanupFailure, quarantineFailure);
+        }
+        try
+        {
+            await connection.CloseAsync();
+        }
+        catch (Exception quarantineFailure)
+        {
+            RelationalCleanupFailures.Attach(cleanupFailure, quarantineFailure);
+        }
+    }
+
+    private static ValueTask InvokeAsync(
+        Func<CancellationToken, ValueTask>? hook,
+        CancellationToken cancellationToken) =>
+        hook?.Invoke(cancellationToken) ?? ValueTask.CompletedTask;
 }
+
+internal sealed record SqlServerDiagnosticRecordPlanExplainHooks(
+    Func<CancellationToken, ValueTask>? AfterEnableAcknowledged = null,
+    Func<CancellationToken, ValueTask>? BeforeRead = null,
+    Func<CancellationToken, ValueTask>? BeforeDisable = null);
