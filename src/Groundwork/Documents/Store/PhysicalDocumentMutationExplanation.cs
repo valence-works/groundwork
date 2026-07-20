@@ -59,13 +59,17 @@ public sealed class PhysicalDocumentMutationCommandExplanation
         string nativePlanFormat,
         string nativePlan,
         IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> selectors,
-        string? renderedCommand = null)
+        string? renderedCommand = null,
+        long? preparedRestrictionRowCount = null)
     {
+        if (preparedRestrictionRowCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(preparedRestrictionRowCount));
         Kind = kind;
         Identity = PhysicalDocumentQueryExplanation.RequireValue(identity, nameof(identity));
         NativePlanFormat = PhysicalDocumentQueryExplanation.RequireValue(nativePlanFormat, nameof(nativePlanFormat));
         NativePlan = PhysicalDocumentQueryExplanation.RequireValue(nativePlan, nameof(nativePlan));
         RenderedCommand = string.IsNullOrWhiteSpace(renderedCommand) ? null : renderedCommand;
+        PreparedRestrictionRowCount = preparedRestrictionRowCount;
         ArgumentNullException.ThrowIfNull(selectors);
         Selectors = Array.AsReadOnly(selectors.ToArray());
     }
@@ -79,6 +83,12 @@ public sealed class PhysicalDocumentMutationCommandExplanation
 
     /// <summary>The exact provider command submitted for planning.</summary>
     public string? RenderedCommand { get; }
+
+    /// <summary>
+    /// Number of rows prepared in the command's transaction-local restriction before planning.
+    /// Null when the command has no prepared restriction.
+    /// </summary>
+    public long? PreparedRestrictionRowCount { get; }
 
     public IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> Selectors { get; }
 }

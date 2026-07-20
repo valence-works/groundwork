@@ -149,14 +149,20 @@ internal static class RelationalPhysicalMutationRuntime
         var stages = handler.BuildSelectionStages(mutation, plan, scope);
         return context.Store.ExecutePhysicalQueryAsync(async (connection, ct) =>
         {
-            await using var transaction = await connection.BeginTransactionAsync(ct);
-            await handler.PrepareSelectionStageExplanationAsync(connection, transaction, ct);
+            await using var mutationTransaction =
+                await context.Store.BeginPhysicalMutationTransactionAsync(connection, ct);
+            var transaction = mutationTransaction.Transaction;
+            await handler.PrepareSelectionStagesAsync(connection, transaction, ct);
             Exception? primaryFailure = null;
             try
             {
                 var commands = new List<PhysicalDocumentMutationCommandExplanation>();
                 foreach (var stage in stages)
                 {
+                    long? preparedRestrictionRowCount =
+                        stage.Kind == PhysicalDocumentMutationCommandKind.PredicateRecheck
+                            ? await handler.CountPreparedRestrictionRowsAsync(connection, transaction, ct)
+                            : null;
                     await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
                         connection,
                         stage.Command.CommandText,
@@ -177,7 +183,17 @@ internal static class RelationalPhysicalMutationRuntime
                             ExpectedIndex(plan, selector.Target),
                             selector.ObservedStorageObjectIdentifier,
                             selector.ObservedIndexIdentifier)).ToArray(),
-                        stage.Command.CommandText));
+                        stage.Command.CommandText,
+                        preparedRestrictionRowCount));
+                    if (stage.Kind == PhysicalDocumentMutationCommandKind.CandidateDiscovery)
+                    {
+                        await handler.PopulatePredicateRecheckInputsAsync(
+                            connection,
+                            transaction,
+                            mutation,
+                            stage,
+                            ct);
+                    }
                 }
                 return new PhysicalDocumentMutationExplanation(
                     plan,
@@ -194,7 +210,7 @@ internal static class RelationalPhysicalMutationRuntime
                 Exception? cleanupFailure = null;
                 try
                 {
-                    await handler.CleanupSelectionStageExplanationAsync(
+                    await handler.CleanupSelectionStagesAsync(
                         connection,
                         transaction,
                         CancellationToken.None);
@@ -205,7 +221,7 @@ internal static class RelationalPhysicalMutationRuntime
                 }
                 try
                 {
-                    await transaction.RollbackAsync(CancellationToken.None);
+                    await mutationTransaction.RollbackAsync(CancellationToken.None);
                 }
                 catch (Exception exception)
                 {

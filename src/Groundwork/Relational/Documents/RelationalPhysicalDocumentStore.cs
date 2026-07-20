@@ -432,6 +432,13 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     internal Task<T> ExecutePhysicalQueryAsync<T>(Func<DbConnection, CancellationToken, Task<T>> action, CancellationToken cancellationToken) =>
         ExecuteAsync(action, cancellationToken);
 
+    internal async ValueTask<IRelationalPhysicalMutationTransaction> BeginPhysicalMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken) =>
+        createMutationTransaction(
+            await dialect.BeginMutationTransactionAsync(connection, cancellationToken)) ??
+        throw new InvalidOperationException("The physical mutation transaction factory returned null.");
+
     internal async Task<T> ExecutePhysicalMutationAsync<T>(
         Func<DbConnection, DbTransaction, CancellationToken, Task<T>> action,
         Func<CancellationToken, ValueTask>? beforeCommit,

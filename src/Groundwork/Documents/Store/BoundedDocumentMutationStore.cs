@@ -310,6 +310,53 @@ public sealed class PhysicalMutationExecutionCertification
     }
 }
 
+/// <summary>
+/// Provider-owned certification for one ordered native-evidence command and its exact selector set.
+/// </summary>
+public sealed class PhysicalMutationEvidenceStageCertification
+{
+    public PhysicalMutationEvidenceStageCertification(
+        PhysicalDocumentMutationCommandKind kind,
+        string identity,
+        IReadOnlyList<PhysicalMutationSelectorCertification> selectors)
+    {
+        var expectedIdentity = kind switch
+        {
+            PhysicalDocumentMutationCommandKind.Selection =>
+                PhysicalDocumentMutationCommandIdentities.Selection,
+            PhysicalDocumentMutationCommandKind.CandidateDiscovery =>
+                PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+            PhysicalDocumentMutationCommandKind.PredicateRecheck =>
+                PhysicalDocumentMutationCommandIdentities.PredicateRecheck,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
+        };
+        if (!string.Equals(identity, expectedIdentity, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Mutation evidence command kind '{kind}' requires identity '{expectedIdentity}'.",
+                nameof(identity));
+        }
+        ArgumentNullException.ThrowIfNull(selectors);
+        if (selectors.Count == 0 ||
+            selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
+        {
+            throw new ArgumentException(
+                "A mutation evidence stage requires a non-empty, target-unique selector set.",
+                nameof(selectors));
+        }
+
+        Kind = kind;
+        Identity = identity;
+        Selectors = Array.AsReadOnly(selectors.ToArray());
+    }
+
+    public PhysicalDocumentMutationCommandKind Kind { get; }
+
+    public string Identity { get; }
+
+    public IReadOnlyList<PhysicalMutationSelectorCertification> Selectors { get; }
+}
+
 public sealed class PhysicalMutationHandlerCertification
 {
     private readonly PhysicalQueryHandlerCertification predicate;
@@ -319,7 +366,8 @@ public sealed class PhysicalMutationHandlerCertification
 
     public PhysicalMutationHandlerCertification(
         PhysicalMutationPlan plan,
-        PhysicalMutationExecutionCertification? execution = null)
+        PhysicalMutationExecutionCertification? execution = null,
+        IReadOnlyList<PhysicalMutationEvidenceStageCertification>? evidenceStages = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         MutationIdentity = plan.MutationIdentity;
@@ -347,6 +395,44 @@ public sealed class PhysicalMutationHandlerCertification
         if (execution is not null && !execution.Certifies(plan))
             throw new ArgumentException("Executable mutation certification does not match the compiled mutation plan.", nameof(execution));
         Execution = execution;
+        var expectedSelectors = ExpectedSelectors(plan, execution);
+        var stages = evidenceStages?.ToArray() ??
+        [
+            new PhysicalMutationEvidenceStageCertification(
+                PhysicalDocumentMutationCommandKind.Selection,
+                PhysicalDocumentMutationCommandIdentities.Selection,
+                expectedSelectors)
+        ];
+        if (stages.Length == 0 ||
+            stages.GroupBy(stage => stage.Identity, StringComparer.Ordinal).Any(group => group.Count() != 1))
+        {
+            throw new ArgumentException(
+                "Mutation evidence stages must be non-empty and have unique identities.",
+                nameof(evidenceStages));
+        }
+        var expectedByTarget = expectedSelectors.ToDictionary(selector => selector.Target);
+        foreach (var selector in stages.SelectMany(stage => stage.Selectors))
+        {
+            if (!expectedByTarget.TryGetValue(selector.Target, out var expected) ||
+                selector.StorageObject != expected.StorageObject ||
+                selector.Index != expected.Index)
+            {
+                throw new ArgumentException(
+                    "Mutation evidence stages must use only selectors certified for the compiled mutation plan.",
+                    nameof(evidenceStages));
+            }
+        }
+        if (!stages.SelectMany(stage => stage.Selectors)
+                .Select(selector => selector.Target)
+                .Distinct()
+                .Order()
+                .SequenceEqual(expectedByTarget.Keys.Order()))
+        {
+            throw new ArgumentException(
+                "Mutation evidence stages must cover every selector certified for the compiled mutation plan.",
+                nameof(evidenceStages));
+        }
+        EvidenceStages = Array.AsReadOnly(stages);
     }
 
     public string MutationIdentity { get; }
@@ -354,6 +440,8 @@ public sealed class PhysicalMutationHandlerCertification
     public BoundedMutationActionKind ActionKind { get; }
 
     public PhysicalMutationExecutionCertification? Execution { get; }
+
+    public IReadOnlyList<PhysicalMutationEvidenceStageCertification> EvidenceStages { get; }
 
     internal bool Certifies(PhysicalMutationPlan plan)
     {
@@ -369,6 +457,38 @@ public sealed class PhysicalMutationHandlerCertification
         return transitionPath == transition?.Path &&
                transitionTarget == transition?.TargetValue &&
                allowedSourceValues.SequenceEqual(transition?.AllowedSourceValues ?? []);
+    }
+
+    private static IReadOnlyList<PhysicalMutationSelectorCertification> ExpectedSelectors(
+        PhysicalMutationPlan plan,
+        PhysicalMutationExecutionCertification? execution)
+    {
+        if (execution is not null)
+        {
+            return execution.Linked is null
+                ? [execution.Primary]
+                : [execution.Primary, execution.Linked];
+        }
+
+        var selectors = new List<PhysicalMutationSelectorCertification>
+        {
+            new(
+                ExecutableStorageObjectRole.PrimaryStorage,
+                plan.Predicate.PrimaryObject,
+                plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+                    ? null
+                    : plan.Predicate.IndexName,
+                new Dictionary<string, string>())
+        };
+        if (plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+        {
+            selectors.Add(new PhysicalMutationSelectorCertification(
+                ExecutableStorageObjectRole.LinkedIndexStorage,
+                plan.Predicate.LookupObject,
+                plan.Predicate.IndexName!,
+                new Dictionary<string, string>()));
+        }
+        return selectors;
     }
 }
 
@@ -529,32 +649,16 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
                 $"Bounded mutation '{plan.MutationIdentity}' has no declared physical index.");
         }
         var certification = handler.Certifications.Single(candidate => candidate.Certifies(plan));
-        var expected = ExpectedSelectors(plan, certification.Execution);
         var commandStamps = evidence.Commands.Select(command => (command.Kind, command.Identity)).ToArray();
-        (PhysicalDocumentMutationCommandKind Kind, string Identity)[] expectedCommandStamps =
-            commandStamps.Any(command =>
-                command.Identity == PhysicalDocumentMutationCommandIdentities.CandidateDiscovery)
-            ?
-            [
-                (
-                    PhysicalDocumentMutationCommandKind.CandidateDiscovery,
-                    PhysicalDocumentMutationCommandIdentities.CandidateDiscovery),
-                (
-                    PhysicalDocumentMutationCommandKind.PredicateRecheck,
-                    PhysicalDocumentMutationCommandIdentities.PredicateRecheck)
-            ]
-            :
-            [
-                (
-                    PhysicalDocumentMutationCommandKind.Selection,
-                    PhysicalDocumentMutationCommandIdentities.Selection)
-            ];
+        var expectedCommandStamps = certification.EvidenceStages
+            .Select(stage => (stage.Kind, stage.Identity))
+            .ToArray();
         if (!commandStamps.SequenceEqual(expectedCommandStamps))
         {
             throw new InvalidOperationException(
                 $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not return the exact selector command sequence.");
         }
-        foreach (var command in evidence.Commands)
+        foreach (var (command, stage) in evidence.Commands.Zip(certification.EvidenceStages))
         {
             if (command.Kind != PhysicalDocumentMutationCommandKind.Selection &&
                 string.IsNullOrWhiteSpace(command.RenderedCommand))
@@ -563,11 +667,7 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
                     $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not stamp " +
                     "the exact rendered execution-stage command.");
             }
-            var expectedForCommand = command.Identity == PhysicalDocumentMutationCommandIdentities.CandidateDiscovery &&
-                                     plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
-                ? expected.Where(selector =>
-                    selector.Target == ExecutableStorageObjectRole.LinkedIndexStorage).ToArray()
-                : expected;
+            var expectedForCommand = stage.Selectors;
             if (command.Selectors.Count != expectedForCommand.Count ||
                 command.Selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
             {
@@ -598,38 +698,6 @@ public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExp
                 }
             }
         }
-    }
-
-    private static IReadOnlyList<PhysicalMutationSelectorCertification> ExpectedSelectors(
-        PhysicalMutationPlan plan,
-        PhysicalMutationExecutionCertification? execution)
-    {
-        if (execution is not null)
-        {
-            return execution.Linked is null
-                ? [execution.Primary]
-                : [execution.Primary, execution.Linked];
-        }
-
-        var selectors = new List<PhysicalMutationSelectorCertification>
-        {
-            new(
-                ExecutableStorageObjectRole.PrimaryStorage,
-                plan.Predicate.PrimaryObject,
-                plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
-                    ? null
-                    : plan.Predicate.IndexName,
-                new Dictionary<string, string>())
-        };
-        if (plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary)
-        {
-            selectors.Add(new PhysicalMutationSelectorCertification(
-                ExecutableStorageObjectRole.LinkedIndexStorage,
-                plan.Predicate.LookupObject,
-                plan.Predicate.IndexName!,
-                new Dictionary<string, string>()));
-        }
-        return selectors;
     }
 
     private static bool SupportsProfile(

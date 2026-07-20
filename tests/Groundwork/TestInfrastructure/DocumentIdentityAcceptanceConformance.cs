@@ -342,14 +342,20 @@ public abstract class DocumentIdentityAcceptanceConformance
         Assert.Equal(selector.Index!.Identifier, selector.ObservedIndexIdentifier);
         if (fixture.CanObserveMutationSelection)
         {
-            var executed = new List<(string Identity, string CommandText)>();
+            var executed = new List<(string Identity, string CommandText, long? PreparedRestrictionRowCount)>();
             var executionRuntime = fixture.CreateObservedMutationRuntime(
-                (identity, commandText) => executed.Add((identity, commandText)));
+                (identity, commandText, preparedRestrictionRowCount) =>
+                    executed.Add((identity, commandText, preparedRestrictionRowCount)));
 
             Assert.Equal(BoundedMutationStatus.Completed, (await executionRuntime.ExecuteAsync(request)).Status);
             Assert.Equal(
-                evidence.Commands.Select(command => (command.Identity, command.RenderedCommand!)),
+                evidence.Commands.Select(command => (
+                    command.Identity,
+                    command.RenderedCommand!,
+                    command.PreparedRestrictionRowCount)),
                 executed);
+            Assert.Null(evidence.Commands[0].PreparedRestrictionRowCount);
+            Assert.True(evidence.Commands[1].PreparedRestrictionRowCount > 0);
         }
     }
 }
@@ -370,7 +376,7 @@ public sealed class DocumentIdentityAcceptanceFixture(
     IBoundedDocumentMutationStore? mutations = null,
     Func<DocumentQuery, Task<DocumentIdentityNativePlanEvidence>>? explainQueryAsync = null,
     Func<DocumentMutation, Task<DocumentIdentityNativePlanEvidence>>? explainMutationAsync = null,
-    Func<Action<string, string>, IBoundedDocumentMutationStore>? observedMutationRuntimeFactory = null) : IAsyncDisposable
+    Func<Action<string, string, long?>, IBoundedDocumentMutationStore>? observedMutationRuntimeFactory = null) : IAsyncDisposable
 {
     public IDocumentStore Documents { get; } = documents;
     public IBoundedDocumentStore Queries { get; } = queries;
@@ -381,7 +387,7 @@ public sealed class DocumentIdentityAcceptanceFixture(
     public Task<DocumentIdentityNativePlanEvidence> ExplainMutationAsync(DocumentMutation mutation) =>
         (explainMutationAsync ?? throw new InvalidOperationException("Native mutation explain was not configured."))(mutation);
     public bool CanObserveMutationSelection => observedMutationRuntimeFactory is not null;
-    public IBoundedDocumentMutationStore CreateObservedMutationRuntime(Action<string, string> observer) =>
+    public IBoundedDocumentMutationStore CreateObservedMutationRuntime(Action<string, string, long?> observer) =>
         (observedMutationRuntimeFactory ??
          throw new InvalidOperationException("Mutation selection observation was not configured."))(observer);
     public ValueTask DisposeAsync() => disposeAsync();

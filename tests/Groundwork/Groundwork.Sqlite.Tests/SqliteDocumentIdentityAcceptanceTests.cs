@@ -219,9 +219,9 @@ public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcce
                         target.Provider,
                         SqliteGroundworkCapabilities.Provider.Name,
                         "sqlite"),
-                    (identity, command) =>
+                    (identity, command, preparedRestrictionRowCount) =>
                     {
-                        observer(identity, command.CommandText);
+                        observer(identity, command.CommandText, preparedRestrictionRowCount);
                         return ValueTask.CompletedTask;
                     }));
         }

@@ -349,9 +349,9 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
                     target.Provider,
                     PostgreSqlGroundworkCapabilities.Provider.Name,
                     "postgresql"),
-                (identity, command) =>
+                (identity, command, preparedRestrictionRowCount) =>
                 {
-                    observer(identity, command.CommandText);
+                    observer(identity, command.CommandText, preparedRestrictionRowCount);
                     return ValueTask.CompletedTask;
                 }));
     }
@@ -528,9 +528,9 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
                     target.Provider,
                     SqlServerGroundworkCapabilities.Provider.Name,
                     "sqlserver"),
-                (identity, command) =>
+                (identity, command, preparedRestrictionRowCount) =>
                 {
-                    observer(identity, command.CommandText);
+                    observer(identity, command.CommandText, preparedRestrictionRowCount);
                     return ValueTask.CompletedTask;
                 }));
     }

@@ -1246,6 +1246,41 @@ public sealed class PhysicalQueryPlanCompilerTests
             plan.Predicate.IndexName!,
             plan.Predicate.LookupObject.Identifier,
             plan.Predicate.IndexName!.Identifier);
+        var stagedHandler = new RecordingMutationHandler(
+            plan.HandlerIdentity,
+            PhysicalQuerySourceKind.LinkedIndex,
+            [
+                new PhysicalMutationHandlerCertification(
+                    plan,
+                    evidenceStages:
+                    [
+                        new PhysicalMutationEvidenceStageCertification(
+                            PhysicalDocumentMutationCommandKind.CandidateDiscovery,
+                            PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+                            [
+                                new PhysicalMutationSelectorCertification(
+                                    ExecutableStorageObjectRole.LinkedIndexStorage,
+                                    plan.Predicate.LookupObject,
+                                    plan.Predicate.IndexName!,
+                                    new Dictionary<string, string>())
+                            ]),
+                        new PhysicalMutationEvidenceStageCertification(
+                            PhysicalDocumentMutationCommandKind.PredicateRecheck,
+                            PhysicalDocumentMutationCommandIdentities.PredicateRecheck,
+                            [
+                                new PhysicalMutationSelectorCertification(
+                                    ExecutableStorageObjectRole.PrimaryStorage,
+                                    plan.Predicate.PrimaryObject,
+                                    index: null,
+                                    new Dictionary<string, string>()),
+                                new PhysicalMutationSelectorCertification(
+                                    ExecutableStorageObjectRole.LinkedIndexStorage,
+                                    plan.Predicate.LookupObject,
+                                    plan.Predicate.IndexName!,
+                                    new Dictionary<string, string>())
+                            ])
+                    ])
+            ]);
         PhysicalMutationDocumentStore Runtime(
             IReadOnlyList<PhysicalDocumentMutationSelectorEvidence> selectors) =>
             new(
@@ -1280,12 +1315,13 @@ public sealed class PhysicalQueryPlanCompilerTests
                 selectors,
                 $"SELECT /* {identity} */");
         PhysicalMutationDocumentStore StagedRuntime(
-            IReadOnlyList<PhysicalDocumentMutationCommandExplanation> commands) =>
+            IReadOnlyList<PhysicalDocumentMutationCommandExplanation> commands,
+            IPhysicalDocumentMutationHandler? certifiedHandler = null) =>
             new(
                 fixture.Route,
                 storage,
                 capabilities,
-                [handler],
+                [certifiedHandler ?? stagedHandler],
                 (_, admitted, _) => Task.FromResult(new PhysicalDocumentMutationExplanation(
                     admitted,
                     BoundedMutationRequestFingerprint.Create(request, admitted, "scope-a"),
@@ -1299,6 +1335,17 @@ public sealed class PhysicalQueryPlanCompilerTests
             [primary, linked]);
 
         Assert.Equal(2, (await StagedRuntime([discovery, recheck]).ExplainAsync(request)).Commands.Count);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            StagedRuntime([discovery, recheck], handler).ExplainAsync(request));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            StagedRuntime([
+                new PhysicalDocumentMutationCommandExplanation(
+                    PhysicalDocumentMutationCommandKind.Selection,
+                    PhysicalDocumentMutationCommandIdentities.Selection,
+                    "test-plan",
+                    "native-plan",
+                    [primary, linked])
+            ]).ExplainAsync(request));
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             StagedRuntime([discovery]).ExplainAsync(request));
         await Assert.ThrowsAsync<InvalidOperationException>(() =>

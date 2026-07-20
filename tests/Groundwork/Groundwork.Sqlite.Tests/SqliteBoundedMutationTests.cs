@@ -42,6 +42,8 @@ public sealed class SqliteBoundedMutationTests
                 PhysicalDocumentMutationCommandIdentities.PredicateRecheck
             ],
             evidence.Commands.Select(command => command.Identity));
+        Assert.Null(evidence.Commands[0].PreparedRestrictionRowCount);
+        Assert.Equal(1, evidence.Commands[1].PreparedRestrictionRowCount);
         Assert.All(evidence.Commands, command => Assert.Equal("sqlite-query-plan", command.NativePlanFormat));
         var selectors = evidence.Commands
             .SelectMany(command => command.Selectors)
@@ -61,15 +63,20 @@ public sealed class SqliteBoundedMutationTests
             evidence.Commands,
             command => Assert.Contains(linked.Index!.Identifier, command.NativePlan, StringComparison.Ordinal));
 
-        var executed = new List<(string Identity, string CommandText)>();
-        var executionRuntime = fixture.CreateObservedMutationRuntime((identity, command) =>
+        var executed = new List<(string Identity, string CommandText, long? PreparedRestrictionRows)>();
+        var executionRuntime = fixture.CreateObservedMutationRuntime((identity, command, preparedRestrictionRows) =>
         {
-            executed.Add((identity, command.CommandText));
+            executed.Add((identity, command.CommandText, preparedRestrictionRows));
             return ValueTask.CompletedTask;
         });
-        Assert.Equal(BoundedMutationStatus.Completed, (await executionRuntime.ExecuteAsync(request)).Status);
+        var result = await executionRuntime.ExecuteAsync(request);
+        Assert.Equal(BoundedMutationStatus.Completed, result.Status);
+        Assert.Equal(1, result.AffectedCount);
         Assert.Equal(
-            evidence.Commands.Select(command => (command.Identity, command.RenderedCommand!)),
+            evidence.Commands.Select(command => (
+                command.Identity,
+                command.RenderedCommand!,
+                command.PreparedRestrictionRowCount)),
             executed);
     }
 
