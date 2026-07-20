@@ -122,10 +122,12 @@ public interface IDiagnosticRecordDeploymentInspector
 }
 
 /// <summary>
-/// Produces provider-native planner evidence for the exact bounded diagnostic-record query or
-/// trim-selection route. Inspection is admission-gated and read-only: it never creates or repairs
-/// physical storage. The returned raw plan can expose object names, predicates, and parameter
-/// values, so hosts must treat it as sensitive diagnostic data.
+/// Produces provider-native planner evidence for the exact bounded diagnostic-record query,
+/// statistics-inspection, or trim-selection route. Inspection is admission-gated and read-only:
+/// it never creates or repairs physical storage. This deliberately covers the scale-bearing
+/// diagnostic-record reads, not generic point document save/delete mutations. The returned raw
+/// plan can expose object names, predicates, and parameter values, so hosts must treat it as
+/// sensitive diagnostic data.
 /// </summary>
 public interface IDiagnosticRecordPlanInspector
 {
@@ -135,6 +137,11 @@ public interface IDiagnosticRecordPlanInspector
     ValueTask<DiagnosticRecordNativePlan> InspectQueryAsync(
         DiagnosticRecordDeploymentManifest deployment,
         DiagnosticRecordQuery query,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<DiagnosticRecordNativePlan> InspectStatisticsAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticStreamInspectionRequest request,
         CancellationToken cancellationToken = default);
 
     ValueTask<DiagnosticRecordNativePlan> InspectTrimSelectionAsync(
@@ -147,6 +154,7 @@ public interface IDiagnosticRecordPlanInspector
 public enum DiagnosticRecordPlanOperation
 {
     Query,
+    Statistics,
     TrimSelection
 }
 
@@ -197,18 +205,32 @@ public static class DiagnosticRecordNativePlanFormats
 /// deployment admission used by runtime sessions. Provider packages supply the exact existing
 /// command/pipeline explain routes; this type deliberately owns no provider SDK dependency.
 /// </summary>
-public sealed class DelegatingDiagnosticRecordPlanInspector(
-    IDiagnosticRecordDeploymentInspector deploymentInspector,
-    Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync,
-    Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync)
-    : IDiagnosticRecordPlanInspector
+public sealed class DelegatingDiagnosticRecordPlanInspector : IDiagnosticRecordPlanInspector
 {
-    private readonly IDiagnosticRecordDeploymentInspector deploymentInspector =
-        deploymentInspector ?? throw new ArgumentNullException(nameof(deploymentInspector));
-    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync =
-        inspectQueryAsync ?? throw new ArgumentNullException(nameof(inspectQueryAsync));
-    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync =
-        inspectTrimSelectionAsync ?? throw new ArgumentNullException(nameof(inspectTrimSelectionAsync));
+    private readonly IDiagnosticRecordDeploymentInspector deploymentInspector;
+    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync;
+    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticStreamInspectionRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectStatisticsAsync;
+    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync;
+
+    public DelegatingDiagnosticRecordPlanInspector(
+        IDiagnosticRecordDeploymentInspector deploymentInspector,
+        Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync,
+        Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync)
+        : this(deploymentInspector, inspectQueryAsync, UnsupportedStatisticsInspection, inspectTrimSelectionAsync)
+    {
+    }
+
+    public DelegatingDiagnosticRecordPlanInspector(
+        IDiagnosticRecordDeploymentInspector deploymentInspector,
+        Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync,
+        Func<DiagnosticRecordStreamDefinition, DiagnosticStreamInspectionRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectStatisticsAsync,
+        Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync)
+    {
+        this.deploymentInspector = deploymentInspector ?? throw new ArgumentNullException(nameof(deploymentInspector));
+        this.inspectQueryAsync = inspectQueryAsync ?? throw new ArgumentNullException(nameof(inspectQueryAsync));
+        this.inspectStatisticsAsync = inspectStatisticsAsync ?? throw new ArgumentNullException(nameof(inspectStatisticsAsync));
+        this.inspectTrimSelectionAsync = inspectTrimSelectionAsync ?? throw new ArgumentNullException(nameof(inspectTrimSelectionAsync));
+    }
 
     public string Provider => deploymentInspector.Provider;
 
@@ -218,6 +240,13 @@ public sealed class DelegatingDiagnosticRecordPlanInspector(
         CancellationToken cancellationToken = default) =>
         InspectAsync(deployment, query.Stream, DiagnosticRecordPlanOperation.Query,
             definition => inspectQueryAsync(definition, query, cancellationToken), cancellationToken);
+
+    public ValueTask<DiagnosticRecordNativePlan> InspectStatisticsAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken = default) =>
+        InspectAsync(deployment, request.Stream, DiagnosticRecordPlanOperation.Statistics,
+            definition => inspectStatisticsAsync(definition, request, cancellationToken), cancellationToken);
 
     public ValueTask<DiagnosticRecordNativePlan> InspectTrimSelectionAsync(
         DiagnosticRecordDeploymentManifest deployment,
@@ -248,6 +277,13 @@ public sealed class DelegatingDiagnosticRecordPlanInspector(
             throw new InvalidOperationException($"Diagnostic-record plan inspector returned '{plan.Operation}' for requested '{operation}'.");
         return plan;
     }
+
+    private static ValueTask<DiagnosticRecordNativePlan> UnsupportedStatisticsInspection(
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken) =>
+        ValueTask.FromException<DiagnosticRecordNativePlan>(new NotSupportedException(
+            "This diagnostic-record plan inspector does not provide statistics-inspection plans."));
 }
 
 /// <summary>The result of a provider's non-mutating diagnostic-record deployment inspection.</summary>

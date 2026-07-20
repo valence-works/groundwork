@@ -188,6 +188,29 @@ public abstract class DiagnosticRecordContractTests
     }
 
     [Fact]
+    public async Task Plan_inspector_admits_and_returns_the_exact_statistics_operation()
+    {
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var calls = 0;
+        var inspector = new DelegatingDiagnosticRecordPlanInspector(
+            ReadyInspector(),
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.Query)),
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref calls);
+                return ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.Statistics));
+            },
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.TrimSelection)));
+
+        var plan = await inspector.InspectStatisticsAsync(
+            deployment,
+            new(new("tenant-a", "scope-a"), Definition().Stream));
+
+        Assert.Equal(1, Volatile.Read(ref calls));
+        Assert.Equal(DiagnosticRecordPlanOperation.Statistics, plan.Operation);
+    }
+
+    [Fact]
     public async Task Plan_inspector_preserves_requested_cancellation_without_touching_the_provider()
     {
         var calls = 0;

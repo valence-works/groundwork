@@ -251,7 +251,7 @@ public sealed class PostgreSqlDiagnosticRecordRuntimeAdmissionTests(PostgreSqlDi
         {
             var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
                 PostgreSqlDiagnosticRecordStoreFactory.CreatePlanInspector(missing)
-                    .InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10)).AsTask());
+                    .InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream)).AsTask());
 
             Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
             await using var connection = new NpgsqlConnection(missing);
@@ -271,11 +271,15 @@ public sealed class PostgreSqlDiagnosticRecordRuntimeAdmissionTests(PostgreSqlDi
             await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(ready, Definition());
             var inspector = PostgreSqlDiagnosticRecordStoreFactory.CreatePlanInspector(ready);
             var query = await inspector.InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10));
+            var statistics = await inspector.InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream));
             var trim = await inspector.InspectTrimSelectionAsync(Deployment(),
                 DiagnosticTrimRequest.Create(Scope, Definition().Stream, new(DateTimeOffset.UtcNow, "plan-trim"), 10));
 
             Assert.Equal(DiagnosticRecordNativePlanFormats.PostgreSqlExplainJson, query.Format);
             Assert.NotEmpty(query.RawPlans);
+            Assert.Equal(DiagnosticRecordPlanOperation.Statistics, statistics.Operation);
+            Assert.Equal(DiagnosticRecordNativePlanFormats.PostgreSqlExplainJson, statistics.Format);
+            Assert.NotEmpty(statistics.RawPlans);
             Assert.Equal(DiagnosticRecordNativePlanFormats.PostgreSqlExplainJson, trim.Format);
             Assert.NotEmpty(trim.RawPlans);
         }
@@ -645,7 +649,7 @@ public sealed class SqlServerDiagnosticRecordRuntimeAdmissionTests(SqlServerDiag
         {
             var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
                 SqlServerDiagnosticRecordStoreFactory.CreatePlanInspector(missing)
-                    .InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10)).AsTask());
+                    .InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream)).AsTask());
 
             Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
             await using var connection = new SqlConnection(missing);
@@ -665,11 +669,15 @@ public sealed class SqlServerDiagnosticRecordRuntimeAdmissionTests(SqlServerDiag
             await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(ready, Definition());
             var inspector = SqlServerDiagnosticRecordStoreFactory.CreatePlanInspector(ready);
             var query = await inspector.InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10));
+            var statistics = await inspector.InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream));
             var trim = await inspector.InspectTrimSelectionAsync(Deployment(),
                 DiagnosticTrimRequest.Create(Scope, Definition().Stream, new(DateTimeOffset.UtcNow, "plan-trim"), 10));
 
             Assert.Equal(DiagnosticRecordNativePlanFormats.SqlServerShowplanXml, query.Format);
             Assert.NotEmpty(query.RawPlans);
+            Assert.Equal(DiagnosticRecordPlanOperation.Statistics, statistics.Operation);
+            Assert.Equal(DiagnosticRecordNativePlanFormats.SqlServerShowplanXml, statistics.Format);
+            Assert.NotEmpty(statistics.RawPlans);
             Assert.Equal(DiagnosticRecordNativePlanFormats.SqlServerShowplanXml, trim.Format);
             Assert.NotEmpty(trim.RawPlans);
         }
@@ -693,14 +701,14 @@ public sealed class SqlServerDiagnosticRecordRuntimeAdmissionTests(SqlServerDiag
                     BeforeDisable: static _ => ValueTask.FromException(new InvalidOperationException("disable plan failure"))));
 
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                inspector.InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10)).AsTask());
+                inspector.InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream)).AsTask());
 
             Assert.Equal("primary plan failure", exception.Message);
             var cleanupFailures = Assert.IsType<List<Exception>>(exception.Data["Groundwork.Relational.CleanupFailures"]);
             Assert.Contains(cleanupFailures, failure => failure.Message == "disable plan failure");
 
             var recovered = await SqlServerDiagnosticRecordStoreFactory.CreatePlanInspector(connectionString)
-                .InspectQueryAsync(Deployment(), new(Scope, Definition().Stream, 10));
+                .InspectStatisticsAsync(Deployment(), new(Scope, Definition().Stream));
             Assert.NotEmpty(recovered.RawPlans);
         }
         finally

@@ -56,7 +56,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
         try
         {
             var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
-                inspector.InspectQueryAsync(Deployment(definition), new(new("tenant-a", "shell-a"), definition.Stream, 10)).AsTask());
+                inspector.InspectStatisticsAsync(Deployment(definition), new(new("tenant-a", "shell-a"), definition.Stream)).AsTask());
 
             Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
             Assert.False(File.Exists(path));
@@ -105,6 +105,7 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
         try
         {
             var query = await inspector.InspectQueryAsync(Deployment(definition), new(scope, definition.Stream, 10));
+            var statistics = await inspector.InspectStatisticsAsync(Deployment(definition), new(scope, definition.Stream));
             var trim = await inspector.InspectTrimSelectionAsync(Deployment(definition),
                 DiagnosticTrimRequest.Create(scope, definition.Stream, new(DateTimeOffset.UtcNow, "trim"), 10));
 
@@ -113,6 +114,9 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
             Assert.Equal("sqlite-explain-query-plan", query.Format);
             Assert.NotEmpty(query.RawPlans);
             Assert.All(query.RawPlans, plan => Assert.False(string.IsNullOrWhiteSpace(plan)));
+            Assert.Equal(DiagnosticRecordPlanOperation.Statistics, statistics.Operation);
+            Assert.Equal("sqlite-explain-query-plan", statistics.Format);
+            Assert.NotEmpty(statistics.RawPlans);
             Assert.Equal(DiagnosticRecordPlanOperation.TrimSelection, trim.Operation);
             Assert.Equal("sqlite-explain-query-plan", trim.Format);
             Assert.NotEmpty(trim.RawPlans);
