@@ -22,6 +22,17 @@ public enum ProjectionRebuildMode
     SemanticMigrationRequired
 }
 
+/// <summary>
+/// Declares whether a projection represents one scalar at its canonical path or each immediate
+/// primitive element in a bounded canonical JSON collection. Collection elements are never
+/// inferred from an arbitrary JSON path.
+/// </summary>
+public enum ProjectionCardinality
+{
+    Scalar,
+    CollectionElements
+}
+
 public enum PhysicalSortDirection
 {
     Ascending,
@@ -57,7 +68,8 @@ public sealed record PhysicalEvolutionMetadata(
 /// A rebuildable provider-native projection of one stable serialized path. Decimal projections
 /// require explicit total <see cref="Precision"/> and fractional <see cref="Scale"/>. For String
 /// projections, <see cref="Length"/> is a maximum count of UTF-16 code units. DateTime projections
-/// represent explicitly offset UTC instants at 100ns tick precision.
+/// represent explicitly offset UTC instants at 100ns tick precision. Collection-element projections
+/// require an explicit bounded <see cref="MaxCollectionElements"/> declaration.
 /// </summary>
 public sealed record ProjectedColumnDefinition(
     string LogicalName,
@@ -69,7 +81,9 @@ public sealed record ProjectedColumnDefinition(
     bool IsNullable = true,
     string? Collation = null,
     string? DefaultValue = null,
-    ProjectionRebuildMode RebuildMode = ProjectionRebuildMode.FromCanonicalJson);
+    ProjectionRebuildMode RebuildMode = ProjectionRebuildMode.FromCanonicalJson,
+    ProjectionCardinality Cardinality = ProjectionCardinality.Scalar,
+    int? MaxCollectionElements = null);
 
 /// <summary>One ordered column reference in a compound physical index.</summary>
 public sealed record PhysicalIndexColumnDefinition(

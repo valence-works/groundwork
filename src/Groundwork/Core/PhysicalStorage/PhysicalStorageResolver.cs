@@ -856,7 +856,11 @@ public static class PhysicalStorageResolver
                 (column.Scale is not null && column.Precision is not null && column.Scale > column.Precision) ||
                 (column.Type == PortablePhysicalType.Decimal &&
                  (column.Precision is null or > 28 || column.Scale is null)) ||
-                (column.Type != PortablePhysicalType.Decimal && column.Scale is not null))
+                (column.Type != PortablePhysicalType.Decimal && column.Scale is not null) ||
+                !Enum.IsDefined(column.Cardinality) ||
+                (column.Cardinality == ProjectionCardinality.Scalar && column.MaxCollectionElements is not null) ||
+                (column.Cardinality == ProjectionCardinality.CollectionElements &&
+                 (column.MaxCollectionElements is null or <= 0 || column.DefaultValue is not null || !column.IsNullable)))
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-018",

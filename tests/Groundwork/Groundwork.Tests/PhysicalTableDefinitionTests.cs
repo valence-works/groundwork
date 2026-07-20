@@ -2,6 +2,8 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Relational.Physicalization;
+using System.Text.Json;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -29,6 +31,93 @@ public sealed class PhysicalTableDefinitionTests
         PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 64)), definition);
         Assert.Throws<PhysicalProjectionValueValidationException>(() =>
             PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 65)), definition));
+    }
+
+    [Fact]
+    public void Collection_element_projection_preserves_each_canonical_element_and_its_ordinal()
+    {
+        var projection = new ProjectedColumnDefinition(
+            "redirect_uri",
+            "redirectUris",
+            PortablePhysicalType.String,
+            Cardinality: ProjectionCardinality.CollectionElements,
+            MaxCollectionElements: 4);
+
+        var elements = CanonicalCollectionElementProjection.Read(
+            "{\"redirectUris\":[\"https://one.example/callback\",\"https://two.example/callback\"]}",
+            projection);
+
+        Assert.Collection(
+            elements,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal(JsonValueKind.String, first.Value.ValueKind);
+                Assert.Equal("https://one.example/callback", first.Value.GetString());
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal(JsonValueKind.String, second.Value.ValueKind);
+                Assert.Equal("https://two.example/callback", second.Value.GetString());
+            });
+    }
+
+    [Fact]
+    public void Collection_element_projection_fails_closed_for_non_array_and_nested_elements()
+    {
+        var projection = new ProjectedColumnDefinition(
+            "scope",
+            "scopes",
+            PortablePhysicalType.String,
+            Cardinality: ProjectionCardinality.CollectionElements,
+            MaxCollectionElements: 2);
+
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":\"read\"}", projection));
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":[{\"name\":\"read\"}]}", projection));
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":[\"read\",\"write\",\"admin\"]}", projection));
+    }
+
+    [Fact]
+    public void Collection_cardinality_changes_the_physical_definition_fingerprint()
+    {
+        var scalar = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition("redirect_uri", "redirectUris", PortablePhysicalType.String)]);
+        var elements = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                "redirectUris",
+                PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+
+        var scalarResult = PhysicalStorageResolver.Resolve(
+            WithDefinition(scalar), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+        var elementsResult = PhysicalStorageResolver.Resolve(
+            WithDefinition(elements), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.True(scalarResult.IsValid);
+        Assert.True(elementsResult.IsValid);
+        Assert.NotEqual(
+            Assert.Single(scalarResult.Definitions).Fingerprint,
+            Assert.Single(elementsResult.Definitions).Fingerprint);
+
+        var routes = ExecutableStorageRouteCompiler.Compile(elementsResult.Definitions);
+        var route = Assert.Single(routes.Routes);
+        var restored = ExecutableStorageRouteSerializer.Deserialize(
+            ExecutableStorageRouteSerializer.Serialize(route));
+
+        Assert.Equal(ProjectionCardinality.CollectionElements, Assert.Single(restored.ProjectedColumns).Definition.Cardinality);
+        Assert.Equal(8, Assert.Single(restored.ProjectedColumns).Definition.MaxCollectionElements);
+        Assert.Throws<NotSupportedException>(() =>
+            RelationalPhysicalProjectionValues.Read(
+                "{\"redirectUris\":[\"https://one.example/callback\"]}",
+                restored.ProjectedColumns));
     }
 
     [Fact]

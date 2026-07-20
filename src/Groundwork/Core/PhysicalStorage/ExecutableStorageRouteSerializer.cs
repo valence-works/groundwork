@@ -213,6 +213,8 @@ public static class ExecutableStorageRouteSerializer
                 WriteNullableString(writer, "collation", projection.Definition.Collation);
                 WriteNullableString(writer, "default", projection.Definition.DefaultValue);
                 writer.WriteString("rebuild", projection.Definition.RebuildMode.ToString());
+                writer.WriteString("cardinality", projection.Definition.Cardinality.ToString());
+                WriteNullableNumber(writer, "maxCollectionElements", projection.Definition.MaxCollectionElements);
                 writer.WriteString("target", projection.Target.ToString());
                 WriteColumn(writer, "column", projection.Column);
                 WriteName(writer, "name", projection.Name);
@@ -322,7 +324,11 @@ public static class ExecutableStorageRouteSerializer
             element.GetProperty("nullable").GetBoolean(),
             ReadNullableString(element, "collation"),
             ReadNullableString(element, "default"),
-            ReadEnum<ProjectionRebuildMode>(element, "rebuild"));
+            ReadEnum<ProjectionRebuildMode>(element, "rebuild"),
+            element.TryGetProperty("cardinality", out var cardinality)
+                ? Enum.Parse<ProjectionCardinality>(cardinality.GetString()!)
+                : ProjectionCardinality.Scalar,
+            ReadNullableInt32(element, "maxCollectionElements"));
         return new ExecutableProjectedColumnRoute(
             definition,
             ReadColumn(element.GetProperty("column")),

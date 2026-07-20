@@ -21,6 +21,8 @@ internal static class MongoDbPhysicalProjectionValues
         IReadOnlyList<ExecutableProjectedColumnRoute> projections)
     {
         ArgumentNullException.ThrowIfNull(canonicalJson);
+        foreach (var projection in projections)
+            CanonicalCollectionElementProjection.RequireScalar(projection.Definition);
         using var document = JsonDocument.Parse(canonicalJson);
         return projections.ToDictionary(
             projection => projection,
