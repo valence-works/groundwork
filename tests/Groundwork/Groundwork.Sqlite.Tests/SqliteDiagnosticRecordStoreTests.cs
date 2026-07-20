@@ -47,6 +47,126 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
     }
 
     [Fact]
+    public async Task Plan_inspector_rejects_a_missing_file_without_creating_it()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-plan-admission-{Guid.NewGuid():N}.db");
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        var inspector = SqliteDiagnosticRecordStoreFactory.CreatePlanInspector(ConnectionString(path));
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
+                inspector.InspectQueryAsync(Deployment(definition), new(new("tenant-a", "shell-a"), definition.Stream, 10)).AsTask());
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Plan_inspector_rejects_definition_drift_without_repairing_the_persisted_definition()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-plan-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var persisted = SqliteDiagnosticRecordStoreFixture.Definition;
+        var changed = persisted with { SchemaVersion = persisted.SchemaVersion + 1 };
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, persisted);
+        var before = await ReadDefinitionFingerprintAsync(connectionString, persisted.Stream);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
+                SqliteDiagnosticRecordStoreFactory.CreatePlanInspector(connectionString)
+                    .InspectQueryAsync(Deployment(changed), new(new("tenant-a", "shell-a"), changed.Stream, 10)).AsTask());
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            Assert.Equal(before, await ReadDefinitionFingerprintAsync(connectionString, persisted.Stream));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Plan_inspector_returns_non_empty_exact_query_and_trim_selection_plans()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-plan-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+        var inspector = SqliteDiagnosticRecordStoreFactory.CreatePlanInspector(connectionString);
+        var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+
+        try
+        {
+            var query = await inspector.InspectQueryAsync(Deployment(definition), new(scope, definition.Stream, 10));
+            var trim = await inspector.InspectTrimSelectionAsync(Deployment(definition),
+                DiagnosticTrimRequest.Create(scope, definition.Stream, new(DateTimeOffset.UtcNow, "trim"), 10));
+
+            Assert.Equal("sqlite", query.Provider);
+            Assert.Equal(DiagnosticRecordPlanOperation.Query, query.Operation);
+            Assert.Equal("sqlite-explain-query-plan", query.Format);
+            Assert.NotEmpty(query.RawPlans);
+            Assert.All(query.RawPlans, plan => Assert.False(string.IsNullOrWhiteSpace(plan)));
+            Assert.Equal(DiagnosticRecordPlanOperation.TrimSelection, trim.Operation);
+            Assert.Equal("sqlite-explain-query-plan", trim.Format);
+            Assert.NotEmpty(trim.RawPlans);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Plan_inspector_preserves_provider_query_validation()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-plan-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordValidationException>(() =>
+                SqliteDiagnosticRecordStoreFactory.CreatePlanInspector(connectionString)
+                    .InspectQueryAsync(Deployment(definition), new(new("tenant-a", "shell-a"), definition.Stream, 0)).AsTask());
+
+            Assert.Contains(exception.Errors, error => error.Code == "query.limit.invalid");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Plan_inspector_honors_requested_cancellation_before_storage_access()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-plan-admission-{Guid.NewGuid():N}.db");
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                SqliteDiagnosticRecordStoreFactory.CreatePlanInspector(ConnectionString(path))
+                    .InspectQueryAsync(Deployment(definition), new(new("tenant-a", "shell-a"), definition.Stream, 10), cancellation.Token).AsTask());
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Session_factory_rejects_definition_drift_without_repairing_the_persisted_definition()
     {
         var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");

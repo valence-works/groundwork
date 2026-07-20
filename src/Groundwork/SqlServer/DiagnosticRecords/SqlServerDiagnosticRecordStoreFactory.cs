@@ -48,6 +48,20 @@ public static class SqlServerDiagnosticRecordStoreFactory
                 new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
+    /// <summary>
+    /// Creates read-only native-plan inspection for already-admitted diagnostic-record storage.
+    /// Returned raw plans may contain database metadata and query values; hosts must treat them
+    /// as sensitive diagnostic evidence.
+    /// </summary>
+    public static IDiagnosticRecordPlanInspector CreatePlanInspector(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        return new DelegatingDiagnosticRecordPlanInspector(
+            new SqlServerDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, cancellationToken),
+            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, cancellationToken));
+    }
+
     public static async Task<SqlServerDiagnosticRecordStore> CreateAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
@@ -101,7 +115,6 @@ public static class SqlServerDiagnosticRecordStoreFactory
     {
         DiagnosticRecordQueryValidator.Validate(query, definition, CapabilityOnlyQueryHandler.Instance);
         SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(query.Scope, query.Stream);
-        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
         var snapshot = query.Continuation is null
             ? await ReadCursorHighWaterAsync(connectionString, query.Scope, query.Stream, cancellationToken)
@@ -117,7 +130,6 @@ public static class SqlServerDiagnosticRecordStoreFactory
     {
         DiagnosticRecordRequestValidator.Validate(request, definition);
         SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
-        await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
         return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), cancellationToken);
     }
@@ -166,11 +178,6 @@ public static class SqlServerDiagnosticRecordStoreFactory
     {
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var statistics = connection.CreateCommand())
-        {
-            statistics.CommandText = $"UPDATE STATISTICS {RelationalDiagnosticRecordSchema.RecordsTable}; UPDATE STATISTICS {RelationalDiagnosticRecordSchema.FieldsTable};";
-            await statistics.ExecuteNonQueryAsync(cancellationToken);
-        }
         await using var command = connection.CreateCommand();
         command.CommandText = $"SET STATISTICS XML ON; {diagnosticCommand.CommandText} SET STATISTICS XML OFF;";
         foreach (var item in diagnosticCommand.Parameters)
@@ -192,6 +199,22 @@ public static class SqlServerDiagnosticRecordStoreFactory
         } while (await reader.NextResultAsync(cancellationToken));
         return plans;
     }
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectQueryPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken) =>
+        new("sqlserver", DiagnosticRecordPlanOperation.Query, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
+            await ExplainQueryAsync(connectionString, definition, query, cancellationToken));
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectTrimPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken) =>
+        new("sqlserver", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
+            await ExplainTrimAsync(connectionString, definition, request, cancellationToken));
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(
         string connectionString,

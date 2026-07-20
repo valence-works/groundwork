@@ -24,6 +24,20 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
                 new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
+    /// <summary>
+    /// Creates read-only native-plan inspection for already-admitted diagnostic-record storage.
+    /// Returned raw plans may contain database metadata and query values; hosts must treat them
+    /// as sensitive diagnostic evidence.
+    /// </summary>
+    public static IDiagnosticRecordPlanInspector CreatePlanInspector(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        return new DelegatingDiagnosticRecordPlanInspector(
+            new PostgreSqlDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, cancellationToken),
+            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, cancellationToken));
+    }
+
     public static async Task<PostgreSqlDiagnosticRecordStore> CreateAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
@@ -76,7 +90,6 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
         CancellationToken cancellationToken = default)
     {
         DiagnosticRecordQueryValidator.Validate(query, definition, CapabilityOnlyQueryHandler.Instance);
-        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new PostgreSqlDiagnosticRecordStore(connectionString, definition);
         var snapshot = query.Continuation is null
             ? await ReadCursorHighWaterAsync(connectionString, query.Scope, query.Stream, cancellationToken)
@@ -91,7 +104,6 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
         CancellationToken cancellationToken = default)
     {
         DiagnosticRecordRequestValidator.Validate(request, definition);
-        await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new PostgreSqlDiagnosticRecordStore(connectionString, definition);
         return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), cancellationToken);
     }
@@ -140,11 +152,6 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var statistics = connection.CreateCommand())
-        {
-            statistics.CommandText = $"ANALYZE {RelationalDiagnosticRecordSchema.RecordsTable}; ANALYZE {RelationalDiagnosticRecordSchema.FieldsTable};";
-            await statistics.ExecuteNonQueryAsync(cancellationToken);
-        }
         await using var command = connection.CreateCommand();
         command.CommandText = $"EXPLAIN (FORMAT JSON) {diagnosticCommand.CommandText}";
         foreach (var item in diagnosticCommand.Parameters)
@@ -155,6 +162,22 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
             plans.Add(reader.GetString(0));
         return plans;
     }
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectQueryPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken) =>
+        new("postgresql", DiagnosticRecordPlanOperation.Query, DiagnosticRecordNativePlanFormats.PostgreSqlExplainJson,
+            await ExplainQueryAsync(connectionString, definition, query, cancellationToken));
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectTrimPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken) =>
+        new("postgresql", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.PostgreSqlExplainJson,
+            await ExplainTrimAsync(connectionString, definition, request, cancellationToken));
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(
         string connectionString,

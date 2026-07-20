@@ -21,6 +21,17 @@ public sealed class MongoDbDiagnosticRecordApiCollection
 public sealed class MongoDbDiagnosticRecordStoreContractTests
 {
     [Fact]
+    public void Factory_exposes_an_admission_gated_native_plan_inspector()
+    {
+        var inspector = MongoDbDiagnosticRecordStoreFactory.CreatePlanInspector(
+            "mongodb://localhost:27017",
+            "groundwork_contract");
+
+        Assert.Equal("mongodb", inspector.Provider);
+        Assert.IsAssignableFrom<IDiagnosticRecordPlanInspector>(inspector);
+    }
+
+    [Fact]
     public async Task Store_reports_that_atomic_diagnostics_require_transaction_capable_mongodb()
     {
         var database = new MongoClient("mongodb://localhost:27017").GetDatabase("groundwork_contract");
