@@ -46,7 +46,7 @@ public static class SqlitePhysicalQueryRuntime
         return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
     }
 
-    private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+    internal static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
         DbCommand command,
         CancellationToken cancellationToken)
     {

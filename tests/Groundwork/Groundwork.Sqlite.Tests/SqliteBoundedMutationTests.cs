@@ -25,6 +25,108 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Fact]
+    public async Task Public_runtime_explains_the_admitted_mutation_with_observed_native_index_evidence()
+    {
+        await using var fixture = await CreateAsync();
+        await fixture.SaveAsync("evidence-target", "stale");
+        var request = Delete("native-evidence", "stale");
+        var mutations = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+
+        var plan = mutations.ResolvePlan(request);
+        var evidence = await mutations.ExplainAsync(request);
+
+        Assert.Equal(plan, evidence.Plan);
+        Assert.Equal(
+            [
+                PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+                PhysicalDocumentMutationCommandIdentities.PredicateRecheck
+            ],
+            evidence.Commands.Select(command => command.Identity));
+        Assert.Null(evidence.Commands[0].PreparedRestrictionRowCount);
+        Assert.Equal(1, evidence.Commands[1].PreparedRestrictionRowCount);
+        Assert.All(evidence.Commands, command => Assert.Equal("sqlite-query-plan", command.NativePlanFormat));
+        var selectors = evidence.Commands
+            .SelectMany(command => command.Selectors)
+            .DistinctBy(selector => selector.Target)
+            .ToArray();
+        Assert.Equal(2, selectors.Length);
+        var primary = selectors.Single(selector =>
+            selector.Target == ExecutableStorageObjectRole.PrimaryStorage);
+        var linked = selectors.Single(selector =>
+            selector.Target == ExecutableStorageObjectRole.LinkedIndexStorage);
+        Assert.Equal(plan.Predicate.PrimaryObject, primary.StorageObject);
+        Assert.Equal(plan.Predicate.LookupObject, linked.StorageObject);
+        Assert.Null(primary.Index);
+        Assert.Equal(plan.Predicate.IndexName, linked.Index);
+        Assert.Equal(plan.Predicate.IndexName!.Identifier, linked.ObservedIndexIdentifier);
+        Assert.All(
+            evidence.Commands,
+            command => Assert.Contains(linked.Index!.Identifier, command.NativePlan, StringComparison.Ordinal));
+
+        var executed = new List<(string Identity, string CommandText, long? PreparedRestrictionRows)>();
+        var executionRuntime = fixture.CreateObservedMutationRuntime((identity, command, preparedRestrictionRows) =>
+        {
+            executed.Add((identity, command.CommandText, preparedRestrictionRows));
+            return ValueTask.CompletedTask;
+        });
+        var result = await executionRuntime.ExecuteAsync(request);
+        Assert.Equal(BoundedMutationStatus.Completed, result.Status);
+        Assert.Equal(1, result.AffectedCount);
+        Assert.Equal(
+            evidence.Commands.Select(command => (
+                command.Identity,
+                command.RenderedCommand!,
+                command.PreparedRestrictionRowCount)),
+            executed);
+    }
+
+    [Theory]
+    [InlineData("wrong-target")]
+    [InlineData("wrong-storage")]
+    [InlineData("wrong-index")]
+    [InlineData("missing-primary")]
+    [InlineData("scan-linked")]
+    [InlineData("scan-primary")]
+    public void Native_plan_inspector_fails_closed_on_target_or_index_drift(string drift)
+    {
+        var (manifest, target) = CreateModel();
+        var route = target.Routes.Single();
+        var storage = manifest.StorageUnits.Single().PhysicalStorage!;
+        var plan = PhysicalMutationPlanCompiler.Compile(
+                route,
+                storage,
+                SqlitePhysicalQueryRuntime.Capabilities(target.Provider))
+            .Plans.Single(candidate => candidate.MutationIdentity == "prune-by-category");
+        var primaryTarget = drift == "wrong-target" ? "x" : "p";
+        var linkedIndex = drift == "wrong-index" ? "wrong_index" : plan.Predicate.IndexName!.Identifier;
+        var primaryOperation = drift == "scan-primary" ? "SCAN" : "SEARCH";
+        var linkedOperation = drift == "scan-linked" ? "SCAN" : "SEARCH";
+        var primary = drift == "missing-primary"
+            ? string.Empty
+            : $"{primaryOperation} {primaryTarget} USING INDEX primary_identity_index (storage_scope=?)";
+        var content = string.Join(
+            Environment.NewLine,
+            new[]
+            {
+                $"{linkedOperation} l USING INDEX {linkedIndex} (category=?)",
+                primary
+            }.Where(line => line.Length != 0));
+        var primaryStorage = drift == "wrong-storage"
+            ? "wrong_primary"
+            : route.PrimaryStorage.Name.Identifier;
+        var rendered =
+            $"SELECT * FROM \"{route.LinkedIndexStorage!.Name.Identifier}\" AS l " +
+            $"JOIN \"{primaryStorage}\" p ON 1 = 1;";
+
+        Assert.Throws<InvalidOperationException>(() =>
+            SqliteNativeMutationPlanInspector.Inspect(
+                rendered,
+                new RelationalPhysicalNativeQueryPlan("sqlite-query-plan", content),
+                plan,
+                route));
+    }
+
+    [Fact]
     public async Task Delete_is_bounded_exact_idempotent_and_rejects_operation_reuse()
     {
         await using var fixture = await CreateAsync();
@@ -257,6 +359,31 @@ public sealed class SqliteBoundedMutationTests
         Assert.Equal(
             new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
             await fixture.CreateMutationRuntime().ExecuteAsync(Transition("rollback-cancellation-1")));
+    }
+
+    [Fact]
+    public async Task Explain_setup_cancellation_rolls_back_and_leaves_the_shared_connection_usable()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var transactionState = new RollbackRequiredMutationTransactionState();
+        await using var fixture = await CreateAsync(
+            point => point == RelationalPhysicalMutationExecutionPoint.AfterSelectionTablesPrepared
+                ? CancelMutation(cancellation)
+                : ValueTask.CompletedTask,
+            transaction => new RollbackRequiredMutationTransaction(transaction, transactionState));
+        await fixture.SaveAsync("explain-setup-target", "stale");
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            explainer.ExplainAsync(Delete("explain-setup-cancellation", "stale")));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(1, transactionState.RollbackCallCount);
+        Assert.Equal(1, transactionState.DisposeCallCount);
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(
+                Delete("after-explain-setup-cancellation", "stale")));
     }
 
     [Fact]
@@ -848,6 +975,18 @@ public sealed class SqliteBoundedMutationTests
                     "sqlite"),
                 intercept);
 
+        public IBoundedDocumentMutationStore CreateObservedMutationRuntime(
+            RelationalPhysicalMutationSelectionObserver observer) =>
+            RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    Documents,
+                    manifest,
+                    Route,
+                    target.Provider,
+                    target.Provider.Name,
+                    "sqlite"),
+                observer);
+
         public async Task<long> CountAsync(string category)
         {
             var query = SqlitePhysicalQueryRuntime.Create(Documents, manifest, Route, target.Provider);
@@ -890,6 +1029,40 @@ public sealed class SqliteBoundedMutationTests
     {
         public int RollbackCallCount { get; set; }
         public int DisposeCallCount { get; set; }
+    }
+
+    private sealed class RollbackRequiredMutationTransactionState
+    {
+        public int RollbackCallCount { get; set; }
+        public int DisposeCallCount { get; set; }
+    }
+
+    private sealed class RollbackRequiredMutationTransaction(
+        DbTransaction transaction,
+        RollbackRequiredMutationTransactionState state) : IRelationalPhysicalMutationTransaction
+    {
+        private bool completed;
+
+        public DbTransaction Transaction => transaction;
+
+        public async Task CommitAsync(CancellationToken cancellationToken)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            completed = true;
+        }
+
+        public async Task RollbackAsync(CancellationToken cancellationToken)
+        {
+            state.RollbackCallCount++;
+            await transaction.RollbackAsync(cancellationToken);
+            completed = true;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            state.DisposeCallCount++;
+            return completed ? transaction.DisposeAsync() : ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FaultingMutationTransaction(

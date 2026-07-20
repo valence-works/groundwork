@@ -17,6 +17,9 @@ public abstract class DocumentIdentityAcceptanceConformance
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase,
         DocumentIdentityAcceptanceSurface surface = DocumentIdentityAcceptanceSurface.Exact);
 
+    protected virtual Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture fixture) =>
+        Task.CompletedTask;
+
     [Fact]
     public async Task Exact_query_matches_an_equivalent_unicode_identity_and_returns_the_authoritative_original()
     {
@@ -304,6 +307,57 @@ public abstract class DocumentIdentityAcceptanceConformance
         Assert.True(evidence.SelectorUsesComparisonKey, evidence.Details);
         Assert.True(evidence.IndexCoversSelectorFields, evidence.Details);
     }
+
+    [Fact]
+    public async Task Public_mutation_runtime_returns_admitted_plan_and_native_selector_evidence()
+    {
+        await using var fixture = await CreateIdentityFixtureAsync(surface: DocumentIdentityAcceptanceSurface.Mutation);
+        const string authoritative = "runtime-evidence-𐐨-é";
+        Assert.Equal(
+            DocumentStoreWriteStatus.Saved,
+            (await fixture.Documents.SaveAsync(DocumentIdentityAcceptanceModel.Save(authoritative, "pending"))).Status);
+        await PrepareMutationNativeEvidenceAsync(fixture);
+        var mutations = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+        var request = DocumentIdentityAcceptanceModel.Delete(
+            "runtime-evidence",
+            "RUNTIME-EVIDENCE-𐐀-É");
+
+        var plan = mutations.ResolvePlan(request);
+        var evidence = await mutations.ExplainAsync(request);
+
+        Assert.Equal(plan, evidence.Plan);
+        Assert.NotEmpty(evidence.Commands);
+        Assert.All(evidence.Commands, command =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(command.NativePlanFormat));
+            Assert.False(string.IsNullOrWhiteSpace(command.NativePlan));
+        });
+        var target = plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+            ? ExecutableStorageObjectRole.LinkedIndexStorage
+            : ExecutableStorageObjectRole.PrimaryStorage;
+        var selector = evidence.Commands
+            .SelectMany(command => command.Selectors)
+            .First(item => item.Target == target);
+        Assert.Equal(plan.Predicate.LookupObject, selector.StorageObject);
+        Assert.Equal(selector.Index!.Identifier, selector.ObservedIndexIdentifier);
+        if (fixture.CanObserveMutationSelection)
+        {
+            var executed = new List<(string Identity, string CommandText, long? PreparedRestrictionRowCount)>();
+            var executionRuntime = fixture.CreateObservedMutationRuntime(
+                (identity, commandText, preparedRestrictionRowCount) =>
+                    executed.Add((identity, commandText, preparedRestrictionRowCount)));
+
+            Assert.Equal(BoundedMutationStatus.Completed, (await executionRuntime.ExecuteAsync(request)).Status);
+            Assert.Equal(
+                evidence.Commands.Select(command => (
+                    command.Identity,
+                    command.RenderedCommand!,
+                    command.PreparedRestrictionRowCount)),
+                executed);
+            Assert.Null(evidence.Commands[0].PreparedRestrictionRowCount);
+            Assert.True(evidence.Commands[1].PreparedRestrictionRowCount > 0);
+        }
+    }
 }
 
 public enum DocumentIdentityAcceptanceSurface
@@ -321,7 +375,8 @@ public sealed class DocumentIdentityAcceptanceFixture(
     Func<ValueTask> disposeAsync,
     IBoundedDocumentMutationStore? mutations = null,
     Func<DocumentQuery, Task<DocumentIdentityNativePlanEvidence>>? explainQueryAsync = null,
-    Func<DocumentMutation, Task<DocumentIdentityNativePlanEvidence>>? explainMutationAsync = null) : IAsyncDisposable
+    Func<DocumentMutation, Task<DocumentIdentityNativePlanEvidence>>? explainMutationAsync = null,
+    Func<Action<string, string, long?>, IBoundedDocumentMutationStore>? observedMutationRuntimeFactory = null) : IAsyncDisposable
 {
     public IDocumentStore Documents { get; } = documents;
     public IBoundedDocumentStore Queries { get; } = queries;
@@ -331,6 +386,10 @@ public sealed class DocumentIdentityAcceptanceFixture(
         (explainQueryAsync ?? throw new InvalidOperationException("Native query explain was not configured."))(query);
     public Task<DocumentIdentityNativePlanEvidence> ExplainMutationAsync(DocumentMutation mutation) =>
         (explainMutationAsync ?? throw new InvalidOperationException("Native mutation explain was not configured."))(mutation);
+    public bool CanObserveMutationSelection => observedMutationRuntimeFactory is not null;
+    public IBoundedDocumentMutationStore CreateObservedMutationRuntime(Action<string, string, long?> observer) =>
+        (observedMutationRuntimeFactory ??
+         throw new InvalidOperationException("Mutation selection observation was not configured."))(observer);
     public ValueTask DisposeAsync() => disposeAsync();
 }
 
