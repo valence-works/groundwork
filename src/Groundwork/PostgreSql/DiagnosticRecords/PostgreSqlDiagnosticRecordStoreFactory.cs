@@ -11,12 +11,17 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
     public static void ValidateDefinition(DiagnosticRecordStreamDefinition definition) =>
         PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
 
-    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    /// <summary>
+    /// Creates a provider-neutral scope/session factory that admits only an already-deployed,
+    /// compatible schema. Session opening and store leasing never materialize or repair storage.
+    /// </summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
-        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
-            new DiagnosticRecordStoreLease(await CreateAsync(connectionString, definition, cancellationToken)));
+        return new DelegatingDiagnosticRecordStoreSessionFactory(
+            new PostgreSqlDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, _) => ValueTask.FromResult(
+                new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
     public static async Task<PostgreSqlDiagnosticRecordStore> CreateAsync(
@@ -28,6 +33,18 @@ public static class PostgreSqlDiagnosticRecordStoreFactory
         ArgumentNullException.ThrowIfNull(definition);
         PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         await PostgreSqlDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
+            definition,
+            null,
+            null);
+    }
+
+    private static PostgreSqlDiagnosticRecordStore OpenExisting(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition)
+    {
+        PostgreSqlDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         return new(
             RelationalSessionFactory.Concurrent(() => new NpgsqlConnection(connectionString)),
             definition,

@@ -339,6 +339,22 @@ public sealed class GroundworkSchemaCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Diagnostic_operational_inspection_failures_use_the_runtime_admission_code()
+    {
+        var missingPath = Path.Combine(directory, $"missing-{Guid.NewGuid():N}.db");
+        var missingUri = $"file:{missingPath}?mode=ro";
+        var status = await DiagnosticRecordDeploymentCoordinator.InspectAsync(
+            "sqlite",
+            $"Data Source={missingUri}",
+            null,
+            new DiagnosticDeploymentManifestSource().CreateDeploymentManifest(),
+            CancellationToken.None);
+
+        var diagnostic = Assert.Single(status.Diagnostics);
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed, diagnostic.Code);
+    }
+
+    [Fact]
     public async Task Combined_plan_uses_the_compiled_document_target_when_same_version_storage_changes()
     {
         var firstDatabase = Path.Combine(directory, "combined-fingerprint-a.db");
@@ -363,6 +379,65 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         Assert.NotEqual(
             first.RootElement.GetProperty("planFingerprint").GetString(),
             second.RootElement.GetProperty("planFingerprint").GetString());
+    }
+
+    [Fact]
+    public async Task Live_validate_rejects_same_named_diagnostic_index_with_wrong_shape_without_mutation()
+    {
+        var database = Path.Combine(directory, "diagnostic-index-shape-drift.db");
+        await ApplyDiagnosticDeploymentAsync(database);
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                DROP INDEX ix_groundwork_diagnostic_records_scope_cursor;
+                CREATE INDEX ix_groundwork_diagnostic_records_scope_cursor
+                    ON groundwork_diagnostic_records (cursor);
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await AssertDiagnosticDriftIsReadOnlyAsync(database);
+    }
+
+    [Fact]
+    public async Task Live_validate_rejects_diagnostic_column_shape_drift_without_mutation()
+    {
+        var database = Path.Combine(directory, "diagnostic-column-shape-drift.db");
+        await ApplyDiagnosticDeploymentAsync(database);
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "ALTER TABLE groundwork_diagnostic_records ADD COLUMN unexpected INTEGER;";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await AssertDiagnosticDriftIsReadOnlyAsync(database);
+    }
+
+    [Fact]
+    public async Task Live_validate_rejects_diagnostic_algorithm_fingerprint_drift_without_mutation()
+    {
+        var database = Path.Combine(directory, "diagnostic-algorithm-drift.db");
+        await ApplyDiagnosticDeploymentAsync(database);
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE groundwork_diagnostic_definitions
+                SET algorithm_manifest_fingerprint = 'drift'
+                WHERE stream_id = 'diagnostic-events';
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await AssertDiagnosticDriftIsReadOnlyAsync(database);
     }
 
     [Fact]
@@ -752,6 +827,33 @@ public sealed class GroundworkSchemaCliTests : IDisposable
         var document = JsonDocument.Parse(output.ToString());
         output.GetStringBuilder().Clear();
         return document;
+    }
+
+    private async Task ApplyDiagnosticDeploymentAsync(string database)
+    {
+        var exit = await GroundworkSchemaCli.RunAsync(
+            Arguments("apply", database, typeof(DiagnosticDeploymentManifestSource)).Concat(["--safe"]).ToArray(),
+            output,
+            error);
+        using var report = ParseOutput();
+        Assert.Equal(SchemaToolExitCodes.Success, exit);
+    }
+
+    private async Task AssertDiagnosticDriftIsReadOnlyAsync(string database)
+    {
+        var before = await CaptureSqliteCatalogAsync(database);
+        var exit = await GroundworkSchemaCli.RunAsync(
+            Arguments("validate", database, typeof(DiagnosticDeploymentManifestSource)),
+            output,
+            error);
+        using var report = ParseOutput();
+
+        Assert.Equal(SchemaToolExitCodes.ValidationFailed, exit);
+        Assert.False(report.RootElement.GetProperty("targetMutated").GetBoolean());
+        Assert.Contains(
+            report.RootElement.GetProperty("diagnostics").EnumerateArray(),
+            diagnostic => diagnostic.GetProperty("code").GetString() == "GW-DIAG-DEPLOY-002");
+        Assert.Equal(before, await CaptureSqliteCatalogAsync(database));
     }
 
     private static async Task<bool> TableExistsAsync(string database, string table)

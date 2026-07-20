@@ -106,6 +106,143 @@ public interface IDiagnosticRecordStoreSessionFactory
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// Read-only provider admission for a complete diagnostic-record deployment. Provider packages
+/// own the inspection mechanics; this contract makes the result and failure semantics stable for
+/// application hosts without exposing provider SDK types.
+/// </summary>
+public interface IDiagnosticRecordDeploymentInspector
+{
+    /// <summary>The stable provider identity used in admission results and failures.</summary>
+    string Provider { get; }
+
+    ValueTask<DiagnosticRecordDeploymentInspection> InspectAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>The result of a provider's non-mutating diagnostic-record deployment inspection.</summary>
+public sealed record DiagnosticRecordDeploymentInspection
+{
+    public DiagnosticRecordDeploymentInspection(
+        string provider,
+        DiagnosticRecordDeploymentAdmissionStatus status,
+        IReadOnlyList<string>? missingStreams = null,
+        IReadOnlyList<string>? driftedStreams = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(provider);
+        if (!StringComparer.Ordinal.Equals(provider, provider.Trim()))
+            throw new ArgumentException("The provider identity cannot start or end with whitespace.", nameof(provider));
+        if (!Enum.IsDefined(status))
+            throw new ArgumentOutOfRangeException(nameof(status), status, null);
+
+        Provider = provider;
+        Status = status;
+        MissingStreams = Snapshot(missingStreams);
+        DriftedStreams = Snapshot(driftedStreams);
+        if (status != DiagnosticRecordDeploymentAdmissionStatus.Missing && MissingStreams.Count != 0)
+            throw new ArgumentException("Only a missing deployment inspection may declare missing streams.", nameof(missingStreams));
+        if (status != DiagnosticRecordDeploymentAdmissionStatus.Drifted && DriftedStreams.Count != 0)
+            throw new ArgumentException("Only a drifted deployment inspection may declare drifted streams.", nameof(driftedStreams));
+        if (status == DiagnosticRecordDeploymentAdmissionStatus.Missing && MissingStreams.Count == 0)
+            throw new ArgumentException("A missing deployment inspection must identify at least one stream.", nameof(missingStreams));
+        if (status == DiagnosticRecordDeploymentAdmissionStatus.Drifted && DriftedStreams.Count == 0)
+            throw new ArgumentException("A drifted deployment inspection must identify at least one stream.", nameof(driftedStreams));
+    }
+
+    public string Provider { get; }
+    public DiagnosticRecordDeploymentAdmissionStatus Status { get; }
+    public IReadOnlyList<string> MissingStreams { get; }
+    public IReadOnlyList<string> DriftedStreams { get; }
+    public bool IsReady => Status == DiagnosticRecordDeploymentAdmissionStatus.Ready;
+
+    public static DiagnosticRecordDeploymentInspection Ready(string provider) =>
+        new(provider, DiagnosticRecordDeploymentAdmissionStatus.Ready);
+
+    public static DiagnosticRecordDeploymentInspection Missing(
+        string provider,
+        DiagnosticRecordDeploymentManifest deployment,
+        IReadOnlyList<string>? streams = null)
+    {
+        ArgumentNullException.ThrowIfNull(deployment);
+        return new(provider, DiagnosticRecordDeploymentAdmissionStatus.Missing,
+            (streams ?? deployment.Streams.Select(stream => stream.Stream.Value).ToArray())
+            .OrderBy(stream => stream, StringComparer.Ordinal).ToArray());
+    }
+
+    public static DiagnosticRecordDeploymentInspection Drifted(
+        string provider,
+        IReadOnlyList<string> streams) =>
+        new(provider, DiagnosticRecordDeploymentAdmissionStatus.Drifted,
+            driftedStreams: streams.OrderBy(stream => stream, StringComparer.Ordinal).ToArray());
+
+    public static DiagnosticRecordDeploymentInspection Rejected(string provider) =>
+        new(provider, DiagnosticRecordDeploymentAdmissionStatus.Rejected);
+
+    private static IReadOnlyList<string> Snapshot(IReadOnlyList<string>? streams)
+    {
+        if (streams is null || streams.Count == 0)
+            return Array.Empty<string>();
+        if (streams.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("Diagnostic stream identities must be non-empty.", nameof(streams));
+        return Array.AsReadOnly(streams
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(stream => stream, StringComparer.Ordinal)
+            .ToArray());
+    }
+}
+
+/// <summary>The durable state of a provider inspection before a diagnostic-record session opens.</summary>
+public enum DiagnosticRecordDeploymentAdmissionStatus
+{
+    Ready,
+    Missing,
+    Drifted,
+    Rejected
+}
+
+/// <summary>Stable machine-readable codes emitted by runtime diagnostic-record admission.</summary>
+public static class DiagnosticRecordDeploymentAdmissionErrorCodes
+{
+    public const string Missing = "GW-DIAG-DEPLOY-001";
+    public const string Drifted = "GW-DIAG-DEPLOY-002";
+    public const string InspectionFailed = "GW-DIAG-DEPLOY-003";
+}
+
+/// <summary>
+/// Stable failure returned when runtime diagnostic persistence is not already deployed. Runtime
+/// admission is intentionally inspect-only: callers must use their explicit deployment workflow
+/// to repair missing or drifted state.
+/// </summary>
+public sealed class DiagnosticRecordDeploymentAdmissionException(
+    string code,
+    DiagnosticRecordDeploymentInspection inspection,
+    Exception? innerException = null)
+    : InvalidOperationException(CreateMessage(code, inspection), innerException)
+{
+    public string Code { get; } = code;
+    public DiagnosticRecordDeploymentInspection Inspection { get; } = inspection;
+
+    internal static DiagnosticRecordDeploymentAdmissionException FromInspection(
+        DiagnosticRecordDeploymentInspection inspection) =>
+        new(inspection.Status switch
+        {
+            DiagnosticRecordDeploymentAdmissionStatus.Missing => DiagnosticRecordDeploymentAdmissionErrorCodes.Missing,
+            DiagnosticRecordDeploymentAdmissionStatus.Drifted => DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted,
+            _ => DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed
+        }, inspection);
+
+    private static string CreateMessage(string code, DiagnosticRecordDeploymentInspection inspection) =>
+        inspection.Status switch
+        {
+            DiagnosticRecordDeploymentAdmissionStatus.Missing =>
+                $"{code}: {inspection.Provider} diagnostic-record schema is not fully deployed. Missing streams: {string.Join(", ", inspection.MissingStreams)}.",
+            DiagnosticRecordDeploymentAdmissionStatus.Drifted =>
+                $"{code}: {inspection.Provider} diagnostic-record schema has incompatible physical or persisted-definition state. Affected streams: {string.Join(", ", inspection.DriftedStreams)}.",
+            _ => $"{code}: {inspection.Provider} diagnostic-record deployment admission failed."
+        };
+}
+
 /// <summary>A scope-bound diagnostic-record store session with deterministic async disposal.</summary>
 public interface IDiagnosticRecordStoreSession : IAsyncDisposable
 {
@@ -122,25 +259,71 @@ public interface IDiagnosticRecordStoreSession : IAsyncDisposable
 /// store to one logical scope, and disposes all opened provider resources deterministically.
 /// </summary>
 public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
+    IDiagnosticRecordDeploymentInspector inspector,
     Func<DiagnosticRecordStreamDefinition, CancellationToken, ValueTask<DiagnosticRecordStoreLease>> openStoreAsync)
     : IDiagnosticRecordStoreSessionFactory
 {
+    private readonly IDiagnosticRecordDeploymentInspector inspector =
+        inspector ?? throw new ArgumentNullException(nameof(inspector));
     private readonly Func<DiagnosticRecordStreamDefinition, CancellationToken, ValueTask<DiagnosticRecordStoreLease>> openStoreAsync =
         openStoreAsync ?? throw new ArgumentNullException(nameof(openStoreAsync));
 
-    public ValueTask<IDiagnosticRecordStoreSession> OpenAsync(
+    public async ValueTask<IDiagnosticRecordStoreSession> OpenAsync(
         DiagnosticRecordDeploymentManifest deployment,
         DiagnosticStorageScope scope,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(deployment);
         cancellationToken.ThrowIfCancellationRequested();
-        return ValueTask.FromResult<IDiagnosticRecordStoreSession>(new Session(deployment, scope, openStoreAsync));
+        await EnsureReadyAsync(inspector, deployment, cancellationToken);
+        return new Session(deployment, scope, inspector, openStoreAsync);
+    }
+
+    private static async ValueTask EnsureReadyAsync(
+        IDiagnosticRecordDeploymentInspector inspector,
+        DiagnosticRecordDeploymentManifest deployment,
+        CancellationToken cancellationToken)
+    {
+        DiagnosticRecordDeploymentInspection inspection;
+        try
+        {
+            inspection = await inspector.InspectAsync(deployment, cancellationToken)
+                         ?? throw new InvalidOperationException(
+                             $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' returned no result.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (DiagnosticRecordDeploymentAdmissionException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            throw new DiagnosticRecordDeploymentAdmissionException(
+                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
+                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
+                exception);
+        }
+
+        if (!StringComparer.OrdinalIgnoreCase.Equals(inspection.Provider, inspector.Provider))
+        {
+            throw new DiagnosticRecordDeploymentAdmissionException(
+                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
+                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
+                new InvalidOperationException(
+                    $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' reported provider " +
+                    $"'{inspection.Provider}' instead of '{inspector.Provider}'."));
+        }
+        if (!inspection.IsReady)
+            throw DiagnosticRecordDeploymentAdmissionException.FromInspection(inspection);
     }
 
     private sealed class Session(
         DiagnosticRecordDeploymentManifest deployment,
         DiagnosticStorageScope scope,
+        IDiagnosticRecordDeploymentInspector inspector,
         Func<DiagnosticRecordStreamDefinition, CancellationToken, ValueTask<DiagnosticRecordStoreLease>> openStoreAsync)
         : IDiagnosticRecordStoreSession
     {
@@ -167,7 +350,7 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
                 ObjectDisposedException.ThrowIf(disposed, this);
                 if (!leases.TryGetValue(stream.Value, out open!))
                 {
-                    open = openStoreAsync(definition, lifetime.Token).AsTask();
+                    open = OpenAdmittedStoreAsync(definition, lifetime.Token);
                     leases.Add(stream.Value, open);
                 }
             }
@@ -187,6 +370,16 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
                 gate.Release();
             }
             return new ScopeBoundDiagnosticRecordStore(lease.Store, Scope, stream);
+        }
+
+        private async Task<DiagnosticRecordStoreLease> OpenAdmittedStoreAsync(
+            DiagnosticRecordStreamDefinition definition,
+            CancellationToken cancellationToken)
+        {
+            // Re-inspect immediately before the first store for each stream is exposed. This closes
+            // the ordinary host-start race without granting the open path any schema-repair authority.
+            await EnsureReadyAsync(inspector, deployment, cancellationToken);
+            return await openStoreAsync(definition, cancellationToken);
         }
 
         public async ValueTask DisposeAsync()
@@ -212,13 +405,26 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
             var failures = new List<Exception>();
             foreach (var open in opens)
             {
+                DiagnosticRecordStoreLease lease;
                 try
                 {
-                    await (await open).DisposeAsync();
+                    lease = await open;
                 }
                 catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
                 {
                     // An in-flight open observed session disposal and never produced a lease.
+                    continue;
+                }
+                catch
+                {
+                    // Admission/provider-open failures are returned to the opening caller and do
+                    // not own a resource. Re-throwing them from cleanup would mask that failure.
+                    continue;
+                }
+
+                try
+                {
+                    await lease.DisposeAsync();
                 }
                 catch (Exception exception)
                 {

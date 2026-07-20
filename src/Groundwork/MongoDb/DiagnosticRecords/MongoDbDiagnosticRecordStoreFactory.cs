@@ -36,18 +36,23 @@ public static class MongoDbDiagnosticRecordStoreFactory
         }
     }
 
-    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    /// <summary>
+    /// Creates a provider-neutral scope/session factory that admits only an already-deployed,
+    /// compatible schema. Session opening and store leasing never materialize or repair storage.
+    /// </summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(
         string connectionString,
         string databaseName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
-        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
-        {
-            var handle = await CreateAsync(connectionString, databaseName, definition, cancellationToken: cancellationToken);
-            return new DiagnosticRecordStoreLease(handle.Store, handle);
-        });
+        return new DelegatingDiagnosticRecordStoreSessionFactory(
+            new MongoDbDiagnosticRecordDeploymentInspector(connectionString, databaseName),
+            (definition, _) =>
+            {
+                var handle = OpenExisting(connectionString, databaseName, definition);
+                return ValueTask.FromResult(new DiagnosticRecordStoreLease(handle.Store, handle));
+            });
     }
 
     public static async Task<MongoDbDiagnosticRecordStoreHandle> CreateAsync(
@@ -72,6 +77,24 @@ public static class MongoDbDiagnosticRecordStoreFactory
             }
             await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, definition, cancellationToken);
             return new(client, new(database, definition, timeProvider));
+        }
+        catch
+        {
+            (client as IDisposable)?.Dispose();
+            throw;
+        }
+    }
+
+    private static MongoDbDiagnosticRecordStoreHandle OpenExisting(
+        string connectionString,
+        string databaseName,
+        DiagnosticRecordStreamDefinition definition)
+    {
+        MongoDbDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
+        var client = new MongoClient(connectionString);
+        try
+        {
+            return new(client, new(client.GetDatabase(databaseName), definition));
         }
         catch
         {
