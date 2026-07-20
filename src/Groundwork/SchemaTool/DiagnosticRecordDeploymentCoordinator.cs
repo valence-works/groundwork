@@ -88,14 +88,36 @@ internal static class DiagnosticRecordDeploymentCoordinator
         if (deployment.Streams.Count == 0)
             return DiagnosticRecordDeploymentStatus.Ready(provider, deployment);
 
-        return provider.ToLowerInvariant() switch
+        var inspector = CreateInspector(provider, connectionString, database);
+        try
         {
-            "sqlite" => await InspectSqliteAsync(connectionString, deployment, cancellationToken),
-            "sqlserver" => await InspectSqlServerAsync(connectionString, deployment, cancellationToken),
-            "postgresql" => await InspectPostgreSqlAsync(connectionString, deployment, cancellationToken),
-            "mongodb" => await InspectMongoDbAsync(connectionString, database, deployment, cancellationToken),
-            _ => throw new SchemaToolConfigurationException("GW-CLI-002", "Unknown provider. Supported providers: mongodb, postgresql, sqlite, sqlserver.")
-        };
+            // Runtime admission is the sole authority for whether the deployed schema is
+            // usable. The inventory below is deliberately limited to preserving the CLI's
+            // operation-level plan display; it must never downgrade an admission result.
+            var inspection = await inspector.InspectAsync(deployment, cancellationToken);
+            var inventory = await ReadOperationInventoryAsync(
+                inspector.Provider,
+                connectionString,
+                database,
+                deployment,
+                cancellationToken);
+            return DiagnosticRecordDeploymentStatus.FromInspection(
+                inspection,
+                deployment,
+                inventory.PhysicalStores,
+                inventory.Indexes);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Keep inspection failures semantically aligned with runtime admission: neither
+            // validation, topology, connectivity, nor a raced catalog read may be mistaken for
+            // a generic schema-tool failure.
+            return DiagnosticRecordDeploymentStatus.Rejected(inspector.Provider, deployment);
+        }
     }
 
     public static async Task ApplyAsync(
@@ -135,131 +157,74 @@ internal static class DiagnosticRecordDeploymentCoordinator
         }
     }
 
-    private static async Task<DiagnosticRecordDeploymentStatus> InspectSqliteAsync(
+    private static IDiagnosticRecordDeploymentInspector CreateInspector(
+        string provider,
         string connectionString,
-        DiagnosticRecordDeploymentManifest deployment,
-        CancellationToken cancellationToken)
-    {
-        var builder = new SqliteConnectionStringBuilder(connectionString);
-        var isInMemory = builder.DataSource == ":memory:" ||
-                          builder.DataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
-                          builder.Mode == SqliteOpenMode.Memory;
-        if (!isInMemory && !File.Exists(builder.DataSource))
-            return DiagnosticRecordDeploymentStatus.Missing("sqlite", deployment, "SQLite diagnostic-record schema is not materialized.");
-
-        builder.Mode = SqliteOpenMode.ReadOnly;
-        try
+        string? database) =>
+        provider.ToLowerInvariant() switch
         {
-            await using var connection = new SqliteConnection(builder.ConnectionString);
-            await connection.OpenAsync(cancellationToken);
-            var objects = await ReadSqliteObjectsAsync(connection, cancellationToken);
-            return await ReadRelationalDefinitionsAsync(
-                "sqlite",
-                deployment,
-                objects.Tables,
-                objects.Indexes,
-                async stream =>
-                {
-                    await using var command = connection.CreateCommand();
-                    command.CommandText = $"SELECT definition_fingerprint FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
-                    command.Parameters.AddWithValue("@stream", stream.Stream.Value);
-                    return await command.ExecuteScalarAsync(cancellationToken) as string;
-                });
-        }
-        catch (SqliteException exception) when (exception.SqliteErrorCode is 1 or 14)
-        {
-            return DiagnosticRecordDeploymentStatus.Missing("sqlite", deployment, "SQLite diagnostic-record schema is not materialized.");
-        }
-    }
+            "sqlite" => new SqliteDiagnosticRecordDeploymentInspector(connectionString),
+            "sqlserver" => new SqlServerDiagnosticRecordDeploymentInspector(connectionString),
+            "postgresql" => new PostgreSqlDiagnosticRecordDeploymentInspector(connectionString),
+            "mongodb" => new MongoDbDiagnosticRecordDeploymentInspector(
+                connectionString,
+                ResolveMongoDatabase(connectionString, database)),
+            _ => throw new SchemaToolConfigurationException("GW-CLI-002", "Unknown provider. Supported providers: mongodb, postgresql, sqlite, sqlserver.")
+        };
 
-    private static async Task<DiagnosticRecordDeploymentStatus> InspectSqlServerAsync(
-        string connectionString,
-        DiagnosticRecordDeploymentManifest deployment,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = new SqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
-        var (tables, indexes) = await ReadSqlServerObjectsAsync(connection, cancellationToken);
-        return await ReadRelationalDefinitionsAsync(
-            "sqlserver",
-            deployment,
-            tables,
-            indexes,
-            async stream =>
-            {
-                await using var command = connection.CreateCommand();
-                command.CommandText = $"SELECT definition_fingerprint FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
-                command.Parameters.AddWithValue("@stream", stream.Stream.Value);
-                return await command.ExecuteScalarAsync(cancellationToken) as string;
-            });
-    }
-
-    private static async Task<DiagnosticRecordDeploymentStatus> InspectPostgreSqlAsync(
-        string connectionString,
-        DiagnosticRecordDeploymentManifest deployment,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = new NpgsqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
-        var (tables, indexes) = await ReadPostgreSqlObjectsAsync(connection, cancellationToken);
-        return await ReadRelationalDefinitionsAsync(
-            "postgresql",
-            deployment,
-            tables,
-            indexes,
-            async stream =>
-            {
-                await using var command = connection.CreateCommand();
-                command.CommandText = $"SELECT definition_fingerprint FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
-                command.Parameters.AddWithValue("stream", stream.Stream.Value);
-                return await command.ExecuteScalarAsync(cancellationToken) as string;
-            });
-    }
-
-    private static async Task<DiagnosticRecordDeploymentStatus> InspectMongoDbAsync(
+    private static async Task<DiagnosticRecordOperationInventory> ReadOperationInventoryAsync(
+        string provider,
         string connectionString,
         string? database,
         DiagnosticRecordDeploymentManifest deployment,
         CancellationToken cancellationToken)
     {
-        var url = MongoUrl.Create(connectionString);
-        var databaseName = ResolveMongoDatabase(connectionString, database);
-        var client = new MongoClient(url);
-        var target = client.GetDatabase(databaseName);
-        using var cursor = await target.ListCollectionNamesAsync(cancellationToken: cancellationToken);
-        var collections = (await cursor.ToListAsync(cancellationToken)).ToHashSet(StringComparer.Ordinal);
-        var expectedCollections = DiagnosticRecordDeploymentOperation.Create("mongodb", deployment)
-            .Where(operation => operation.Kind == "CreateDiagnosticCollection")
-            .Select(operation => operation.SubjectIdentity)
-            .Where(collections.Contains)
-            .ToHashSet(StringComparer.Ordinal);
-        var indexes = await ReadMongoIndexesAsync(target, expectedCollections, cancellationToken);
-
-        var definitions = target.GetCollection<BsonDocument>(MongoDbDiagnosticRecordNames.StreamDefinitions);
-        var drifted = new List<string>();
-        var missing = new List<string>();
-        foreach (var stream in deployment.Streams)
+        switch (provider)
         {
-            var id = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(stream.Stream.Value)));
-            var actual = await definitions.Find(Builders<BsonDocument>.Filter.Eq("_id", id))
-                .FirstOrDefaultAsync(cancellationToken);
-            if (actual is null)
+            case "sqlite":
             {
-                missing.Add(stream.Stream.Value);
-                continue;
+                var builder = new SqliteConnectionStringBuilder(connectionString);
+                var isMemory = builder.DataSource == ":memory:" ||
+                               builder.DataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
+                               builder.Mode == SqliteOpenMode.Memory;
+                if (!isMemory && !builder.DataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase) && !File.Exists(builder.DataSource))
+                    return DiagnosticRecordOperationInventory.Empty;
+                builder.Mode = SqliteOpenMode.ReadOnly;
+                await using var connection = new SqliteConnection(builder.ConnectionString);
+                await connection.OpenAsync(cancellationToken);
+                var (tables, indexes) = await ReadSqliteObjectsAsync(connection, cancellationToken);
+                return new(tables, indexes);
             }
-            var expectedFingerprint = DiagnosticRecordPhysicalSchemaState.Capture(stream).DefinitionFingerprint;
-            if (!actual.TryGetValue("fingerprint", out var fingerprint) ||
-                !StringComparer.Ordinal.Equals(fingerprint.AsString, expectedFingerprint))
-                drifted.Add(stream.Stream.Value);
+            case "sqlserver":
+            {
+                await using var connection = new SqlConnection(connectionString);
+                await connection.OpenAsync(cancellationToken);
+                var (tables, indexes) = await ReadSqlServerObjectsAsync(connection, cancellationToken);
+                return new(tables, indexes);
+            }
+            case "postgresql":
+            {
+                await using var connection = new NpgsqlConnection(connectionString);
+                await connection.OpenAsync(cancellationToken);
+                var (tables, indexes) = await ReadPostgreSqlObjectsAsync(connection, cancellationToken);
+                return new(tables, indexes);
+            }
+            case "mongodb":
+            {
+                using var client = new MongoClient(connectionString);
+                var target = client.GetDatabase(ResolveMongoDatabase(connectionString, database));
+                using var cursor = await target.ListCollectionNamesAsync(cancellationToken: cancellationToken);
+                var collections = (await cursor.ToListAsync(cancellationToken)).ToHashSet(StringComparer.Ordinal);
+                var expected = DiagnosticRecordDeploymentOperation.Create("mongodb", deployment)
+                    .Where(operation => operation.Kind == "CreateDiagnosticCollection")
+                    .Select(operation => operation.SubjectIdentity)
+                    .Where(collections.Contains)
+                    .ToHashSet(StringComparer.Ordinal);
+                return new(collections, await ReadMongoIndexesAsync(target, expected, cancellationToken));
+            }
+            default:
+                throw new SchemaToolConfigurationException("GW-CLI-002", "Unknown provider. Supported providers: mongodb, postgresql, sqlite, sqlserver.");
         }
-        return DiagnosticRecordDeploymentStatus.FromInspection(
-            "mongodb",
-            deployment,
-            collections,
-            indexes,
-            missing,
-            drifted);
     }
 
     private static async Task<IReadOnlySet<string>> ReadMongoIndexesAsync(
@@ -278,45 +243,6 @@ internal static class DiagnosticRecordDeploymentCoordinator
         return result;
     }
 
-    private static async Task<DiagnosticRecordDeploymentStatus> ReadRelationalDefinitionsAsync(
-        string provider,
-        DiagnosticRecordDeploymentManifest deployment,
-        IReadOnlySet<string> tables,
-        IReadOnlySet<string> indexes,
-        Func<DiagnosticRecordStreamDefinition, Task<string?>> readFingerprint)
-    {
-        var missing = new List<string>();
-        var drifted = new List<string>();
-        if (!tables.Contains(RelationalDiagnosticRecordSchema.DefinitionsTable))
-        {
-            missing.AddRange(deployment.Streams.Select(stream => stream.Stream.Value));
-            return DiagnosticRecordDeploymentStatus.FromInspection(
-                provider,
-                deployment,
-                tables,
-                indexes,
-                missing,
-                drifted);
-        }
-        foreach (var stream in deployment.Streams)
-        {
-            var actual = await readFingerprint(stream);
-            if (actual is null)
-            {
-                missing.Add(stream.Stream.Value);
-                continue;
-            }
-            if (!StringComparer.Ordinal.Equals(actual, DiagnosticRecordPhysicalSchemaState.Capture(stream).DefinitionFingerprint))
-                drifted.Add(stream.Stream.Value);
-        }
-        return DiagnosticRecordDeploymentStatus.FromInspection(
-            provider,
-            deployment,
-            tables,
-            indexes,
-            missing,
-            drifted);
-    }
 
     private static async Task<(IReadOnlySet<string> Tables, IReadOnlySet<string> Indexes)> ReadSqliteObjectsAsync(
         SqliteConnection connection,
@@ -411,30 +337,26 @@ internal sealed record DiagnosticRecordDeploymentStatus(
         };
     }
 
-    public static DiagnosticRecordDeploymentStatus Missing(
-        string provider,
-        DiagnosticRecordDeploymentManifest deployment,
-        string message)
-    {
-        var status = Uninspected(provider, deployment);
-        return status with
-        {
-            Diagnostics =
-            [
-                GroundworkDiagnostic.Warning("GW-DIAG-DEPLOY-001", message, "diagnosticRecords")
-            ]
-        };
-    }
-
+    /// <summary>
+    /// Projects the provider admission result into the CLI report. Catalog names are used only to
+    /// retain the existing per-operation plan detail; admission itself has already checked full
+    /// physical shape, persisted definition, and comparison-algorithm state.
+    /// </summary>
     public static DiagnosticRecordDeploymentStatus FromInspection(
-        string provider,
+        DiagnosticRecordDeploymentInspection inspection,
         DiagnosticRecordDeploymentManifest deployment,
         IReadOnlySet<string> physicalStores,
-        IReadOnlySet<string> indexes,
-        IReadOnlyList<string> missing,
-        IReadOnlyList<string> drifted)
+        IReadOnlySet<string> indexes)
     {
+        ArgumentNullException.ThrowIfNull(inspection);
+        ArgumentNullException.ThrowIfNull(deployment);
+        ArgumentNullException.ThrowIfNull(physicalStores);
+        ArgumentNullException.ThrowIfNull(indexes);
+
+        var provider = inspection.Provider;
         var operations = DiagnosticRecordDeploymentOperation.Create(provider, deployment);
+        var missing = inspection.MissingStreams;
+        var drifted = inspection.DriftedStreams;
         var pending = operations.Where(operation => operation.Kind switch
         {
             "CreateDiagnosticTable" or "CreateDiagnosticCollection" =>
@@ -445,15 +367,30 @@ internal sealed record DiagnosticRecordDeploymentStatus(
                 drifted.Contains(operation.SubjectIdentity, StringComparer.Ordinal),
             _ => true
         }).ToArray();
-        var diagnostics = drifted.Select(stream => GroundworkDiagnostic.Error(
-            "GW-DIAG-DEPLOY-002",
-            $"Diagnostic stream '{stream}' has an incompatible persisted definition.",
-            $"diagnosticRecords.{stream}")).ToList();
-        if (pending.Length != 0)
+        var diagnostics = new List<GroundworkDiagnostic>();
+        switch (inspection.Status)
+        {
+            case DiagnosticRecordDeploymentAdmissionStatus.Drifted:
+                diagnostics.AddRange(drifted.Select(stream => GroundworkDiagnostic.Error(
+                    DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted,
+                    $"Diagnostic stream '{stream}' has incompatible physical schema, persisted definition, or comparison-algorithm state.",
+                    $"diagnosticRecords.{stream}")));
+                break;
+            case DiagnosticRecordDeploymentAdmissionStatus.Rejected:
+                diagnostics.Add(GroundworkDiagnostic.Error(
+                    DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
+                    "Diagnostic-record definitions or provider topology are incompatible with the selected provider.",
+                    "diagnosticRecords"));
+                break;
+        }
+        var hasMissingPhysicalOperation = pending.Any(operation => operation.Kind is
+            "CreateDiagnosticTable" or "CreateDiagnosticCollection" or "CreateDiagnosticIndex");
+        if (inspection.Status == DiagnosticRecordDeploymentAdmissionStatus.Missing ||
+            inspection.Status == DiagnosticRecordDeploymentAdmissionStatus.Ready && hasMissingPhysicalOperation)
         {
             diagnostics.Add(GroundworkDiagnostic.Warning(
-                "GW-DIAG-DEPLOY-001",
-                "Diagnostic-record physical operations remain pending.",
+                DiagnosticRecordDeploymentAdmissionErrorCodes.Missing,
+                "Diagnostic-record deployment remains incomplete.",
                 "diagnosticRecords"));
         }
         return new(
@@ -482,6 +419,15 @@ internal sealed record DiagnosticRecordDeploymentStatus(
                     deployment.DiagnosticFingerprint
                 }
                 .Concat(operations.SelectMany(operation => new[] { operation.Identity, operation.Fingerprint }))))));
+}
+
+internal sealed record DiagnosticRecordOperationInventory(
+    IReadOnlySet<string> PhysicalStores,
+    IReadOnlySet<string> Indexes)
+{
+    public static readonly DiagnosticRecordOperationInventory Empty = new(
+        new HashSet<string>(StringComparer.Ordinal),
+        new HashSet<string>(StringComparer.Ordinal));
 }
 
 internal sealed record DiagnosticRecordDeploymentOperation(

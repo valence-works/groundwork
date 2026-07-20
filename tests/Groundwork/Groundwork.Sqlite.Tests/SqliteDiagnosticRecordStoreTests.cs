@@ -1,6 +1,7 @@
 using Groundwork.DiagnosticRecords;
 using Groundwork.DiagnosticRecords.Tests;
 using Groundwork.DiagnosticRecords.Relational;
+using Groundwork.Core.Manifests;
 using Groundwork.Provider.Relational;
 using Groundwork.Sqlite.DiagnosticRecords;
 using Microsoft.Data.Sqlite;
@@ -24,6 +25,242 @@ public sealed class SqliteDiagnosticRecordStoreTests : RelationalDiagnosticRecor
 [Collection(SqliteDiagnosticRecordTestCollection.Name)]
 public sealed class SqliteDiagnosticRecordMaterializerTests
 {
+    [Fact]
+    public async Task Session_factory_rejects_a_missing_file_without_creating_it()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var deployment = Deployment(SqliteDiagnosticRecordStoreFixture.Definition);
+        var factory = SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(ConnectionString(path));
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await factory.OpenAsync(deployment, new("tenant-a", "shell-a")));
+
+            Assert.Equal("GW-DIAG-DEPLOY-001", exception.Code);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_definition_drift_without_repairing_the_persisted_definition()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var persisted = SqliteDiagnosticRecordStoreFixture.Definition;
+        var changed = persisted with { SchemaVersion = persisted.SchemaVersion + 1 };
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, persisted);
+        var before = await ReadDefinitionFingerprintAsync(connectionString, persisted.Stream);
+
+        try
+        {
+            var factory = SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString);
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await factory.OpenAsync(Deployment(changed), new("tenant-a", "shell-a")));
+
+            Assert.Equal("GW-DIAG-DEPLOY-002", exception.Code);
+            Assert.Equal(before, await ReadDefinitionFingerprintAsync(connectionString, persisted.Stream));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_algorithm_state_drift_without_repair()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+
+        try
+        {
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var drift = connection.CreateCommand();
+                drift.CommandText = $"UPDATE {RelationalDiagnosticRecordSchema.DefinitionsTable} SET algorithm_manifest_fingerprint = 'drifted' WHERE stream_id = @stream;";
+                drift.Parameters.AddWithValue("@stream", definition.Stream.Value);
+                await drift.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString)
+                    .OpenAsync(Deployment(definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            Assert.Equal("drifted", await ReadDefinitionStateAsync(connectionString, definition.Stream, "algorithm_manifest_fingerprint"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_wrong_index_shape_without_repair()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+
+        try
+        {
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var corrupt = connection.CreateCommand();
+                corrupt.CommandText = "DROP INDEX ix_groundwork_diagnostic_records_scope_cursor; CREATE INDEX ix_groundwork_diagnostic_records_scope_cursor ON groundwork_diagnostic_records (stream_id, scope_id, tenant_id, cursor);";
+                await corrupt.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString)
+                    .OpenAsync(Deployment(definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            await using var verify = new SqliteConnection(connectionString);
+            await verify.OpenAsync();
+            await using var read = verify.CreateCommand();
+            read.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ix_groundwork_diagnostic_records_scope_cursor';";
+            Assert.Contains("(stream_id, scope_id, tenant_id, cursor)", Assert.IsType<string>(await read.ExecuteScalarAsync()), StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_a_same_name_descending_index_without_repair()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+
+        try
+        {
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var corrupt = connection.CreateCommand();
+                corrupt.CommandText = "DROP INDEX ix_groundwork_diagnostic_records_scope_cursor; CREATE INDEX ix_groundwork_diagnostic_records_scope_cursor ON groundwork_diagnostic_records (tenant_id, scope_id, stream_id, cursor DESC);";
+                await corrupt.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString)
+                    .OpenAsync(Deployment(definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_classifies_a_same_name_view_as_drift_not_missing()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+
+        try
+        {
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var corrupt = connection.CreateCommand();
+                corrupt.CommandText = $"DROP TABLE {RelationalDiagnosticRecordSchema.DefinitionsTable}; CREATE VIEW {RelationalDiagnosticRecordSchema.DefinitionsTable} AS SELECT 'stream' AS stream_id;";
+                await corrupt.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString)
+                    .OpenAsync(Deployment(definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_opens_a_ready_deployment_and_concurrent_callers_only_inspect()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+        var factory = SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString);
+
+        try
+        {
+            var sessions = await Task.WhenAll(Enumerable.Range(0, 8).Select(async _ =>
+                await factory.OpenAsync(Deployment(definition), new("tenant-a", "shell-a"))));
+            foreach (var session in sessions)
+            {
+                Assert.Equal(new DiagnosticStorageScope("tenant-a", "shell-a"), session.Scope);
+                await session.DisposeAsync();
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task First_store_open_reinspects_and_does_not_recreate_schema_removed_after_session_admission()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"groundwork-runtime-admission-{Guid.NewGuid():N}.db");
+        var connectionString = ConnectionString(path);
+        var definition = SqliteDiagnosticRecordStoreFixture.Definition;
+        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition);
+        var factory = SqliteDiagnosticRecordStoreFactory.CreateSessionFactory(connectionString);
+
+        try
+        {
+            await using var session = await factory.OpenAsync(
+                Deployment(definition),
+                new("tenant-a", "shell-a"));
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var drop = connection.CreateCommand();
+                drop.CommandText = "DROP INDEX ix_groundwork_diagnostic_records_scope_cursor;";
+                await drop.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await session.OpenStoreAsync(definition.Stream));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+            await using var verify = new SqliteConnection(connectionString);
+            await verify.OpenAsync();
+            await using var read = verify.CreateCommand();
+            read.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_groundwork_diagnostic_records_scope_cursor';";
+            Assert.Equal(0L, await read.ExecuteScalarAsync());
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     [Fact]
     public async Task Concurrent_admission_runs_once()
     {
@@ -499,6 +736,44 @@ public sealed class SqliteDiagnosticRecordMaterializerTests
                 schema));
 
         Assert.False(File.Exists(path));
+    }
+
+    private static DiagnosticRecordDeploymentManifest Deployment(DiagnosticRecordStreamDefinition definition) => new(
+        new StorageManifest(
+            new("diagnostic-runtime-admission-tests"),
+            new("tests"),
+            new("1"),
+            [],
+            new HashSet<string>(),
+            []),
+        [definition]);
+
+    private static string ConnectionString(string path) =>
+        new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+
+    private static async Task<string?> ReadDefinitionFingerprintAsync(
+        string connectionString,
+        DiagnosticStreamId stream)
+    {
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT definition_fingerprint FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
+        command.Parameters.AddWithValue("@stream", stream.Value);
+        return await command.ExecuteScalarAsync() as string;
+    }
+
+    private static async Task<string?> ReadDefinitionStateAsync(
+        string connectionString,
+        DiagnosticStreamId stream,
+        string column)
+    {
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT {column} FROM {RelationalDiagnosticRecordSchema.DefinitionsTable} WHERE stream_id = @stream;";
+        command.Parameters.AddWithValue("@stream", stream.Value);
+        return await command.ExecuteScalarAsync() as string;
     }
 
     private static async Task<(string Path, SqliteDiagnosticRecordStore First, SqliteDiagnosticRecordStore Second)> CreateIndependentStoresAsync(

@@ -246,5 +246,8 @@ with the combined deployment and one `DiagnosticStorageScope`, then opens only a
 The returned store and every handler exposed through `Handlers` reject a different scope or stream.
 Concurrent opens of the same stream share one provider lease; session disposal coordinates with
 in-flight opens and disposes every successfully created lease exactly once. Provider SDK types,
-connection strings, and topology checks remain inside the provider package. MongoDB's session
-factory preserves the replica-set/sharded topology gate before it creates or materializes a stream.
+connection strings, and topology checks remain inside the provider package. Every session factory
+performs read-only admission when the session opens and again immediately before its first store
+lease is exposed. Missing or drifted storage fails with a stable `GW-DIAG-DEPLOY-*` code; runtime
+session creation never creates, repairs, or materializes schema. MongoDB's session factory also
+preserves the replica-set/sharded topology gate.

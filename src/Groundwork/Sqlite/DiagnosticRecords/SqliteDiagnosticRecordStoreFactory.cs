@@ -9,12 +9,17 @@ public static class SqliteDiagnosticRecordStoreFactory
     public static void ValidateDefinition(DiagnosticRecordStreamDefinition definition) =>
         SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
 
-    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    /// <summary>
+    /// Creates a provider-neutral scope/session factory that admits only an already-deployed,
+    /// compatible schema. Session opening and store leasing never materialize or repair storage.
+    /// </summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
-        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
-            new DiagnosticRecordStoreLease(await CreateAsync(connectionString, definition, cancellationToken)));
+        return new DelegatingDiagnosticRecordStoreSessionFactory(
+            new SqliteDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, _) => ValueTask.FromResult(
+                new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
     public static async Task<SqliteDiagnosticRecordStore> CreateAsync(
@@ -25,6 +30,19 @@ public static class SqliteDiagnosticRecordStoreFactory
         ArgumentNullException.ThrowIfNull(definition);
         SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            SqliteRelationalSessions.CreateSerializedDeferred(connectionString),
+            SqliteRelationalSessions.CreateSerializedImmediate(connectionString),
+            definition,
+            null,
+            null);
+    }
+
+    private static SqliteDiagnosticRecordStore OpenExisting(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition)
+    {
+        SqliteDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         return new(
             SqliteRelationalSessions.CreateSerializedDeferred(connectionString),
             SqliteRelationalSessions.CreateSerializedImmediate(connectionString),

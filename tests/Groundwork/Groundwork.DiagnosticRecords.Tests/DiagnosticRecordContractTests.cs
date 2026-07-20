@@ -42,8 +42,9 @@ public abstract class DiagnosticRecordContractTests
     public async Task Session_factory_admits_only_declared_streams_and_enforces_scope_isolation()
     {
         var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
-        var factory = new DelegatingDiagnosticRecordStoreSessionFactory((_, _) =>
-            ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore())));
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            ReadyInspector(),
+            (_, _) => ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore())));
         await using var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
 
         var store = await session.OpenStoreAsync(Definition().Stream);
@@ -58,6 +59,88 @@ public abstract class DiagnosticRecordContractTests
     }
 
     [Fact]
+    public async Task Admitting_session_factory_rejects_a_missing_deployment_before_the_store_delegate_can_run()
+    {
+        var opens = 0;
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            new StubDeploymentInspector(
+                DiagnosticRecordDeploymentInspection.Missing("test", deployment, [Definition().Stream.Value])),
+            (_, _) =>
+            {
+                Interlocked.Increment(ref opens);
+                return ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore()));
+            });
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+            await factory.OpenAsync(deployment, new("tenant-a", "shell-a")));
+
+        Assert.Equal("GW-DIAG-DEPLOY-001", exception.Code);
+        Assert.Equal(0, Volatile.Read(ref opens));
+    }
+
+    [Fact]
+    public async Task Session_reinspects_before_first_store_open_and_never_invokes_the_open_delegate_after_drift()
+    {
+        var opens = 0;
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var inspector = new SequencedDeploymentInspector(
+            DiagnosticRecordDeploymentInspection.Ready("test"),
+            DiagnosticRecordDeploymentInspection.Drifted("test", [Definition().Stream.Value]));
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            inspector,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref opens);
+                return ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore()));
+            });
+        await using var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+            await session.OpenStoreAsync(Definition().Stream));
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+        Assert.Equal(2, inspector.Calls);
+        Assert.Equal(0, Volatile.Read(ref opens));
+    }
+
+    [Fact]
+    public async Task Session_factory_classifies_inspector_failure_and_preserves_the_provider_exception()
+    {
+        var opens = 0;
+        var failure = new InvalidOperationException("provider unavailable");
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            new ThrowingDeploymentInspector("test", failure),
+            (_, _) =>
+            {
+                Interlocked.Increment(ref opens);
+                return ValueTask.FromResult(new DiagnosticRecordStoreLease(new NonCooperativeStore()));
+            });
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+            await factory.OpenAsync(deployment, new("tenant-a", "shell-a")));
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed, exception.Code);
+        Assert.Same(failure, exception.InnerException);
+        Assert.Equal(0, Volatile.Read(ref opens));
+    }
+
+    [Fact]
+    public void Deployment_inspection_snapshots_and_orders_stream_identities()
+    {
+        var streams = new List<string> { "z", "a", "z" };
+
+        var inspection = new DiagnosticRecordDeploymentInspection(
+            "test",
+            DiagnosticRecordDeploymentAdmissionStatus.Missing,
+            streams);
+        streams.Clear();
+
+        Assert.Equal(["a", "z"], inspection.MissingStreams);
+    }
+
+    [Fact]
     public async Task Session_factory_opens_each_stream_once_under_concurrency_and_disposes_one_lease()
     {
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -65,13 +148,15 @@ public abstract class DiagnosticRecordContractTests
         var opens = 0;
         var resource = new CountingResource();
         var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
-        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
-        {
-            Interlocked.Increment(ref opens);
-            entered.SetResult();
-            await release.Task;
-            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
-        });
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            ReadyInspector(),
+            async (_, _) =>
+            {
+                Interlocked.Increment(ref opens);
+                entered.SetResult();
+                await release.Task;
+                return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+            });
         var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
 
         var stores = Enumerable.Range(0, 16)
@@ -93,12 +178,14 @@ public abstract class DiagnosticRecordContractTests
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var resource = new CountingResource();
         var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
-        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(async (_, _) =>
-        {
-            entered.SetResult();
-            await release.Task;
-            return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
-        });
+        var factory = new DelegatingDiagnosticRecordStoreSessionFactory(
+            ReadyInspector(),
+            async (_, _) =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return new DiagnosticRecordStoreLease(new NonCooperativeStore(), resource);
+            });
         var session = await factory.OpenAsync(deployment, new("tenant-a", "shell-a"));
         var open = session.OpenStoreAsync(Definition().Stream).AsTask();
         await entered.Task;
@@ -773,4 +860,47 @@ public abstract class DiagnosticRecordContractTests
             return ValueTask.CompletedTask;
         }
     }
+
+    private sealed class StubDeploymentInspector(DiagnosticRecordDeploymentInspection inspection)
+        : IDiagnosticRecordDeploymentInspector
+    {
+        public string Provider => inspection.Provider;
+
+        public ValueTask<DiagnosticRecordDeploymentInspection> InspectAsync(
+            DiagnosticRecordDeploymentManifest deployment,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(inspection);
+    }
+
+    private sealed class ThrowingDeploymentInspector(string provider, Exception failure)
+        : IDiagnosticRecordDeploymentInspector
+    {
+        public string Provider { get; } = provider;
+
+        public ValueTask<DiagnosticRecordDeploymentInspection> InspectAsync(
+            DiagnosticRecordDeploymentManifest deployment,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<DiagnosticRecordDeploymentInspection>(failure);
+    }
+
+    private sealed class SequencedDeploymentInspector(
+        params DiagnosticRecordDeploymentInspection[] inspections)
+        : IDiagnosticRecordDeploymentInspector
+    {
+        private int calls;
+
+        public string Provider => inspections[0].Provider;
+        public int Calls => Volatile.Read(ref calls);
+
+        public ValueTask<DiagnosticRecordDeploymentInspection> InspectAsync(
+            DiagnosticRecordDeploymentManifest deployment,
+            CancellationToken cancellationToken = default)
+        {
+            var index = Interlocked.Increment(ref calls) - 1;
+            return ValueTask.FromResult(inspections[Math.Min(index, inspections.Length - 1)]);
+        }
+    }
+
+    private static IDiagnosticRecordDeploymentInspector ReadyInspector() =>
+        new StubDeploymentInspector(DiagnosticRecordDeploymentInspection.Ready("test"));
 }

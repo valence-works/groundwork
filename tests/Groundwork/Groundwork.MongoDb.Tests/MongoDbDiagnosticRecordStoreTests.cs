@@ -1,5 +1,6 @@
 using Groundwork.DiagnosticRecords;
 using Groundwork.DiagnosticRecords.Tests;
+using Groundwork.Core.Manifests;
 using Groundwork.MongoDb.DiagnosticRecords;
 using MongoDB.Driver;
 using MongoDB.Bson;
@@ -813,16 +814,194 @@ public sealed class MongoDbDiagnosticRecordStandaloneTests : IAsyncLifetime
     public async Task DisposeAsync() => await _container.DisposeAsync();
 
     [Fact]
-    public async Task Factory_rejects_standalone_deployments_before_exposing_a_non_atomic_store()
+    public async Task Session_factory_rejects_standalone_deployments_before_exposing_a_non_atomic_store_or_mutating_schema()
     {
-        var exception = await Assert.ThrowsAsync<NotSupportedException>(() =>
-            MongoDbDiagnosticRecordStoreFactory.CreateAsync(
-                _container.GetConnectionString(),
-                $"groundwork_{Guid.NewGuid():N}",
-                new(new("logs"), 1, "logs", [], new(), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10))));
+        var databaseName = $"groundwork_{Guid.NewGuid():N}";
+        var definition = new DiagnosticRecordStreamDefinition(
+            new("logs"), 1, "logs", [], new(), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10));
+        var deployment = new DiagnosticRecordDeploymentManifest(
+            new StorageManifest(new("diagnostic-runtime-admission-tests"), new("tests"), new("1"), [], new HashSet<string>(), []),
+            [definition]);
+        var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(_container.GetConnectionString(), databaseName);
 
-        Assert.Contains("require multi-document transactions", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("Standalone", exception.Message, StringComparison.Ordinal);
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+            await factory.OpenAsync(deployment, new("tenant-a", "shell-a")));
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed, exception.Code);
+        var topology = Assert.IsType<NotSupportedException>(exception.InnerException);
+        Assert.Contains("require multi-document transactions", topology.Message, StringComparison.Ordinal);
+        Assert.Contains("Standalone", topology.Message, StringComparison.Ordinal);
+        using var client = new MongoClient(_container.GetConnectionString());
+        Assert.DoesNotContain(databaseName, await (await client.ListDatabaseNamesAsync()).ToListAsync());
+    }
+}
+
+[Collection(MongoDbDiagnosticRecordCollection.Name)]
+public sealed class MongoDbDiagnosticRecordRuntimeAdmissionTests(MongoDbReplicaSetFixture replicaSet)
+{
+    [Fact]
+    public async Task Session_factory_rejects_a_missing_database_without_creating_collections()
+    {
+        var databaseName = $"groundwork_runtime_admission_{Guid.NewGuid():N}";
+        var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(replicaSet.ConnectionString, databaseName);
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+            await factory.OpenAsync(Deployment(Definition), new("tenant-a", "shell-a")));
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+        Assert.DoesNotContain(databaseName, await (await replicaSet.PrimaryClient.ListDatabaseNamesAsync()).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_definition_drift_without_repairing_the_persisted_definition()
+    {
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+        var changed = Definition with { SchemaVersion = Definition.SchemaVersion + 1 };
+        var before = await ReadDefinitionFingerprintAsync(database, Definition.Stream);
+
+        try
+        {
+            var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(replicaSet.ConnectionString, database.DatabaseNamespace.DatabaseName);
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await factory.OpenAsync(Deployment(changed), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            Assert.Equal(before, await ReadDefinitionFingerprintAsync(database, Definition.Stream));
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_algorithm_state_drift_without_repairing_it()
+    {
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+        var definitions = database.GetCollection<BsonDocument>(MongoDbDiagnosticRecordNames.StreamDefinitions);
+        await definitions.UpdateOneAsync(
+            Builders<BsonDocument>.Filter.Empty,
+            Builders<BsonDocument>.Update.Set("algorithm_manifest_fingerprint", "drifted"));
+
+        try
+        {
+            var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(
+                replicaSet.ConnectionString,
+                database.DatabaseNamespace.DatabaseName);
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await factory.OpenAsync(Deployment(Definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            Assert.Equal(
+                "drifted",
+                (await definitions.Find(Builders<BsonDocument>.Filter.Empty).SingleAsync())["algorithm_manifest_fingerprint"].AsString);
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_rejects_an_incompatible_existing_index_without_repairing_it()
+    {
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+        const string indexName = "ix_groundwork_diagnostic_records_scope_cursor";
+        var records = database.GetCollection<BsonDocument>(MongoDbDiagnosticRecordNames.Records);
+        await records.Indexes.DropOneAsync(indexName);
+        await records.Indexes.CreateOneAsync(new CreateIndexModel<BsonDocument>(
+            new BsonDocument("payload_json", 1),
+            new CreateIndexOptions { Name = indexName }));
+
+        try
+        {
+            var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(
+                replicaSet.ConnectionString,
+                database.DatabaseNamespace.DatabaseName);
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await factory.OpenAsync(Deployment(Definition), new("tenant-a", "shell-a")));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+            using var indexes = await records.Indexes.ListAsync();
+            var actual = (await indexes.ToListAsync()).Single(index => index["name"].AsString == indexName);
+            Assert.Equal(new BsonDocument("payload_json", 1), actual["key"].AsBsonDocument);
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task First_store_open_reinspects_and_does_not_recreate_schema_removed_after_session_admission()
+    {
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+        var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(
+            replicaSet.ConnectionString,
+            database.DatabaseNamespace.DatabaseName);
+        await using var session = await factory.OpenAsync(Deployment(Definition), new("tenant-a", "shell-a"));
+        await database.DropCollectionAsync(MongoDbDiagnosticRecordNames.Records);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(async () =>
+                await session.OpenStoreAsync(Definition.Stream));
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+            using var collections = await database.ListCollectionNamesAsync();
+            Assert.DoesNotContain(MongoDbDiagnosticRecordNames.Records, await collections.ToListAsync());
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task Session_factory_opens_a_ready_deployment()
+    {
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+
+        try
+        {
+            var factory = MongoDbDiagnosticRecordStoreFactory.CreateSessionFactory(replicaSet.ConnectionString, database.DatabaseNamespace.DatabaseName);
+            await using var session = await factory.OpenAsync(Deployment(Definition), new("tenant-a", "shell-a"));
+
+            Assert.Equal(new DiagnosticStorageScope("tenant-a", "shell-a"), session.Scope);
+            Assert.NotNull(await session.OpenStoreAsync(Definition.Stream));
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    private static readonly DiagnosticRecordStreamDefinition Definition = new(
+        new("logs"), 1, "diagnostic_logs", [], new(), TimeSpan.FromMinutes(5),
+        TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(10));
+
+    private static DiagnosticRecordDeploymentManifest Deployment(DiagnosticRecordStreamDefinition definition) => new(
+        new StorageManifest(
+            new("diagnostic-runtime-admission-tests"),
+            new("tests"),
+            new("1"),
+            [],
+            new HashSet<string>(),
+            []),
+        [definition]);
+
+    private static async Task<string?> ReadDefinitionFingerprintAsync(IMongoDatabase database, DiagnosticStreamId stream)
+    {
+        var id = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(stream.Value)));
+        var document = await database.GetCollection<BsonDocument>(MongoDbDiagnosticRecordNames.StreamDefinitions)
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", id))
+            .SingleAsync();
+        return document["fingerprint"].AsString;
     }
 }
 

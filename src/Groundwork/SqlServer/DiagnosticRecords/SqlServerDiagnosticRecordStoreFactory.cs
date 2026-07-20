@@ -35,12 +35,17 @@ public static class SqlServerDiagnosticRecordStoreFactory
         }
     }
 
-    /// <summary>Creates a provider-neutral scope/session factory for a declared deployment.</summary>
+    /// <summary>
+    /// Creates a provider-neutral scope/session factory that admits only an already-deployed,
+    /// compatible schema. Session opening and store leasing never materialize or repair storage.
+    /// </summary>
     public static IDiagnosticRecordStoreSessionFactory CreateSessionFactory(string connectionString)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
-        return new DelegatingDiagnosticRecordStoreSessionFactory(async (definition, cancellationToken) =>
-            new DiagnosticRecordStoreLease(await CreateAsync(connectionString, definition, cancellationToken)));
+        return new DelegatingDiagnosticRecordStoreSessionFactory(
+            new SqlServerDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, _) => ValueTask.FromResult(
+                new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
     public static async Task<SqlServerDiagnosticRecordStore> CreateAsync(
@@ -52,6 +57,18 @@ public static class SqlServerDiagnosticRecordStoreFactory
         ArgumentNullException.ThrowIfNull(definition);
         SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         await SqlServerDiagnosticRecordMaterializer.MaterializeAsync(connectionString, definition, cancellationToken: cancellationToken);
+        return new(
+            RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
+            definition,
+            null,
+            null);
+    }
+
+    private static SqlServerDiagnosticRecordStore OpenExisting(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition)
+    {
+        SqlServerDiagnosticRecordValidator.ValidateDefinitionAndThrow(definition);
         return new(
             RelationalSessionFactory.Concurrent(() => new SqlConnection(connectionString)),
             definition,
