@@ -121,6 +121,135 @@ public interface IDiagnosticRecordDeploymentInspector
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// Produces provider-native planner evidence for the exact bounded diagnostic-record query or
+/// trim-selection route. Inspection is admission-gated and read-only: it never creates or repairs
+/// physical storage. The returned raw plan can expose object names, predicates, and parameter
+/// values, so hosts must treat it as sensitive diagnostic data.
+/// </summary>
+public interface IDiagnosticRecordPlanInspector
+{
+    /// <summary>The stable provider identity used in plan-inspection results.</summary>
+    string Provider { get; }
+
+    ValueTask<DiagnosticRecordNativePlan> InspectQueryAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken = default);
+
+    ValueTask<DiagnosticRecordNativePlan> InspectTrimSelectionAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>The executable diagnostic-record route represented by native planner output.</summary>
+public enum DiagnosticRecordPlanOperation
+{
+    Query,
+    TrimSelection
+}
+
+/// <summary>
+/// Immutable provider-native planner output. <see cref="RawPlans"/> is intentionally not
+/// normalized: it is evidence emitted by the provider for the exact operation route and may
+/// contain sensitive database metadata or query values.
+/// </summary>
+public sealed record DiagnosticRecordNativePlan
+{
+    public DiagnosticRecordNativePlan(
+        string provider,
+        DiagnosticRecordPlanOperation operation,
+        string format,
+        IReadOnlyList<string> rawPlans)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(provider);
+        ArgumentException.ThrowIfNullOrWhiteSpace(format);
+        if (!Enum.IsDefined(operation))
+            throw new ArgumentOutOfRangeException(nameof(operation), operation, null);
+        ArgumentNullException.ThrowIfNull(rawPlans);
+        if (rawPlans.Count == 0 || rawPlans.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("Native planner output must contain at least one non-empty item.", nameof(rawPlans));
+
+        Provider = provider;
+        Operation = operation;
+        Format = format;
+        RawPlans = Array.AsReadOnly(rawPlans.ToArray());
+    }
+
+    public string Provider { get; }
+    public DiagnosticRecordPlanOperation Operation { get; }
+    public string Format { get; }
+    public IReadOnlyList<string> RawPlans { get; }
+}
+
+/// <summary>Stable names for provider-native diagnostic-record plan payload formats.</summary>
+public static class DiagnosticRecordNativePlanFormats
+{
+    public const string SqliteExplainQueryPlan = "sqlite-explain-query-plan";
+    public const string PostgreSqlExplainJson = "postgresql-explain-json";
+    public const string SqlServerShowplanXml = "sqlserver-showplan-xml";
+    public const string MongoDbExplainJson = "mongodb-explain-json";
+}
+
+/// <summary>
+/// Provider-neutral adapter that gates native plan inspection through the same non-mutating
+/// deployment admission used by runtime sessions. Provider packages supply the exact existing
+/// command/pipeline explain routes; this type deliberately owns no provider SDK dependency.
+/// </summary>
+public sealed class DelegatingDiagnosticRecordPlanInspector(
+    IDiagnosticRecordDeploymentInspector deploymentInspector,
+    Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync,
+    Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync)
+    : IDiagnosticRecordPlanInspector
+{
+    private readonly IDiagnosticRecordDeploymentInspector deploymentInspector =
+        deploymentInspector ?? throw new ArgumentNullException(nameof(deploymentInspector));
+    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticRecordQuery, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectQueryAsync =
+        inspectQueryAsync ?? throw new ArgumentNullException(nameof(inspectQueryAsync));
+    private readonly Func<DiagnosticRecordStreamDefinition, DiagnosticTrimRequest, CancellationToken, ValueTask<DiagnosticRecordNativePlan>> inspectTrimSelectionAsync =
+        inspectTrimSelectionAsync ?? throw new ArgumentNullException(nameof(inspectTrimSelectionAsync));
+
+    public string Provider => deploymentInspector.Provider;
+
+    public ValueTask<DiagnosticRecordNativePlan> InspectQueryAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken = default) =>
+        InspectAsync(deployment, query.Stream, DiagnosticRecordPlanOperation.Query,
+            definition => inspectQueryAsync(definition, query, cancellationToken), cancellationToken);
+
+    public ValueTask<DiagnosticRecordNativePlan> InspectTrimSelectionAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken = default) =>
+        InspectAsync(deployment, request.Stream, DiagnosticRecordPlanOperation.TrimSelection,
+            definition => inspectTrimSelectionAsync(definition, request, cancellationToken), cancellationToken);
+
+    private async ValueTask<DiagnosticRecordNativePlan> InspectAsync(
+        DiagnosticRecordDeploymentManifest deployment,
+        DiagnosticStreamId stream,
+        DiagnosticRecordPlanOperation operation,
+        Func<DiagnosticRecordStreamDefinition, ValueTask<DiagnosticRecordNativePlan>> inspectAsync,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(deployment);
+        cancellationToken.ThrowIfCancellationRequested();
+        var definition = deployment.Streams.SingleOrDefault(item =>
+            StringComparer.Ordinal.Equals(item.Stream.Value, stream.Value))
+            ?? throw new InvalidOperationException($"Diagnostic stream '{stream.Value}' is not declared by this deployment.");
+
+        await DiagnosticRecordDeploymentAdmission.EnsureReadyAsync(deploymentInspector, deployment, cancellationToken);
+        var plan = await inspectAsync(definition)
+            ?? throw new InvalidOperationException($"Diagnostic-record plan inspector '{GetType().FullName}' returned no result.");
+        if (!StringComparer.OrdinalIgnoreCase.Equals(plan.Provider, Provider))
+            throw new InvalidOperationException($"Diagnostic-record plan inspector reported provider '{plan.Provider}' instead of '{Provider}'.");
+        if (plan.Operation != operation)
+            throw new InvalidOperationException($"Diagnostic-record plan inspector returned '{plan.Operation}' for requested '{operation}'.");
+        return plan;
+    }
+}
+
 /// <summary>The result of a provider's non-mutating diagnostic-record deployment inspection.</summary>
 public sealed record DiagnosticRecordDeploymentInspection
 {
@@ -275,49 +404,8 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
     {
         ArgumentNullException.ThrowIfNull(deployment);
         cancellationToken.ThrowIfCancellationRequested();
-        await EnsureReadyAsync(inspector, deployment, cancellationToken);
+        await DiagnosticRecordDeploymentAdmission.EnsureReadyAsync(inspector, deployment, cancellationToken);
         return new Session(deployment, scope, inspector, openStoreAsync);
-    }
-
-    private static async ValueTask EnsureReadyAsync(
-        IDiagnosticRecordDeploymentInspector inspector,
-        DiagnosticRecordDeploymentManifest deployment,
-        CancellationToken cancellationToken)
-    {
-        DiagnosticRecordDeploymentInspection inspection;
-        try
-        {
-            inspection = await inspector.InspectAsync(deployment, cancellationToken)
-                         ?? throw new InvalidOperationException(
-                             $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' returned no result.");
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (DiagnosticRecordDeploymentAdmissionException)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            throw new DiagnosticRecordDeploymentAdmissionException(
-                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
-                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
-                exception);
-        }
-
-        if (!StringComparer.OrdinalIgnoreCase.Equals(inspection.Provider, inspector.Provider))
-        {
-            throw new DiagnosticRecordDeploymentAdmissionException(
-                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
-                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
-                new InvalidOperationException(
-                    $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' reported provider " +
-                    $"'{inspection.Provider}' instead of '{inspector.Provider}'."));
-        }
-        if (!inspection.IsReady)
-            throw DiagnosticRecordDeploymentAdmissionException.FromInspection(inspection);
     }
 
     private sealed class Session(
@@ -378,7 +466,7 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
         {
             // Re-inspect immediately before the first store for each stream is exposed. This closes
             // the ordinary host-start race without granting the open path any schema-repair authority.
-            await EnsureReadyAsync(inspector, deployment, cancellationToken);
+            await DiagnosticRecordDeploymentAdmission.EnsureReadyAsync(inspector, deployment, cancellationToken);
             return await openStoreAsync(definition, cancellationToken);
         }
 
@@ -437,6 +525,50 @@ public sealed class DelegatingDiagnosticRecordStoreSessionFactory(
             if (failures.Count > 1)
                 throw new AggregateException("One or more diagnostic-record leases failed to dispose.", failures);
         }
+    }
+}
+
+internal static class DiagnosticRecordDeploymentAdmission
+{
+    public static async ValueTask EnsureReadyAsync(
+        IDiagnosticRecordDeploymentInspector inspector,
+        DiagnosticRecordDeploymentManifest deployment,
+        CancellationToken cancellationToken)
+    {
+        DiagnosticRecordDeploymentInspection inspection;
+        try
+        {
+            inspection = await inspector.InspectAsync(deployment, cancellationToken)
+                         ?? throw new InvalidOperationException(
+                             $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' returned no result.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (DiagnosticRecordDeploymentAdmissionException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            throw new DiagnosticRecordDeploymentAdmissionException(
+                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
+                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
+                exception);
+        }
+
+        if (!StringComparer.OrdinalIgnoreCase.Equals(inspection.Provider, inspector.Provider))
+        {
+            throw new DiagnosticRecordDeploymentAdmissionException(
+                DiagnosticRecordDeploymentAdmissionErrorCodes.InspectionFailed,
+                DiagnosticRecordDeploymentInspection.Rejected(inspector.Provider),
+                new InvalidOperationException(
+                    $"Diagnostic-record deployment inspector '{inspector.GetType().FullName}' reported provider " +
+                    $"'{inspection.Provider}' instead of '{inspector.Provider}'."));
+        }
+        if (!inspection.IsReady)
+            throw DiagnosticRecordDeploymentAdmissionException.FromInspection(inspection);
     }
 }
 

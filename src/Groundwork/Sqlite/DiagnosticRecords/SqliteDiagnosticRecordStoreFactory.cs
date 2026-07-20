@@ -22,6 +22,20 @@ public static class SqliteDiagnosticRecordStoreFactory
                 new DiagnosticRecordStoreLease(OpenExisting(connectionString, definition))));
     }
 
+    /// <summary>
+    /// Creates read-only native-plan inspection for already-admitted diagnostic-record storage.
+    /// Returned raw plans may contain database metadata and query values; hosts must treat them
+    /// as sensitive diagnostic evidence.
+    /// </summary>
+    public static IDiagnosticRecordPlanInspector CreatePlanInspector(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        return new DelegatingDiagnosticRecordPlanInspector(
+            new SqliteDiagnosticRecordDeploymentInspector(connectionString),
+            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, cancellationToken),
+            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, cancellationToken));
+    }
+
     public static async Task<SqliteDiagnosticRecordStore> CreateAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
@@ -76,7 +90,6 @@ public static class SqliteDiagnosticRecordStoreFactory
         CancellationToken cancellationToken = default)
     {
         DiagnosticRecordQueryValidator.Validate(query, definition, new CapabilityOnlyQueryHandler());
-        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new SqliteDiagnosticRecordStore(connectionString, definition);
         var snapshot = query.Continuation is null
             ? await ReadCursorHighWaterAsync(connectionString, query.Scope, query.Stream, cancellationToken)
@@ -91,7 +104,6 @@ public static class SqliteDiagnosticRecordStoreFactory
         CancellationToken cancellationToken = default)
     {
         DiagnosticRecordRequestValidator.Validate(request, definition);
-        await SqliteDiagnosticRecordMaterializer.MaterializeAsync(connectionString, cancellationToken: cancellationToken);
         var store = new SqliteDiagnosticRecordStore(connectionString, definition);
         return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), cancellationToken);
     }
@@ -140,11 +152,6 @@ public static class SqliteDiagnosticRecordStoreFactory
     {
         await using var connection = SqliteConnectionFactory.Create(connectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var analyze = connection.CreateCommand())
-        {
-            analyze.CommandText = "ANALYZE;";
-            await analyze.ExecuteNonQueryAsync(cancellationToken);
-        }
         await using var command = connection.CreateCommand();
         command.CommandText = $"EXPLAIN QUERY PLAN {diagnosticCommand.CommandText}";
         foreach (var item in diagnosticCommand.Parameters)
@@ -155,6 +162,22 @@ public static class SqliteDiagnosticRecordStoreFactory
             result.Add(reader.GetString(3));
         return result;
     }
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectQueryPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken) =>
+        new("sqlite", DiagnosticRecordPlanOperation.Query, DiagnosticRecordNativePlanFormats.SqliteExplainQueryPlan,
+            await ExplainQueryAsync(connectionString, definition, query, cancellationToken));
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectTrimPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken) =>
+        new("sqlite", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.SqliteExplainQueryPlan,
+            await ExplainTrimAsync(connectionString, definition, request, cancellationToken));
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(
         string connectionString,

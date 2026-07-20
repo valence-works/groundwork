@@ -127,6 +127,96 @@ public abstract class DiagnosticRecordContractTests
     }
 
     [Fact]
+    public async Task Plan_inspector_rejects_missing_storage_before_the_provider_plan_delegate_can_run()
+    {
+        var calls = 0;
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var inspector = new DelegatingDiagnosticRecordPlanInspector(
+            new StubDeploymentInspector(DiagnosticRecordDeploymentInspection.Missing("test", deployment)),
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref calls);
+                return ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.Query));
+            },
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.TrimSelection)));
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
+            inspector.InspectQueryAsync(deployment, Query()).AsTask());
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+        Assert.Equal(0, Volatile.Read(ref calls));
+    }
+
+    [Fact]
+    public async Task Plan_inspector_rejects_drift_before_the_provider_plan_delegate_can_run()
+    {
+        var calls = 0;
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var inspector = new DelegatingDiagnosticRecordPlanInspector(
+            new StubDeploymentInspector(DiagnosticRecordDeploymentInspection.Drifted("test", [Definition().Stream.Value])),
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref calls);
+                return ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.Query));
+            },
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.TrimSelection)));
+
+        var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
+            inspector.InspectQueryAsync(deployment, Query()).AsTask());
+
+        Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Drifted, exception.Code);
+        Assert.Equal(0, Volatile.Read(ref calls));
+    }
+
+    [Fact]
+    public async Task Plan_inspector_returns_the_exact_requested_operation_and_snapshots_raw_output()
+    {
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var output = new List<string> { "native-plan" };
+        var inspector = new DelegatingDiagnosticRecordPlanInspector(
+            ReadyInspector(),
+            (_, _, _) => ValueTask.FromResult(new DiagnosticRecordNativePlan("test", DiagnosticRecordPlanOperation.Query, "test-format", output)),
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.TrimSelection)));
+
+        var plan = await inspector.InspectQueryAsync(deployment, Query());
+        output[0] = "mutated";
+
+        Assert.Equal("test", plan.Provider);
+        Assert.Equal(DiagnosticRecordPlanOperation.Query, plan.Operation);
+        Assert.Equal("test-format", plan.Format);
+        Assert.Equal(["native-plan"], plan.RawPlans);
+    }
+
+    [Fact]
+    public async Task Plan_inspector_preserves_requested_cancellation_without_touching_the_provider()
+    {
+        var calls = 0;
+        var deployment = new DiagnosticRecordDeploymentManifest(StorageManifest(), [Definition()]);
+        var inspector = new DelegatingDiagnosticRecordPlanInspector(
+            ReadyInspector(),
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref calls);
+                return ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.Query));
+            },
+            (_, _, _) => ValueTask.FromResult(Plan(DiagnosticRecordPlanOperation.TrimSelection)));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            inspector.InspectQueryAsync(deployment, Query(), cancellation.Token).AsTask());
+
+        Assert.Equal(0, Volatile.Read(ref calls));
+    }
+
+    [Fact]
+    public void Native_plan_rejects_empty_raw_output()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            new DiagnosticRecordNativePlan("test", DiagnosticRecordPlanOperation.Query, "format", []));
+    }
+
+    [Fact]
     public void Deployment_inspection_snapshots_and_orders_stream_identities()
     {
         var streams = new List<string> { "z", "a", "z" };
@@ -780,6 +870,11 @@ public abstract class DiagnosticRecordContractTests
         MaxOperationClockSkew: TimeSpan.FromMinutes(5),
         AppendIdempotencyWindow: TimeSpan.FromMinutes(10),
         TrimIdempotencyWindow: TimeSpan.FromMinutes(10));
+
+    private static DiagnosticRecordQuery Query() => new(new("tenant-a", "scope-a"), Definition().Stream, 10);
+
+    private static DiagnosticRecordNativePlan Plan(DiagnosticRecordPlanOperation operation) =>
+        new("test", operation, "test-format", ["native-plan"]);
 
     private static StorageManifest StorageManifest() => new(
         new("diagnostic-deployment-tests"),

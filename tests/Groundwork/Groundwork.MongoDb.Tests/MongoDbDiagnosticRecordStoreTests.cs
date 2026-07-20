@@ -21,6 +21,17 @@ public sealed class MongoDbDiagnosticRecordApiCollection
 public sealed class MongoDbDiagnosticRecordStoreContractTests
 {
     [Fact]
+    public void Factory_exposes_an_admission_gated_native_plan_inspector()
+    {
+        var inspector = MongoDbDiagnosticRecordStoreFactory.CreatePlanInspector(
+            "mongodb://localhost:27017",
+            "groundwork_contract");
+
+        Assert.Equal("mongodb", inspector.Provider);
+        Assert.IsAssignableFrom<IDiagnosticRecordPlanInspector>(inspector);
+    }
+
+    [Fact]
     public async Task Store_reports_that_atomic_diagnostics_require_transaction_capable_mongodb()
     {
         var database = new MongoClient("mongodb://localhost:27017").GetDatabase("groundwork_contract");
@@ -974,6 +985,47 @@ public sealed class MongoDbDiagnosticRecordRuntimeAdmissionTests(MongoDbReplicaS
 
             Assert.Equal(new DiagnosticStorageScope("tenant-a", "shell-a"), session.Scope);
             Assert.NotNull(await session.OpenStoreAsync(Definition.Stream));
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(database.DatabaseNamespace.DatabaseName);
+        }
+    }
+
+    [Fact]
+    public async Task Plan_inspector_rejects_a_missing_database_without_creating_collections_and_returns_native_query_and_trim_plans_when_ready()
+    {
+        var missingDatabaseName = $"groundwork_runtime_admission_{Guid.NewGuid():N}";
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticRecordDeploymentAdmissionException>(() =>
+                MongoDbDiagnosticRecordStoreFactory.CreatePlanInspector(replicaSet.ConnectionString, missingDatabaseName)
+                    .InspectQueryAsync(Deployment(Definition), new(new("tenant-a", "shell-a"), Definition.Stream, 10)).AsTask());
+
+            Assert.Equal(DiagnosticRecordDeploymentAdmissionErrorCodes.Missing, exception.Code);
+            Assert.DoesNotContain(missingDatabaseName, await (await replicaSet.PrimaryClient.ListDatabaseNamesAsync()).ToListAsync());
+        }
+        finally
+        {
+            await replicaSet.PrimaryClient.DropDatabaseAsync(missingDatabaseName);
+        }
+
+        var database = replicaSet.PrimaryClient.GetDatabase($"groundwork_runtime_admission_{Guid.NewGuid():N}");
+        try
+        {
+            await MongoDbDiagnosticRecordMaterializer.MaterializeAsync(database, Definition);
+            var inspector = MongoDbDiagnosticRecordStoreFactory.CreatePlanInspector(
+                replicaSet.ConnectionString,
+                database.DatabaseNamespace.DatabaseName);
+            var scope = new DiagnosticStorageScope("tenant-a", "shell-a");
+            var query = await inspector.InspectQueryAsync(Deployment(Definition), new(scope, Definition.Stream, 10));
+            var trim = await inspector.InspectTrimSelectionAsync(Deployment(Definition),
+                DiagnosticTrimRequest.Create(scope, Definition.Stream, new(DateTimeOffset.UtcNow, "plan-trim"), 10));
+
+            Assert.Equal(DiagnosticRecordNativePlanFormats.MongoDbExplainJson, query.Format);
+            Assert.NotEmpty(query.RawPlans);
+            Assert.Equal(DiagnosticRecordNativePlanFormats.MongoDbExplainJson, trim.Format);
+            Assert.NotEmpty(trim.RawPlans);
         }
         finally
         {

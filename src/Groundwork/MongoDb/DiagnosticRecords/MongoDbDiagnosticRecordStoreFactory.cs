@@ -55,6 +55,23 @@ public static class MongoDbDiagnosticRecordStoreFactory
             });
     }
 
+    /// <summary>
+    /// Creates read-only native-plan inspection for already-admitted diagnostic-record storage.
+    /// Returned raw plans may contain database metadata and query values; hosts must treat them
+    /// as sensitive diagnostic evidence.
+    /// </summary>
+    public static IDiagnosticRecordPlanInspector CreatePlanInspector(
+        string connectionString,
+        string databaseName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
+        return new DelegatingDiagnosticRecordPlanInspector(
+            new MongoDbDiagnosticRecordDeploymentInspector(connectionString, databaseName),
+            (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, databaseName, definition, query, cancellationToken),
+            (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, databaseName, definition, request, cancellationToken));
+    }
+
     public static async Task<MongoDbDiagnosticRecordStoreHandle> CreateAsync(
         string connectionString,
         string databaseName,
@@ -101,6 +118,30 @@ public static class MongoDbDiagnosticRecordStoreFactory
             (client as IDisposable)?.Dispose();
             throw;
         }
+    }
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectQueryPlanAsync(
+        string connectionString,
+        string databaseName,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticRecordQuery query,
+        CancellationToken cancellationToken)
+    {
+        await using var handle = OpenExisting(connectionString, databaseName, definition);
+        var plan = await handle.Store.ExplainQueryAsync(query, cancellationToken);
+        return new("mongodb", DiagnosticRecordPlanOperation.Query, DiagnosticRecordNativePlanFormats.MongoDbExplainJson, [plan.ToString()]);
+    }
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectTrimPlanAsync(
+        string connectionString,
+        string databaseName,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticTrimRequest request,
+        CancellationToken cancellationToken)
+    {
+        await using var handle = OpenExisting(connectionString, databaseName, definition);
+        var plan = await handle.Store.ExplainTrimAsync(request, cancellationToken);
+        return new("mongodb", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.MongoDbExplainJson, [plan.ToString()]);
     }
 
 }

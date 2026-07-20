@@ -93,6 +93,20 @@ public sealed class DiagnosticRecordProviderApiTests
     }
 
     [Fact]
+    public void Relational_providers_expose_admission_gated_native_plan_inspectors()
+    {
+        var sqlServer = SqlServerDiagnosticRecordStoreFactory.CreatePlanInspector(
+            "Server=localhost;Database=groundwork;User ID=sa;Password=NotARealPassword1!;TrustServerCertificate=True");
+        var postgreSql = PostgreSqlDiagnosticRecordStoreFactory.CreatePlanInspector(
+            "Host=localhost;Database=groundwork;Username=groundwork;Password=not-real");
+
+        Assert.Equal("sqlserver", sqlServer.Provider);
+        Assert.Equal("postgresql", postgreSql.Provider);
+        Assert.IsAssignableFrom<IDiagnosticRecordPlanInspector>(sqlServer);
+        Assert.IsAssignableFrom<IDiagnosticRecordPlanInspector>(postgreSql);
+    }
+
+    [Fact]
     public void Relational_providers_reject_declared_string_bounds_beyond_adapter_capabilities_before_io()
     {
         var oversized = Definition with
