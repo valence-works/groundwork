@@ -14,6 +14,7 @@ namespace Groundwork.Relational.Documents;
 internal enum RelationalPhysicalMutationExecutionPoint
 {
     BeforeSelection,
+    AfterSelectionTablesPrepared,
     AfterCandidateDiscovery,
     BeforePrimaryLocks,
     AfterPrimaryLocks,
@@ -305,6 +306,11 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         await CreateSelectionTableAsync(connection, transaction, CandidateTableExpression, cancellationToken);
         await CreateSelectionTableAsync(connection, transaction, ProvisionalTableExpression, cancellationToken);
         await CreateSelectionTableAsync(connection, transaction, SelectionTableExpression, cancellationToken);
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.AfterSelectionTablesPrepared,
+            connection,
+            transaction,
+            cancellationToken);
     }
 
     internal async Task PopulatePredicateRecheckInputsAsync(

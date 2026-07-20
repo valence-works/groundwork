@@ -362,6 +362,31 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Fact]
+    public async Task Explain_setup_cancellation_rolls_back_and_leaves_the_shared_connection_usable()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var transactionState = new RollbackRequiredMutationTransactionState();
+        await using var fixture = await CreateAsync(
+            point => point == RelationalPhysicalMutationExecutionPoint.AfterSelectionTablesPrepared
+                ? CancelMutation(cancellation)
+                : ValueTask.CompletedTask,
+            transaction => new RollbackRequiredMutationTransaction(transaction, transactionState));
+        await fixture.SaveAsync("explain-setup-target", "stale");
+        var explainer = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            explainer.ExplainAsync(Delete("explain-setup-cancellation", "stale")));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(1, transactionState.RollbackCallCount);
+        Assert.Equal(1, transactionState.DisposeCallCount);
+        Assert.Equal(
+            new BoundedMutationResult(BoundedMutationStatus.Completed, 1),
+            await fixture.CreateMutationRuntime().ExecuteAsync(
+                Delete("after-explain-setup-cancellation", "stale")));
+    }
+
+    [Fact]
     public async Task Delete_failure_before_commit_restores_primary_linked_and_ledger_state()
     {
         await using var fixture = await CreateAsync(point => point == RelationalPhysicalMutationExecutionPoint.BeforeCommit
@@ -1004,6 +1029,40 @@ public sealed class SqliteBoundedMutationTests
     {
         public int RollbackCallCount { get; set; }
         public int DisposeCallCount { get; set; }
+    }
+
+    private sealed class RollbackRequiredMutationTransactionState
+    {
+        public int RollbackCallCount { get; set; }
+        public int DisposeCallCount { get; set; }
+    }
+
+    private sealed class RollbackRequiredMutationTransaction(
+        DbTransaction transaction,
+        RollbackRequiredMutationTransactionState state) : IRelationalPhysicalMutationTransaction
+    {
+        private bool completed;
+
+        public DbTransaction Transaction => transaction;
+
+        public async Task CommitAsync(CancellationToken cancellationToken)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            completed = true;
+        }
+
+        public async Task RollbackAsync(CancellationToken cancellationToken)
+        {
+            state.RollbackCallCount++;
+            await transaction.RollbackAsync(cancellationToken);
+            completed = true;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            state.DisposeCallCount++;
+            return completed ? transaction.DisposeAsync() : ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FaultingMutationTransaction(

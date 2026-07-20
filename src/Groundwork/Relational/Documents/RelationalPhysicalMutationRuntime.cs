@@ -99,7 +99,7 @@ internal static class RelationalPhysicalMutationRuntime
             runtime.Capabilities,
             handlers,
             explain is null ? null : (mutation, plan, cancellationToken) =>
-                ExplainAsync(context, mutation, plan, explain, cancellationToken),
+                ExplainAsync(context, mutation, plan, explain, intercept, cancellationToken),
             explain is null ? null : (mutation, plan) =>
                 InvocationFingerprint(context.Store, mutation, plan));
     }
@@ -137,10 +137,11 @@ internal static class RelationalPhysicalMutationRuntime
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
         RelationalPhysicalMutationExplainExecutor explain,
+        RelationalPhysicalMutationInterceptor? intercept,
         CancellationToken cancellationToken)
     {
         var runtime = BuildRuntime(context);
-        var (handler, admitted) = ResolveCommandHandler(context.Store, runtime, mutation);
+        var (handler, admitted) = ResolveCommandHandler(context.Store, runtime, mutation, intercept);
         if (!admitted.Equals(plan))
             throw new InvalidOperationException("Provider-native mutation explanation did not resolve the admitted plan.");
         var scope = context.Store.ResolveMutationScope(mutation.DocumentKind);
@@ -152,10 +153,10 @@ internal static class RelationalPhysicalMutationRuntime
             await using var mutationTransaction =
                 await context.Store.BeginPhysicalMutationTransactionAsync(connection, ct);
             var transaction = mutationTransaction.Transaction;
-            await handler.PrepareSelectionStagesAsync(connection, transaction, ct);
             Exception? primaryFailure = null;
             try
             {
+                await handler.PrepareSelectionStagesAsync(connection, transaction, ct);
                 var commands = new List<PhysicalDocumentMutationCommandExplanation>();
                 foreach (var stage in stages)
                 {
@@ -265,7 +266,8 @@ internal static class RelationalPhysicalMutationRuntime
     private static (RelationalPhysicalDocumentMutationHandler Handler, PhysicalMutationPlan Plan) ResolveCommandHandler(
         RelationalPhysicalDocumentStore store,
         RuntimeComponents runtime,
-        DocumentMutation mutation)
+        DocumentMutation mutation,
+        RelationalPhysicalMutationInterceptor? intercept = null)
     {
         var plan = runtime.Compilation.Plans.Single(candidate =>
             candidate.MutationIdentity == mutation.MutationIdentity);
@@ -276,7 +278,8 @@ internal static class RelationalPhysicalMutationRuntime
                 plan.HandlerIdentity,
                 source,
                 store,
-                [RelationalPhysicalDocumentMutationHandler.Certify(plan)]),
+                [RelationalPhysicalDocumentMutationHandler.Certify(plan)],
+                intercept),
             plan);
     }
 
