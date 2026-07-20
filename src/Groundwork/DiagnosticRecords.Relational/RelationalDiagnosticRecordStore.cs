@@ -261,6 +261,21 @@ public sealed class RelationalDiagnosticRecordStore :
         return new(dialect.PrepareCommandText(dialect.ApplyLimit(sql, "keep")), parameters);
     }
 
+    internal RelationalDiagnosticCommand BuildStatisticsCommand(DiagnosticStreamInspectionRequest request)
+    {
+        var parameters = ScopeParameters(request.Scope, request.Stream);
+        return new(dialect.PrepareCommandText($"""
+            SELECT
+                (SELECT COUNT(*) FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()}),
+                (SELECT MAX(cursor) FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()}),
+                next_cursor,
+                logical_high_water_type,
+                logical_high_water_value
+            FROM {RelationalDiagnosticRecordSchema.StreamsTable}
+            WHERE {ScopeWhere()};
+            """), parameters);
+    }
+
     private async Task<OperationExecution<DiagnosticAppendResult>> AppendInTransactionAsync(
         DbConnection connection,
         DbTransaction transaction,
@@ -760,18 +775,8 @@ public sealed class RelationalDiagnosticRecordStore :
 
     private async Task<DiagnosticStreamStatistics> ReadStatisticsAsync(DbConnection connection, DbTransaction transaction, DiagnosticStorageScope scope, DiagnosticStreamId stream, CancellationToken cancellationToken)
     {
-        var parameters = ScopeParameters(scope, stream);
         await using var command = CreateCommand(connection, transaction,
-            new($"""
-                SELECT
-                    (SELECT COUNT(*) FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()}),
-                    (SELECT MAX(cursor) FROM {RelationalDiagnosticRecordSchema.RecordsTable} WHERE {ScopeWhere()}),
-                    next_cursor,
-                    logical_high_water_type,
-                    logical_high_water_value
-                FROM {RelationalDiagnosticRecordSchema.StreamsTable}
-                WHERE {ScopeWhere()};
-                """, parameters));
+            BuildStatisticsCommand(new(scope, stream)));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
             return new(new(0), null, null, null);

@@ -33,6 +33,7 @@ public static class SqliteDiagnosticRecordStoreFactory
         return new DelegatingDiagnosticRecordPlanInspector(
             new SqliteDiagnosticRecordDeploymentInspector(connectionString),
             (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, cancellationToken),
+            (definition, request, cancellationToken) => InspectStatisticsPlanAsync(connectionString, definition, request, cancellationToken),
             (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, cancellationToken));
     }
 
@@ -108,6 +109,17 @@ public static class SqliteDiagnosticRecordStoreFactory
         return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), cancellationToken);
     }
 
+    internal static async ValueTask<IReadOnlyList<string>> ExplainStatisticsAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        DiagnosticRecordRequestValidator.Validate(request, definition);
+        var store = new SqliteDiagnosticRecordStore(connectionString, definition);
+        return await ExplainAsync(connectionString, store.Inner.BuildStatisticsCommand(request), cancellationToken);
+    }
+
     internal static async ValueTask<IReadOnlyList<string>> ReadComparisonKeysAsync(
         string connectionString,
         DiagnosticStorageScope scope,
@@ -178,6 +190,14 @@ public static class SqliteDiagnosticRecordStoreFactory
         CancellationToken cancellationToken) =>
         new("sqlite", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.SqliteExplainQueryPlan,
             await ExplainTrimAsync(connectionString, definition, request, cancellationToken));
+
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectStatisticsPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken) =>
+        new("sqlite", DiagnosticRecordPlanOperation.Statistics, DiagnosticRecordNativePlanFormats.SqliteExplainQueryPlan,
+            await ExplainStatisticsAsync(connectionString, definition, request, cancellationToken));
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(
         string connectionString,

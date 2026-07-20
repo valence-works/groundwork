@@ -5,6 +5,14 @@ are not a general update/delete language. A manifest fixes both the predicate sh
 allowed effect; a runtime caller supplies an operation identity and the values for the remaining
 declared predicates.
 
+## Point document operations
+
+`Save`, `Delete`, and `Load` by a known document identity are bounded point operations, not
+scale-bearing selection routes. They therefore do not require a generic document-mutation plan
+inspector. When a workflow first selects or retains a potentially large set, native plan evidence
+belongs to that preceding bounded query, capacity check, or diagnostic-record statistics route;
+the subsequent identity-addressed writes are covered by the selected set's contract.
+
 ```csharp
 var physicalStorage = new StorageUnitPhysicalStorage(
     StorageUnitProvisioningMode.Declared,

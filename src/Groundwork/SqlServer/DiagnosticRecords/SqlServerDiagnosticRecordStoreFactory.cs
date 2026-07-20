@@ -65,6 +65,7 @@ public static class SqlServerDiagnosticRecordStoreFactory
         return new DelegatingDiagnosticRecordPlanInspector(
             new SqlServerDiagnosticRecordDeploymentInspector(connectionString),
             (definition, query, cancellationToken) => InspectQueryPlanAsync(connectionString, definition, query, hooks, cancellationToken),
+            (definition, request, cancellationToken) => InspectStatisticsPlanAsync(connectionString, definition, request, hooks, cancellationToken),
             (definition, request, cancellationToken) => InspectTrimPlanAsync(connectionString, definition, request, hooks, cancellationToken));
     }
 
@@ -131,6 +132,18 @@ public static class SqlServerDiagnosticRecordStoreFactory
         DiagnosticTrimRequest request,
         CancellationToken cancellationToken = default) =>
         await ExplainTrimAsync(
+            connectionString,
+            definition,
+            request,
+            new SqlServerDiagnosticRecordPlanExplainHooks(),
+            cancellationToken);
+
+    internal static async ValueTask<IReadOnlyList<string>> ExplainStatisticsAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken = default) =>
+        await ExplainStatisticsAsync(
             connectionString,
             definition,
             request,
@@ -250,6 +263,15 @@ public static class SqlServerDiagnosticRecordStoreFactory
         new("sqlserver", DiagnosticRecordPlanOperation.TrimSelection, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
             await ExplainTrimAsync(connectionString, definition, request, hooks, cancellationToken));
 
+    private static async ValueTask<DiagnosticRecordNativePlan> InspectStatisticsPlanAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
+        CancellationToken cancellationToken) =>
+        new("sqlserver", DiagnosticRecordPlanOperation.Statistics, DiagnosticRecordNativePlanFormats.SqlServerShowplanXml,
+            await ExplainStatisticsAsync(connectionString, definition, request, hooks, cancellationToken));
+
     private static async ValueTask<IReadOnlyList<string>> ExplainQueryAsync(
         string connectionString,
         DiagnosticRecordStreamDefinition definition,
@@ -277,6 +299,19 @@ public static class SqlServerDiagnosticRecordStoreFactory
         SqlServerDiagnosticRecordValidator.ValidateOperationAndThrow(request.Scope, request.Stream, request.OperationId);
         var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
         return await ExplainAsync(connectionString, store.Inner.BuildTrimSelectionCommand(request), hooks, cancellationToken);
+    }
+
+    private static async ValueTask<IReadOnlyList<string>> ExplainStatisticsAsync(
+        string connectionString,
+        DiagnosticRecordStreamDefinition definition,
+        DiagnosticStreamInspectionRequest request,
+        SqlServerDiagnosticRecordPlanExplainHooks hooks,
+        CancellationToken cancellationToken)
+    {
+        DiagnosticRecordRequestValidator.Validate(request, definition);
+        SqlServerDiagnosticRecordValidator.ValidateScopeAndThrow(request.Scope, request.Stream);
+        var store = new SqlServerDiagnosticRecordStore(connectionString, definition);
+        return await ExplainAsync(connectionString, store.Inner.BuildStatisticsCommand(request), hooks, cancellationToken);
     }
 
     private static async ValueTask<long> ReadCursorHighWaterAsync(

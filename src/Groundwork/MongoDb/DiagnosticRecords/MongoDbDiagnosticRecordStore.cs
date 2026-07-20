@@ -375,6 +375,48 @@ public sealed class MongoDbDiagnosticRecordStore :
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Returns MongoDB's native query-planner evidence for the exact statistics-inspection read
+    /// sequence: stream state, retained-record count, and maximum retained cursor.
+    /// </summary>
+    internal async ValueTask<IReadOnlyList<BsonDocument>> ExplainStatisticsAsync(
+        DiagnosticStreamInspectionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        DiagnosticRecordRequestValidator.Validate(request, _definition);
+        var recordsFilter = Render(ScopeFilter(request.Scope, request.Stream));
+        var commands = new[]
+        {
+            new BsonDocument
+            {
+                { "find", MongoDbDiagnosticRecordNames.Streams },
+                { "filter", new BsonDocument("_id", StreamKey(request.Scope, request.Stream)) },
+                { "limit", 1 }
+            },
+            new BsonDocument
+            {
+                { "count", MongoDbDiagnosticRecordNames.Records },
+                { "query", recordsFilter }
+            },
+            new BsonDocument
+            {
+                { "find", MongoDbDiagnosticRecordNames.Records },
+                { "filter", recordsFilter },
+                { "sort", new BsonDocument("cursor", -1) },
+                { "limit", 1 }
+            }
+        };
+
+        var plans = new List<BsonDocument>(commands.Length);
+        foreach (var command in commands)
+        {
+            plans.Add(await _database.RunCommandAsync<BsonDocument>(
+                new BsonDocument { { "explain", command }, { "verbosity", "queryPlanner" } },
+                cancellationToken: cancellationToken));
+        }
+        return plans;
+    }
+
     private IReadOnlyList<BsonDocument> BuildTrimSelectionPipeline(DiagnosticTrimRequest request) =>
     [
         new("$match", Render(ScopeFilter(request.Scope, request.Stream))),
