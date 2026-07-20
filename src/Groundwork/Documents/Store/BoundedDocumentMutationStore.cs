@@ -393,16 +393,18 @@ public interface IPhysicalDocumentMutationHandler
 /// Resolves and validates the complete named mutation before dispatching to a provider handler.
 /// Unknown names, shapes, effects, routes, and capability claims fail before provider I/O.
 /// </summary>
-public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStore
+public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExplainer
 {
     private readonly IReadOnlyDictionary<string, PhysicalMutationPlan> plans;
     private readonly IReadOnlyDictionary<string, IPhysicalDocumentMutationHandler> handlers;
+    private readonly PhysicalDocumentMutationExplainExecutor? explain;
 
     public PhysicalMutationDocumentStore(
         ExecutableStorageRoute route,
         StorageUnitPhysicalStorage storage,
         PhysicalQueryPlannerCapabilities predicateCapabilities,
-        IReadOnlyList<IPhysicalDocumentMutationHandler> handlers)
+        IReadOnlyList<IPhysicalDocumentMutationHandler> handlers,
+        PhysicalDocumentMutationExplainExecutor? explain = null)
     {
         ArgumentNullException.ThrowIfNull(route);
         ArgumentNullException.ThrowIfNull(storage);
@@ -450,6 +452,7 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
 
         plans = compilation.Plans.ToFrozenDictionary(plan => plan.MutationIdentity, StringComparer.Ordinal);
         this.handlers = byIdentity.ToFrozenDictionary(group => group.Key, group => group.Value[0], StringComparer.Ordinal);
+        this.explain = explain;
     }
 
     public Task<BoundedMutationResult> ExecuteAsync(
@@ -476,6 +479,47 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
 
         ValidateRuntimeShape(mutation, plan);
         return plan;
+    }
+
+    public PhysicalMutationPlan ResolvePlan(DocumentMutation mutation) => Admit(mutation);
+
+    public async Task<PhysicalDocumentMutationExplanation> ExplainAsync(
+        DocumentMutation mutation,
+        CancellationToken cancellationToken = default)
+    {
+        var plan = Admit(mutation);
+        if (explain is null)
+        {
+            throw new NotSupportedException(
+                $"Bounded mutation '{mutation.MutationIdentity}' has no provider-native evidence runtime.");
+        }
+
+        var evidence = await explain(mutation, plan, cancellationToken);
+        if (!ReferenceEquals(evidence.Plan, plan) && !evidence.Plan.Equals(plan))
+            throw new InvalidOperationException("Provider-native mutation evidence returned a different admitted plan.");
+        ValidateEvidence(plan, evidence);
+        return evidence;
+    }
+
+    private static void ValidateEvidence(PhysicalMutationPlan plan, PhysicalDocumentMutationExplanation evidence)
+    {
+        if (plan.Predicate.IndexName is null)
+        {
+            throw new InvalidOperationException(
+                $"Bounded mutation '{plan.MutationIdentity}' has no declared physical index.");
+        }
+        var target = plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+            ? ExecutableStorageObjectRole.LinkedIndexStorage
+            : ExecutableStorageObjectRole.PrimaryStorage;
+        var observed = evidence.Selectors.SingleOrDefault(candidate => candidate.Target == target);
+        if (observed is null ||
+            observed.StorageObject != plan.Predicate.LookupObject ||
+            !string.Equals(observed.ObservedIndexIdentifier, observed.Index.Identifier, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not prove declared target " +
+                $"'{plan.Predicate.LookupObject.Identifier}' and its declared physical index.");
+        }
     }
 
     private static bool SupportsProfile(

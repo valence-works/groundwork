@@ -310,6 +310,16 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
     protected override IPhysicalSchemaExecutor CreateSchemaExecutor() =>
         new PostgreSqlPhysicalSchemaExecutor(fixture.Container.GetConnectionString());
 
+    protected override async Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture identityFixture)
+    {
+        await SeedPlanNoiseAsync(identityFixture.Route);
+        await using var connection = new NpgsqlConnection(fixture.Container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var analyze = connection.CreateCommand();
+        analyze.CommandText = $"ANALYZE {Quote(identityFixture.Route.PrimaryStorage.Name.Identifier)};";
+        await analyze.ExecuteNonQueryAsync();
+    }
+
     protected override DocumentIdentityAcceptanceFixture CreateFixture(
         StorageManifest manifest,
         PhysicalSchemaTarget target,
@@ -465,6 +475,16 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
     protected override string DialectName => "sqlserver";
     protected override IPhysicalSchemaExecutor CreateSchemaExecutor() =>
         new SqlServerPhysicalSchemaExecutor(fixture.Container.GetConnectionString());
+
+    protected override async Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture identityFixture)
+    {
+        await SeedPlanNoiseAsync(identityFixture.Route);
+        await using var connection = new SqlConnection(fixture.Container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var statistics = connection.CreateCommand();
+        statistics.CommandText = $"UPDATE STATISTICS {Quote(identityFixture.Route.PrimaryStorage.Name.Identifier)};";
+        await statistics.ExecuteNonQueryAsync();
+    }
 
     protected override DocumentIdentityAcceptanceFixture CreateFixture(
         StorageManifest manifest,

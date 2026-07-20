@@ -12,12 +12,12 @@ namespace Groundwork.Sqlite.Documents;
 /// <summary>Builds the certified SQLite bounded-mutation runtime for one compiled route.</summary>
 public static class SqlitePhysicalMutationRuntime
 {
-    public static IBoundedDocumentMutationStore Create(
+    public static IPhysicalDocumentMutationExplainer Create(
         SqlitePhysicalDocumentStore store,
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        Create(store, manifest, route, provider, null);
+        (IPhysicalDocumentMutationExplainer)Create(store, manifest, route, provider, null);
 
     internal static IBoundedDocumentMutationStore Create(
         SqlitePhysicalDocumentStore store,
@@ -25,7 +25,7 @@ public static class SqlitePhysicalMutationRuntime
         ExecutableStorageRoute route,
         ProviderIdentity provider,
         Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept) =>
-        RelationalPhysicalMutationRuntime.Create(
+        (IPhysicalDocumentMutationExplainer)RelationalPhysicalMutationRuntime.Create(
             new RelationalPhysicalMutationRuntimeContext(
                 store,
                 manifest,
@@ -34,7 +34,8 @@ public static class SqlitePhysicalMutationRuntime
                 SqliteGroundworkCapabilities.Provider.Name,
                 "sqlite",
                 CanonicalJsonValueKinds(provider)),
-            intercept);
+            intercept,
+            SqlitePhysicalQueryRuntime.ExplainAsync);
 
     internal static async Task<string> ExplainAsync(
         SqliteConnection connection,

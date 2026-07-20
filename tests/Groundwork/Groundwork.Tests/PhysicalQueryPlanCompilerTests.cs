@@ -1129,6 +1129,16 @@ public sealed class PhysicalQueryPlanCompilerTests
         Assert.Equal(BoundedMutationStatus.Completed, completed.Status);
         Assert.Equal(3, completed.AffectedCount);
         Assert.Equal(1, handler.ExecutionCount);
+        Assert.Equal(plan, mutations.ResolvePlan(new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "inspection-only",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))])));
+        await Assert.ThrowsAsync<NotSupportedException>(() => mutations.ExplainAsync(new DocumentMutation(
+            "workflowTriggerBinding",
+            "prune-by-stimulus-type",
+            "missing-evidence",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Equal("stimulusType", "http"))])));
         await Assert.ThrowsAsync<InvalidOperationException>(() => mutations.ExecuteAsync(new DocumentMutation(
             "workflowTriggerBinding",
             "undeclared-prune",

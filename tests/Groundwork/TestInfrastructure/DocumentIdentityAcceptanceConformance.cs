@@ -17,6 +17,9 @@ public abstract class DocumentIdentityAcceptanceConformance
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.UnicodeOrdinalIgnoreCase,
         DocumentIdentityAcceptanceSurface surface = DocumentIdentityAcceptanceSurface.Exact);
 
+    protected virtual Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture fixture) =>
+        Task.CompletedTask;
+
     [Fact]
     public async Task Exact_query_matches_an_equivalent_unicode_identity_and_returns_the_authoritative_original()
     {
@@ -303,6 +306,34 @@ public abstract class DocumentIdentityAcceptanceConformance
         Assert.True(evidence.SelectorUsesLookupKey, evidence.Details);
         Assert.True(evidence.SelectorUsesComparisonKey, evidence.Details);
         Assert.True(evidence.IndexCoversSelectorFields, evidence.Details);
+    }
+
+    [Fact]
+    public async Task Public_mutation_runtime_returns_admitted_plan_and_native_selector_evidence()
+    {
+        await using var fixture = await CreateIdentityFixtureAsync(surface: DocumentIdentityAcceptanceSurface.Mutation);
+        const string authoritative = "runtime-evidence-𐐨-é";
+        Assert.Equal(
+            DocumentStoreWriteStatus.Saved,
+            (await fixture.Documents.SaveAsync(DocumentIdentityAcceptanceModel.Save(authoritative, "pending"))).Status);
+        await PrepareMutationNativeEvidenceAsync(fixture);
+        var mutations = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+        var request = DocumentIdentityAcceptanceModel.Delete(
+            "runtime-evidence",
+            "RUNTIME-EVIDENCE-𐐀-É");
+
+        var plan = mutations.ResolvePlan(request);
+        var evidence = await mutations.ExplainAsync(request);
+
+        Assert.Equal(plan, evidence.Plan);
+        Assert.False(string.IsNullOrWhiteSpace(evidence.NativePlanFormat));
+        Assert.False(string.IsNullOrWhiteSpace(evidence.NativePlan));
+        var target = plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+            ? ExecutableStorageObjectRole.LinkedIndexStorage
+            : ExecutableStorageObjectRole.PrimaryStorage;
+        var selector = Assert.Single(evidence.Selectors.Where(item => item.Target == target));
+        Assert.Equal(plan.Predicate.LookupObject, selector.StorageObject);
+        Assert.Equal(selector.Index.Identifier, selector.ObservedIndexIdentifier);
     }
 }
 

@@ -25,6 +25,27 @@ public sealed class SqliteBoundedMutationTests
     }
 
     [Fact]
+    public async Task Public_runtime_explains_the_admitted_mutation_with_observed_native_index_evidence()
+    {
+        await using var fixture = await CreateAsync();
+        await fixture.SaveAsync("evidence-target", "stale");
+        var request = Delete("native-evidence", "stale");
+        var mutations = Assert.IsAssignableFrom<IPhysicalDocumentMutationExplainer>(fixture.Mutations);
+
+        var plan = mutations.ResolvePlan(request);
+        var evidence = await mutations.ExplainAsync(request);
+
+        Assert.Equal(plan, evidence.Plan);
+        Assert.Equal("sqlite-query-plan", evidence.NativePlanFormat);
+        var selector = Assert.Single(evidence.Selectors);
+        Assert.Equal(plan.Predicate.LookupObject, selector.StorageObject);
+        Assert.Equal(plan.Predicate.IndexName, selector.Index);
+        Assert.Equal(plan.Predicate.IndexName!.Identifier, selector.ObservedIndexIdentifier);
+        Assert.Contains(selector.Index.Identifier, evidence.NativePlan, StringComparison.Ordinal);
+        Assert.Contains(selector.StorageObject.Identifier, evidence.RenderedCommand, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Delete_is_bounded_exact_idempotent_and_rejects_operation_reuse()
     {
         await using var fixture = await CreateAsync();

@@ -41,6 +41,11 @@ public static class SqlServerPhysicalQueryRuntime
             (command, cancellationToken) => ExplainAsync(command, hooks, cancellationToken));
     }
 
+    internal static Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+        DbCommand command,
+        CancellationToken cancellationToken) =>
+        ExplainAsync(command, new SqlServerPhysicalQueryExplainHooks(), cancellationToken);
+
     private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
         DbCommand command,
         SqlServerPhysicalQueryExplainHooks hooks,

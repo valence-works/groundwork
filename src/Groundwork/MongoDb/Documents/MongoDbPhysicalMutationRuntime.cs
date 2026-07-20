@@ -11,12 +11,12 @@ namespace Groundwork.MongoDb.Documents;
 /// <summary>Builds the certified MongoDB bounded-mutation runtime for one compiled route.</summary>
 public static class MongoDbPhysicalMutationRuntime
 {
-    public static IBoundedDocumentMutationStore Create(
+    public static IPhysicalDocumentMutationExplainer Create(
         MongoDbPhysicalDocumentStore store,
         StorageManifest manifest,
         ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        Create(store, manifest, route, provider, null);
+        (IPhysicalDocumentMutationExplainer)Create(store, manifest, route, provider, null);
 
     internal static IBoundedDocumentMutationStore Create(
         MongoDbPhysicalDocumentStore store,
@@ -57,7 +57,14 @@ public static class MongoDbPhysicalMutationRuntime
             route,
             storage,
             capabilities,
-            handlers.Cast<IPhysicalDocumentMutationHandler>().ToArray());
+            handlers.Cast<IPhysicalDocumentMutationHandler>().ToArray(),
+            (mutation, plan, cancellationToken) => ExplainAsync(
+                store,
+                binding,
+                handlers,
+                mutation,
+                plan,
+                cancellationToken));
         return new BoundRuntime(
             binding,
             mutations,
@@ -76,8 +83,26 @@ public static class MongoDbPhysicalMutationRuntime
         ArgumentNullException.ThrowIfNull(mutation);
         var runtime = CreateRuntime(store, manifest, route, provider, intercept: null);
         var plan = runtime.Mutations.Admit(mutation);
-        var executable = runtime.Binding.Bindings.Single(candidate => candidate.Plan.Equals(plan));
-        var handler = runtime.Handlers[plan.HandlerIdentity];
+        var explanation = await ExplainAsync(
+            store,
+            runtime.Binding,
+            runtime.Handlers.Values.ToArray(),
+            mutation,
+            plan,
+            cancellationToken);
+        return BsonDocument.Parse(explanation.NativePlan);
+    }
+
+    private static async Task<PhysicalDocumentMutationExplanation> ExplainAsync(
+        MongoDbPhysicalDocumentStore store,
+        RuntimeBinding binding,
+        IReadOnlyCollection<MongoDbPhysicalDocumentMutationHandler> handlers,
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        CancellationToken cancellationToken)
+    {
+        var executable = binding.Bindings.Single(candidate => candidate.Plan.Equals(plan));
+        var handler = handlers.Single(candidate => candidate.Identity == plan.HandlerIdentity);
         var invocation = handler.BindInvocation(mutation, plan);
         await store.EnsureMutationSupportedAsync(mutation.DocumentKind, cancellationToken);
         var evidence = new BsonDocument
@@ -103,7 +128,28 @@ public static class MongoDbPhysicalMutationRuntime
         {
             evidence["linked"] = BsonNull.Value;
         }
-        return evidence;
+        var selectors = new List<PhysicalDocumentMutationSelectorEvidence>
+        {
+            new(
+                executable.Schema.Primary.Target,
+                executable.Schema.Primary.StorageObject,
+                executable.Schema.Primary.Index,
+                evidence["primary"]["winningPlanIndex"].AsString)
+        };
+        if (executable.Schema.Linked is not null)
+        {
+            selectors.Add(new(
+                executable.Schema.Linked.Target,
+                executable.Schema.Linked.StorageObject,
+                executable.Schema.Linked.Index,
+                evidence["linked"]["winningPlanIndex"].AsString));
+        }
+        return new PhysicalDocumentMutationExplanation(
+            plan,
+            invocation.Fingerprint,
+            "mongodb-query-planner",
+            evidence.ToJson(),
+            selectors);
     }
 
     private static RuntimeBinding Resolve(

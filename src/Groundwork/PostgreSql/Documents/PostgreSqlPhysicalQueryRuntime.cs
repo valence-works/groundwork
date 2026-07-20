@@ -22,7 +22,7 @@ public static class PostgreSqlPhysicalQueryRuntime
             "postgresql",
             ExplainAsync);
 
-    private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+    internal static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
         DbCommand command,
         CancellationToken cancellationToken)
     {

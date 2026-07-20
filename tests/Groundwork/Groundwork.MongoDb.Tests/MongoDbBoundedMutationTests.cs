@@ -73,6 +73,35 @@ public sealed class MongoDbBoundedMutationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Public_runtime_preserves_mongodb_native_plan_with_observed_selector_index()
+    {
+        var database = new MongoClient(container.GetConnectionString())
+            .GetDatabase($"groundwork_{Guid.NewGuid():N}");
+        var model = Model();
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var documents = new MongoDbPhysicalDocumentStore(
+            database,
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+        var route = Assert.Single(model.Routes);
+        var mutations = MongoDbPhysicalMutationRuntime.Create(
+            documents,
+            model.Manifest,
+            route,
+            model.Provider);
+        var request = Delete("native-evidence", "stale");
+
+        var plan = mutations.ResolvePlan(request);
+        var evidence = await mutations.ExplainAsync(request);
+
+        Assert.Equal(plan, evidence.Plan);
+        Assert.Equal("mongodb-query-planner", evidence.NativePlanFormat);
+        Assert.Contains("winningPlan", evidence.NativePlan, StringComparison.Ordinal);
+        Assert.All(evidence.Selectors, selector =>
+            Assert.Equal(selector.Index.Identifier, selector.ObservedIndexIdentifier));
+    }
+
+    [Fact]
     public async Task Delete_is_exact_idempotent_and_rejects_operation_reuse()
     {
         var database = new MongoDB.Driver.MongoClient(container.GetConnectionString())

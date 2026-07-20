@@ -26,21 +26,25 @@ internal static class RelationalPhysicalMutationRuntime
 
     internal static IBoundedDocumentMutationStore Create(
         RelationalPhysicalMutationRuntimeContext context,
-        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null) =>
+        Func<RelationalPhysicalMutationExecutionPoint, ValueTask>? intercept = null,
+        RelationalPhysicalQueryExplainExecutor? explain = null) =>
         CreateCore(
             context,
-            intercept is null ? null : (point, _, _, _) => intercept(point));
+            intercept is null ? null : (point, _, _, _) => intercept(point),
+            explain);
 
     internal static IBoundedDocumentMutationStore CreateWithInterceptor(
         RelationalPhysicalMutationRuntimeContext context,
         RelationalPhysicalMutationInterceptor intercept) =>
         CreateCore(
             context,
-            intercept ?? throw new ArgumentNullException(nameof(intercept)));
+            intercept ?? throw new ArgumentNullException(nameof(intercept)),
+            explain: null);
 
     private static IBoundedDocumentMutationStore CreateCore(
         RelationalPhysicalMutationRuntimeContext context,
-        RelationalPhysicalMutationInterceptor? intercept)
+        RelationalPhysicalMutationInterceptor? intercept,
+        RelationalPhysicalQueryExplainExecutor? explain)
     {
         ArgumentNullException.ThrowIfNull(context);
         var runtime = BuildRuntime(context);
@@ -61,7 +65,9 @@ internal static class RelationalPhysicalMutationRuntime
             context.Route,
             runtime.Storage,
             runtime.Capabilities,
-            handlers);
+            handlers,
+            explain is null ? null : (mutation, plan, cancellationToken) =>
+                ExplainAsync(context, mutation, plan, explain, cancellationToken));
     }
 
     internal static RelationalPhysicalQueryCommand BuildSelectionCommand(
@@ -91,6 +97,47 @@ internal static class RelationalPhysicalMutationRuntime
             plan,
             context.Store.ResolveMutationScope(mutation.DocumentKind));
     }
+
+    private static Task<PhysicalDocumentMutationExplanation> ExplainAsync(
+        RelationalPhysicalMutationRuntimeContext context,
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        RelationalPhysicalQueryExplainExecutor explain,
+        CancellationToken cancellationToken)
+    {
+        var runtime = BuildRuntime(context);
+        var (handler, admitted) = ResolveCommandHandler(context.Store, runtime, mutation);
+        if (!admitted.Equals(plan))
+            throw new InvalidOperationException("Provider-native mutation explanation did not resolve the admitted plan.");
+        var scope = context.Store.ResolveMutationScope(mutation.DocumentKind);
+        if (scope.AcrossScopes || scope.StorageKey is null)
+            throw new InvalidOperationException("Bounded mutations require one route-derived target scope.");
+        var selection = handler.BuildSelectionCommand(mutation, plan, scope);
+        return context.Store.ExecutePhysicalQueryAsync(async (connection, ct) =>
+        {
+            await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(connection, selection.CommandText);
+            foreach (var (name, value) in selection.Parameters)
+                context.Store.AddPhysicalParameter(command, name, value);
+            var native = await explain(command, ct);
+            NativeMutationPlanEvidence.Validate(plan, native.Content, selection.CommandText);
+            return new PhysicalDocumentMutationExplanation(
+                plan,
+                BoundedMutationRequestFingerprint.Create(mutation, plan, scope.StorageKey),
+                native.Format,
+                native.Content,
+                [new PhysicalDocumentMutationSelectorEvidence(
+                    Target(plan),
+                    plan.Predicate.LookupObject,
+                    plan.Predicate.IndexName!,
+                    plan.Predicate.IndexName!.Identifier)],
+                selection.CommandText);
+        }, cancellationToken);
+    }
+
+    private static ExecutableStorageObjectRole Target(PhysicalMutationPlan plan) =>
+        plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+            ? ExecutableStorageObjectRole.LinkedIndexStorage
+            : ExecutableStorageObjectRole.PrimaryStorage;
 
     private static (RelationalPhysicalDocumentMutationHandler Handler, PhysicalMutationPlan Plan) ResolveCommandHandler(
         RelationalPhysicalDocumentStore store,
@@ -223,4 +270,19 @@ internal static class RelationalPhysicalMutationRuntime
         StorageUnitPhysicalStorage Storage,
         PhysicalQueryPlannerCapabilities Capabilities,
         PhysicalMutationPlanCompilationResult Compilation);
+}
+
+internal static class NativeMutationPlanEvidence
+{
+    internal static void Validate(PhysicalMutationPlan plan, string nativePlan, string renderedCommand)
+    {
+        if (string.IsNullOrWhiteSpace(nativePlan) || plan.Predicate.IndexName is null ||
+            !nativePlan.Contains(plan.Predicate.IndexName.Identifier, StringComparison.Ordinal) ||
+            !renderedCommand.Contains(plan.Predicate.LookupObject.Identifier, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Provider-native mutation plan for '{plan.MutationIdentity}' did not use declared target " +
+                $"'{plan.Predicate.LookupObject.Identifier}' and index '{plan.Predicate.IndexName?.Identifier ?? "<none>"}'.");
+        }
+    }
 }
