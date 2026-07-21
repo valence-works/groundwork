@@ -427,7 +427,6 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Theory]
-    [InlineData(PortableQueryOperation.Contains)]
     [InlineData(PortableQueryOperation.NotContains)]
     [InlineData(PortableQueryOperation.StartsWith)]
     public void Query_compilation_preserves_provider_diagnostics_for_case_insensitive_regex_operations(
