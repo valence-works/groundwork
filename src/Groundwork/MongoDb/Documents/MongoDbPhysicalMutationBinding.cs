@@ -182,9 +182,34 @@ internal static class MongoDbPhysicalMutationModelValidation
 
 internal static class MongoDbScaleBearingOperationValidation
 {
+    /// <summary>
+    /// Pattern operations that an ordinary MongoDB B-tree index cannot serve in-index for a
+    /// scale-bearing bounded mutation. Bounded mutations translate predicates to exact equality and
+    /// range filters only (see <c>MongoDbPhysicalDocumentMutationHandler.Comparison</c>), so every
+    /// case-insensitive regular-expression operation stays uncertified on the mutation path.
+    /// </summary>
     public static PortableQueryOperation[] UnsupportedOperations(
         StorageUnitPhysicalStorage storage,
-        BoundedQueryDeclaration query)
+        BoundedQueryDeclaration query) =>
+        UnsupportedOperations(storage, query, containsServedInIndex: false);
+
+    /// <summary>
+    /// Pattern operations that a scale-bearing bounded <em>query</em> cannot serve in-index. Unlike
+    /// bounded mutations, the query handler executes Contains as a case-insensitive escaped regex
+    /// over the keyword member — the relational LOWER(col) LIKE '%v%' covering-scan equivalent: the
+    /// storage-scope prefix (plus any equality bounds) bounds the IXSCAN and the regex is an in-index
+    /// residual that does not narrow it. Contains is therefore certifiable whenever the filtered path
+    /// is a keyword member of the declared index; NotContains and StartsWith remain uncertified.
+    /// </summary>
+    public static PortableQueryOperation[] UnsupportedQueryOperations(
+        StorageUnitPhysicalStorage storage,
+        BoundedQueryDeclaration query) =>
+        UnsupportedOperations(storage, query, containsServedInIndex: true);
+
+    private static PortableQueryOperation[] UnsupportedOperations(
+        StorageUnitPhysicalStorage storage,
+        BoundedQueryDeclaration query,
+        bool containsServedInIndex)
     {
         var logicalIndex = storage.LogicalIndexes.Single(index => index.Identity == query.IndexIdentity);
         var predicates = query.PredicateFields.Count == 0
@@ -194,12 +219,30 @@ internal static class MongoDbScaleBearingOperationValidation
         return predicates
             .SelectMany(predicate => predicate.Operations.Select(operation => (predicate.Path, Operation: operation)))
             .Where(item => item.Path != PhysicalDocumentFieldPaths.Id &&
-                           item.Operation is PortableQueryOperation.Contains or PortableQueryOperation.NotContains or PortableQueryOperation.StartsWith)
+                           IsUnservableAsIndexedScan(logicalIndex, item.Path, item.Operation, containsServedInIndex))
             .Select(item => item.Operation)
             .Distinct()
             .Order()
             .ToArray();
     }
+
+    private static bool IsUnservableAsIndexedScan(
+        LogicalIndexDeclaration logicalIndex,
+        string path,
+        PortableQueryOperation operation,
+        bool containsServedInIndex) => operation switch
+    {
+        PortableQueryOperation.Contains =>
+            !(containsServedInIndex && IsKeywordMember(logicalIndex, path)),
+        PortableQueryOperation.NotContains or PortableQueryOperation.StartsWith => true,
+        _ => false
+    };
+
+    private static bool IsKeywordMember(LogicalIndexDeclaration logicalIndex, string path) =>
+        logicalIndex.Fields.Any(field => field.Path == path) &&
+        PortableQueryOperationCompatibility.Supports(
+            logicalIndex.GetValueKind(path),
+            PortableQueryOperation.Contains);
 }
 
 internal sealed class MongoDbPhysicalMutationSchemaBinding
