@@ -197,9 +197,28 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysica
         StorageUnitPhysicalStorage storage,
         PhysicalQueryPlannerCapabilities capabilities,
         IReadOnlyList<IPhysicalDocumentQueryHandler> handlers)
+        : this(CompilePlans(route, storage, capabilities), capabilities, handlers)
     {
-        ArgumentNullException.ThrowIfNull(route);
-        ArgumentNullException.ThrowIfNull(storage);
+    }
+
+    /// <summary>
+    /// Binds already-compiled plans to executable handlers without recompiling. Callers that admit a
+    /// route once and open many sessions use this so plan compilation is not repeated per session; the
+    /// plans must be the output of <see cref="PhysicalQueryPlanCompiler.Compile"/> for the same route and
+    /// capabilities the handlers certify.
+    /// </summary>
+    public static PhysicalQueryDocumentStore FromCompiledPlans(
+        IReadOnlyList<PhysicalQueryPlan> compiledPlans,
+        PhysicalQueryPlannerCapabilities capabilities,
+        IReadOnlyList<IPhysicalDocumentQueryHandler> handlers) =>
+        new(compiledPlans, capabilities, handlers);
+
+    private PhysicalQueryDocumentStore(
+        IReadOnlyList<PhysicalQueryPlan> compiledPlans,
+        PhysicalQueryPlannerCapabilities capabilities,
+        IReadOnlyList<IPhysicalDocumentQueryHandler> handlers)
+    {
+        ArgumentNullException.ThrowIfNull(compiledPlans);
         ArgumentNullException.ThrowIfNull(capabilities);
         ArgumentNullException.ThrowIfNull(handlers);
 
@@ -221,15 +240,7 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysica
             }
         }
 
-        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
-        if (!compilation.IsValid)
-        {
-            throw new InvalidOperationException(string.Join(
-                Environment.NewLine,
-                compilation.Diagnostics.Select(diagnostic => $"{diagnostic.Code}: {diagnostic.Message}")));
-        }
-
-        foreach (var plan in compilation.Plans)
+        foreach (var plan in compiledPlans)
         {
             var handler = byIdentity[plan.HandlerIdentity][0];
             if (handler.Certifications is null || !handler.Certifications.Any(certification => certification.Certifies(plan)))
@@ -241,8 +252,27 @@ public sealed class PhysicalQueryDocumentStore : IBoundedDocumentStore, IPhysica
             }
         }
 
-        plans = compilation.Plans.ToDictionary(plan => plan.QueryIdentity, StringComparer.Ordinal);
+        plans = compiledPlans.ToDictionary(plan => plan.QueryIdentity, StringComparer.Ordinal);
         this.handlers = byIdentity.ToDictionary(group => group.Key, group => group.Value[0], StringComparer.Ordinal);
+    }
+
+    private static IReadOnlyList<PhysicalQueryPlan> CompilePlans(
+        ExecutableStorageRoute route,
+        StorageUnitPhysicalStorage storage,
+        PhysicalQueryPlannerCapabilities capabilities)
+    {
+        ArgumentNullException.ThrowIfNull(route);
+        ArgumentNullException.ThrowIfNull(storage);
+        ArgumentNullException.ThrowIfNull(capabilities);
+        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
+        if (!compilation.IsValid)
+        {
+            throw new InvalidOperationException(string.Join(
+                Environment.NewLine,
+                compilation.Diagnostics.Select(diagnostic => $"{diagnostic.Code}: {diagnostic.Message}")));
+        }
+
+        return compilation.Plans;
     }
 
     private static bool SupportsProfile(

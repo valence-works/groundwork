@@ -241,7 +241,7 @@ public sealed class MongoDbPhysicalDocumentStore :
                 hooks,
                 transactionCapability)
         };
-        return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
+        return PhysicalQueryDocumentStore.FromCompiledPlans(plans.Plans, capabilities, handlers);
     }
 
     private static void ValidateTypedPaths(

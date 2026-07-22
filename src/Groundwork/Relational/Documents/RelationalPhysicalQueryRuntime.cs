@@ -19,11 +19,8 @@ public static class RelationalPhysicalQueryRuntime
         ExecutableStorageRoute route,
         ProviderIdentity provider,
         string handlerPrefix,
-        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
-    {
-        var runtime = BuildRuntime(store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds, null);
-        return new PhysicalQueryDocumentStore(route, runtime.Storage, runtime.Capabilities, runtime.Handlers);
-    }
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null) =>
+        CompilePlanSet(manifest, route, provider, handlerPrefix, null, canonicalJsonValueKinds).Bind(store);
 
     internal static IBoundedDocumentStore CreateWithExplainer(
         RelationalPhysicalDocumentStore store,
@@ -35,9 +32,33 @@ public static class RelationalPhysicalQueryRuntime
         IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
     {
         ArgumentNullException.ThrowIfNull(explain);
-        var runtime = BuildRuntime(
-            store, manifest, route, provider, handlerPrefix, canonicalJsonValueKinds, explain);
-        return new PhysicalQueryDocumentStore(route, runtime.Storage, runtime.Capabilities, runtime.Handlers);
+        return CompilePlanSet(manifest, route, provider, handlerPrefix, explain, canonicalJsonValueKinds).Bind(store);
+    }
+
+    /// <summary>
+    /// Compiles a connection-independent plan set for one route once, so a session-per-operation consumer
+    /// can bind it to a fresh store on each open without recompiling the admitted catalog.
+    /// </summary>
+    public static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null) =>
+        CompilePlanSet(manifest, route, provider, handlerPrefix, null, canonicalJsonValueKinds);
+
+    internal static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        string handlerPrefix,
+        RelationalPhysicalQueryExplainExecutor? explain,
+        IReadOnlySet<IndexValueKind>? canonicalJsonValueKinds = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerPrefix);
+        ArgumentNullException.ThrowIfNull(provider);
+        var capabilities = Capabilities(provider, handlerPrefix, canonicalJsonValueKinds);
+        return RelationalPhysicalQueryPlanSet.Compile(manifest, route, capabilities, explain);
     }
 
     public static PhysicalQueryPlannerCapabilities Capabilities(
@@ -182,12 +203,10 @@ public static class RelationalPhysicalQueryRuntime
                 certifications,
                 explain);
         }).ToArray();
-        return new RuntimeComponents(storage, capabilities, compilation, handlers);
+        return new RuntimeComponents(compilation, handlers);
     }
 
     private sealed record RuntimeComponents(
-        StorageUnitPhysicalStorage Storage,
-        PhysicalQueryPlannerCapabilities Capabilities,
         PhysicalQueryPlanCompilationResult Compilation,
         IReadOnlyList<IPhysicalDocumentQueryHandler> Handlers);
 }

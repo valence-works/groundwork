@@ -19,31 +19,23 @@ public static class SqlitePhysicalQueryRuntime
         ProviderIdentity provider)
     {
         ArgumentNullException.ThrowIfNull(store);
+        return CompilePlanSet(manifest, route, provider).Bind(store);
+    }
+
+    /// <summary>
+    /// Compiles a connection-independent plan set for one route once. A session-per-operation consumer
+    /// compiles this at admission and calls <see cref="RelationalPhysicalQueryPlanSet.Bind"/> on each
+    /// session open, so the admitted catalog is never recompiled per session.
+    /// </summary>
+    public static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider)
+    {
         ArgumentNullException.ThrowIfNull(manifest);
         ArgumentNullException.ThrowIfNull(route);
         ArgumentNullException.ThrowIfNull(provider);
-        var unit = manifest.StorageUnits.Single(candidate => candidate.Identity == route.StorageUnit);
-        var storage = unit.PhysicalStorage ?? throw new InvalidOperationException(
-            $"Storage unit '{route.StorageUnit.Value}' has no physical query declarations.");
-        var capabilities = Capabilities(provider);
-        var compilation = PhysicalQueryPlanCompiler.Compile(route, storage, capabilities);
-        if (!compilation.IsValid)
-            throw new InvalidOperationException(string.Join(Environment.NewLine, compilation.Diagnostics.Select(x => $"{x.Code}: {x.Message}")));
-
-        var handlers = capabilities.HandlerIdentities.Select(registration =>
-        {
-            var certifications = compilation.Plans
-                .Where(plan => plan.HandlerIdentity == registration.Value)
-                .Select(RelationalPhysicalDocumentQueryHandler.Certify)
-                .ToArray();
-            return (IPhysicalDocumentQueryHandler)new RelationalPhysicalDocumentQueryHandler(
-                registration.Value,
-                registration.Key,
-                store,
-                certifications,
-                ExplainAsync);
-        }).ToArray();
-        return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
+        return RelationalPhysicalQueryPlanSet.Compile(manifest, route, Capabilities(provider), ExplainAsync);
     }
 
     internal static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
