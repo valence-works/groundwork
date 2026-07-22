@@ -13,14 +13,21 @@ public static class PostgreSqlPhysicalQueryRuntime
         PostgreSqlPhysicalDocumentStore store,
         StorageManifest manifest,
         ExecutableStorageRoute route,
+        ProviderIdentity provider)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        return CompilePlanSet(manifest, route, provider).Bind(store);
+    }
+
+    /// <summary>
+    /// Compiles a connection-independent plan set once so a session-per-operation consumer can bind it to
+    /// a fresh store on each open without recompiling the admitted catalog.
+    /// </summary>
+    public static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
         ProviderIdentity provider) =>
-        RelationalPhysicalQueryRuntime.CreateWithExplainer(
-            store,
-            manifest,
-            route,
-            provider,
-            "postgresql",
-            ExplainAsync);
+        RelationalPhysicalQueryRuntime.CompilePlanSet(manifest, route, provider, "postgresql", ExplainAsync);
 
     internal static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
         DbCommand command,
