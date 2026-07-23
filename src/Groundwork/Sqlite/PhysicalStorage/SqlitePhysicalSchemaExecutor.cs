@@ -134,22 +134,7 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
 
             await using var transaction = await connection.BeginTransactionAsync(ct);
             await ApplyOperationCoreAsync(operation, transaction, ct);
-            var appliedAt = DateTimeOffset.UtcNow;
-            await using (var command = connection.CreateCommand())
-            {
-                command.Transaction = (SqliteTransaction)transaction;
-                command.CommandText = """
-                    INSERT OR IGNORE INTO groundwork_physical_schema_operations
-                    (manifest_id, provider_name, operation_id, operation_fingerprint, applied_utc)
-                    VALUES (@manifestId, @providerName, @identity, @fingerprint, @appliedUtc);
-                    """;
-                command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
-                command.Parameters.AddWithValue("@providerName", target.ProviderName);
-                command.Parameters.AddWithValue("@identity", operation.Identity);
-                command.Parameters.AddWithValue("@fingerprint", operation.Fingerprint);
-                command.Parameters.AddWithValue("@appliedUtc", appliedAt.ToUniversalTime().ToString("O"));
-                await command.ExecuteNonQueryAsync(ct);
-            }
+            await InsertOperationRecordAsync(target, operation, DateTimeOffset.UtcNow, transaction, ct);
             await transaction.CommitAsync(ct);
             var durable = await ReadOperationAsync(target, operation.Identity, ct)
                 ?? throw new InvalidOperationException($"Physical operation '{operation.Identity}' was not durably recorded.");
@@ -157,6 +142,100 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, durable.Fingerprint);
             return new PhysicalSchemaOperationAcknowledgement(operation.Identity, durable.Fingerprint, durable.AppliedAt);
         }, cancellationToken);
+
+    /// <summary>
+    /// Single-transaction batch apply: every pending operation and the batch's trailing
+    /// full-target validation execute inside one transaction with one durability re-read, so a
+    /// mid-batch failure rolls the whole plan back instead of leaving partially committed
+    /// operations. Per-object validation is deferred to the trailing
+    /// <see cref="ValidatePhysicalSchemaOperation"/> when the batch carries one; already-durable
+    /// operations keep their per-operation reconciliation semantics.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<PhysicalSchemaOperationAcknowledgement>> ApplyOperationBatchAsync(
+        PhysicalSchemaTargetIdentity target,
+        IReadOnlyList<PhysicalSchemaOperation> operations,
+        IPhysicalSchemaApplicationLock applicationLock,
+        CancellationToken cancellationToken) =>
+        await WithConnectionAsync(async ct =>
+        {
+            ArgumentNullException.ThrowIfNull(target);
+            ArgumentNullException.ThrowIfNull(operations);
+            RequireApplicationLock(applicationLock, target);
+            var deferObjectValidation = operations.Count != 0 && operations[^1] is ValidatePhysicalSchemaOperation;
+            var prior = await ReadOperationsAsync(target, ct);
+            var acknowledgements = new PhysicalSchemaOperationAcknowledgement[operations.Count];
+            var pending = new List<int>(operations.Count);
+            var appliedAt = DateTimeOffset.UtcNow;
+            await using (var transaction = await connection.BeginTransactionAsync(ct))
+            {
+                for (var index = 0; index < operations.Count; index++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var operation = operations[index];
+                    if (prior.TryGetValue(operation.Identity, out var recorded))
+                    {
+                        if (!string.Equals(recorded.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
+                            throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, recorded.Fingerprint);
+                        if (operation is ValidatePhysicalSchemaOperation ||
+                            (operation is BackfillCanonicalJsonOperation &&
+                             !await IsOperationPublishedAsync(target, operation, transaction, ct)))
+                        {
+                            await ApplyOperationCoreAsync(operation, transaction, ct, validateObjects: !deferObjectValidation);
+                        }
+                        acknowledgements[index] = new PhysicalSchemaOperationAcknowledgement(
+                            operation.Identity,
+                            recorded.Fingerprint,
+                            recorded.AppliedAt);
+                        continue;
+                    }
+
+                    await ApplyOperationCoreAsync(operation, transaction, ct, validateObjects: !deferObjectValidation);
+                    await InsertOperationRecordAsync(target, operation, appliedAt, transaction, ct);
+                    pending.Add(index);
+                }
+                await transaction.CommitAsync(ct);
+            }
+
+            if (pending.Count != 0)
+            {
+                var durable = await ReadOperationsAsync(target, ct);
+                foreach (var index in pending)
+                {
+                    var operation = operations[index];
+                    if (!durable.TryGetValue(operation.Identity, out var recorded))
+                        throw new InvalidOperationException($"Physical operation '{operation.Identity}' was not durably recorded.");
+                    if (!string.Equals(recorded.Fingerprint, operation.Fingerprint, StringComparison.Ordinal))
+                        throw new PhysicalSchemaFingerprintConflictException(operation.Identity, operation.Fingerprint, recorded.Fingerprint);
+                    acknowledgements[index] = new PhysicalSchemaOperationAcknowledgement(
+                        operation.Identity,
+                        recorded.Fingerprint,
+                        recorded.AppliedAt);
+                }
+            }
+            return (IReadOnlyList<PhysicalSchemaOperationAcknowledgement>)acknowledgements;
+        }, cancellationToken);
+
+    private async Task InsertOperationRecordAsync(
+        PhysicalSchemaTargetIdentity target,
+        PhysicalSchemaOperation operation,
+        DateTimeOffset appliedAt,
+        DbTransaction transaction,
+        CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = (SqliteTransaction)transaction;
+        command.CommandText = """
+            INSERT OR IGNORE INTO groundwork_physical_schema_operations
+            (manifest_id, provider_name, operation_id, operation_fingerprint, applied_utc)
+            VALUES (@manifestId, @providerName, @identity, @fingerprint, @appliedUtc);
+            """;
+        command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("@providerName", target.ProviderName);
+        command.Parameters.AddWithValue("@identity", operation.Identity);
+        command.Parameters.AddWithValue("@fingerprint", operation.Fingerprint);
+        command.Parameters.AddWithValue("@appliedUtc", appliedAt.ToUniversalTime().ToString("O"));
+        await command.ExecuteNonQueryAsync(ct);
+    }
 
     public async ValueTask RecordAppliedStateAsync(
         PhysicalSchemaAppliedState state,
@@ -209,22 +288,23 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
     private async Task ApplyOperationCoreAsync(
         PhysicalSchemaOperation operation,
         DbTransaction transaction,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool validateObjects = true)
     {
         switch (operation)
         {
             case CreatePrimaryStorageOperation create:
-                await CreatePrimaryAsync(create.Route, transaction, cancellationToken);
+                await CreatePrimaryAsync(create.Route, transaction, cancellationToken, validateObjects);
                 break;
             case CreatePhysicalEntityStorageOperation create:
-                await CreatePrimaryAsync(create.Route, transaction, cancellationToken);
+                await CreatePrimaryAsync(create.Route, transaction, cancellationToken, validateObjects);
                 break;
             case CreateLinkedStorageOperation create:
-                await CreateLinkedAsync(create.Route, transaction, cancellationToken);
+                await CreateLinkedAsync(create.Route, transaction, cancellationToken, validateObjects);
                 break;
             case AddProjectedColumnOperation add:
                 RelationalPhysicalStorageColumns.Validate(add.Route);
-                await AddColumnAsync(add.Storage.Name.Identifier, add.Column.Column.Identifier, add.Column.Definition, transaction, cancellationToken);
+                await AddColumnAsync(add.Storage.Name.Identifier, add.Column.Column.Identifier, add.Column.Definition, transaction, cancellationToken, validateObjects);
                 break;
             case FinalizeProjectedColumnOperation finalize:
                 RelationalPhysicalStorageColumns.Validate(finalize.Route);
@@ -233,11 +313,12 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                     finalize.Column.Column.Identifier,
                     finalize.Column.Definition,
                     transaction,
-                    cancellationToken);
+                    cancellationToken,
+                    validateObjects);
                 break;
             case CreatePhysicalIndexOperation create:
                 RelationalPhysicalStorageColumns.Validate(create.Route);
-                await CreateIndexAsync(create.Index, create.Storage.Name.Identifier, transaction, cancellationToken);
+                await CreateIndexAsync(create.Index, create.Storage.Name.Identifier, transaction, cancellationToken, validateObjects);
                 break;
             case BackfillCanonicalJsonOperation backfill:
                 if (backfill.Route is not null)
@@ -252,7 +333,11 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         }
     }
 
-    private async Task CreatePrimaryAsync(ExecutableStorageRoute route, DbTransaction transaction, CancellationToken ct)
+    private async Task CreatePrimaryAsync(
+        ExecutableStorageRoute route,
+        DbTransaction transaction,
+        CancellationToken ct,
+        bool validateObjects = true)
     {
         RelationalPhysicalStorageColumns.Validate(route);
         var envelope = route.Envelope;
@@ -274,10 +359,15 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             $"CREATE TABLE IF NOT EXISTS {Q(route.PrimaryStorage.Name.Identifier)} ({string.Join(", ", columns)});",
             transaction,
             ct);
-        await ValidatePrimaryStorageAsync(route, transaction, ct);
+        if (validateObjects)
+            await ValidatePrimaryStorageAsync(route, transaction, ct);
     }
 
-    private async Task CreateLinkedAsync(ExecutableStorageRoute route, DbTransaction transaction, CancellationToken ct)
+    private async Task CreateLinkedAsync(
+        ExecutableStorageRoute route,
+        DbTransaction transaction,
+        CancellationToken ct,
+        bool validateObjects = true)
     {
         var relationship = route.LinkedRelationship!;
         var key = route.AuxiliaryKey ?? throw new InvalidOperationException("Linked storage requires an auxiliary key.");
@@ -294,7 +384,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             $"CREATE TABLE IF NOT EXISTS {Q(route.LinkedIndexStorage!.Name.Identifier)} ({string.Join(", ", columns)});",
             transaction,
             ct);
-        await ValidateLinkedStorageAsync(route, transaction, ct);
+        if (validateObjects)
+            await ValidateLinkedStorageAsync(route, transaction, ct);
     }
 
     private async Task AddColumnAsync(
@@ -302,12 +393,14 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         string column,
         ProjectedColumnDefinition definition,
         DbTransaction transaction,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool validateObjects = true)
     {
         SqlitePhysicalValueConverter.Validate(definition);
         if (await ColumnExistsAsync(table, column, transaction, ct))
         {
-            await ValidateProjectedColumnStageAsync(table, column, definition, transaction, ct);
+            if (validateObjects)
+                await ValidateProjectedColumnStageAsync(table, column, definition, transaction, ct);
             return;
         }
         var staged = definition.IsNullable ? definition : definition with { IsNullable = true };
@@ -315,7 +408,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             $"ALTER TABLE {Q(table)} ADD COLUMN {ProjectedColumnSql(column, staged)};",
             transaction,
             ct);
-        await ValidateProjectedColumnStageAsync(table, column, definition, transaction, ct);
+        if (validateObjects)
+            await ValidateProjectedColumnStageAsync(table, column, definition, transaction, ct);
     }
 
     private async Task FinalizeColumnAsync(
@@ -323,11 +417,13 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         string column,
         ProjectedColumnDefinition definition,
         DbTransaction transaction,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool validateObjects = true)
     {
         if (definition.IsNullable)
         {
-            await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
+            if (validateObjects)
+                await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
             return;
         }
 
@@ -336,10 +432,15 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             throw new InvalidOperationException($"Projected column '{table}.{column}' is missing.");
         if (found.IsNotNull)
         {
-            await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
+            if (validateObjects)
+                await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
             return;
         }
 
+        // The rebuild rewrites the column declaration wholesale, so the staged column must prove
+        // compatible first — deferred batch validation would otherwise let a drifted preexisting
+        // column be coerced instead of rejected.
+        await ValidateProjectedColumnStageAsync(table, column, definition, transaction, ct);
         await using (var count = connection.CreateCommand())
         {
             count.Transaction = (SqliteTransaction)transaction;
@@ -352,7 +453,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         }
 
         await RebuildTableWithFinalizedColumnAsync(table, column, definition, actual.Keys.ToArray(), transaction, ct);
-        await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
+        if (validateObjects)
+            await ValidateProjectedColumnAsync(table, column, definition, transaction, ct);
     }
 
     private async Task RebuildTableWithFinalizedColumnAsync(
@@ -395,13 +497,19 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         await ValidateProjectedColumnAsync(table, column, staged, transaction, ct);
     }
 
-    private async Task CreateIndexAsync(ExecutablePhysicalIndexRoute index, string table, DbTransaction transaction, CancellationToken ct)
+    private async Task CreateIndexAsync(
+        ExecutablePhysicalIndexRoute index,
+        string table,
+        DbTransaction transaction,
+        CancellationToken ct,
+        bool validateObjects = true)
     {
         var unique = index.IsUnique ? "UNIQUE " : string.Empty;
         var columns = string.Join(", ", index.Columns.Select(column =>
             $"{Q(column.Column.Identifier)} {(column.Direction == PhysicalSortDirection.Descending ? "DESC" : "ASC")}"));
         await ExecuteAsync($"CREATE {unique}INDEX IF NOT EXISTS {Q(index.Name.Identifier)} ON {Q(table)} ({columns});", transaction, ct);
-        await ValidateIndexAsync(index, table, transaction, ct);
+        if (validateObjects)
+            await ValidateIndexAsync(index, table, transaction, ct);
     }
 
     private async Task BackfillAsync(BackfillCanonicalJsonOperation operation, DbTransaction transaction, CancellationToken ct)
@@ -989,6 +1097,25 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         return await reader.ReadAsync(ct)
             ? (reader.GetString(0), DateTimeOffset.Parse(reader.GetString(1)))
             : null;
+    }
+
+    private async Task<IReadOnlyDictionary<string, (string Fingerprint, DateTimeOffset AppliedAt)>> ReadOperationsAsync(
+        PhysicalSchemaTargetIdentity target,
+        CancellationToken ct)
+    {
+        var operations = new Dictionary<string, (string, DateTimeOffset)>(StringComparer.Ordinal);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT operation_id, operation_fingerprint, applied_utc
+            FROM groundwork_physical_schema_operations
+            WHERE manifest_id = @manifestId AND provider_name = @providerName;
+            """;
+        command.Parameters.AddWithValue("@manifestId", target.ManifestIdentity.Value);
+        command.Parameters.AddWithValue("@providerName", target.ProviderName);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            operations.Add(reader.GetString(0), (reader.GetString(1), DateTimeOffset.Parse(reader.GetString(2))));
+        return operations;
     }
 
     private async Task<bool> IsOperationPublishedAsync(

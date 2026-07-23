@@ -40,6 +40,34 @@ public interface IPhysicalSchemaExecutor
         CancellationToken cancellationToken);
 
     /// <summary>
+    /// Applies or reconciles every non-recording operation of one authorized plan, in order, and
+    /// returns exactly one acknowledgement per operation in that same order. Every per-operation
+    /// contract (idempotent identity/fingerprint replay, fingerprint-conflict rejection,
+    /// unpublished-operation reconciliation, durable acknowledgement) applies unchanged to each
+    /// operation of the batch. The default implementation applies each operation individually
+    /// through <see cref="ApplyOperationAsync"/>. Implementations may override it to bound the
+    /// whole batch in a single atomic durable unit with one durability barrier; such an
+    /// implementation may defer each operation's live-object validation to the batch's trailing
+    /// <see cref="ValidatePhysicalSchemaOperation"/> when the batch ends with one covering the
+    /// complete target, because a validation failure then rolls back the entire batch.
+    /// </summary>
+    async ValueTask<IReadOnlyList<PhysicalSchemaOperationAcknowledgement>> ApplyOperationBatchAsync(
+        PhysicalSchemaTargetIdentity target,
+        IReadOnlyList<PhysicalSchemaOperation> operations,
+        IPhysicalSchemaApplicationLock applicationLock,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(operations);
+        var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>(operations.Count);
+        foreach (var operation in operations)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            acknowledgements.Add(await ApplyOperationAsync(target, operation, applicationLock, cancellationToken));
+        }
+        return acknowledgements;
+    }
+
+    /// <summary>
     /// Atomically records the complete target snapshot using compare-and-swap against the expected
     /// prior target fingerprint. Implementations must treat an identical already-recorded state as
     /// success, which makes acknowledgement loss after the write recoverable on restart.
@@ -167,22 +195,22 @@ public static class PhysicalSchemaApplication
                 history.AppliedState);
         }
 
-        var acknowledgements = new List<PhysicalSchemaOperationAcknowledgement>();
-        foreach (var operation in plan.Operations)
+        var operations = plan.Operations
+            .Where(operation => operation is not RecordPhysicalSchemaAppliedStateOperation)
+            .ToArray();
+        var acknowledgements = await executor.ApplyOperationBatchAsync(
+            target.Identity,
+            operations,
+            applicationLock,
+            applicationToken);
+        applicationToken.ThrowIfCancellationRequested();
+        if (acknowledgements.Count != operations.Length)
         {
-            if (operation is RecordPhysicalSchemaAppliedStateOperation)
-                continue;
-
-            applicationToken.ThrowIfCancellationRequested();
-            var acknowledgement = await executor.ApplyOperationAsync(
-                target.Identity,
-                operation,
-                applicationLock,
-                applicationToken);
-            applicationToken.ThrowIfCancellationRequested();
-            EnsureAcknowledges(operation, acknowledgement);
-            acknowledgements.Add(acknowledgement);
+            throw new InvalidOperationException(
+                $"Executor acknowledged {acknowledgements.Count} operations while {operations.Length} were expected.");
         }
+        for (var index = 0; index < operations.Length; index++)
+            EnsureAcknowledges(operations[index], acknowledgements[index]);
 
         applicationToken.ThrowIfCancellationRequested();
         var appliedState = plan.Complete(acknowledgements, timeProvider.GetUtcNow());

@@ -245,6 +245,56 @@ public sealed class PhysicalSchemaApplicationTests
     }
 
     [Fact]
+    public async Task Application_applies_the_whole_plan_as_one_batch_ending_with_live_validation()
+    {
+        var target = CreateTarget(includeSecondProjection: true);
+        var executor = new FakePhysicalSchemaExecutor();
+        var observing = new BatchObservingExecutor(executor);
+
+        var result = await PhysicalSchemaApplication.ApplyAsync(target, observing);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, result.Outcome);
+        var batch = Assert.Single(observing.Batches);
+        Assert.Equal(
+            result.Plan.Operations
+                .Where(operation => operation is not RecordPhysicalSchemaAppliedStateOperation)
+                .Select(operation => operation.Identity),
+            batch.Select(operation => operation.Identity));
+        Assert.IsType<ValidatePhysicalSchemaOperation>(batch[^1]);
+    }
+
+    [Fact]
+    public async Task Batch_acknowledgement_count_mismatch_never_records_target_state()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+        var truncating = new BatchObservingExecutor(
+            executor,
+            acknowledgements => acknowledgements.Take(acknowledgements.Count - 1).ToArray());
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, truncating));
+
+        Assert.Contains("acknowledged", exception.Message);
+        Assert.Null(executor.AppliedState);
+    }
+
+    [Fact]
+    public async Task Misordered_batch_acknowledgements_never_record_target_state()
+    {
+        var target = CreateTarget(includeSecondProjection: false);
+        var executor = new FakePhysicalSchemaExecutor();
+        var reversing = new BatchObservingExecutor(
+            executor,
+            acknowledgements => acknowledgements.Reverse().ToArray());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, reversing));
+
+        Assert.Null(executor.AppliedState);
+    }
+
+    [Fact]
     public async Task CancellationNeverRecordsUnappliedTargetState()
     {
         var target = CreateTarget(includeSecondProjection: false);
@@ -578,6 +628,56 @@ public sealed class PhysicalSchemaApplicationTests
                 return ValueTask.CompletedTask;
             }
         }
+    }
+
+    private sealed class BatchObservingExecutor(
+        FakePhysicalSchemaExecutor inner,
+        Func<IReadOnlyList<PhysicalSchemaOperationAcknowledgement>, IReadOnlyList<PhysicalSchemaOperationAcknowledgement>>? tamper = null)
+        : IPhysicalSchemaExecutor
+    {
+        private IPhysicalSchemaExecutor Inner => inner;
+
+        public List<IReadOnlyList<PhysicalSchemaOperation>> Batches { get; } = [];
+
+        public ValueTask<IPhysicalSchemaApplicationLock> AcquireApplicationLockAsync(
+            PhysicalSchemaTargetIdentity target,
+            CancellationToken cancellationToken) =>
+            Inner.AcquireApplicationLockAsync(target, cancellationToken);
+
+        public ValueTask<PhysicalSchemaHistoryState> ReadHistoryAsync(
+            PhysicalSchemaTargetIdentity target,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken) =>
+            Inner.ReadHistoryAsync(target, applicationLock, cancellationToken);
+
+        public ValueTask<PhysicalSchemaOperationAcknowledgement> ApplyOperationAsync(
+            PhysicalSchemaTargetIdentity target,
+            PhysicalSchemaOperation operation,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken) =>
+            Inner.ApplyOperationAsync(target, operation, applicationLock, cancellationToken);
+
+        public async ValueTask<IReadOnlyList<PhysicalSchemaOperationAcknowledgement>> ApplyOperationBatchAsync(
+            PhysicalSchemaTargetIdentity target,
+            IReadOnlyList<PhysicalSchemaOperation> operations,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken)
+        {
+            Batches.Add(operations);
+            var acknowledgements = await Inner.ApplyOperationBatchAsync(
+                target,
+                operations,
+                applicationLock,
+                cancellationToken);
+            return tamper is null ? acknowledgements : tamper(acknowledgements);
+        }
+
+        public ValueTask RecordAppliedStateAsync(
+            PhysicalSchemaAppliedState state,
+            string? expectedAppliedTargetFingerprint,
+            IPhysicalSchemaApplicationLock applicationLock,
+            CancellationToken cancellationToken) =>
+            Inner.RecordAppliedStateAsync(state, expectedAppliedTargetFingerprint, applicationLock, cancellationToken);
     }
 
     private sealed class InjectedExecutionException : Exception;
