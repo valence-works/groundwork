@@ -95,6 +95,19 @@ identity/fingerprint without replaying already-published work or non-idempotent 
 backfill is the exception: while its identity/fingerprint is absent from published applied state,
 retry reruns the idempotent projection so writes made after the unpublished attempt are not missed.
 
+The coordinator hands the complete authorized plan (every non-record operation, in plan order) to
+`IPhysicalSchemaExecutor.ApplyOperationBatchAsync` and requires exactly one acknowledgement per
+operation, bound by position. The default implementation applies each operation individually and
+inherits every per-operation contract above. An executor may override it to execute the whole batch
+as a single atomic durable unit with one durability barrier; because every applicable plan ends with
+a full-target `ValidatePhysicalSchemaOperation`, such an implementation may defer per-object live
+validation to that trailing operation — a validation failure then rolls back the entire batch
+instead of leaving partially committed operations. The SQLite executor does exactly this, turning a
+fresh-database apply from one transaction per operation into one transaction per plan. Deferral must
+not weaken rejection: an operation whose execution depends on the current live shape (for example a
+required-column finalization that rebuilds the column declaration) still proves the existing object
+compatible before transforming it.
+
 The coordinator records target state only after every non-record operation returns the exact
 expected acknowledgement. Failure, cancellation, partial execution, or a mismatched
 acknowledgement cannot record unapplied target state. State recording is compare-and-swap against
