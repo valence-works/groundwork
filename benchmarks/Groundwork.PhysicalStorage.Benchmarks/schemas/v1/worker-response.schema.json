@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/worker-response.schema.json",
+  "title": "Groundwork physical-storage independent worker response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "runGroupId",
+    "ordinal",
+    "role",
+    "succeeded",
+    "requestDigest",
+    "gitCommit",
+    "gitTreeDigest"
+  ],
+  "properties": {
+    "protocolVersion": { "const": "groundwork.physical-storage.worker/v1" },
+    "runGroupId": { "type": "string", "minLength": 1 },
+    "ordinal": { "type": "integer", "minimum": 1 },
+    "role": { "enum": ["untimedWarmup", "measured"] },
+    "succeeded": { "type": "boolean" },
+    "runDirectory": { "type": ["string", "null"], "minLength": 1 },
+    "consumerEvidence": { "type": ["string", "null"], "minLength": 1 },
+    "failureType": { "type": ["string", "null"], "minLength": 1 },
+    "requestDigest": { "$ref": "#/$defs/digest" },
+    "gitCommit": { "type": "string", "minLength": 1 },
+    "gitTreeDigest": { "$ref": "#/$defs/digest" },
+    "artifacts": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "manifestDigest",
+        "elsaMigrationEvidence",
+        "elsaMigrationEvidenceDigest"
+      ],
+      "properties": {
+        "manifest": { "type": "string", "minLength": 1 },
+        "manifestDigest": { "$ref": "#/$defs/digest" },
+        "elsaMigrationEvidence": { "type": "string", "minLength": 1 },
+        "elsaMigrationEvidenceDigest": { "$ref": "#/$defs/digest" },
+        "consumerEvidence": { "type": ["string", "null"], "minLength": 1 },
+        "consumerEvidenceDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] }
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

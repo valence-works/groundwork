@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/physical-storage-benchmarks.yml"
+      - "tools/verify_physical_storage_scheduled_coverage.py"
       - "benchmarks/Groundwork.PhysicalStorage.Benchmarks/**"
       - "src/Groundwork/**"
       - "tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/**"
@@ -28,7 +29,7 @@ env:
 
 jobs:
   smoke:
-    name: SQLite smoke evidence (non-decision)
+    name: SQLite shared-form PR smoke (non-decision)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -48,15 +49,15 @@ jobs:
       - name: Test harness contracts
         run: dotnet test tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/Groundwork.PhysicalStorage.Benchmarks.Tests.csproj --configuration Release --no-restore
 
-      - name: Run smoke matrix
+      - name: Run narrow SQLite shared-form smoke
         run: |
           dotnet run --configuration Release --no-build \
             --project benchmarks/Groundwork.PhysicalStorage.Benchmarks \
             -- run \
             --profile smoke \
             --providers sqlite \
-            --forms all \
-            --workloads all \
+            --forms shared \
+            --workloads reused-client-point-read-batch,indexed-query,insert,optimistic-concurrency,pagination-and-count \
             --output "${RUNNER_TEMP}/physical-storage-smoke"
 
       - name: Upload non-promotable smoke evidence
@@ -68,11 +69,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  scheduled:
-    name: Four-provider scheduled evidence (non-gating scaffold)
+  scheduled-contracts:
+    name: Scheduled harness contract preflight
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, x64, groundwork-benchmark]
-    timeout-minutes: 360
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -89,24 +90,90 @@ jobs:
       - name: Test harness contracts
         run: dotnet test tests/Groundwork/Groundwork.PhysicalStorage.Benchmarks.Tests/Groundwork.PhysicalStorage.Benchmarks.Tests.csproj --configuration Release --no-restore
 
-      - name: Run scheduled harness evidence
+  scheduled-shard:
+    name: Scheduled shard ${{ matrix.provider }}/${{ matrix.form }}/n${{ matrix.dataset }}
+    if: github.event_name != 'pull_request'
+    needs: scheduled-contracts
+    runs-on: [self-hosted, linux, x64, groundwork-benchmark]
+    timeout-minutes: 280
+    strategy:
+      fail-fast: false
+      max-parallel: 36
+      matrix:
+        provider: [sqlite, sqlserver, postgresql, mongodb]
+        form: [shared, dedicated, entity]
+        dataset: [1000, 100000, 1000000]
+    env:
+      SHARD_ID: ${{ matrix.provider }}-${{ matrix.form }}-n${{ matrix.dataset }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore benchmarks/Groundwork.PhysicalStorage.Benchmarks/Groundwork.PhysicalStorage.Benchmarks.csproj
+
+      - name: Build harness
+        run: dotnet build benchmarks/Groundwork.PhysicalStorage.Benchmarks/Groundwork.PhysicalStorage.Benchmarks.csproj --configuration Release --no-restore
+
+      - name: Run deterministic scheduled shard
         run: |
           dotnet run --configuration Release --no-build \
             --project benchmarks/Groundwork.PhysicalStorage.Benchmarks \
             -- run \
             --profile scheduled \
-            --providers all \
-            --forms all \
+            --providers "${{ matrix.provider }}" \
+            --forms "${{ matrix.form }}" \
             --workloads all \
-            --output "${RUNNER_TEMP}/physical-storage-scheduled/evidence"
+            --dataset-sizes "${{ matrix.dataset }}" \
+            --payload-padding-bytes 0 \
+            --selectivity-bps 5000 \
+            --independent-runs 3 \
+            --output "${RUNNER_TEMP}/physical-storage-scheduled/${SHARD_ID}/evidence"
 
-          echo "This workflow validates harness execution only. Its artifacts are non-promotable and must not gate an Elsa migration decision."
-
-      - name: Upload non-promotable scheduled evidence
+      - name: Upload non-promotable scheduled shard evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: physical-storage-scheduled-${{ github.run_id }}
-          path: ${{ runner.temp }}/physical-storage-scheduled
-          if-no-files-found: ignore
+          name: physical-storage-scheduled-${{ github.run_id }}-${{ env.SHARD_ID }}
+          path: ${{ runner.temp }}/physical-storage-scheduled/${{ env.SHARD_ID }}
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-and-aggregate:
+    name: Verify and aggregate complete scheduled evidence
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: scheduled-shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download every scheduled shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: physical-storage-scheduled-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/physical-storage-scheduled-aggregate/shards
+          merge-multiple: false
+
+      - name: Verify complete matrix, worker coverage, and result equality
+        run: |
+          python3 tools/verify_physical_storage_scheduled_coverage.py \
+            --root "${{ runner.temp }}/physical-storage-scheduled-aggregate" \
+            --run-id "${{ github.run_id }}"
+
+      - name: Upload aggregate inputs and verification result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-storage-scheduled-aggregate-${{ github.run_id }}
+          path: ${{ runner.temp }}/physical-storage-scheduled-aggregate
+          if-no-files-found: error
           retention-days: 30

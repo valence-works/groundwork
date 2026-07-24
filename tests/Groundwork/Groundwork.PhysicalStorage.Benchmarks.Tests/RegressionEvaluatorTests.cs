@@ -16,7 +16,7 @@ public sealed class RegressionEvaluatorTests
         Assert.True(result.IsComparable);
         Assert.True(result.RequiresConfirmation);
         Assert.True(result.Regressed);
-        Assert.All(result.Metrics.Where(metric => metric.Name.StartsWith("latency", StringComparison.Ordinal)),
+        Assert.All(result.Metrics.Where(metric => metric.Name.StartsWith("operation_latency", StringComparison.Ordinal)),
             metric => Assert.True(metric.LowerConfidenceRatio > 1.10));
         var throughput = Assert.Single(result.Metrics, metric => metric.Name == "throughput_ops_per_second");
         Assert.Equal(MetricDirection.HigherIsBetter, throughput.Direction);
@@ -63,7 +63,7 @@ public sealed class RegressionEvaluatorTests
     public void Scheduled_gate_refuses_to_compare_underpowered_runs()
     {
         var result = RegressionEvaluator.Compare(
-            "sqlite/entity/read", Samples(5, 1_000), Samples(5, 2_000), RegressionPolicy.Scheduled);
+            "sqlite/entity/read", Samples(1, 1_000), Samples(1, 2_000), RegressionPolicy.Scheduled);
 
         Assert.False(result.IsComparable);
         Assert.False(result.Regressed);
@@ -84,11 +84,40 @@ public sealed class RegressionEvaluatorTests
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("invalid", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Scheduled_gate_uses_process_median_and_enforces_three_independent_processes()
+    {
+        var baseline = new[]
+        {
+            Samples(30, 1_000),
+            Samples(30, 1_000),
+            Samples(30, 100_000)
+        };
+        var candidate = new[]
+        {
+            Samples(30, 1_300),
+            Samples(30, 1_300),
+            Samples(30, 1)
+        };
+
+        var result = RegressionEvaluator.CompareIndependentRuns(
+            "sqlite/entity/read", baseline, candidate, RegressionPolicy.Scheduled);
+        var underpowered = RegressionEvaluator.CompareIndependentRuns(
+            "sqlite/entity/read", baseline[..2], candidate[..2], RegressionPolicy.Scheduled);
+
+        var latency = Assert.Single(result.Metrics, metric => metric.Name == "operation_latency_p50_ns");
+        Assert.Equal(1_000, latency.Baseline);
+        Assert.Equal(1_300, latency.Candidate);
+        Assert.False(underpowered.IsComparable);
+        Assert.Contains("3 independent", Assert.Single(underpowered.Diagnostics), StringComparison.Ordinal);
+    }
+
     private static BenchmarkSample[] Samples(int count, long elapsedNanoseconds) =>
         Enumerable.Range(0, count)
             .Select(iteration => new BenchmarkSample(
                 iteration, 10, elapsedNanoseconds + iteration, 1_000, 1, 0, 0,
-                null, null, new Dictionary<string, long>()))
+                null, null, new Dictionary<string, long>(),
+                Enumerable.Repeat(elapsedNanoseconds, 10).ToArray()))
             .ToArray();
 
     private static BenchmarkSample[] SamplesWithStorage(
@@ -111,6 +140,7 @@ public sealed class RegressionEvaluatorTests
                     110,
                     0,
                     new Dictionary<string, long>()),
-                ProviderWork: new Dictionary<string, long>()))
+                ProviderWork: new Dictionary<string, long>(),
+                OperationLatencyNanoseconds: Enumerable.Repeat(100L, 10).ToArray()))
             .ToArray();
 }

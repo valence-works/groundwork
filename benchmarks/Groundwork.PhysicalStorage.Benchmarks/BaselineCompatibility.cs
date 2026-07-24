@@ -6,7 +6,8 @@ public sealed record BenchmarkBaseline(
     BenchmarkRunConfiguration? Configuration,
     BenchmarkMachineMetadata? Machine,
     IReadOnlyList<BenchmarkProviderMetadata>? Providers,
-    ElsaMigrationEvidenceReport? EvidenceReport)
+    ElsaMigrationEvidenceReport? EvidenceReport,
+    BenchmarkConsumerEvidenceReport? ConsumerEvidence = null)
 {
     public bool HasProvenance =>
         Manifest is not null &&
@@ -18,7 +19,7 @@ public sealed record BenchmarkBaseline(
 
 public sealed record BaselineCompatibility(bool IsCompatible, IReadOnlyList<string> Diagnostics);
 
-public static class BaselineCompatibilityEvaluator
+public static partial class BaselineCompatibilityEvaluator
 {
     public static BaselineCompatibility Evaluate(
         BenchmarkRunConfiguration candidateConfiguration,
@@ -48,6 +49,8 @@ public static class BaselineCompatibilityEvaluator
         var baselineMachine = baseline.Machine!;
         var baselineProviders = baseline.Providers!;
         var evidence = baseline.EvidenceReport!;
+        if (baseline.ConsumerEvidence is null)
+            diagnostics.Add("Baseline canonical consumer evidence is missing.");
 
         if (manifest.SchemaVersion != BenchmarkProfiles.SchemaVersion ||
             baselineConfiguration.SchemaVersion != BenchmarkProfiles.SchemaVersion ||
@@ -69,6 +72,8 @@ public static class BaselineCompatibilityEvaluator
         CompareMachine(candidateMachine, baselineMachine, diagnostics);
         RequireProviderMetadata(candidateConfiguration.Providers, candidateProviders, "Candidate", diagnostics);
         RequireProviderMetadata(baselineConfiguration.Providers, baselineProviders, "Baseline", diagnostics);
+        RequireReproducibilityValues(candidateProviders, "Candidate", diagnostics);
+        RequireReproducibilityValues(baselineProviders, "Baseline", diagnostics);
         CompareProviders(candidateProviders, baselineProviders, diagnostics);
         ValidateRawRecords(baseline, baselineConfiguration, evidence, diagnostics);
 
@@ -83,9 +88,12 @@ public static class BaselineCompatibilityEvaluator
         if (candidate.Mode != baseline.Mode ||
             candidate.Seed != baseline.Seed ||
             candidate.DatasetSize != baseline.DatasetSize ||
+            candidate.DataShape != baseline.DataShape ||
             candidate.MigrationDatasetSize != baseline.MigrationDatasetSize ||
             candidate.WarmupIterations != baseline.WarmupIterations ||
             candidate.MeasurementIterations != baseline.MeasurementIterations ||
+            candidate.MinimumMeasuredOperations != baseline.MinimumMeasuredOperations ||
+            candidate.MinimumSteadyStateDurationSeconds != baseline.MinimumSteadyStateDurationSeconds ||
             candidate.OperationsPerIteration != baseline.OperationsPerIteration ||
             candidate.Concurrency != baseline.Concurrency)
             diagnostics.Add("Candidate and baseline fixed profile controls differ.");
@@ -118,6 +126,14 @@ public static class BaselineCompatibilityEvaluator
             diagnostics.Add("Candidate and baseline stopwatch frequency differ.");
         if (!candidate.HarnessVersion.Equals(baseline.HarnessVersion, StringComparison.Ordinal))
             diagnostics.Add("Candidate and baseline harness version differ.");
+        if (!candidate.CpuModel.Equals(baseline.CpuModel, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline CPU model differ.");
+        if (!candidate.Memory.Equals(baseline.Memory, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline memory metadata differ.");
+        if (!candidate.Storage.Equals(baseline.Storage, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline storage/filesystem metadata differ.");
+        if (!candidate.PowerManagement.Equals(baseline.PowerManagement, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline power/governor metadata differ.");
     }
 
     private static void CompareProviders(
@@ -139,6 +155,8 @@ public static class BaselineCompatibilityEvaluator
                 diagnostics.Add($"Candidate and baseline provider version differ for {candidateProvider.Provider}.");
             if (!SameConfiguration(candidateProvider.Configuration, baselineProvider.Configuration))
                 diagnostics.Add($"Candidate and baseline provider configuration differ for {candidateProvider.Provider}.");
+            if (!SameConfiguration(candidateProvider.EffectiveSettings, baselineProvider.EffectiveSettings))
+                diagnostics.Add($"Candidate and baseline effective database settings differ for {candidateProvider.Provider}.");
         }
     }
 
@@ -152,6 +170,89 @@ public static class BaselineCompatibilityEvaluator
         foreach (var provider in configured.Where(provider => !represented.Contains(provider)))
             diagnostics.Add($"{source} provider metadata is missing {provider}.");
     }
+
+    private static void RequireReproducibilityValues(
+        IReadOnlyList<BenchmarkProviderMetadata> providers,
+        string source,
+        ICollection<string> diagnostics)
+    {
+        foreach (var provider in providers)
+        {
+            RequireCompleteEffectiveSettings(provider, source, diagnostics);
+            RequireContainerImageDigest(provider, source, diagnostics);
+        }
+    }
+
+    private static void RequireCompleteEffectiveSettings(
+        BenchmarkProviderMetadata provider,
+        string source,
+        ICollection<string> diagnostics)
+    {
+        if (provider.EffectiveSettings.Count == 0 ||
+            provider.EffectiveSettings.Any(pair =>
+                string.IsNullOrWhiteSpace(pair.Key) ||
+                string.IsNullOrWhiteSpace(pair.Value) ||
+                IsUnavailable(pair.Key, pair.Value)) ||
+            provider.Configuration.Any(pair =>
+                string.IsNullOrWhiteSpace(pair.Key) ||
+                string.IsNullOrWhiteSpace(pair.Value) ||
+                IsUnavailable(pair.Key, pair.Value)))
+        {
+            diagnostics.Add(
+                $"{source} provider {provider.Provider} has unavailable or malformed reproducibility settings; it is not comparable.");
+            return;
+        }
+
+        var missing = provider.Configuration.Keys
+            .Except(provider.EffectiveSettings.Keys, StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (missing.Length > 0)
+        {
+            diagnostics.Add(
+                $"{source} provider {provider.Provider} effective settings do not include every declared configuration setting: {string.Join(", ", missing)}.");
+        }
+    }
+
+    private static void RequireContainerImageDigest(
+        BenchmarkProviderMetadata provider,
+        string source,
+        ICollection<string> diagnostics)
+    {
+        if (provider.Provider == BenchmarkProvider.Sqlite)
+        {
+            return;
+        }
+
+        if (!provider.Configuration.TryGetValue("source", out var providerSource) ||
+            string.IsNullOrWhiteSpace(providerSource))
+        {
+            diagnostics.Add(
+                $"{source} provider {provider.Provider} requires a recorded container or controlled-infrastructure source.");
+            return;
+        }
+
+        if (!providerSource.StartsWith("testcontainer:", StringComparison.Ordinal))
+            return;
+
+        if (!ImmutableDigestPattern().IsMatch(providerSource))
+        {
+            diagnostics.Add(
+                $"{source} provider {provider.Provider} testcontainer source requires an immutable image digest in the form immutableDigest=sha256:<64 lowercase hexadecimal characters>.");
+        }
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(
+        @"(?:^|;)immutableDigest=sha256:[0-9a-f]{64}(?:;|$)",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant)]
+    private static partial System.Text.RegularExpressions.Regex ImmutableDigestPattern();
+
+    private static bool IsUnavailable(string key, string value) =>
+        key.Contains("digest", StringComparison.OrdinalIgnoreCase) &&
+        value.Contains("unavailable", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("captureStatus", StringComparison.OrdinalIgnoreCase) &&
+        value.Contains("unavailable", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("immutableDigest=unavailable", StringComparison.OrdinalIgnoreCase);
 
     private static bool SameConfiguration(
         IReadOnlyDictionary<string, string> first,
@@ -168,12 +269,28 @@ public static class BaselineCompatibilityEvaluator
         var groups = baseline.Records
             .GroupBy(record => record.Case.Identity, StringComparer.Ordinal)
             .ToArray();
-        if (groups.Length == 0 || groups.Any(group => group.Count() != configuration.MeasurementIterations))
-            diagnostics.Add("Baseline raw measurements must contain exactly the configured sample count per case.");
+        if (groups.Length == 0 || groups.Any(group =>
+                group.Count() < configuration.MeasurementIterations ||
+                group.Sum(record => (long)record.Sample.Operations) < configuration.MinimumMeasuredOperations ||
+                group.Sum(record => record.Sample.ElapsedNanoseconds) <
+                configuration.MinimumSteadyStateDurationSeconds * 1_000_000_000L))
+        {
+            diagnostics.Add(
+                "Baseline raw measurements must satisfy the configured sample count, operation count, " +
+                "and steady-state duration floors per case.");
+        }
         if (baseline.Records.Any(record =>
                 !configuration.Providers.Contains(record.Case.Provider) ||
                 !configuration.StorageForms.Contains(record.Case.StorageForm)))
             diagnostics.Add("Baseline raw measurements contain a case outside the configured provider/form matrix.");
+        if (baseline.Records.Any(record =>
+                record.Sample.OperationLatencyNanoseconds is null ||
+                record.Sample.OperationLatencyNanoseconds.Count != record.Sample.Operations ||
+                record.Sample.OperationLatencyNanoseconds.Any(latency => latency <= 0)))
+        {
+            diagnostics.Add(
+                "Baseline raw measurements must contain one positive raw latency observation per operation.");
+        }
 
         var rawCases = groups.Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
         var evidenceCases = evidence.Cases.Select(item => item.CaseIdentity).ToArray();

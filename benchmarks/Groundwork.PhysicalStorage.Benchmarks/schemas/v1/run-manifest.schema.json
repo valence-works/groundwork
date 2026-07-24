@@ -19,7 +19,8 @@
     "providerMetadata",
     "configuration",
     "planArtifacts",
-    "regressionConfirmationRun"
+    "regressionConfirmationRun",
+    "artifactIntegrity"
   ],
   "properties": {
     "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
@@ -36,6 +37,8 @@
     "machineMetadata": { "type": "string", "minLength": 1 },
     "providerMetadata": { "type": "string", "minLength": 1 },
     "configuration": { "type": "string", "minLength": 1 },
+    "consumerEvidence": { "type": ["string", "null"], "minLength": 1 },
+    "artifactIntegrity": { "type": "string", "minLength": 1 },
     "planArtifacts": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

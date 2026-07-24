@@ -1,3 +1,4 @@
+using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.SchemaEvolution;
 using Groundwork.Documents.Scoping;
@@ -29,7 +30,8 @@ public sealed class SqliteBenchmarkTarget(
         ["cache"] = "Shared",
         ["journal_mode"] = "WAL",
         ["synchronous"] = "provider default per operation connection",
-        ["connection_lifetime"] = "per-operation serialized production sessions"
+        ["connection_lifetime"] = "per-operation serialized production sessions",
+        ["factory"] = nameof(SqliteDocumentStoreFactory.OpenPhysicalAsync)
     };
 
     private string ConnectionString => new SqliteConnectionStringBuilder
@@ -40,7 +42,12 @@ public sealed class SqliteBenchmarkTarget(
         Pooling = true
     }.ConnectionString;
 
-    public override async Task InitializeAsync(CancellationToken cancellationToken)
+    public override Task InitializeAsync(CancellationToken cancellationToken) =>
+        InitializeAsync(beforeAdmission: null, cancellationToken);
+
+    internal async Task InitializeAsync(
+        Func<string, BenchmarkPhysicalModel, CancellationToken, Task>? beforeAdmission,
+        CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
         File.Delete(databasePath);
@@ -48,7 +55,7 @@ public sealed class SqliteBenchmarkTarget(
             StorageForm,
             Instance,
             SqliteGroundworkCapabilities.Provider,
-            ProviderPhysicalNameNormalizer.Identity);
+            SqliteGroundworkCapabilities.PhysicalNames);
         await using (var connection = new SqliteConnection(ConnectionString))
         {
             await connection.OpenAsync(cancellationToken);
@@ -61,15 +68,16 @@ public sealed class SqliteBenchmarkTarget(
             version.CommandText = "SELECT sqlite_version();";
             ProviderVersion = Convert.ToString(await version.ExecuteScalarAsync(cancellationToken)) ?? "unknown";
         }
-        OpenStores();
+        if (beforeAdmission is not null)
+            await beforeAdmission(ConnectionString, model, cancellationToken);
+        await OpenStoresAsync(cancellationToken);
     }
 
     public override async Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
         IReadOnlyList<BenchmarkPlanRequest> requests,
         CancellationToken cancellationToken)
     {
-        await EnsurePlanScaleAsync(10_000, cancellationToken);
-        var store = CreateStore(DocumentStoreAccess.Scoped(new("tenant-a")));
+        var store = (SqlitePhysicalDocumentStore)TenantA;
         var canonicalJsonValueKinds = new HashSet<Groundwork.Core.Indexing.IndexValueKind>
         {
             Groundwork.Core.Indexing.IndexValueKind.String,
@@ -78,11 +86,6 @@ public sealed class SqliteBenchmarkTarget(
         };
         await using var connection = new SqliteConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var analyze = connection.CreateCommand())
-        {
-            analyze.CommandText = "ANALYZE;";
-            await analyze.ExecuteNonQueryAsync(cancellationToken);
-        }
         var indexName = model.Route.Indexes.Single().Name.Identifier;
         var evidence = new List<NativePlanEvidence>(requests.Count);
         foreach (var request in requests)
@@ -143,22 +146,22 @@ public sealed class SqliteBenchmarkTarget(
             StorageForm,
             suffix,
             SqliteGroundworkCapabilities.Provider,
-            ProviderPhysicalNameNormalizer.Identity,
+            SqliteGroundworkCapabilities.PhysicalNames,
             includeCategory: false);
         var additive = BenchmarkModelFactory.CompileRelational(
             StorageForm,
             suffix,
             SqliteGroundworkCapabilities.Provider,
-            ProviderPhysicalNameNormalizer.Identity,
+            SqliteGroundworkCapabilities.PhysicalNames,
             includeCategory: true);
         await using var connection = new SqliteConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await PhysicalSchemaApplication.ApplyAsync(initial.Target, new SqlitePhysicalSchemaExecutor(connection), cancellationToken: cancellationToken);
-        var store = new SqlitePhysicalDocumentStore(
-            ConnectionString,
+        var store = await OpenStoreAsync(
             initial.Manifest,
-            initial.Target.Routes,
-            DocumentStoreAccess.Scoped(new("tenant-a")));
+            BenchmarkModelFactory.NamePolicy(suffix),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
         for (var index = 0; index < migrationDatasetSize; index++)
         {
             RequireStatus(await store.SaveAsync(
@@ -167,7 +170,7 @@ public sealed class SqliteBenchmarkTarget(
                 DocumentStoreWriteStatus.Saved,
                 "migration seed");
         }
-        migration = new MigrationState(additive, migrationDatasetSize);
+        migration = new MigrationState(additive, suffix, migrationDatasetSize);
     }
 
     public override async Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken)
@@ -217,10 +220,17 @@ public sealed class SqliteBenchmarkTarget(
 
     protected override Task ResetClientStateAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
         SqliteConnection.ClearAllPools();
-        OpenStores();
-        return Task.CompletedTask;
+        return OpenStoresAsync(cancellationToken);
+    }
+
+    protected override async Task FinalizeSeedAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = new SqliteConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var analyze = connection.CreateCommand();
+        analyze.CommandText = "ANALYZE;";
+        await analyze.ExecuteNonQueryAsync(cancellationToken);
     }
 
     protected override async Task<WorkloadExecution> ExecuteBackfillMigrationAsync(CancellationToken cancellationToken)
@@ -234,21 +244,25 @@ public sealed class SqliteBenchmarkTarget(
             cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.Applied)
             throw new InvalidOperationException($"Backfill migration returned {result.Outcome}; expected Applied.");
-        return Execution(1, logicalMutations: state.Rows, providerWork: new Dictionary<string, long>
-        {
-            ["backfilled_documents"] = state.Rows
-        });
+        return Execution(
+            1,
+            logicalMutations: state.Rows,
+            providerWork: new Dictionary<string, long>
+            {
+                ["backfilled_documents"] = state.Rows
+            },
+            observableResultVector: BackfillObservableResult(result.Outcome.ToString(), state.Rows));
     }
 
     protected override async Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken)
     {
         var state = migration ?? throw new InvalidOperationException("Migration iteration was not executed.");
         var route = state.Additive.Route;
-        var store = new SqlitePhysicalDocumentStore(
-            ConnectionString,
+        var store = await OpenStoreAsync(
             state.Additive.Manifest,
-            state.Additive.Target.Routes,
-            DocumentStoreAccess.Scoped(new("tenant-a")));
+            BenchmarkModelFactory.NamePolicy(state.Suffix),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
         var queries = SqlitePhysicalQueryRuntime.Create(
             store,
             state.Additive.Manifest,
@@ -282,42 +296,68 @@ public sealed class SqliteBenchmarkTarget(
         CancellationToken cancellationToken)
     {
         SqliteConnection.ClearAllPools();
+        PhysicalSchemaApplicationResult restart;
         await using (var connection = new SqliteConnection(ConnectionString))
         {
             await connection.OpenAsync(cancellationToken);
-            var result = await PhysicalSchemaApplication.ApplyAsync(
+            restart = await PhysicalSchemaApplication.ApplyAsync(
                 model.Target,
                 new SqlitePhysicalSchemaExecutor(connection),
                 cancellationToken: cancellationToken);
-            if (result.Outcome != PhysicalSchemaApplicationOutcome.NoChanges)
-                throw new InvalidOperationException($"Restart validation returned {result.Outcome}; expected NoChanges.");
+            if (restart.Outcome != PhysicalSchemaApplicationOutcome.NoChanges)
+                throw new InvalidOperationException($"Restart validation returned {restart.Outcome}; expected NoChanges.");
         }
-        OpenStores();
+        await OpenStoresAsync(cancellationToken);
+        var documents = new List<DocumentEnvelope>(operations);
         for (var index = 0; index < operations; index++)
         {
-            if (await TenantA.LoadAsync(
-                    BenchmarkModelFactory.DocumentKind,
-                    $"seed-{index:D8}",
-                    cancellationToken) is null)
+            var document = await TenantA.LoadAsync(
+                BenchmarkModelFactory.DocumentKind,
+                $"seed-{index:D8}",
+                cancellationToken);
+            if (document is null)
             {
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
+            documents.Add(document);
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
+        return Execution(
+            1,
+            providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 },
+            observableResultVector: RestartObservableResult("reopened", documents));
     }
 
-    private void OpenStores()
+    private async Task OpenStoresAsync(CancellationToken cancellationToken)
     {
-        var tenantA = CreateStore(DocumentStoreAccess.Scoped(new("tenant-a")));
-        var tenantB = CreateStore(DocumentStoreAccess.Scoped(new("tenant-b")));
+        var namePolicy = BenchmarkModelFactory.NamePolicy(Instance);
+        var tenantA = await OpenStoreAsync(
+            model.Manifest,
+            namePolicy,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
+        var tenantB = await OpenStoreAsync(
+            model.Manifest,
+            namePolicy,
+            DocumentStoreAccess.Scoped(new("tenant-b")),
+            cancellationToken);
         SetStores(
             tenantA,
             tenantB,
             SqlitePhysicalQueryRuntime.Create(tenantA, model.Manifest, model.Route, model.Target.Provider));
     }
 
-    private SqlitePhysicalDocumentStore CreateStore(DocumentStoreAccess access) =>
-        new(ConnectionString, model.Manifest, model.Target.Routes, access);
+    private Task<SqlitePhysicalDocumentStore> OpenStoreAsync(
+        StorageManifest manifest,
+        IPhysicalNamePolicy namePolicy,
+        DocumentStoreAccess access,
+        CancellationToken cancellationToken) =>
+        SqliteDocumentStoreFactory.OpenPhysicalAsync(
+            ConnectionString,
+            manifest,
+            SqliteGroundworkCapabilities.Provider,
+            access,
+            namePolicy,
+            cancellationToken: cancellationToken);
 
     private static async Task ConfigureAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
@@ -349,5 +389,5 @@ public sealed class SqliteBenchmarkTarget(
         }
     }
 
-    private sealed record MigrationState(BenchmarkPhysicalModel Additive, int Rows);
+    private sealed record MigrationState(BenchmarkPhysicalModel Additive, string Suffix, int Rows);
 }

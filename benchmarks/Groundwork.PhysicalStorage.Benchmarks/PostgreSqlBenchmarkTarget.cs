@@ -8,6 +8,7 @@ using Groundwork.PostgreSql.Documents;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Npgsql;
+using System.Text.Json;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
 
@@ -33,7 +34,8 @@ public sealed class PostgreSqlBenchmarkTarget(
         ["source"] = sourceDescription,
         ["schema_per_form"] = "true",
         ["pooling"] = new NpgsqlConnectionStringBuilder(serverConnectionString).Pooling.ToString(),
-        ["connection_lifetime"] = "per-operation concurrent production sessions"
+        ["connection_lifetime"] = "per-operation concurrent production sessions",
+        ["factory"] = nameof(PostgreSqlDocumentStoreFactory.OpenPhysicalAsync)
     };
 
     protected override ProviderIdentity GroundworkProvider => PostgreSqlGroundworkCapabilities.Provider;
@@ -45,28 +47,21 @@ public sealed class PostgreSqlBenchmarkTarget(
         IReadOnlyList<BenchmarkPlanRequest> requests,
         CancellationToken cancellationToken)
     {
-        await EnsurePlanScaleAsync(10_000, cancellationToken);
+        var store = RelationalTenantA;
         await using var connection = new NpgsqlConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var statistics = connection.CreateCommand())
-        {
-            statistics.CommandText = Model.Route.LinkedIndexStorage is null
-                ? $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)};"
-                : $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)}; ANALYZE {Q(Model.Route.LinkedIndexStorage.Name.Identifier)};";
-            await statistics.ExecuteNonQueryAsync(cancellationToken);
-        }
         var indexName = Model.Route.Indexes.Single().Name.Identifier;
         var evidence = new List<NativePlanEvidence>(requests.Count);
         foreach (var request in requests)
         {
-            var rendered = RenderPlan(request);
+            var rendered = RenderPlan(request, store);
             await using var command = connection.CreateCommand();
             command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";
             foreach (var (name, value) in rendered.Parameters)
                 command.Parameters.AddWithValue(name, value ?? DBNull.Value);
             var plan = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
-            if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
-                plan.Contains("\"Node Type\": \"Seq Scan\"", StringComparison.OrdinalIgnoreCase))
+            var indexedRelation = (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier;
+            if (!UsesDeclaredIndexWithoutScanningIndexedRelation(plan, indexName, indexedRelation))
             {
                 throw new InvalidOperationException(
                     $"PostgreSQL native-plan gate rejected {request.Workload}/{request.Operation}. Expected index '{indexName}'.{Environment.NewLine}{plan}");
@@ -74,11 +69,64 @@ public sealed class PostgreSqlBenchmarkTarget(
             evidence.Add(new NativePlanEvidence(
                 request,
                 Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
-                (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
+                indexedRelation,
                 indexName, plan,
-                ["declared index is selected", "Seq Scan is absent", "query shape is rendered by the certified production handler"]));
+                [
+                    "declared index is selected on the predicate-bearing relation",
+                    "the predicate-bearing relation is not sequentially scanned",
+                    "an optimizer-selected scan of a separate primary payload relation is permitted for linked forms",
+                    "query shape is rendered by the certified production handler"
+                ]));
         }
         return evidence;
+    }
+
+    internal static bool UsesDeclaredIndexWithoutScanningIndexedRelation(
+        string plan,
+        string indexName,
+        string indexedRelation)
+    {
+        if (string.IsNullOrWhiteSpace(plan) ||
+            string.IsNullOrWhiteSpace(indexName) ||
+            string.IsNullOrWhiteSpace(indexedRelation))
+        {
+            return false;
+        }
+
+        using var document = JsonDocument.Parse(plan);
+        var declaredIndexSelected = false;
+        var indexedRelationScanned = false;
+        Visit(document.RootElement);
+        return declaredIndexSelected && !indexedRelationScanned;
+
+        void Visit(JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                var nodeType = element.TryGetProperty("Node Type", out var nodeTypeElement)
+                    ? nodeTypeElement.GetString()
+                    : null;
+                var relation = element.TryGetProperty("Relation Name", out var relationElement)
+                    ? relationElement.GetString()
+                    : null;
+                var selectedIndex = element.TryGetProperty("Index Name", out var indexElement)
+                    ? indexElement.GetString()
+                    : null;
+                declaredIndexSelected |= string.Equals(selectedIndex, indexName, StringComparison.OrdinalIgnoreCase);
+                indexedRelationScanned |=
+                    string.Equals(nodeType, "Seq Scan", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(relation, indexedRelation, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in element.EnumerateObject())
+                    Visit(property.Value);
+            }
+            else if (element.ValueKind == JsonValueKind.Array)
+                foreach (var child in element.EnumerateArray())
+                    Visit(child);
+        }
     }
 
     public override async Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken)
@@ -140,10 +188,18 @@ public sealed class PostgreSqlBenchmarkTarget(
 
     protected override IPhysicalSchemaExecutor CreateExecutor() => new PostgreSqlPhysicalSchemaExecutor(ConnectionString);
 
-    protected override RelationalPhysicalDocumentStore CreateStore(
+    protected override async Task<RelationalPhysicalDocumentStore> OpenStoreAsync(
         StorageManifest manifest,
-        IReadOnlyList<ExecutableStorageRoute> routes,
-        DocumentStoreAccess access) => new PostgreSqlPhysicalDocumentStore(ConnectionString, manifest, routes, access);
+        IPhysicalNamePolicy namePolicy,
+        DocumentStoreAccess access,
+        CancellationToken cancellationToken) =>
+        await PostgreSqlDocumentStoreFactory.OpenPhysicalAsync(
+            ConnectionString,
+            manifest,
+            GroundworkProvider,
+            access,
+            namePolicy,
+            cancellationToken: cancellationToken);
 
     protected override async Task<string> ReadProviderVersionAsync(CancellationToken cancellationToken)
     {
@@ -172,6 +228,19 @@ public sealed class PostgreSqlBenchmarkTarget(
     }
 
     protected override void ClearPools() => NpgsqlConnection.ClearAllPools();
+
+    protected override async Task FinalizeSeedAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var statistics = connection.CreateCommand();
+        statistics.CommandText = Model.Route.LinkedIndexStorage is null
+            ? $"SET default_statistics_target = 10000; ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)};"
+            : $"SET default_statistics_target = 10000; " +
+              $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)}; " +
+              $"ANALYZE {Q(Model.Route.LinkedIndexStorage.Name.Identifier)};";
+        await statistics.ExecuteNonQueryAsync(cancellationToken);
+    }
 
     private static string Q(string value) => $"\"{value.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 }

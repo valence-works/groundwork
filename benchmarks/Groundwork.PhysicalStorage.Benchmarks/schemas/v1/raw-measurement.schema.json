@@ -50,7 +50,7 @@
         "logicalPayloadBytes",
         "logicalMutations",
         "providerWork",
-        "normalizedBatchLatencyNanosecondsPerOperation",
+        "operationLatencyNanoseconds",
         "throughputOperationsPerSecond",
         "allocatedBytesPerOperation"
       ],
@@ -65,7 +65,11 @@
         "storageBefore": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
         "storageAfter": { "oneOf": [{ "$ref": "#/$defs/storage" }, { "type": "null" }] },
         "providerWork": { "$ref": "#/$defs/integerMap" },
-        "normalizedBatchLatencyNanosecondsPerOperation": { "type": "number", "exclusiveMinimum": 0 },
+        "operationLatencyNanoseconds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1 }
+        },
         "throughputOperationsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
         "allocatedBytesPerOperation": { "type": "number", "minimum": 0 }
       }

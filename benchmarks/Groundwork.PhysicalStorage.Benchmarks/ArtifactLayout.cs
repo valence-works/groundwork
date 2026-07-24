@@ -15,6 +15,8 @@ public sealed class ArtifactLayout
     public string SummaryMarkdown => Path.Combine(Root, "reports", "summary.md");
     public string RegressionJson => Path.Combine(Root, "reports", "regression.json");
     public string ElsaMigrationEvidenceJson => Path.Combine(Root, "reports", "elsa-migration-evidence.json");
+    public string ConsumerEvidenceJson => Path.Combine(Root, "reports", "consumer-evidence.json");
+    public string ArtifactIntegrityJson => Path.Combine(Root, "reports", "artifact-integrity.json");
     public string MachineMetadata => Path.Combine(Root, "metadata", "machine.json");
     public string ProviderMetadata => Path.Combine(Root, "metadata", "providers.json");
     public string Configuration => Path.Combine(Root, "metadata", "configuration.json");
@@ -40,6 +42,7 @@ public sealed class ArtifactLayout
         foreach (var file in new[]
                  {
                      Manifest, RawMeasurements, SummaryJson, SummaryMarkdown, RegressionJson, ElsaMigrationEvidenceJson,
+                     ConsumerEvidenceJson, ArtifactIntegrityJson,
                      MachineMetadata, ProviderMetadata, Configuration,
                      Plan(new BenchmarkCase(BenchmarkProvider.Sqlite,
                          Groundwork.Core.PhysicalStorage.PhysicalStorageForm.SharedDocuments,

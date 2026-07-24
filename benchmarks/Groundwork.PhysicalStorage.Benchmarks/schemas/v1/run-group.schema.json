@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/run-group.schema.json",
+  "title": "Groundwork physical-storage run group v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "runGroupId",
+    "promotable",
+    "externalOracleJoinRequired",
+    "gitCommit",
+    "gitDirty",
+    "gitTreeDigest",
+    "completedAtUtc",
+    "runs",
+    "confirmedRegression"
+  ],
+  "properties": {
+    "protocolVersion": { "const": "groundwork.physical-storage.worker/v1" },
+    "runGroupId": { "type": "string", "minLength": 1 },
+    "promotable": { "const": false },
+    "externalOracleJoinRequired": { "const": true },
+    "gitCommit": { "type": "string", "minLength": 1 },
+    "gitDirty": { "type": "boolean" },
+    "gitTreeDigest": { "$ref": "#/$defs/digest" },
+    "completedAtUtc": { "type": "string", "format": "date-time" },
+    "baselineRunGroup": { "type": ["string", "null"], "minLength": 1 },
+    "regressionReport": { "type": ["string", "null"], "minLength": 1 },
+    "regressionReportDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+    "confirmedRegression": { "type": "boolean" },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/run" }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "independentRun",
+        "role",
+        "request",
+        "response",
+        "requestDigest",
+        "responseDigest",
+        "workerManifest",
+        "workerManifestDigest",
+        "elsaMigrationEvidence",
+        "elsaMigrationEvidenceDigest"
+      ],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "independentRun": { "type": "integer", "minimum": 0 },
+        "role": { "enum": ["untimedWarmup", "measured"] },
+        "request": { "type": "string", "minLength": 1 },
+        "response": { "type": "string", "minLength": 1 },
+        "consumerEvidence": { "type": ["string", "null"], "minLength": 1 },
+        "consumerEvidenceDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "requestDigest": { "$ref": "#/$defs/digest" },
+        "responseDigest": { "$ref": "#/$defs/digest" },
+        "workerManifest": { "type": "string", "minLength": 1 },
+        "workerManifestDigest": { "$ref": "#/$defs/digest" },
+        "elsaMigrationEvidence": { "type": "string", "minLength": 1 },
+        "elsaMigrationEvidenceDigest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

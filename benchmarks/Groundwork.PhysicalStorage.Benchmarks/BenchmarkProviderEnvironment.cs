@@ -85,7 +85,7 @@ public sealed class BenchmarkProviderEnvironment : IBenchmarkProviderEnvironment
         RequireContainers(allowContainers, BenchmarkProvider.SqlServer);
         sqlServer = new MsSqlBuilder(SqlServerImage).Build();
         await sqlServer.StartAsync(cancellationToken);
-        return (sqlServer.GetConnectionString(), $"testcontainer:{SqlServerImage}");
+        return (sqlServer.GetConnectionString(), $"testcontainer:{SqlServerImage};immutableDigest=unavailable");
     }
 
     private async Task<(string ConnectionString, string Source)> StartPostgreSqlAsync(
@@ -102,7 +102,7 @@ public sealed class BenchmarkProviderEnvironment : IBenchmarkProviderEnvironment
             .WithPassword("groundwork")
             .Build();
         await postgreSql.StartAsync(cancellationToken);
-        return (postgreSql.GetConnectionString(), $"testcontainer:{PostgreSqlImage}");
+        return (postgreSql.GetConnectionString(), $"testcontainer:{PostgreSqlImage};immutableDigest=unavailable");
     }
 
     private async Task<(string ConnectionString, string Source)> StartMongoDbAsync(
@@ -115,7 +115,8 @@ public sealed class BenchmarkProviderEnvironment : IBenchmarkProviderEnvironment
         RequireContainers(allowContainers, BenchmarkProvider.MongoDb);
         mongoDb = new MongoDbBuilder(MongoDbImage).WithReplicaSet("groundwork-rs").Build();
         await mongoDb.StartAsync(cancellationToken);
-        return (mongoDb.GetConnectionString(), $"testcontainer:{MongoDbImage};replicaSet=groundwork-rs");
+        return (mongoDb.GetConnectionString(),
+            $"testcontainer:{MongoDbImage};immutableDigest=unavailable;replicaSet=groundwork-rs");
     }
 
     private static void RequireContainers(bool allowContainers, BenchmarkProvider provider)

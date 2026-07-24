@@ -15,6 +15,9 @@ public sealed class BenchmarkContractTests
         Assert.Equal(Enum.GetValues<PhysicalStorageForm>(), profile.StorageForms);
         Assert.True(profile.WarmupIterations >= 1);
         Assert.True(profile.MeasurementIterations >= 5);
+        Assert.Equal(3, BenchmarkProfiles.ScheduledDimensions.IndependentRuns);
+        Assert.Equal(100, BenchmarkProfiles.Scheduled.MinimumMeasuredOperations);
+        Assert.Equal(30, BenchmarkProfiles.Scheduled.MinimumSteadyStateDurationSeconds);
     }
 
     [Fact]

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -20,14 +21,40 @@ public sealed record BenchmarkMachineMetadata(
     string HarnessVersion,
     string GitCommit,
     bool GitDirty,
-    DateTimeOffset CapturedAtUtc);
+    DateTimeOffset CapturedAtUtc)
+{
+    public string GitTreeDigest { get; init; } = "unavailable";
+    public string CpuModel { get; init; } = "unavailable";
+    public string Memory { get; init; } = "unavailable";
+    public string Storage { get; init; } = "unavailable";
+    public string PowerManagement { get; init; } = "unavailable";
+}
+
+public sealed record BenchmarkGitState(string Commit, bool Dirty, string TreeDigest);
 
 public sealed record BenchmarkProviderMetadata(
     BenchmarkProvider Provider,
     string Version,
-    IReadOnlyDictionary<string, string> Configuration);
+    IReadOnlyDictionary<string, string> Configuration)
+{
+    public IReadOnlyDictionary<string, string> EffectiveSettings { get; init; } =
+        new Dictionary<string, string>
+        {
+            ["captureStatus"] = "unavailable:not-exposed-by-provider-target"
+        };
+}
 
 public sealed record BenchmarkRunFailure(string Type, string Message);
+
+public sealed record BenchmarkArtifactDigest(string Path, string Digest);
+
+public sealed record BenchmarkArtifactIntegrity(
+    string SchemaVersion,
+    string RunId,
+    IReadOnlyList<BenchmarkArtifactDigest> Artifacts)
+{
+    public const string ContractVersion = "groundwork.physical-storage.artifact-integrity/v1";
+}
 
 public sealed record BenchmarkRunManifest(
     string SchemaVersion,
@@ -47,7 +74,9 @@ public sealed record BenchmarkRunManifest(
     IReadOnlyList<string> PlanArtifacts,
     string? BaselineRun,
     bool RegressionConfirmationRun,
-    BenchmarkRunFailure? Failure);
+    BenchmarkRunFailure? Failure,
+    string? ConsumerEvidence = null,
+    string? ArtifactIntegrity = null);
 
 public sealed record RawBenchmarkRecord(BenchmarkCase Case, BenchmarkSample Sample);
 
@@ -56,7 +85,8 @@ public sealed record BenchmarkCaseResult(
     CorrectnessGateResult Correctness,
     IReadOnlyList<string> PlanArtifacts,
     BenchmarkCaseSummary Summary,
-    IReadOnlyList<BenchmarkSample> Samples);
+    IReadOnlyList<BenchmarkSample> Samples,
+    IReadOnlyList<BenchmarkObservableResult>? ObservableResults = null);
 
 public sealed record BenchmarkRunReport(
     string SchemaVersion,
@@ -64,16 +94,18 @@ public sealed record BenchmarkRunReport(
     BenchmarkRunMode Mode,
     IReadOnlyList<BenchmarkCaseResult> Cases,
     IReadOnlyList<RegressionEvaluation> Regressions,
-    BaselineEligibility BaselineEligibility);
+    BaselineEligibility BaselineEligibility,
+    BenchmarkDataShape? DataShape = null);
 
 public sealed record ElsaMigrationEvidenceCase(
     string CaseIdentity,
     BenchmarkProvider Provider,
     Groundwork.Core.PhysicalStorage.PhysicalStorageForm StorageForm,
     BenchmarkWorkload Workload,
-    double NormalizedBatchLatencyP50NanosecondsPerOperation,
-    double NormalizedBatchLatencyP95NanosecondsPerOperation,
-    double NormalizedBatchLatencyP99NanosecondsPerOperation,
+    int OperationLatencyObservationCount,
+    double OperationLatencyP50Nanoseconds,
+    double OperationLatencyP95Nanoseconds,
+    double OperationLatencyP99Nanoseconds,
     double ThroughputOperationsPerSecond,
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
@@ -115,9 +147,10 @@ public sealed record ElsaMigrationEvidenceReport(
                 result.Case.Provider,
                 result.Case.StorageForm,
                 result.Case.Workload,
-                result.Summary.NormalizedBatchLatencyP50NanosecondsPerOperation,
-                result.Summary.NormalizedBatchLatencyP95NanosecondsPerOperation,
-                result.Summary.NormalizedBatchLatencyP99NanosecondsPerOperation,
+                result.Summary.OperationLatencyObservationCount,
+                result.Summary.OperationLatencyP50Nanoseconds,
+                result.Summary.OperationLatencyP95Nanoseconds,
+                result.Summary.OperationLatencyP99Nanoseconds,
                 result.Summary.ThroughputOperationsPerSecond,
                 result.Summary.AllocatedBytesPerOperation,
                 result.Summary.RoundTripsPerOperation,
@@ -177,6 +210,54 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
 
     public Task WriteConfigurationAsync(BenchmarkRunConfiguration configuration, CancellationToken cancellationToken) =>
         WriteJsonAsync(Layout.Configuration, configuration, cancellationToken);
+
+    public Task WriteConsumerEvidenceAsync(
+        BenchmarkConsumerEvidenceReport report,
+        CancellationToken cancellationToken) =>
+        WriteImmutableJsonAsync(Layout.ConsumerEvidenceJson, report, cancellationToken);
+
+    public async Task WriteArtifactIntegrityAsync(
+        BenchmarkRunManifest manifest,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!manifest.Status.Equals("completed", StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(manifest.ArtifactIntegrity))
+        {
+            throw new InvalidOperationException("Only a completed manifest with an integrity location can be sealed.");
+        }
+
+        await rawWriter.FlushAsync(cancellationToken);
+        var required = new List<string>
+        {
+            Layout.RelativePath(Layout.Manifest),
+            manifest.RawMeasurements,
+            manifest.Summary,
+            manifest.ElsaMigrationEvidence,
+            manifest.MachineMetadata,
+            manifest.ProviderMetadata,
+            manifest.Configuration
+        };
+        if (manifest.ConsumerEvidence is not null)
+            required.Add(manifest.ConsumerEvidence);
+        foreach (var plan in manifest.PlanArtifacts)
+        {
+            required.Add(plan);
+            required.Add($"{plan}.assertions.json");
+        }
+
+        var artifacts = required
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(relative => new BenchmarkArtifactDigest(
+                relative,
+                DigestFile(ResolveArtifact(Layout, relative))))
+            .ToArray();
+        await WriteImmutableJsonAsync(
+            Layout.ArtifactIntegrityJson,
+            new BenchmarkArtifactIntegrity(BenchmarkArtifactIntegrity.ContractVersion, manifest.RunId, artifacts),
+            cancellationToken);
+    }
 
     public async Task AppendSampleAsync(RawBenchmarkRecord record, CancellationToken cancellationToken)
     {
@@ -251,13 +332,32 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
             return new BenchmarkBaseline(records, null, null, null, null, null);
 
         var root = Path.GetFullPath(runOrRawPath);
+        var manifest = await ReadJsonAsync<BenchmarkRunManifest>(Path.Combine(root, "manifest.json"), cancellationToken);
+        var layout = new ArtifactLayout(root);
+        if (string.IsNullOrWhiteSpace(manifest.ArtifactIntegrity))
+            throw new InvalidOperationException("Baseline run has no artifact-integrity ledger.");
+        var integrity = await ReadJsonAsync<BenchmarkArtifactIntegrity>(
+            ResolveArtifact(layout, manifest.ArtifactIntegrity), cancellationToken);
+        VerifyArtifactIntegrity(layout, manifest, integrity);
+        var configuration = await ReadJsonAsync<BenchmarkRunConfiguration>(Path.Combine(root, "metadata", "configuration.json"), cancellationToken);
+        var machine = await ReadJsonAsync<BenchmarkMachineMetadata>(Path.Combine(root, "metadata", "machine.json"), cancellationToken);
+        var providers = await ReadJsonAsync<IReadOnlyList<BenchmarkProviderMetadata>>(Path.Combine(root, "metadata", "providers.json"), cancellationToken);
+        var evidence = await ReadJsonAsync<ElsaMigrationEvidenceReport>(Path.Combine(root, "reports", "elsa-migration-evidence.json"), cancellationToken);
+        var report = await ReadJsonAsync<BenchmarkRunReport>(Path.Combine(root, "reports", "summary.json"), cancellationToken);
+        var consumer = manifest.ConsumerEvidence is null
+            ? null
+            : await ReadJsonAsync<BenchmarkConsumerEvidenceReport>(ResolveArtifact(layout, manifest.ConsumerEvidence), cancellationToken);
+        if (consumer is null)
+            throw new InvalidOperationException("Baseline run has no canonical consumer evidence.");
+        BenchmarkConsumerEvidenceReport.VerifyBoundClaims(report, configuration, machine, providers, layout, consumer);
         return new BenchmarkBaseline(
             records,
-            await ReadJsonAsync<BenchmarkRunManifest>(Path.Combine(root, "manifest.json"), cancellationToken),
-            await ReadJsonAsync<BenchmarkRunConfiguration>(Path.Combine(root, "metadata", "configuration.json"), cancellationToken),
-            await ReadJsonAsync<BenchmarkMachineMetadata>(Path.Combine(root, "metadata", "machine.json"), cancellationToken),
-            await ReadJsonAsync<IReadOnlyList<BenchmarkProviderMetadata>>(Path.Combine(root, "metadata", "providers.json"), cancellationToken),
-            await ReadJsonAsync<ElsaMigrationEvidenceReport>(Path.Combine(root, "reports", "elsa-migration-evidence.json"), cancellationToken));
+            manifest,
+            configuration,
+            machine,
+            providers,
+            evidence,
+            consumer);
     }
 
     private static async Task WriteJsonAsync<T>(string path, T value, CancellationToken cancellationToken)
@@ -275,6 +375,16 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
             if (File.Exists(temporary))
                 File.Delete(temporary);
         }
+    }
+
+    private static async Task WriteImmutableJsonAsync<T>(
+        string path,
+        T value,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        await JsonSerializer.SerializeAsync(stream, value, BenchmarkJson.Options, cancellationToken);
     }
 
     private static async Task WriteTextAsync(string path, string value, CancellationToken cancellationToken)
@@ -302,6 +412,56 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
                ?? throw new InvalidOperationException($"Baseline provenance artifact '{path}' is null.");
     }
 
+    private static void VerifyArtifactIntegrity(
+        ArtifactLayout layout,
+        BenchmarkRunManifest manifest,
+        BenchmarkArtifactIntegrity integrity)
+    {
+        if (integrity.SchemaVersion != BenchmarkArtifactIntegrity.ContractVersion ||
+            integrity.RunId != manifest.RunId || integrity.Artifacts.Count == 0 ||
+            integrity.Artifacts.Select(item => item.Path).Distinct(StringComparer.Ordinal).Count() != integrity.Artifacts.Count)
+        {
+            throw new InvalidOperationException("Baseline artifact-integrity ledger semantics are invalid.");
+        }
+        var required = new[]
+        {
+            layout.RelativePath(layout.Manifest), manifest.RawMeasurements, manifest.Summary,
+            manifest.ElsaMigrationEvidence, manifest.MachineMetadata, manifest.ProviderMetadata,
+            manifest.Configuration
+        }.Concat(manifest.ConsumerEvidence is null ? [] : [manifest.ConsumerEvidence])
+         .Concat(manifest.PlanArtifacts.SelectMany(plan => new[] { plan, $"{plan}.assertions.json" }))
+         .ToHashSet(StringComparer.Ordinal);
+        if (!required.SetEquals(integrity.Artifacts.Select(item => item.Path)))
+            throw new InvalidOperationException("Baseline artifact-integrity ledger does not bind the complete required artifact set.");
+        foreach (var artifact in integrity.Artifacts)
+        {
+            var path = ResolveArtifact(layout, artifact.Path);
+            if (!File.Exists(path) || !CryptographicOperations.FixedTimeEquals(
+                    Convert.FromHexString(artifact.Digest),
+                    SHA256.HashData(File.ReadAllBytes(path))))
+            {
+                throw new InvalidOperationException($"Baseline artifact integrity verification failed for '{artifact.Path}'.");
+            }
+        }
+    }
+
+    private static string ResolveArtifact(ArtifactLayout layout, string relative)
+    {
+        if (string.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative))
+            throw new InvalidOperationException("Artifact paths must be non-empty and relative.");
+        var root = Path.GetFullPath(layout.Root);
+        var path = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+        if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Artifact path '{relative}' escapes the run root.");
+        return path;
+    }
+
+    private static string DigestFile(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexStringLower(SHA256.HashData(stream));
+    }
+
     private static string Markdown(BenchmarkRunReport report)
     {
         var builder = new StringBuilder();
@@ -312,15 +472,15 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         builder.AppendLine($"Mode: `{report.Mode}`");
         builder.AppendLine($"Baseline eligible: `{report.BaselineEligibility.Eligible}`");
         builder.AppendLine();
-        builder.AppendLine("| Provider | Form | Workload | normalized batch p50 (ms/op) | normalized batch p95 (ms/op) | normalized batch p99 (ms/op) | ops/s | B/op | round trips/op | storage delta | net storage/logical payload | plan |");
+        builder.AppendLine("| Provider | Form | Workload | raw operation p50 (ms) | raw operation p95 (ms) | raw operation p99 (ms) | ops/s | B/op | round trips/op | storage delta | net storage/logical payload | plan |");
         builder.AppendLine("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         foreach (var result in report.Cases.OrderBy(result => result.Case.Identity, StringComparer.Ordinal))
         {
             var summary = result.Summary;
             builder.AppendLine(
                 $"| {result.Case.Provider} | {result.Case.StorageForm} | {result.Case.Workload} | " +
-                $"{summary.NormalizedBatchLatencyP50NanosecondsPerOperation / 1_000_000:F3} | {summary.NormalizedBatchLatencyP95NanosecondsPerOperation / 1_000_000:F3} | " +
-                $"{summary.NormalizedBatchLatencyP99NanosecondsPerOperation / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
+                $"{summary.OperationLatencyP50Nanoseconds / 1_000_000:F3} | {summary.OperationLatencyP95Nanoseconds / 1_000_000:F3} | " +
+                $"{summary.OperationLatencyP99Nanoseconds / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
                 $"{summary.AllocatedBytesPerOperation:F1} | {Format(summary.RoundTripsPerOperation)} | " +
                 $"{Format(summary.StorageGrowthBytes)} | {Format(summary.NetStorageGrowthBytesPerLogicalPayloadByte)} | " +
                 $"{FormatPlans(result.PlanArtifacts)} |");
@@ -368,7 +528,7 @@ public static class BenchmarkMetadata
 
     public static BenchmarkMachineMetadata Capture(string repositoryRoot)
     {
-        var git = ReadGit(repositoryRoot);
+        var git = CaptureGit(repositoryRoot);
         return new BenchmarkMachineMetadata(
             RuntimeInformation.OSDescription,
             Environment.MachineName,
@@ -381,24 +541,111 @@ public static class BenchmarkMetadata
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
             git.Commit,
             git.Dirty,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow)
+        {
+            GitTreeDigest = git.TreeDigest,
+            CpuModel = CaptureCpuModel(),
+            Memory = CaptureMemory(),
+            Storage = CaptureStorage(repositoryRoot),
+            PowerManagement = CapturePowerManagement()
+        };
     }
 
-    private static (string Commit, bool Dirty) ReadGit(string repositoryRoot)
+    public static BenchmarkGitState CaptureGit(string repositoryRoot)
     {
         try
         {
             var commit = RunGit(repositoryRoot, "rev-parse HEAD").Trim();
             var dirty = !string.IsNullOrWhiteSpace(RunGit(repositoryRoot, "status --porcelain"));
-            return (commit, dirty);
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            digest.AppendData(Encoding.UTF8.GetBytes(commit));
+            digest.AppendData(RunGitBytes(repositoryRoot, "diff --binary --no-ext-diff HEAD --"));
+            var untracked = RunGitBytes(repositoryRoot, "ls-files --others --exclude-standard -z");
+            digest.AppendData(untracked);
+            foreach (var relative in Encoding.UTF8.GetString(untracked)
+                         .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+                         .Order(StringComparer.Ordinal))
+            {
+                var path = Path.GetFullPath(Path.Combine(repositoryRoot, relative));
+                if (File.Exists(path))
+                    digest.AppendData(File.ReadAllBytes(path));
+            }
+            return new BenchmarkGitState(commit, dirty, Convert.ToHexStringLower(digest.GetHashAndReset()));
         }
         catch
         {
-            return ("unknown", true);
+            return new BenchmarkGitState(
+                "unknown",
+                true,
+                Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes("unavailable"))));
         }
     }
 
+    private static string CaptureCpuModel() =>
+        FirstAvailable(
+            () => OperatingSystem.IsMacOS() ? Run("sysctl", "-n machdep.cpu.brand_string").Trim() : null,
+            () => OperatingSystem.IsMacOS() ? Run("sysctl", "-n hw.model").Trim() : null,
+            () => File.ReadLines("/proc/cpuinfo")
+                .FirstOrDefault(line => line.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
+                ?.Split(':', 2)[1].Trim());
+
+    private static string CaptureMemory() =>
+        FirstAvailable(
+            () => OperatingSystem.IsMacOS() ? $"{Run("sysctl", "-n hw.memsize").Trim()} bytes" : null,
+            () => File.ReadLines("/proc/meminfo")
+                .FirstOrDefault(line => line.StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
+                ?.Trim());
+
+    private static string CaptureStorage(string repositoryRoot)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(repositoryRoot))!;
+            var drive = new DriveInfo(root);
+            var fileSystem = OperatingSystem.IsMacOS()
+                ? Run("stat", $"-f %T {Quote(repositoryRoot)}").Trim()
+                : Run("stat", $"-f -c %T {Quote(repositoryRoot)}").Trim();
+            return $"filesystem={fileSystem};totalBytes={drive.TotalSize};availableBytes={drive.AvailableFreeSpace}";
+        }
+        catch
+        {
+            return "unavailable";
+        }
+    }
+
+    private static string CapturePowerManagement() =>
+        FirstAvailable(
+            () => File.Exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+                ? $"governor={File.ReadAllText("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Trim()}"
+                : null,
+            () => OperatingSystem.IsMacOS()
+                ? $"lowPowerMode={Run("pmset", "-g custom")
+                    .Split('\n')
+                    .FirstOrDefault(line => line.Contains("lowpowermode", StringComparison.OrdinalIgnoreCase))
+                    ?.Trim() ?? "unavailable"}"
+                : null);
+
+    private static string FirstAvailable(params Func<string?>[] readers)
+    {
+        foreach (var reader in readers)
+        {
+            try
+            {
+                var value = reader();
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value;
+            }
+            catch
+            {
+            }
+        }
+        return "unavailable";
+    }
+
     private static string RunGit(string repositoryRoot, string arguments)
+        => Encoding.UTF8.GetString(RunGitBytes(repositoryRoot, arguments));
+
+    private static byte[] RunGitBytes(string repositoryRoot, string arguments)
     {
         using var process = Process.Start(new ProcessStartInfo("git", arguments)
         {
@@ -407,10 +654,28 @@ public static class BenchmarkMetadata
             RedirectStandardError = true,
             UseShellExecute = false
         }) ?? throw new InvalidOperationException("Unable to start git.");
+        using var output = new MemoryStream();
+        process.StandardOutput.BaseStream.CopyTo(output);
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(process.StandardError.ReadToEnd());
+        return output.ToArray();
+    }
+
+    private static string Run(string fileName, string arguments)
+    {
+        using var process = Process.Start(new ProcessStartInfo(fileName, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        }) ?? throw new InvalidOperationException($"Unable to start '{fileName}'.");
         var output = process.StandardOutput.ReadToEnd();
         process.WaitForExit();
         if (process.ExitCode != 0)
             throw new InvalidOperationException(process.StandardError.ReadToEnd());
         return output;
     }
+
+    private static string Quote(string value) => $"\"{value.Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
 }

@@ -199,10 +199,14 @@ public sealed class MongoDbBenchmarkTarget(
             .MaterializeAsync(state.Additive, cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.Applied)
             throw new InvalidOperationException($"Backfill migration returned {result.Outcome}; expected Applied.");
-        return Execution(1, logicalMutations: state.Rows, providerWork: new Dictionary<string, long>
-        {
-            ["backfilled_documents"] = state.Rows
-        });
+        return Execution(
+            1,
+            logicalMutations: state.Rows,
+            providerWork: new Dictionary<string, long>
+            {
+                ["backfilled_documents"] = state.Rows
+            },
+            observableResultVector: BackfillObservableResult(result.Outcome.ToString(), state.Rows));
     }
 
     protected override async Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken)
@@ -245,17 +249,23 @@ public sealed class MongoDbBenchmarkTarget(
     {
         await DisposeHandlesAsync();
         await OpenStoresAsync(cancellationToken);
+        var documents = new List<DocumentEnvelope>(operations);
         for (var index = 0; index < operations; index++)
         {
-            if (await TenantA.LoadAsync(
-                    BenchmarkModelFactory.DocumentKind,
-                    $"seed-{index:D8}",
-                    cancellationToken) is null)
+            var document = await TenantA.LoadAsync(
+                BenchmarkModelFactory.DocumentKind,
+                $"seed-{index:D8}",
+                cancellationToken);
+            if (document is null)
             {
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
+            documents.Add(document);
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["factory_restart_validations"] = 1 });
+        return Execution(
+            1,
+            providerWork: new Dictionary<string, long> { ["factory_restart_validations"] = 1 },
+            observableResultVector: RestartObservableResult("reopened", documents));
     }
 
     private async Task OpenStoresAsync(CancellationToken cancellationToken)

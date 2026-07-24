@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/run-group-regression.schema.json",
+  "title": "Groundwork physical-storage run-group regression report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "candidateRunGroupId",
+    "baselineRunGroupId",
+    "minimumIndependentRuns",
+    "evaluations",
+    "regressed"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "groundwork.physical-storage.run-group-regression/v1" },
+    "candidateRunGroupId": { "type": "string", "minLength": 1 },
+    "baselineRunGroupId": { "type": "string", "minLength": 1 },
+    "minimumIndependentRuns": { "type": "integer", "minimum": 1 },
+    "regressed": { "type": "boolean" },
+    "evaluations": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

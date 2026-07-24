@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
@@ -10,7 +9,11 @@ public sealed record BenchmarkRunRequest(
     string? OutputDirectory,
     string? BaselineRun,
     bool AllowContainers,
-    bool RegressionConfirmationRun);
+    bool RegressionConfirmationRun,
+    BenchmarkMatrixDimensions? Dimensions = null,
+    BenchmarkDataShape? DataShape = null,
+    int IndependentRun = 1,
+    BenchmarkExecutionRole Role = BenchmarkExecutionRole.Measured);
 
 public sealed record BenchmarkRunResult(
     string RunDirectory,
@@ -21,18 +24,21 @@ public sealed class BenchmarkRunner
 {
     private readonly Action<string> progress;
     private readonly Func<IBenchmarkProviderEnvironment> environmentFactory;
+    private readonly TimeProvider timeProvider;
 
     public BenchmarkRunner(Action<string>? progress = null)
-        : this(progress, static () => new BenchmarkProviderEnvironment())
+        : this(progress, static () => new BenchmarkProviderEnvironment(), TimeProvider.System)
     {
     }
 
     internal BenchmarkRunner(
         Action<string>? progress,
-        Func<IBenchmarkProviderEnvironment> environmentFactory)
+        Func<IBenchmarkProviderEnvironment> environmentFactory,
+        TimeProvider? timeProvider = null)
     {
         this.progress = progress ?? (_ => { });
         this.environmentFactory = environmentFactory ?? throw new ArgumentNullException(nameof(environmentFactory));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public async Task<BenchmarkRunResult> RunAsync(
@@ -43,6 +49,11 @@ public sealed class BenchmarkRunner
         request.Configuration.Validate();
         if (request.Workloads.Count == 0)
             throw new ArgumentException("At least one workload must be selected.", nameof(request));
+        var dataShape = request.DataShape ??
+                        new BenchmarkDataShape(request.Configuration.DatasetSize, 0, 5_000);
+        dataShape.Validate();
+        var executionConfiguration = request.Configuration with { DataShape = dataShape };
+        executionConfiguration.Validate();
 
         var machine = BenchmarkMetadata.Capture(request.RepositoryRoot);
         var nonce = Guid.NewGuid().ToString("N")[..8];
@@ -82,10 +93,14 @@ public sealed class BenchmarkRunner
             [],
             request.BaselineRun,
             request.RegressionConfirmationRun,
-            null);
+            null,
+            request.Role == BenchmarkExecutionRole.Measured
+                ? layout.RelativePath(layout.ConsumerEvidenceJson)
+                : null,
+            layout.RelativePath(layout.ArtifactIntegrityJson));
         await writer.WriteManifestAsync(manifest, cancellationToken);
         await writer.WriteMachineAsync(machine, cancellationToken);
-        await writer.WriteConfigurationAsync(request.Configuration, cancellationToken);
+        await writer.WriteConfigurationAsync(executionConfiguration, cancellationToken);
 
         try
         {
@@ -103,7 +118,9 @@ public sealed class BenchmarkRunner
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var instancePrefix = $"r{nonce}_p{(int)provider}_f{(int)form}";
-                    var planRequests = BenchmarkPlanRequests.ForWorkloads(request.Workloads);
+                    var planRequests = request.Role == BenchmarkExecutionRole.Measured
+                        ? BenchmarkPlanRequests.ForWorkloads(request.Workloads)
+                        : [];
                     if (planRequests.Count > 0)
                     {
                         var planInstance = $"{instancePrefix}_plan";
@@ -117,7 +134,7 @@ public sealed class BenchmarkRunner
                         await planTarget.InitializeAsync(cancellationToken);
                         await planTarget.SeedAsync(
                             request.Configuration.Seed,
-                            request.Configuration.DatasetSize,
+                            dataShape,
                             cancellationToken);
                         var evidence = await planTarget.RunNativePlanGatesAsync(planRequests, cancellationToken);
                         if (evidence.Count != planRequests.Count || !evidence.Select(item => item.Request).SequenceEqual(planRequests))
@@ -141,11 +158,11 @@ public sealed class BenchmarkRunner
                         instance,
                         scratch,
                         request.Configuration.MigrationDatasetSize);
-                    progress($"[{provider}/{form}] materializing and seeding {request.Configuration.DatasetSize:N0} documents");
+                    progress($"[{provider}/{form}] materializing and seeding {dataShape.DatasetSize:N0} documents");
                     await target.InitializeAsync(cancellationToken);
                     await target.SeedAsync(
                         request.Configuration.Seed,
-                        request.Configuration.DatasetSize,
+                        dataShape,
                         cancellationToken);
                     var correctness = await target.RunCorrectnessGateAsync(cancellationToken);
                     providerMetadata.Add(new BenchmarkProviderMetadata(
@@ -156,14 +173,20 @@ public sealed class BenchmarkRunner
                     foreach (var workload in request.Workloads)
                     {
                         var benchmarkCase = new BenchmarkCase(provider, form, workload);
-                        progress($"[{benchmarkCase.Identity}] warmup {request.Configuration.WarmupIterations}, measure {request.Configuration.MeasurementIterations}");
-                        var totalIterations = request.Configuration.WarmupIterations + request.Configuration.MeasurementIterations;
+                        var warmupOnly = request.Role == BenchmarkExecutionRole.UntimedWarmup;
+                        var warmupIterations = warmupOnly ? request.Configuration.WarmupIterations : 0;
+                        var measurementIterations = warmupOnly ? 0 : request.Configuration.MeasurementIterations;
+                        progress(
+                            $"[{benchmarkCase.Identity}] warmup {warmupIterations}, measure at least " +
+                            $"{measurementIterations} iterations/{request.Configuration.MinimumMeasuredOperations} operations/" +
+                            $"{request.Configuration.MinimumSteadyStateDurationSeconds} seconds");
+                        var totalIterations = warmupIterations + measurementIterations;
                         await target.PrepareWorkloadAsync(
                             workload,
                             totalIterations,
                             request.Configuration.OperationsPerIteration,
                             cancellationToken);
-                        for (var iteration = 0; iteration < request.Configuration.WarmupIterations; iteration++)
+                        for (var iteration = 0; iteration < warmupIterations; iteration++)
                         {
                             await target.PrepareIterationAsync(workload, iteration, cancellationToken);
                             await target.ExecuteAsync(
@@ -174,11 +197,31 @@ public sealed class BenchmarkRunner
                                 cancellationToken);
                             await target.ValidateIterationAsync(workload, cancellationToken);
                         }
+                        if (warmupOnly)
+                            continue;
 
                         var samples = new List<BenchmarkSample>(request.Configuration.MeasurementIterations);
-                        for (var iteration = 0; iteration < request.Configuration.MeasurementIterations; iteration++)
+                        BenchmarkObservableResultVector? observableResultVector = null;
+                        var iterationObservableResults = new List<(int Iteration, BenchmarkObservableResultVector Vector)>();
+                        long measuredOperations = 0;
+                        long measuredElapsedNanoseconds = 0;
+                        var minimumElapsedNanoseconds =
+                            request.Configuration.MinimumSteadyStateDurationSeconds * 1_000_000_000L;
+                        for (var iteration = 0;
+                             iteration < request.Configuration.MeasurementIterations ||
+                             measuredOperations < request.Configuration.MinimumMeasuredOperations ||
+                             measuredElapsedNanoseconds < minimumElapsedNanoseconds;
+                             iteration++)
                         {
-                            var globalIteration = request.Configuration.WarmupIterations + iteration;
+                            var globalIteration = iteration;
+                            if (iteration >= request.Configuration.MeasurementIterations)
+                            {
+                                await target.PrepareWorkloadAsync(
+                                    workload,
+                                    totalIterations: 1,
+                                    request.Configuration.OperationsPerIteration,
+                                    cancellationToken);
+                            }
                             await target.PrepareIterationAsync(workload, globalIteration, cancellationToken);
                             var capturesStorage = CapturesStorage(workload);
                             var storageBefore = capturesStorage
@@ -186,14 +229,23 @@ public sealed class BenchmarkRunner
                                 : null;
                             var allocatedBefore = GC.GetTotalAllocatedBytes(precise: false);
                             using var measurement = signals.BeginMeasurement();
-                            var timestamp = Stopwatch.GetTimestamp();
+                            var timestamp = timeProvider.GetTimestamp();
                             var execution = await target.ExecuteAsync(
                                 workload,
                                 globalIteration,
                                 request.Configuration.OperationsPerIteration,
                                 request.Configuration.Concurrency,
                                 cancellationToken);
-                            var elapsedTicks = Stopwatch.GetTimestamp() - timestamp;
+                            ValidateExecution(execution, benchmarkCase);
+                            observableResultVector = RequireStableObservableResult(
+                                benchmarkCase,
+                                observableResultVector,
+                                execution.ObservableResultVector,
+                                workload);
+                            iterationObservableResults.Add((globalIteration, execution.ObservableResultVector!));
+                            var elapsedNanoseconds = Math.Max(
+                                1,
+                                (long)Math.Round(timeProvider.GetElapsedTime(timestamp).TotalNanoseconds));
                             var signalSnapshot = measurement.Complete();
                             QueryBranchEvidence.EnsureObserved(
                                 workload,
@@ -207,15 +259,18 @@ public sealed class BenchmarkRunner
                             var sample = new BenchmarkSample(
                                 iteration,
                                 execution.Operations,
-                                Math.Max(1, (long)Math.Round(elapsedTicks * 1_000_000_000d / Stopwatch.Frequency)),
+                                elapsedNanoseconds,
                                 allocatedBytes,
                                 execution.RoundTrips ?? signalSnapshot.ObservableRoundTrips,
                                 execution.LogicalPayloadBytes,
                                 execution.LogicalMutations,
                                 storageBefore,
                                 storageAfter,
-                                Merge(execution.ProviderWork, signalSnapshot.ToProviderWork()));
+                                Merge(execution.ProviderWork, signalSnapshot.ToProviderWork()),
+                                execution.OperationLatencyNanoseconds);
                             samples.Add(sample);
+                            measuredOperations += sample.Operations;
+                            measuredElapsedNanoseconds += sample.ElapsedNanoseconds;
                             await writer.AppendSampleAsync(new RawBenchmarkRecord(benchmarkCase, sample), cancellationToken);
                         }
                         caseResults.Add(new BenchmarkCaseResult(
@@ -225,7 +280,8 @@ public sealed class BenchmarkRunner
                                 ? applicablePlans.ToArray()
                                 : [],
                             BenchmarkSummarizer.Summarize(benchmarkCase.Identity, samples),
-                            samples));
+                            samples,
+                            BenchmarkObservableResultVector.AggregateIterations(iterationObservableResults).Results));
                     }
                 }
             }
@@ -236,15 +292,17 @@ public sealed class BenchmarkRunner
                 : await CompareBaselineAsync(
                     request.BaselineRun,
                     caseResults,
-                    request.Configuration,
+                    executionConfiguration,
                     machine,
                     distinctProviders,
                     request.Configuration.Mode == BenchmarkRunMode.Scheduled
                         ? RegressionPolicy.Scheduled
                         : RegressionPolicy.Smoke,
+                    layout,
+                    request.IndependentRun,
                     cancellationToken);
             var baselineEligibility = BaselineEligibilityEvaluator.Evaluate(
-                request.Configuration,
+                executionConfiguration,
                 request.Workloads,
                 machine,
                 caseResults);
@@ -254,11 +312,24 @@ public sealed class BenchmarkRunner
                 request.Configuration.Mode,
                 caseResults,
                 regressions,
-                baselineEligibility);
+                baselineEligibility,
+                dataShape);
             await writer.WriteProvidersAsync(
                 distinctProviders,
                 cancellationToken);
             await writer.WriteReportAsync(report, cancellationToken);
+            if (request.Role == BenchmarkExecutionRole.Measured)
+            {
+                await writer.WriteConsumerEvidenceAsync(
+                    BenchmarkConsumerEvidenceReport.Create(
+                        report,
+                        executionConfiguration,
+                        machine,
+                        distinctProviders,
+                        layout,
+                        request.IndependentRun),
+                    cancellationToken);
+            }
             manifest = manifest with
             {
                 Status = "completed",
@@ -266,6 +337,7 @@ public sealed class BenchmarkRunner
                 PlanArtifacts = planArtifacts.Distinct(StringComparer.Ordinal).ToArray()
             };
             await writer.WriteManifestAsync(manifest, cancellationToken);
+            await writer.WriteArtifactIntegrityAsync(manifest, cancellationToken);
             TryDeleteDirectory(scratch);
             var confirmedRegression = request.RegressionConfirmationRun &&
                                       regressions.Any(evaluation => evaluation.Regressed && evaluation.RequiresConfirmation);
@@ -294,6 +366,40 @@ public sealed class BenchmarkRunner
         }
     }
 
+    private static void ValidateExecution(WorkloadExecution execution, BenchmarkCase benchmarkCase)
+    {
+        if (execution.Operations <= 0 ||
+            execution.OperationLatencyNanoseconds is null ||
+            execution.OperationLatencyNanoseconds.Count != execution.Operations ||
+            execution.OperationLatencyNanoseconds.Any(latency => latency <= 0))
+        {
+            throw new InvalidOperationException(
+                $"[{benchmarkCase.Identity}] target must return one positive raw latency observation per operation.");
+        }
+    }
+
+    private static BenchmarkObservableResultVector RequireStableObservableResult(
+        BenchmarkCase benchmarkCase,
+        BenchmarkObservableResultVector? prior,
+        BenchmarkObservableResultVector? current,
+        BenchmarkWorkload workload)
+    {
+        if (current is null)
+        {
+            throw new InvalidOperationException(
+                $"[{benchmarkCase.Identity}] measured execution returned no canonical observable result vector.");
+        }
+        // Pagination deliberately selects a deterministic but iteration-varying page.
+        // Its complete iteration-aware aggregate is retained in the case evidence.
+        if (workload != BenchmarkWorkload.PaginationAndCount &&
+            prior is not null && !prior.Digest.Equals(current.Digest, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"[{benchmarkCase.Identity}] observable results changed between measured iterations.");
+        }
+        return prior ?? current;
+    }
+
     private static async Task<IReadOnlyList<RegressionEvaluation>> CompareBaselineAsync(
         string baselineRun,
         IReadOnlyList<BenchmarkCaseResult> candidate,
@@ -301,6 +407,8 @@ public sealed class BenchmarkRunner
         BenchmarkMachineMetadata candidateMachine,
         IReadOnlyList<BenchmarkProviderMetadata> candidateProviders,
         RegressionPolicy policy,
+        ArtifactLayout candidateLayout,
+        int independentRun,
         CancellationToken cancellationToken)
     {
         var baseline = await BenchmarkArtifactWriter.ReadBaselineAsync(baselineRun, cancellationToken);
@@ -311,28 +419,64 @@ public sealed class BenchmarkRunner
             baseline);
         if (!compatibility.IsCompatible)
         {
-            return candidate.Select(result => new RegressionEvaluation(
-                    result.Case.Identity,
-                    false,
-                    policy.RequiresConfirmation,
-                    [],
-                    compatibility.Diagnostics))
-                .ToArray();
+            throw new InvalidOperationException(
+                $"Baseline comparison rejected: {string.Join(" ", compatibility.Diagnostics)}");
         }
+
+        var candidateEvidence = BenchmarkConsumerEvidenceReport.CreateResults(
+            new BenchmarkRunReport(
+                BenchmarkProfiles.SchemaVersion,
+                "candidate-comparison",
+                candidateConfiguration.Mode,
+                candidate,
+                [],
+                new BaselineEligibility(false, []),
+                candidateConfiguration.DataShape),
+            candidateConfiguration,
+            candidateMachine,
+            candidateProviders,
+            candidateLayout,
+            independentRun);
+        var baselineEvidence = baseline.ConsumerEvidence!.Results;
 
         var groups = baseline.Records.GroupBy(record => record.Case.Identity, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => (IReadOnlyList<BenchmarkSample>)group.Select(record => record.Sample).ToArray(), StringComparer.Ordinal);
-        return candidate.Select(result => groups.TryGetValue(result.Case.Identity, out var baselineSamples)
-                ? WithDiagnostics(
-                    RegressionEvaluator.Compare(result.Case.Identity, baselineSamples, result.Samples, policy),
-                    compatibility.Diagnostics)
-                : new RegressionEvaluation(
-                    result.Case.Identity,
-                    false,
-                    policy.RequiresConfirmation,
-                    [],
-                    ["No matching case exists in the baseline run."]))
+        foreach (var result in candidate)
+        {
+            if (!SemanticsMatch(result.Case, candidateEvidence, baselineEvidence))
+            {
+                throw new InvalidOperationException(
+                    $"Baseline comparison rejected: canonical workload fingerprint or result semantics differ for '{result.Case.Identity}'.");
+            }
+            if (!groups.ContainsKey(result.Case.Identity))
+            {
+                throw new InvalidOperationException(
+                    $"Baseline comparison rejected: no matching exact case exists for '{result.Case.Identity}'.");
+            }
+        }
+        return candidate.Select(result =>
+                WithDiagnostics(
+                    RegressionEvaluator.Compare(result.Case.Identity, groups[result.Case.Identity], result.Samples, policy),
+                    compatibility.Diagnostics))
             .ToArray();
+    }
+
+    private static bool SemanticsMatch(
+        BenchmarkCase benchmarkCase,
+        IReadOnlyList<BenchmarkConsumerEvidenceResult> candidate,
+        IReadOnlyList<BenchmarkConsumerEvidenceResult> baseline)
+    {
+        var provider = BenchmarkConsumerEvidenceReport.ProviderIdentity(benchmarkCase.Provider);
+        var workload = BenchmarkConsumerEvidenceReport.WorkloadIdentity(benchmarkCase.Workload);
+        var candidateResult = candidate.SingleOrDefault(result => result.ProviderIdentity == provider &&
+            result.StorageForm == benchmarkCase.StorageForm && result.WorkloadIdentity == workload);
+        var baselineResult = baseline.SingleOrDefault(result => result.ProviderIdentity == provider &&
+            result.StorageForm == benchmarkCase.StorageForm && result.WorkloadIdentity == workload);
+        return candidateResult is not null && baselineResult is not null &&
+               candidateResult.WorkloadFingerprint == baselineResult.WorkloadFingerprint &&
+               candidateResult.ResultDigest == baselineResult.ResultDigest &&
+               candidateResult.ProviderConfigurationDigest == baselineResult.ProviderConfigurationDigest &&
+               candidateResult.NativePlanDigest == baselineResult.NativePlanDigest;
     }
 
     private static RegressionEvaluation WithDiagnostics(

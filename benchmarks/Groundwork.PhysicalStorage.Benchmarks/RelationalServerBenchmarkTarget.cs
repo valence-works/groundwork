@@ -31,8 +31,15 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
     protected abstract IProviderPhysicalNameNormalizer PhysicalNames { get; }
     protected abstract string HandlerPrefix { get; }
     protected abstract string ConnectionString { get; }
+    protected RelationalPhysicalDocumentStore RelationalTenantA =>
+        (RelationalPhysicalDocumentStore)TenantA;
 
-    public override async Task InitializeAsync(CancellationToken cancellationToken)
+    public override Task InitializeAsync(CancellationToken cancellationToken) =>
+        InitializeAsync(beforeAdmission: null, cancellationToken);
+
+    internal async Task InitializeAsync(
+        Func<string, BenchmarkPhysicalModel, CancellationToken, Task>? beforeAdmission,
+        CancellationToken cancellationToken)
     {
         await CreateIsolationBoundaryAsync(cancellationToken);
         Model = Compile(Instance, includeCategory: true);
@@ -41,7 +48,9 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             CreateExecutor(),
             cancellationToken: cancellationToken);
         ProviderVersion = await ReadProviderVersionAsync(cancellationToken);
-        OpenStores();
+        if (beforeAdmission is not null)
+            await beforeAdmission(ConnectionString, Model, cancellationToken);
+        await OpenStoresAsync(cancellationToken);
     }
 
     public override async Task PrepareIterationAsync(
@@ -58,7 +67,11 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             initial.Target,
             CreateExecutor(),
             cancellationToken: cancellationToken);
-        var store = CreateStore(initial.Manifest, initial.Target.Routes, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var store = await OpenStoreAsync(
+            initial.Manifest,
+            BenchmarkModelFactory.NamePolicy(suffix),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
         const int batchSize = 100;
         for (var offset = 0; offset < migrationDatasetSize; offset += batchSize)
         {
@@ -75,7 +88,7 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             }
             await unitOfWork.CommitAsync(cancellationToken);
         }
-        migration = new MigrationState(additive, migrationDatasetSize);
+        migration = new MigrationState(additive, suffix, migrationDatasetSize);
     }
 
     protected override async Task<WorkloadExecution> ExecuteBackfillMigrationAsync(CancellationToken cancellationToken)
@@ -87,20 +100,25 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.Applied)
             throw new InvalidOperationException($"Backfill migration returned {result.Outcome}; expected Applied.");
-        return Execution(1, logicalMutations: state.Rows, providerWork: new Dictionary<string, long>
-        {
-            ["backfilled_documents"] = state.Rows
-        });
+        return Execution(
+            1,
+            logicalMutations: state.Rows,
+            providerWork: new Dictionary<string, long>
+            {
+                ["backfilled_documents"] = state.Rows
+            },
+            observableResultVector: BackfillObservableResult(result.Outcome.ToString(), state.Rows));
     }
 
     protected override async Task ValidateBackfillMigrationAsync(CancellationToken cancellationToken)
     {
         var state = migration ?? throw new InvalidOperationException("Migration iteration was not executed.");
         var route = state.Additive.Route;
-        var store = CreateStore(
+        var store = await OpenStoreAsync(
             state.Additive.Manifest,
-            state.Additive.Target.Routes,
-            DocumentStoreAccess.Scoped(new("tenant-a")));
+            BenchmarkModelFactory.NamePolicy(state.Suffix),
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
         var queries = RelationalPhysicalQueryRuntime.Create(
             store,
             state.Additive.Manifest,
@@ -132,33 +150,39 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             cancellationToken: cancellationToken);
         if (result.Outcome != PhysicalSchemaApplicationOutcome.NoChanges)
             throw new InvalidOperationException($"Restart validation returned {result.Outcome}; expected NoChanges.");
-        OpenStores();
+        await OpenStoresAsync(cancellationToken);
+        var documents = new List<DocumentEnvelope>(operations);
         for (var index = 0; index < operations; index++)
         {
-            if (await TenantA.LoadAsync(
-                    BenchmarkModelFactory.DocumentKind,
-                    $"seed-{index:D8}",
-                    cancellationToken) is null)
+            var document = await TenantA.LoadAsync(
+                BenchmarkModelFactory.DocumentKind,
+                $"seed-{index:D8}",
+                cancellationToken);
+            if (document is null)
             {
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
+            documents.Add(document);
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
+        return Execution(
+            1,
+            providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 },
+            observableResultVector: RestartObservableResult("reopened", documents));
     }
 
     protected override Task ResetClientStateAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
         ClearPools();
-        OpenStores();
-        return Task.CompletedTask;
+        return OpenStoresAsync(cancellationToken);
     }
 
-    private protected RelationalPhysicalQueryCommand RenderPlan(BenchmarkPlanRequest request)
+    private protected RelationalPhysicalQueryCommand RenderPlan(
+        BenchmarkPlanRequest request,
+        RelationalPhysicalDocumentStore store)
     {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(store);
         var query = Query(request.Skip, request.Take, request.Ordered);
-        var store = CreateStore(Model.Manifest, Model.Target.Routes, DocumentStoreAccess.Scoped(new("tenant-a")));
         return request.Operation == NativePlanOperation.Selection
             ? RelationalPhysicalQueryRuntime.BuildQueryCommand(
                 store,
@@ -181,10 +205,11 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
     protected abstract Task CreateIsolationBoundaryAsync(CancellationToken cancellationToken);
     protected abstract Task DropIsolationBoundaryAsync(CancellationToken cancellationToken);
     protected abstract IPhysicalSchemaExecutor CreateExecutor();
-    protected abstract RelationalPhysicalDocumentStore CreateStore(
+    protected abstract Task<RelationalPhysicalDocumentStore> OpenStoreAsync(
         StorageManifest manifest,
-        IReadOnlyList<ExecutableStorageRoute> routes,
-        DocumentStoreAccess access);
+        IPhysicalNamePolicy namePolicy,
+        DocumentStoreAccess access,
+        CancellationToken cancellationToken);
     protected abstract Task<string> ReadProviderVersionAsync(CancellationToken cancellationToken);
     protected abstract Task<long> CountProjectedRowsAsync(
         ExecutableStorageRoute route,
@@ -207,10 +232,19 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
             PhysicalNames,
             includeCategory);
 
-    private void OpenStores()
+    private async Task OpenStoresAsync(CancellationToken cancellationToken)
     {
-        var tenantA = CreateStore(Model.Manifest, Model.Target.Routes, DocumentStoreAccess.Scoped(new("tenant-a")));
-        var tenantB = CreateStore(Model.Manifest, Model.Target.Routes, DocumentStoreAccess.Scoped(new("tenant-b")));
+        var namePolicy = BenchmarkModelFactory.NamePolicy(Instance);
+        var tenantA = await OpenStoreAsync(
+            Model.Manifest,
+            namePolicy,
+            DocumentStoreAccess.Scoped(new("tenant-a")),
+            cancellationToken);
+        var tenantB = await OpenStoreAsync(
+            Model.Manifest,
+            namePolicy,
+            DocumentStoreAccess.Scoped(new("tenant-b")),
+            cancellationToken);
         SetStores(
             tenantA,
             tenantB,
@@ -223,5 +257,5 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
                 CanonicalJsonValueKinds));
     }
 
-    private sealed record MigrationState(BenchmarkPhysicalModel Additive, int Rows);
+    private sealed record MigrationState(BenchmarkPhysicalModel Additive, string Suffix, int Rows);
 }

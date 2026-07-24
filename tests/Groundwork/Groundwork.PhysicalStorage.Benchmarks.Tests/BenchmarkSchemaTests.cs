@@ -13,6 +13,11 @@ public sealed class BenchmarkSchemaTests
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-manifest.schema.json",
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/raw-measurement.schema.json",
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/elsa-migration-evidence.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/consumer-evidence.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/worker-invocation.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/worker-response.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-group.schema.json",
+        "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-group-regression.schema.json",
         "benchmarks/Groundwork.PhysicalStorage.Benchmarks/baselines/v1/baseline-index.schema.json"
     };
 
@@ -51,6 +56,65 @@ public sealed class BenchmarkSchemaTests
         Assert.Equal(BenchmarkProfiles.SchemaVersion, root.GetProperty("schemaVersion").GetString());
         Assert.Equal("scaffolding-no-approved-baselines", root.GetProperty("status").GetString());
         Assert.Empty(root.GetProperty("baselines").EnumerateArray());
+    }
+
+    [Fact]
+    public void Raw_measurement_schema_requires_direct_operation_latency_observations()
+    {
+        using var document = Read(
+            "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/raw-measurement.schema.json");
+        var sample = document.RootElement.GetProperty("$defs").GetProperty("sample");
+
+        Assert.Contains(
+            sample.GetProperty("required").EnumerateArray(),
+            property => property.GetString() == "operationLatencyNanoseconds");
+        Assert.True(sample.GetProperty("properties").TryGetProperty("operationLatencyNanoseconds", out var latency));
+        Assert.Equal(1, latency.GetProperty("minItems").GetInt32());
+        Assert.False(
+            sample.GetProperty("properties")
+                .TryGetProperty("normalizedBatchLatencyNanosecondsPerOperation", out _));
+    }
+
+    [Fact]
+    public void Serialized_manifest_satisfies_the_strict_v1_schema_contract()
+    {
+        var manifest = new BenchmarkRunManifest(
+            BenchmarkProfiles.SchemaVersion,
+            "schema-fixture",
+            "completed",
+            BenchmarkRunMode.Smoke,
+            DateTimeOffset.UnixEpoch,
+            DateTimeOffset.UnixEpoch,
+            "0123456789abcdef",
+            false,
+            "raw/measurements.jsonl",
+            "reports/summary.json",
+            "reports/elsa-migration-evidence.json",
+            "metadata/machine.json",
+            "metadata/providers.json",
+            "metadata/configuration.json",
+            [],
+            null,
+            false,
+            null,
+            null,
+            "reports/artifact-integrity.json");
+        using var schema = Read(
+            "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-manifest.schema.json");
+        using var serialized = JsonDocument.Parse(JsonSerializer.Serialize(manifest, BenchmarkJson.CompactOptions));
+        var contract = schema.RootElement;
+        var payload = serialized.RootElement;
+        var properties = contract.GetProperty("properties");
+
+        foreach (var required in contract.GetProperty("required").EnumerateArray())
+            Assert.True(payload.TryGetProperty(required.GetString()!, out _), $"Serialized manifest omitted '{required}'.");
+        foreach (var property in payload.EnumerateObject())
+            Assert.True(properties.TryGetProperty(property.Name, out _), $"Schema forbids serialized property '{property.Name}'.");
+
+        var artifactIntegrity = properties.GetProperty("artifactIntegrity");
+        Assert.Equal("string", artifactIntegrity.GetProperty("type").GetString());
+        Assert.True(artifactIntegrity.GetProperty("minLength").GetInt32() > 0);
+        Assert.Equal("reports/artifact-integrity.json", payload.GetProperty("artifactIntegrity").GetString());
     }
 
     private static JsonDocument Read(string relativePath) =>

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/worker-invocation.schema.json",
+  "title": "Groundwork physical-storage independent worker invocation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "runGroupId", "ordinal", "independentRun", "role", "request", "expectedGitCommit", "expectedGitTreeDigest"],
+  "properties": {
+    "protocolVersion": { "const": "groundwork.physical-storage.worker/v1" },
+    "runGroupId": { "type": "string", "minLength": 1 },
+    "ordinal": { "type": "integer", "minimum": 1 },
+    "independentRun": { "type": "integer", "minimum": 0 },
+    "role": { "enum": ["untimedWarmup", "measured"] },
+    "expectedGitCommit": { "type": "string", "minLength": 1 },
+    "expectedGitTreeDigest": { "$ref": "#/$defs/digest" },
+    "request": { "$ref": "#/$defs/request" }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repositoryRoot",
+        "configuration",
+        "workloads",
+        "outputDirectory",
+        "allowContainers",
+        "regressionConfirmationRun",
+        "dataShape",
+        "independentRun",
+        "role"
+      ],
+      "properties": {
+        "repositoryRoot": { "type": "string", "minLength": 1 },
+        "configuration": { "$ref": "#/$defs/configuration" },
+        "workloads": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string" } },
+        "outputDirectory": { "type": "string", "minLength": 1 },
+        "baselineRun": { "type": ["string", "null"] },
+        "allowContainers": { "type": "boolean" },
+        "regressionConfirmationRun": { "type": "boolean" },
+        "dimensions": { "type": ["object", "null"] },
+        "dataShape": { "$ref": "#/$defs/dataShape" },
+        "independentRun": { "type": "integer", "minimum": 0 },
+        "role": { "enum": ["untimedWarmup", "measured"] }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "mode",
+        "seed",
+        "datasetSize",
+        "migrationDatasetSize",
+        "warmupIterations",
+        "measurementIterations",
+        "minimumMeasuredOperations",
+        "minimumSteadyStateDurationSeconds",
+        "operationsPerIteration",
+        "concurrency",
+        "providers",
+        "storageForms"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "groundwork.physical-storage.benchmark/v1" },
+        "mode": { "enum": ["smoke", "scheduled"] },
+        "seed": { "type": "integer" },
+        "datasetSize": { "type": "integer", "minimum": 1 },
+        "migrationDatasetSize": { "type": "integer", "minimum": 1 },
+        "warmupIterations": { "type": "integer", "minimum": 1 },
+        "measurementIterations": { "type": "integer", "minimum": 5 },
+        "minimumMeasuredOperations": { "type": "integer", "minimum": 1 },
+        "minimumSteadyStateDurationSeconds": { "type": "integer", "minimum": 0 },
+        "operationsPerIteration": { "type": "integer", "minimum": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "providers": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string" } },
+        "storageForms": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "dataShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["datasetSize", "payloadPaddingBytes", "querySelectivityBasisPoints", "identity"],
+      "properties": {
+        "datasetSize": { "type": "integer", "minimum": 1 },
+        "payloadPaddingBytes": { "type": "integer", "minimum": 0 },
+        "querySelectivityBasisPoints": { "type": "integer", "minimum": 1, "maximum": 9999 },
+        "identity": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
