@@ -563,7 +563,15 @@ internal static class PhysicalSchemaOperationCanonicalizer
             Column(storage.IdComparisonKey),
             Column(storage.IdLookupKey),
             Column(storage.Ordinal),
-            ProjectedColumn(storage.Value)
+            ProjectedColumn(storage.Value),
+            storage.OwnerOrdinalKey.Name.ObjectKind.ToString(),
+            storage.OwnerOrdinalKey.Name.FeatureDefaultLogicalName,
+            storage.OwnerOrdinalKey.Name.LogicalName,
+            storage.OwnerOrdinalKey.Name.Identifier,
+            storage.OwnerOrdinalKey.Name.CollisionScope,
+            storage.OwnerOrdinalKey.Name.NamingOwner.Value,
+            storage.OwnerOrdinalKey.Target.ToString(),
+            .. storage.OwnerOrdinalKey.Columns.Select(Column)
         ]);
     public static string PrimaryStorage(ExecutableStorageRoute route) => string.Join(
         '\u001f',

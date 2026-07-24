@@ -55,7 +55,11 @@ public static class ExecutableStorageRouteSerializer
                     projectedColumns.Single(projection => projection.Definition.LogicalName == element.GetProperty("projection").GetString()).Definition,
                     ReadColumn(element.GetProperty("value")),
                     ExecutableStorageObjectRole.CollectionElementStorage,
-                    ReadStorageObject(element.GetProperty("storage")).Name)))
+                    ReadStorageObject(element.GetProperty("storage")).Name),
+                new ExecutableCollectionElementKeyRoute(
+                    ReadName(element.GetProperty("ownerOrdinalKey").GetProperty("name")),
+                    ReadEnum<ExecutableStorageObjectRole>(element.GetProperty("ownerOrdinalKey"), "target"),
+                    element.GetProperty("ownerOrdinalKey").GetProperty("columns").EnumerateArray().Select(ReadColumn))))
             .ToArray();
         var route = new ExecutableStorageRoute(
             new StorageUnitIdentity(root.GetProperty("storageUnit").GetString()!),
@@ -257,6 +261,16 @@ public static class ExecutableStorageRouteSerializer
                     WriteColumn(writer, "idLookupKey", collection.IdLookupKey);
                     WriteColumn(writer, "ordinal", collection.Ordinal);
                     WriteColumn(writer, "value", collection.Value.Column);
+                    writer.WritePropertyName("ownerOrdinalKey");
+                    writer.WriteStartObject();
+                    WriteName(writer, "name", collection.OwnerOrdinalKey.Name);
+                    writer.WriteString("target", collection.OwnerOrdinalKey.Target.ToString());
+                    writer.WritePropertyName("columns");
+                    writer.WriteStartArray();
+                    foreach (var column in collection.OwnerOrdinalKey.Columns)
+                        WriteColumnValue(writer, column);
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();

@@ -183,7 +183,50 @@ public sealed record ExecutableCollectionElementStorageRoute(
     ExecutableColumnRoute IdComparisonKey,
     ExecutableColumnRoute IdLookupKey,
     ExecutableColumnRoute Ordinal,
-    ExecutableProjectedColumnRoute Value);
+    ExecutableProjectedColumnRoute Value,
+    ExecutableCollectionElementKeyRoute OwnerOrdinalKey);
+
+/// <summary>Provider-resolved uniqueness evidence for one collection owner and source ordinal.</summary>
+public sealed class ExecutableCollectionElementKeyRoute : IEquatable<ExecutableCollectionElementKeyRoute>
+{
+    public ExecutableCollectionElementKeyRoute(
+        ProviderPhysicalObjectName name,
+        ExecutableStorageObjectRole target,
+        IEnumerable<ExecutableColumnRoute> columns)
+    {
+        Name = name;
+        Target = target;
+        Columns = Array.AsReadOnly(columns?.ToArray() ?? throw new ArgumentNullException(nameof(columns)));
+        string[] expectedColumns = ["document_kind", "storage_scope", "id_lookup_key", "ordinal"];
+        if (Name.ObjectKind != PhysicalObjectKind.PhysicalIndex ||
+            Target != ExecutableStorageObjectRole.CollectionElementStorage ||
+            !Columns.Select(column => column.LogicalName).SequenceEqual(expectedColumns, StringComparer.Ordinal))
+        {
+            throw new ArgumentException(
+                "Collection element keys require a physical-index name and the ordered collection-storage columns " +
+                "'document_kind', 'storage_scope', 'id_lookup_key', and 'ordinal'.",
+                nameof(columns));
+        }
+    }
+
+    public ProviderPhysicalObjectName Name { get; }
+    public ExecutableStorageObjectRole Target { get; }
+    public IReadOnlyList<ExecutableColumnRoute> Columns { get; }
+
+    public bool Equals(ExecutableCollectionElementKeyRoute? other) => other is not null &&
+        Name == other.Name && Target == other.Target && Columns.SequenceEqual(other.Columns);
+
+    public override bool Equals(object? obj) => Equals(obj as ExecutableCollectionElementKeyRoute);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Name);
+        hash.Add(Target);
+        foreach (var column in Columns) hash.Add(column);
+        return hash.ToHashCode();
+    }
+}
 
 public sealed record ExecutableIndexColumnRoute(
     ExecutableColumnRoute Column,

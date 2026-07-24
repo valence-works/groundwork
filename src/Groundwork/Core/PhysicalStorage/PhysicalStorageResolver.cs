@@ -1142,6 +1142,13 @@ public static class PhysicalStorageResolver
                 true)));
         defaultNames.AddRange(definition.ProjectedColumns
             .Where(column => column.Cardinality == ProjectionCardinality.CollectionElements)
+            .Select(column => (
+                PhysicalObjectKind.PhysicalIndex,
+                ExecutableStorageRouteCompiler.CollectionElementOwnerOrdinalKeyLogicalName(column.LogicalName),
+                unit.Identity,
+                true)));
+        defaultNames.AddRange(definition.ProjectedColumns
+            .Where(column => column.Cardinality == ProjectionCardinality.CollectionElements)
             .SelectMany(column => new[]
             {
                 "document_kind", "storage_scope", "id_comparison_key", "id_lookup_key", "ordinal", "value"

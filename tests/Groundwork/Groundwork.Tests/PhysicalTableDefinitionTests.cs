@@ -112,12 +112,23 @@ public sealed class PhysicalTableDefinitionTests
         var restored = ExecutableStorageRouteSerializer.Deserialize(
             ExecutableStorageRouteSerializer.Serialize(route));
 
+        Assert.Equal(route, restored);
+        Assert.Equal(route.Fingerprint, restored.Fingerprint);
+
         Assert.Equal(ProjectionCardinality.CollectionElements, Assert.Single(restored.ProjectedColumns).Definition.Cardinality);
         Assert.Equal(8, Assert.Single(restored.ProjectedColumns).Definition.MaxCollectionElements);
         var elementStorage = Assert.Single(restored.CollectionElementStorages);
         Assert.Equal(ExecutableStorageObjectRole.CollectionElementStorage, elementStorage.Storage.Role);
         Assert.Equal("redirect_uri__elements", elementStorage.Storage.Name.Identifier);
         Assert.Same(Assert.Single(restored.ProjectedColumns), elementStorage.Projection);
+        Assert.Equal(
+            ["document_kind", "storage_scope", "id_lookup_key", "ordinal"],
+            elementStorage.OwnerOrdinalKey.Columns.Select(column => column.LogicalName));
+        Assert.Equal("redirect_uri__owner_ordinal_unique", elementStorage.OwnerOrdinalKey.Name.Identifier);
+        Assert.Throws<ArgumentException>(() => new ExecutableCollectionElementKeyRoute(
+            elementStorage.OwnerOrdinalKey.Name,
+            elementStorage.OwnerOrdinalKey.Target,
+            elementStorage.OwnerOrdinalKey.Columns.Reverse()));
         Assert.Throws<NotSupportedException>(() =>
             RelationalPhysicalProjectionValues.Read(
                 "{\"redirectUris\":[\"https://one.example/callback\"]}",
@@ -144,6 +155,28 @@ public sealed class PhysicalTableDefinitionTests
                 Assert.Equal(2, third.Ordinal);
                 Assert.Equal("https://one.example/callback", third.Value);
             });
+    }
+
+    [Fact]
+    public void Collection_projections_resolve_distinct_storage_and_owner_key_names()
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable("applications",
+        [
+            new ProjectedColumnDefinition("redirect_uri", "redirectUris", PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements, MaxCollectionElements: 8),
+            new ProjectedColumnDefinition("scope", "scopes", PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements, MaxCollectionElements: 8)
+        ]);
+        var resolved = PhysicalStorageResolver.Resolve(
+            WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+        var route = Assert.Single(ExecutableStorageRouteCompiler.Compile(resolved.Definitions).Routes);
+
+        Assert.Equal(
+            ["redirect_uri__elements", "scope__elements"],
+            route.CollectionElementStorages.Select(storage => storage.Storage.Name.Identifier));
+        Assert.Equal(
+            ["redirect_uri__owner_ordinal_unique", "scope__owner_ordinal_unique"],
+            route.CollectionElementStorages.Select(storage => storage.OwnerOrdinalKey.Name.Identifier));
     }
 
     [Theory]

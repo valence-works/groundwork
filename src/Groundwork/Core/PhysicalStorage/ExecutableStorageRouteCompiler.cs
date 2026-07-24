@@ -200,6 +200,16 @@ public static class ExecutableStorageRouteCompiler
             var value = Field("value");
             if (new[] { documentKind, storageScope, idComparison, idLookup, ordinal, value }.Any(field => field is null))
                 continue;
+            var keyFeatureDefault = CollectionElementOwnerOrdinalKeyLogicalName(projection.Definition.LogicalName);
+            expectedNames.Add((PhysicalObjectKind.PhysicalIndex, keyFeatureDefault));
+            var keyName = RequireName(
+                providerDefinition,
+                PhysicalObjectKind.PhysicalIndex,
+                keyFeatureDefault,
+                target,
+                diagnostics);
+            if (keyName is null)
+                continue;
             collectionElementStorages.Add(new ExecutableCollectionElementStorageRoute(
                 new ExecutableStorageObjectRoute(
                     ExecutableStorageObjectRole.CollectionElementStorage,
@@ -216,7 +226,11 @@ public static class ExecutableStorageRouteCompiler
                     projection.Definition,
                     value!,
                     ExecutableStorageObjectRole.CollectionElementStorage,
-                    name)));
+                    name),
+                new ExecutableCollectionElementKeyRoute(
+                    keyName,
+                    ExecutableStorageObjectRole.CollectionElementStorage,
+                    [documentKind!, storageScope!, idLookup!, ordinal!])));
         }
 
         var indexes = new List<ExecutablePhysicalIndexRoute>();
@@ -345,6 +359,9 @@ public static class ExecutableStorageRouteCompiler
 
     internal static string CollectionElementStorageLogicalName(string projectionLogicalName) =>
         $"{projectionLogicalName}__elements";
+
+    internal static string CollectionElementOwnerOrdinalKeyLogicalName(string projectionLogicalName) =>
+        $"{projectionLogicalName}__owner_ordinal_unique";
 
     private static ExecutableDocumentEnvelopeRoute? CompileEnvelope(
         ProviderPhysicalTableDefinition definition,

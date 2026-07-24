@@ -314,7 +314,8 @@ public static class PhysicalSchemaDiffPlanner
             ColumnName("CollectionIdComparisonKey", storage.IdComparisonKey, ExecutableStorageObjectRole.CollectionElementStorage),
             ColumnName("CollectionIdLookupKey", storage.IdLookupKey, ExecutableStorageObjectRole.CollectionElementStorage),
             ColumnName("CollectionOrdinal", storage.Ordinal, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionValue", storage.Value.Column, ExecutableStorageObjectRole.CollectionElementStorage)
+            ColumnName("CollectionValue", storage.Value.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ObjectName(storage.OwnerOrdinalKey.Name, ExecutableStorageObjectRole.CollectionElementStorage)
         }));
         names.AddRange(route.Indexes.Select(index =>
             new PhysicalSchemaResolvedName("PhysicalIndex", index.Identity, index.Name.Identifier, index.Target)));
