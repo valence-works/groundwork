@@ -106,6 +106,27 @@ public readonly record struct DiagnosticRequestFingerprint
         return new(Convert.ToHexStringLower(hash.GetHashAndReset()));
     }
 
+    public static DiagnosticRequestFingerprint ForGroupQuery(
+        DiagnosticRecordGroupQuery query,
+        DiagnosticRecordStreamDefinition definition)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(definition);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Append(hash, "diagnostic-group-query-v1");
+        Append(hash, query.Scope.TenantId);
+        Append(hash, query.Scope.ScopeId);
+        Append(hash, query.Stream.Value);
+        Append(hash, query.Profile);
+        Append(hash, query.Take);
+        Append(hash, query.Order is null ? 0 : 1);
+        Append(hash, query.Order?.Alias ?? "");
+        Append(hash, query.Order is null ? 0 : (int)query.Order.Direction);
+        Append(hash, query.Predicate);
+        Append(hash, DiagnosticRecordPhysicalSchemaState.Capture(definition).DefinitionFingerprint);
+        return new(Convert.ToHexStringLower(hash.GetHashAndReset()));
+    }
+
     private static void Append(IncrementalHash hash, DiagnosticRecordPredicate? predicate)
     {
         switch (predicate)
@@ -137,6 +158,40 @@ public readonly record struct DiagnosticRequestFingerprint
                     Append(hash, value.CanonicalValue ?? "");
                 }
                 break;
+        }
+    }
+
+    private static void Append(IncrementalHash hash, DiagnosticRecordGroupPredicate? predicate)
+    {
+        switch (predicate)
+        {
+            case null:
+                Append(hash, 0);
+                break;
+            case DiagnosticRecordGroupPredicate.All all:
+                Append(hash, 1);
+                Append(hash, all.Predicates.Count);
+                foreach (var child in all.Predicates) Append(hash, child);
+                break;
+            case DiagnosticRecordGroupPredicate.Any any:
+                Append(hash, 2);
+                Append(hash, any.Predicates.Count);
+                foreach (var child in any.Predicates) Append(hash, child);
+                break;
+            case DiagnosticRecordGroupPredicate.Comparison comparison:
+                Append(hash, 3);
+                Append(hash, comparison.Alias);
+                Append(hash, (int)comparison.Operator);
+                Append(hash, comparison.Values.Count);
+                foreach (var value in comparison.Values)
+                {
+                    Append(hash, (int)value.Type);
+                    Append(hash, value.IsInitialized ? 1 : 0);
+                    Append(hash, value.CanonicalValue ?? "");
+                }
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(predicate));
         }
     }
 

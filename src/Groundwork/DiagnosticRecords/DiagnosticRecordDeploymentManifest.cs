@@ -620,6 +620,7 @@ internal sealed class ScopeBoundDiagnosticRecordStore :
     IDiagnosticRecordStore,
     IDiagnosticAppendHandler,
     IDiagnosticQueryHandler,
+    IDiagnosticGroupedQueryHandler,
     IDiagnosticInspectHandler,
     IDiagnosticTrimHandler
 {
@@ -635,12 +636,13 @@ internal sealed class ScopeBoundDiagnosticRecordStore :
         this.inner = inner;
         this.scope = scope;
         this.stream = stream;
-        Handlers = new(this, this, this, this);
+        Handlers = new(this, this, this, this) { GroupedQuery = this };
     }
 
     public DiagnosticRecordStoreHandlers Handlers { get; }
 
     public DiagnosticQueryHandlerCapabilities Capabilities => inner.Handlers.Query.Capabilities;
+    DiagnosticGroupedQueryHandlerCapabilities IDiagnosticGroupedQueryHandler.Capabilities => inner.Handlers.GroupedQuery.Capabilities;
 
     public ValueTask<DiagnosticAppendResult> AppendAsync(DiagnosticRecordBatch batch, CancellationToken cancellationToken = default)
     {
@@ -652,6 +654,12 @@ internal sealed class ScopeBoundDiagnosticRecordStore :
     {
         Ensure(query.Scope, query.Stream);
         return inner.QueryAsync(query, cancellationToken);
+    }
+
+    public ValueTask<DiagnosticRecordGroupPage> QueryGroupsAsync(DiagnosticRecordGroupQuery query, CancellationToken cancellationToken = default)
+    {
+        Ensure(query.Scope, query.Stream);
+        return inner.QueryGroupsAsync(query, cancellationToken);
     }
 
     public ValueTask<DiagnosticStreamStatistics> InspectAsync(DiagnosticStreamInspectionRequest request, CancellationToken cancellationToken = default)
