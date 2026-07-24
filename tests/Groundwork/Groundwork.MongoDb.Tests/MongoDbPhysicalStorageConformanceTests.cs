@@ -124,6 +124,99 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Collection_element_storage_creates_a_strict_typed_collection_and_exact_owner_ordinal_key()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int32,
+            valueKind: IndexValueKind.Number,
+            path: "states",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+
+        var first = await PhysicalSchemaApplication.ApplyAsync(model.Target, new MongoDbPhysicalSchemaExecutor(database));
+        var restart = await PhysicalSchemaApplication.ApplyAsync(model.Target, new MongoDbPhysicalSchemaExecutor(database));
+        var metadata = await CollectionMetadataAsync(database, storage.Storage.Name.Identifier);
+        var options = metadata["options"].AsBsonDocument;
+        var collection = database.GetCollection<BsonDocument>(storage.Storage.Name.Identifier);
+        var index = (await (await collection.Indexes.ListAsync()).ToListAsync())
+            .Single(candidate => candidate["name"].AsString == storage.OwnerOrdinalKey.Name.Identifier);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, first.Outcome);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, restart.Outcome);
+        Assert.False(options.Contains("collation")); // MongoDB omits its semantic simple default.
+        Assert.Equal("strict", options["validationLevel"].AsString);
+        Assert.Equal("error", options["validationAction"].AsString);
+        Assert.Equal(MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage), options["validator"].AsBsonDocument);
+        Assert.Equal(
+            storage.OwnerOrdinalKey.Columns.Select(field => field.Column.Identifier),
+            index["key"].AsBsonDocument.Names);
+        Assert.True(index["unique"].ToBoolean());
+
+        var valid = CollectionElementDocument(storage, ordinal: 0, value: new BsonInt32(3));
+        await collection.InsertOneAsync(valid);
+        await Assert.ThrowsAsync<MongoWriteException>(() => collection.InsertOneAsync(
+            CollectionElementDocument(storage, ordinal: 1, value: new BsonString("wrong-type"))));
+        await Assert.ThrowsAsync<MongoWriteException>(() => collection.InsertOneAsync(
+            CollectionElementDocument(storage, ordinal: 1, value: new BsonInt32(4), includeComparisonKey: false)));
+        await Assert.ThrowsAsync<MongoWriteException>(() => collection.InsertOneAsync(
+            CollectionElementDocument(storage, ordinal: 0, value: new BsonInt32(5), comparisonKey: "different")));
+
+        await database.RunCommandAsync<BsonDocument>(new BsonDocument
+        {
+            ["collMod"] = storage.Storage.Name.Identifier,
+            ["validator"] = new BsonDocument("$jsonSchema", new BsonDocument("bsonType", "object")),
+            ["validationLevel"] = "strict",
+            ["validationAction"] = "error"
+        });
+        var inspection = await new MongoDbPhysicalSchemaExecutor(database)
+            .InspectHistoryAsync(model.Target, CancellationToken.None);
+        Assert.False(inspection.IsAppliedSchemaValid);
+    }
+
+    [Fact]
+    public async Task Collection_element_storage_fails_closed_when_the_live_owner_ordinal_key_drifts()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int32,
+            valueKind: IndexValueKind.Number,
+            path: "states",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+
+        await database.RunCommandAsync<BsonDocument>(new BsonDocument
+        {
+            ["create"] = storage.Storage.Name.Identifier,
+            ["collation"] = new BsonDocument("locale", "simple"),
+            ["validator"] = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage),
+            ["validationLevel"] = "strict",
+            ["validationAction"] = "error"
+        });
+        await database.GetCollection<BsonDocument>(storage.Storage.Name.Identifier).Indexes.CreateOneAsync(
+            new CreateIndexModel<BsonDocument>(
+                new BsonDocument(storage.OwnerOrdinalKey.Columns.Reverse()
+                    .Select(field => new BsonElement(field.Column.Identifier, 1))),
+                new CreateIndexOptions
+                {
+                    Name = storage.OwnerOrdinalKey.Name.Identifier,
+                    Unique = true,
+                    Collation = Collation.Simple
+                }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(model.Target, new MongoDbPhysicalSchemaExecutor(database)));
+
+        Assert.Contains(storage.OwnerOrdinalKey.Name.Identifier, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Unicode_equivalent_identity_loads_the_retained_original_spelling()
     {
         var (_, _, store) = await CreateIdentityStoreAsync(PhysicalStorageForm.PhysicalEntityTable);
@@ -2262,6 +2355,34 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
                 .Set("owner", "stolen-owner")
                 .Inc("fence", 1L));
 
+    private static BsonDocument CollectionElementDocument(
+        ExecutableCollectionElementStorageRoute storage,
+        int ordinal,
+        BsonValue value,
+        string comparisonKey = "comparison",
+        bool includeComparisonKey = true)
+    {
+        var document = new BsonDocument
+        {
+            [storage.DocumentKind.Column.Identifier] = "workItem",
+            [storage.StorageScope.Column.Identifier] = "tenant-a",
+            [storage.IdComparisonKey.Column.Identifier] = comparisonKey,
+            [storage.IdLookupKey.Column.Identifier] = "lookup",
+            [storage.Ordinal.Column.Identifier] = ordinal,
+            [storage.Value.Column.Identifier] = value
+        };
+        if (!includeComparisonKey)
+            document.Remove(storage.IdComparisonKey.Column.Identifier);
+        return document;
+    }
+
+    private static async Task<BsonDocument> CollectionMetadataAsync(IMongoDatabase database, string name)
+    {
+        using var cursor = await database.ListCollectionsAsync(
+            new ListCollectionsOptions { Filter = Builders<BsonDocument>.Filter.Eq("name", name) });
+        return Assert.Single(await cursor.ToListAsync());
+    }
+
     internal static MongoDbPhysicalStorageModel Model(
         PhysicalStorageForm form,
         IReadOnlySet<PortableQueryOperation>? operations = null,
@@ -2271,6 +2392,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         string path = "status",
         bool isNullable = false,
         string? defaultValue = null,
+        string? collation = null,
         bool isUnique = false,
         MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded,
         StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal,
@@ -2286,6 +2408,7 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             Precision: projectedType == PortablePhysicalType.Decimal ? 18 : null,
             Scale: projectedType == PortablePhysicalType.Decimal ? 4 : null,
             IsNullable: isNullable,
+            Collation: collation,
             DefaultValue: defaultValue,
             Cardinality: cardinality,
             MaxCollectionElements: maxCollectionElements);

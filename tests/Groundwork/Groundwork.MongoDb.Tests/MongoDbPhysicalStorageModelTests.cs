@@ -720,6 +720,109 @@ public sealed class MongoDbPhysicalStorageModelTests
             });
     }
 
+    [Fact]
+    public void Collection_element_validator_requires_all_synthetic_members_and_an_int32_number_value()
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int32,
+            valueKind: IndexValueKind.Number,
+            path: "states",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+        var schema = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage)["$jsonSchema"].AsBsonDocument;
+        var properties = schema["properties"].AsBsonDocument;
+
+        Assert.Equal(
+            [
+                storage.DocumentKind.Column.Identifier,
+                storage.StorageScope.Column.Identifier,
+                storage.IdComparisonKey.Column.Identifier,
+                storage.IdLookupKey.Column.Identifier,
+                storage.Ordinal.Column.Identifier,
+                storage.Value.Column.Identifier
+            ],
+            schema["required"].AsBsonArray.Select(value => value.AsString));
+        Assert.Equal("int", properties[storage.Value.Column.Identifier]["bsonType"].AsString);
+        Assert.Equal(
+            storage.OwnerOrdinalKey.Columns.Select(field => field.Column.Identifier),
+            MongoDbPhysicalSchemaExecutor.CollectionElementOwnerOrdinalIndexKeys(storage).Names);
+    }
+
+    [Theory]
+    [InlineData(PortablePhysicalType.String, IndexValueKind.Keyword, "{\"values\":[\"open\"]}", BsonType.String, "string")]
+    [InlineData(PortablePhysicalType.Int32, IndexValueKind.Number, "{\"values\":[42]}", BsonType.Int32, "int")]
+    [InlineData(PortablePhysicalType.Int64, IndexValueKind.Number, "{\"values\":[42000000000]}", BsonType.Int64, "long")]
+    [InlineData(PortablePhysicalType.Decimal, IndexValueKind.Number, "{\"values\":[1.25]}", BsonType.Decimal128, "decimal")]
+    [InlineData(PortablePhysicalType.Boolean, IndexValueKind.Boolean, "{\"values\":[true]}", BsonType.Boolean, "bool")]
+    [InlineData(PortablePhysicalType.DateTime, IndexValueKind.DateTime, "{\"values\":[\"2026-01-01T01:00:00+01:00\"]}", BsonType.Int64, "long")]
+    [InlineData(PortablePhysicalType.Guid, IndexValueKind.Keyword, "{\"values\":[\"20b7b527-8799-45b2-8f43-aa742308da8c\"]}", BsonType.String, "string")]
+    [InlineData(PortablePhysicalType.Binary, IndexValueKind.Keyword, "{\"values\":[\"AQID\"]}", BsonType.Binary, "binData")]
+    public void Collection_element_validator_bson_type_matches_the_runtime_conversion_boundary(
+        PortablePhysicalType type,
+        IndexValueKind valueKind,
+        string canonicalJson,
+        BsonType expectedRuntimeType,
+        string expectedValidatorType)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: type,
+            valueKind: valueKind,
+            path: "values",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+        var runtimeValue = Assert.Single(MongoDbPhysicalProjectionValues.ResolveCollection(
+            canonicalJson,
+            storage.Projection)).Value;
+        var validatorType = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage)
+            ["$jsonSchema"].AsBsonDocument["properties"].AsBsonDocument
+            [storage.Value.Column.Identifier].AsBsonDocument["bsonType"].AsString;
+
+        Assert.Equal(expectedRuntimeType, runtimeValue.BsonType);
+        Assert.Equal(expectedValidatorType, validatorType);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("simple")]
+    [InlineData("ordinal")]
+    [InlineData("binary")]
+    public void Collection_element_validator_accepts_portable_simple_binary_collation_aliases(string? collation)
+    {
+        var storage = CollectionElementStorageWithCollation(collation);
+
+        _ = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage);
+    }
+
+    [Theory]
+    [InlineData("nocase")]
+    [InlineData("en")]
+    public void Collection_element_validator_rejects_non_binary_collation(string collation)
+    {
+        var storage = CollectionElementStorageWithCollation(collation);
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage));
+
+        Assert.Contains(collation, exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static ExecutableCollectionElementStorageRoute CollectionElementStorageWithCollation(string? collation) =>
+        Assert.Single(Assert.Single(MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.String,
+            valueKind: IndexValueKind.Keyword,
+            path: "values",
+            isNullable: true,
+            collation: collation,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4).Routes).CollectionElementStorages);
+
     [Theory]
     [InlineData("{\"resources\":[null]}")]
     [InlineData("{\"resources\":[\"42\"]}")]
