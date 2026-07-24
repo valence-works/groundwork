@@ -20,8 +20,6 @@ public sealed record BenchmarkSample(
     IReadOnlyDictionary<string, long> ProviderWork,
     IReadOnlyList<long> OperationLatencyNanoseconds)
 {
-    [System.Text.Json.Serialization.JsonIgnore]
-    public double NormalizedBatchLatencyNanosecondsPerOperation => (double)ElapsedNanoseconds / Operations;
     public double ThroughputOperationsPerSecond => Operations * 1_000_000_000d / ElapsedNanoseconds;
     public double AllocatedBytesPerOperation => (double)AllocatedBytes / Operations;
 }
@@ -39,17 +37,7 @@ public sealed record BenchmarkCaseSummary(
     long? StorageGrowthBytes,
     double? NetStorageGrowthBytesPerLogicalPayloadByte,
     double? NetPhysicalRowGrowthPerLogicalMutation,
-    IReadOnlyDictionary<string, double> ProviderWorkPerOperation)
-{
-    // Compatibility aliases for v1 consumers. Values now come from raw operation
-    // observations; they are never derived by dividing a batch duration.
-    [System.Text.Json.Serialization.JsonIgnore]
-    public double NormalizedBatchLatencyP50NanosecondsPerOperation => OperationLatencyP50Nanoseconds;
-    [System.Text.Json.Serialization.JsonIgnore]
-    public double NormalizedBatchLatencyP95NanosecondsPerOperation => OperationLatencyP95Nanoseconds;
-    [System.Text.Json.Serialization.JsonIgnore]
-    public double NormalizedBatchLatencyP99NanosecondsPerOperation => OperationLatencyP99Nanoseconds;
-}
+    IReadOnlyDictionary<string, double> ProviderWorkPerOperation);
 
 public static class BenchmarkSummarizer
 {
