@@ -46,11 +46,11 @@ public static class ExecutableStorageRouteSerializer
                 ReadStorageObject(element.GetProperty("storage")),
                 projectedColumns.Single(projection => projection.Definition.LogicalName ==
                     element.GetProperty("projection").GetString()),
-                ReadColumn(element.GetProperty("documentKind")),
-                ReadColumn(element.GetProperty("storageScope")),
-                ReadColumn(element.GetProperty("idComparisonKey")),
-                ReadColumn(element.GetProperty("idLookupKey")),
-                ReadColumn(element.GetProperty("ordinal")),
+                new(ExecutableCollectionElementFieldRole.DocumentKind, ReadColumn(element.GetProperty("documentKind"))),
+                new(ExecutableCollectionElementFieldRole.StorageScope, ReadColumn(element.GetProperty("storageScope"))),
+                new(ExecutableCollectionElementFieldRole.IdentityComparison, ReadColumn(element.GetProperty("idComparisonKey"))),
+                new(ExecutableCollectionElementFieldRole.IdentityLookup, ReadColumn(element.GetProperty("idLookupKey"))),
+                new(ExecutableCollectionElementFieldRole.Ordinal, ReadColumn(element.GetProperty("ordinal"))),
                 new ExecutableProjectedColumnRoute(
                     projectedColumns.Single(projection => projection.Definition.LogicalName == element.GetProperty("projection").GetString()).Definition,
                     ReadColumn(element.GetProperty("value")),
@@ -59,7 +59,8 @@ public static class ExecutableStorageRouteSerializer
                 new ExecutableCollectionElementKeyRoute(
                     ReadName(element.GetProperty("ownerOrdinalKey").GetProperty("name")),
                     ReadEnum<ExecutableStorageObjectRole>(element.GetProperty("ownerOrdinalKey"), "target"),
-                    element.GetProperty("ownerOrdinalKey").GetProperty("columns").EnumerateArray().Select(ReadColumn))))
+                    element.GetProperty("ownerOrdinalKey").GetProperty("columns").EnumerateArray().Select((column, index) => new ExecutableCollectionElementFieldRoute(
+                        index switch { 0 => ExecutableCollectionElementFieldRole.DocumentKind, 1 => ExecutableCollectionElementFieldRole.StorageScope, 2 => ExecutableCollectionElementFieldRole.IdentityLookup, _ => ExecutableCollectionElementFieldRole.Ordinal }, ReadColumn(column))))))
             .ToArray();
         var route = new ExecutableStorageRoute(
             new StorageUnitIdentity(root.GetProperty("storageUnit").GetString()!),
@@ -255,11 +256,11 @@ public static class ExecutableStorageRouteSerializer
                     writer.WriteStartObject();
                     writer.WriteString("projection", collection.Projection.Definition.LogicalName);
                     WriteStorageObject(writer, "storage", collection.Storage);
-                    WriteColumn(writer, "documentKind", collection.DocumentKind);
-                    WriteColumn(writer, "storageScope", collection.StorageScope);
-                    WriteColumn(writer, "idComparisonKey", collection.IdComparisonKey);
-                    WriteColumn(writer, "idLookupKey", collection.IdLookupKey);
-                    WriteColumn(writer, "ordinal", collection.Ordinal);
+                    WriteColumn(writer, "documentKind", collection.DocumentKind.Column);
+                    WriteColumn(writer, "storageScope", collection.StorageScope.Column);
+                    WriteColumn(writer, "idComparisonKey", collection.IdComparisonKey.Column);
+                    WriteColumn(writer, "idLookupKey", collection.IdLookupKey.Column);
+                    WriteColumn(writer, "ordinal", collection.Ordinal.Column);
                     WriteColumn(writer, "value", collection.Value.Column);
                     writer.WritePropertyName("ownerOrdinalKey");
                     writer.WriteStartObject();
@@ -268,7 +269,7 @@ public static class ExecutableStorageRouteSerializer
                     writer.WritePropertyName("columns");
                     writer.WriteStartArray();
                     foreach (var column in collection.OwnerOrdinalKey.Columns)
-                        WriteColumnValue(writer, column);
+                        WriteColumnValue(writer, column.Column);
                     writer.WriteEndArray();
                     writer.WriteEndObject();
                     writer.WriteEndObject();

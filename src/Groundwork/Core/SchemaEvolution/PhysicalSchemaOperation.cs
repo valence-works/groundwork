@@ -558,11 +558,11 @@ internal static class PhysicalSchemaOperationCanonicalizer
         '\u001f',
         [
             Storage(storage.Storage),
-            Column(storage.DocumentKind),
-            Column(storage.StorageScope),
-            Column(storage.IdComparisonKey),
-            Column(storage.IdLookupKey),
-            Column(storage.Ordinal),
+            Column(storage.DocumentKind.Column),
+            Column(storage.StorageScope.Column),
+            Column(storage.IdComparisonKey.Column),
+            Column(storage.IdLookupKey.Column),
+            Column(storage.Ordinal.Column),
             ProjectedColumn(storage.Value),
             storage.OwnerOrdinalKey.Name.ObjectKind.ToString(),
             storage.OwnerOrdinalKey.Name.FeatureDefaultLogicalName,
@@ -571,7 +571,7 @@ internal static class PhysicalSchemaOperationCanonicalizer
             storage.OwnerOrdinalKey.Name.CollisionScope,
             storage.OwnerOrdinalKey.Name.NamingOwner.Value,
             storage.OwnerOrdinalKey.Target.ToString(),
-            .. storage.OwnerOrdinalKey.Columns.Select(Column)
+            .. storage.OwnerOrdinalKey.Columns.Select(column => Column(column.Column))
         ]);
     public static string PrimaryStorage(ExecutableStorageRoute route) => string.Join(
         '\u001f',

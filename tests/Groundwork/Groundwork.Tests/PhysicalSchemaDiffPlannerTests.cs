@@ -567,7 +567,7 @@ public sealed class PhysicalSchemaDiffPlannerTests
         Assert.Empty(plan.Operations.OfType<FinalizeProjectedColumnOperation>());
         Assert.Empty(plan.Operations.OfType<BackfillCanonicalJsonOperation>());
         Assert.Equal(ExecutableStorageObjectRole.CollectionElementStorage, create.Storage.Value.Target);
-        Assert.Equal("ordinal", create.Storage.Ordinal.LogicalName);
+        Assert.Equal("ordinal", create.Storage.Ordinal.Column.LogicalName);
         Assert.Equal("value", create.Storage.Value.Column.LogicalName);
     }
 

@@ -123,12 +123,31 @@ public sealed class PhysicalTableDefinitionTests
         Assert.Same(Assert.Single(restored.ProjectedColumns), elementStorage.Projection);
         Assert.Equal(
             ["document_kind", "storage_scope", "id_lookup_key", "ordinal"],
-            elementStorage.OwnerOrdinalKey.Columns.Select(column => column.LogicalName));
+            elementStorage.OwnerOrdinalKey.Columns.Select(column => column.Column.LogicalName));
         Assert.Equal("redirect_uri__owner_ordinal_unique", elementStorage.OwnerOrdinalKey.Name.Identifier);
         Assert.Throws<ArgumentException>(() => new ExecutableCollectionElementKeyRoute(
             elementStorage.OwnerOrdinalKey.Name,
             elementStorage.OwnerOrdinalKey.Target,
             elementStorage.OwnerOrdinalKey.Columns.Reverse()));
+        Assert.Throws<ArgumentException>(() => new ExecutableCollectionElementStorageRoute(
+            elementStorage.Storage,
+            elementStorage.Projection,
+            elementStorage.StorageScope,
+            elementStorage.DocumentKind,
+            elementStorage.IdComparisonKey,
+            elementStorage.IdLookupKey,
+            elementStorage.Ordinal,
+            elementStorage.Value,
+            elementStorage.OwnerOrdinalKey));
+        var canonical = ExecutableStorageRouteSerializer.Serialize(route);
+        const string documentKind =
+            "\"documentKind\":{\"logical\":\"document_kind\",\"identifier\":\"redirect_uri__document_kind\"}";
+        Assert.Contains(documentKind, canonical, StringComparison.Ordinal);
+        Assert.Throws<ArgumentException>(() => ExecutableStorageRouteSerializer.Deserialize(
+            canonical.Replace(
+                documentKind,
+                "\"documentKind\":{\"logical\":\"storage_scope\",\"identifier\":\"redirect_uri__document_kind\"}",
+                StringComparison.Ordinal)));
         Assert.Throws<NotSupportedException>(() =>
             RelationalPhysicalProjectionValues.Read(
                 "{\"redirectUris\":[\"https://one.example/callback\"]}",

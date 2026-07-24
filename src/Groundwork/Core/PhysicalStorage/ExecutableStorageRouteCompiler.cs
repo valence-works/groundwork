@@ -217,11 +217,11 @@ public static class ExecutableStorageRouteCompiler
                     definition.SchemaVersion,
                     definition.Evolution),
                 projection,
-                documentKind!,
-                storageScope!,
-                idComparison!,
-                idLookup!,
-                ordinal!,
+                new(ExecutableCollectionElementFieldRole.DocumentKind, documentKind!),
+                new(ExecutableCollectionElementFieldRole.StorageScope, storageScope!),
+                new(ExecutableCollectionElementFieldRole.IdentityComparison, idComparison!),
+                new(ExecutableCollectionElementFieldRole.IdentityLookup, idLookup!),
+                new(ExecutableCollectionElementFieldRole.Ordinal, ordinal!),
                 new ExecutableProjectedColumnRoute(
                     projection.Definition,
                     value!,
@@ -230,7 +230,12 @@ public static class ExecutableStorageRouteCompiler
                 new ExecutableCollectionElementKeyRoute(
                     keyName,
                     ExecutableStorageObjectRole.CollectionElementStorage,
-                    [documentKind!, storageScope!, idLookup!, ordinal!])));
+                    [
+                        new(ExecutableCollectionElementFieldRole.DocumentKind, documentKind!),
+                        new(ExecutableCollectionElementFieldRole.StorageScope, storageScope!),
+                        new(ExecutableCollectionElementFieldRole.IdentityLookup, idLookup!),
+                        new(ExecutableCollectionElementFieldRole.Ordinal, ordinal!)
+                    ])));
         }
 
         var indexes = new List<ExecutablePhysicalIndexRoute>();

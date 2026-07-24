@@ -309,11 +309,11 @@ public static class PhysicalSchemaDiffPlanner
         names.AddRange(route.CollectionElementStorages.SelectMany(storage => new[]
         {
             ObjectName(storage.Storage.Name, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionDocumentKind", storage.DocumentKind, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionStorageScope", storage.StorageScope, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionIdComparisonKey", storage.IdComparisonKey, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionIdLookupKey", storage.IdLookupKey, ExecutableStorageObjectRole.CollectionElementStorage),
-            ColumnName("CollectionOrdinal", storage.Ordinal, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionDocumentKind", storage.DocumentKind.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionStorageScope", storage.StorageScope.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionIdComparisonKey", storage.IdComparisonKey.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionIdLookupKey", storage.IdLookupKey.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionOrdinal", storage.Ordinal.Column, ExecutableStorageObjectRole.CollectionElementStorage),
             ColumnName("CollectionValue", storage.Value.Column, ExecutableStorageObjectRole.CollectionElementStorage),
             ObjectName(storage.OwnerOrdinalKey.Name, ExecutableStorageObjectRole.CollectionElementStorage)
         }));

@@ -175,16 +175,103 @@ public sealed record ExecutableProjectedColumnRoute(
     ProviderPhysicalObjectName Name);
 
 /// <summary>One provider-owned, typed element storage object for a bounded collection projection.</summary>
-public sealed record ExecutableCollectionElementStorageRoute(
-    ExecutableStorageObjectRoute Storage,
-    ExecutableProjectedColumnRoute Projection,
-    ExecutableColumnRoute DocumentKind,
-    ExecutableColumnRoute StorageScope,
-    ExecutableColumnRoute IdComparisonKey,
-    ExecutableColumnRoute IdLookupKey,
-    ExecutableColumnRoute Ordinal,
-    ExecutableProjectedColumnRoute Value,
-    ExecutableCollectionElementKeyRoute OwnerOrdinalKey);
+public sealed class ExecutableCollectionElementStorageRoute : IEquatable<ExecutableCollectionElementStorageRoute>
+{
+    public ExecutableCollectionElementStorageRoute(
+        ExecutableStorageObjectRoute storage,
+        ExecutableProjectedColumnRoute projection,
+        ExecutableCollectionElementFieldRoute documentKind,
+        ExecutableCollectionElementFieldRoute storageScope,
+        ExecutableCollectionElementFieldRoute idComparisonKey,
+        ExecutableCollectionElementFieldRoute idLookupKey,
+        ExecutableCollectionElementFieldRoute ordinal,
+        ExecutableProjectedColumnRoute value,
+        ExecutableCollectionElementKeyRoute ownerOrdinalKey)
+    {
+        ArgumentNullException.ThrowIfNull(storage);
+        ArgumentNullException.ThrowIfNull(projection);
+        ArgumentNullException.ThrowIfNull(documentKind);
+        ArgumentNullException.ThrowIfNull(storageScope);
+        ArgumentNullException.ThrowIfNull(idComparisonKey);
+        ArgumentNullException.ThrowIfNull(idLookupKey);
+        ArgumentNullException.ThrowIfNull(ordinal);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(ownerOrdinalKey);
+        Storage = storage;
+        Projection = projection;
+        DocumentKind = documentKind;
+        StorageScope = storageScope;
+        IdComparisonKey = idComparisonKey;
+        IdLookupKey = idLookupKey;
+        Ordinal = ordinal;
+        Value = value;
+        OwnerOrdinalKey = ownerOrdinalKey;
+        if (Storage.Role != ExecutableStorageObjectRole.CollectionElementStorage ||
+            Value.Target != Storage.Role ||
+            Value.Name != Storage.Name ||
+            DocumentKind.Role != ExecutableCollectionElementFieldRole.DocumentKind ||
+            StorageScope.Role != ExecutableCollectionElementFieldRole.StorageScope ||
+            IdComparisonKey.Role != ExecutableCollectionElementFieldRole.IdentityComparison ||
+            IdLookupKey.Role != ExecutableCollectionElementFieldRole.IdentityLookup ||
+            Ordinal.Role != ExecutableCollectionElementFieldRole.Ordinal ||
+            !OwnerOrdinalKey.Columns.SequenceEqual([DocumentKind, StorageScope, IdLookupKey, Ordinal]))
+        {
+            throw new ArgumentException("Collection element storage fields and owner key do not match the required roles.");
+        }
+    }
+
+    public ExecutableStorageObjectRoute Storage { get; }
+    public ExecutableProjectedColumnRoute Projection { get; }
+    public ExecutableCollectionElementFieldRoute DocumentKind { get; }
+    public ExecutableCollectionElementFieldRoute StorageScope { get; }
+    public ExecutableCollectionElementFieldRoute IdComparisonKey { get; }
+    public ExecutableCollectionElementFieldRoute IdLookupKey { get; }
+    public ExecutableCollectionElementFieldRoute Ordinal { get; }
+    public ExecutableProjectedColumnRoute Value { get; }
+    public ExecutableCollectionElementKeyRoute OwnerOrdinalKey { get; }
+
+    public bool Equals(ExecutableCollectionElementStorageRoute? other) =>
+        other is not null &&
+        Storage == other.Storage &&
+        Projection == other.Projection &&
+        DocumentKind == other.DocumentKind &&
+        StorageScope == other.StorageScope &&
+        IdComparisonKey == other.IdComparisonKey &&
+        IdLookupKey == other.IdLookupKey &&
+        Ordinal == other.Ordinal &&
+        Value == other.Value &&
+        OwnerOrdinalKey.Equals(other.OwnerOrdinalKey);
+
+    public override bool Equals(object? obj) => Equals(obj as ExecutableCollectionElementStorageRoute);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Storage);
+        hash.Add(Projection);
+        hash.Add(DocumentKind);
+        hash.Add(StorageScope);
+        hash.Add(IdComparisonKey);
+        hash.Add(IdLookupKey);
+        hash.Add(Ordinal);
+        hash.Add(Value);
+        hash.Add(OwnerOrdinalKey);
+        return hash.ToHashCode();
+    }
+}
+
+public enum ExecutableCollectionElementFieldRole
+{
+    DocumentKind,
+    StorageScope,
+    IdentityComparison,
+    IdentityLookup,
+    Ordinal
+}
+
+public sealed record ExecutableCollectionElementFieldRoute(
+    ExecutableCollectionElementFieldRole Role,
+    ExecutableColumnRoute Column);
 
 /// <summary>Provider-resolved uniqueness evidence for one collection owner and source ordinal.</summary>
 public sealed class ExecutableCollectionElementKeyRoute : IEquatable<ExecutableCollectionElementKeyRoute>
@@ -192,15 +279,21 @@ public sealed class ExecutableCollectionElementKeyRoute : IEquatable<ExecutableC
     public ExecutableCollectionElementKeyRoute(
         ProviderPhysicalObjectName name,
         ExecutableStorageObjectRole target,
-        IEnumerable<ExecutableColumnRoute> columns)
+        IEnumerable<ExecutableCollectionElementFieldRoute> columns)
     {
         Name = name;
         Target = target;
         Columns = Array.AsReadOnly(columns?.ToArray() ?? throw new ArgumentNullException(nameof(columns)));
-        string[] expectedColumns = ["document_kind", "storage_scope", "id_lookup_key", "ordinal"];
+        ExecutableCollectionElementFieldRole[] expectedColumns =
+        [
+            ExecutableCollectionElementFieldRole.DocumentKind,
+            ExecutableCollectionElementFieldRole.StorageScope,
+            ExecutableCollectionElementFieldRole.IdentityLookup,
+            ExecutableCollectionElementFieldRole.Ordinal
+        ];
         if (Name.ObjectKind != PhysicalObjectKind.PhysicalIndex ||
             Target != ExecutableStorageObjectRole.CollectionElementStorage ||
-            !Columns.Select(column => column.LogicalName).SequenceEqual(expectedColumns, StringComparer.Ordinal))
+            !Columns.Select(column => column.Role).SequenceEqual(expectedColumns))
         {
             throw new ArgumentException(
                 "Collection element keys require a physical-index name and the ordered collection-storage columns " +
@@ -211,7 +304,7 @@ public sealed class ExecutableCollectionElementKeyRoute : IEquatable<ExecutableC
 
     public ProviderPhysicalObjectName Name { get; }
     public ExecutableStorageObjectRole Target { get; }
-    public IReadOnlyList<ExecutableColumnRoute> Columns { get; }
+    public IReadOnlyList<ExecutableCollectionElementFieldRoute> Columns { get; }
 
     public bool Equals(ExecutableCollectionElementKeyRoute? other) => other is not null &&
         Name == other.Name && Target == other.Target && Columns.SequenceEqual(other.Columns);
