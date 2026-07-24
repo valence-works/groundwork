@@ -121,6 +121,70 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     }
 
     [Theory]
+    [InlineData(CollectionElementDrift.WrongType)]
+    [InlineData(CollectionElementDrift.WrongCollation)]
+    [InlineData(CollectionElementDrift.WrongDefault)]
+    [InlineData(CollectionElementDrift.WrongPrimaryKeyOrder)]
+    public async Task Collection_element_storage_replays_cleanly_and_rejects_live_drift(CollectionElementDrift drift)
+    {
+        var model = RelationalPhysicalStorageTestModels.Create(
+            PhysicalStorageForm.PhysicalEntityTable,
+            SqlServerGroundworkCapabilities.Provider,
+            includePriority: false,
+            instance: $"collection_{Guid.NewGuid():N}"[..19],
+            normalizer: SqlServerGroundworkCapabilities.PhysicalNames,
+            includeCollection: true);
+        var storage = Assert.Single(Assert.Single(model.Target.Routes).CollectionElementStorages);
+        var connectionString = container.GetConnectionString();
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied,
+            (await PhysicalSchemaApplication.ApplyAsync(
+                model.Target,
+                new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges,
+            (await PhysicalSchemaApplication.ApplyAsync(
+                model.Target,
+                new SqlServerPhysicalSchemaExecutor(connectionString))).Outcome);
+
+        await using (var connection = new SqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+            var table = Q(storage.Storage.Name.Identifier);
+            var value = Q(storage.Value.Column.Identifier);
+            var key = string.Join(", ", storage.OwnerOrdinalKey.Columns.Reverse().Select(column => Q(column.Column.Identifier)));
+            var sql = drift switch
+            {
+                CollectionElementDrift.WrongType =>
+                    $"ALTER TABLE {table} ALTER COLUMN {value} int NOT NULL;",
+                CollectionElementDrift.WrongCollation =>
+                    $"ALTER TABLE {table} ALTER COLUMN {value} nvarchar(128) COLLATE Latin1_General_100_CI_AS NOT NULL;",
+                CollectionElementDrift.WrongDefault =>
+                    $"ALTER TABLE {table} ADD CONSTRAINT {Q($"DF_{Guid.NewGuid():N}")} DEFAULT N'unexpected' FOR {value};",
+                CollectionElementDrift.WrongPrimaryKeyOrder =>
+                    $"ALTER TABLE {table} DROP CONSTRAINT {Q(await PrimaryKeyAsync(connection, storage.Storage.Name.Identifier))}; " +
+                    $"ALTER TABLE {table} ADD CONSTRAINT {Q($"PK_{Guid.NewGuid():N}")} PRIMARY KEY NONCLUSTERED ({key});",
+                _ => throw new ArgumentOutOfRangeException(nameof(drift), drift, null)
+            };
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => PhysicalSchemaApplication.ApplyAsync(
+            model.Target,
+            new SqlServerPhysicalSchemaExecutor(connectionString)));
+        Assert.Contains(storage.Storage.Name.Identifier, exception.Message, StringComparison.Ordinal);
+
+        static async Task<string> PrimaryKeyAsync(SqlConnection connection, string table)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID(@table) AND type = 'PK';";
+            command.Parameters.AddWithValue("@table", table);
+            return (string)(await command.ExecuteScalarAsync())!;
+        }
+    }
+
+    [Theory]
     [InlineData(128, false)]
     [InlineData(129, true)]
     public async Task Additive_linked_string_projection_length_is_validated_before_sql_server_backfill(
@@ -1743,5 +1807,13 @@ public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
         PlainHash,
         NonPersistedHash,
         WrongHashExpression
+    }
+
+    public enum CollectionElementDrift
+    {
+        WrongType,
+        WrongCollation,
+        WrongDefault,
+        WrongPrimaryKeyOrder
     }
 }

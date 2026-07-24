@@ -2,6 +2,8 @@ using Groundwork.Core.Manifests;
 using Groundwork.Core.Indexing;
 using Groundwork.Core.PhysicalStorage;
 using Groundwork.Core.Queries;
+using Groundwork.Relational.Physicalization;
+using System.Text.Json;
 using Xunit;
 
 namespace Groundwork.Tests;
@@ -29,6 +31,223 @@ public sealed class PhysicalTableDefinitionTests
         PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 64)), definition);
         Assert.Throws<PhysicalProjectionValueValidationException>(() =>
             PhysicalProjectionValueValidation.ValidateStringLength(string.Concat(Enumerable.Repeat("😀", 65)), definition));
+    }
+
+    [Fact]
+    public void Collection_element_projection_preserves_each_canonical_element_and_its_ordinal()
+    {
+        var projection = new ProjectedColumnDefinition(
+            "redirect_uri",
+            "redirectUris",
+            PortablePhysicalType.String,
+            Cardinality: ProjectionCardinality.CollectionElements,
+            MaxCollectionElements: 4);
+
+        var elements = CanonicalCollectionElementProjection.Read(
+            "{\"redirectUris\":[\"https://one.example/callback\",\"https://two.example/callback\"]}",
+            projection);
+
+        Assert.Collection(
+            elements,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal(JsonValueKind.String, first.Value.ValueKind);
+                Assert.Equal("https://one.example/callback", first.Value.GetString());
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal(JsonValueKind.String, second.Value.ValueKind);
+                Assert.Equal("https://two.example/callback", second.Value.GetString());
+            });
+    }
+
+    [Fact]
+    public void Collection_element_projection_fails_closed_for_non_array_and_nested_elements()
+    {
+        var projection = new ProjectedColumnDefinition(
+            "scope",
+            "scopes",
+            PortablePhysicalType.String,
+            Cardinality: ProjectionCardinality.CollectionElements,
+            MaxCollectionElements: 2);
+
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":\"read\"}", projection));
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":[{\"name\":\"read\"}]}", projection));
+        Assert.Throws<InvalidDataException>(() => CanonicalCollectionElementProjection.Read(
+            "{\"scopes\":[\"read\",\"write\",\"admin\"]}", projection));
+    }
+
+    [Fact]
+    public void Collection_cardinality_changes_the_physical_definition_fingerprint()
+    {
+        var scalar = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition("redirect_uri", "redirectUris", PortablePhysicalType.String)]);
+        var elements = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                "redirectUris",
+                PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+
+        var scalarResult = PhysicalStorageResolver.Resolve(
+            WithDefinition(scalar), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+        var elementsResult = PhysicalStorageResolver.Resolve(
+            WithDefinition(elements), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.True(scalarResult.IsValid);
+        Assert.True(elementsResult.IsValid);
+        Assert.NotEqual(
+            Assert.Single(scalarResult.Definitions).Fingerprint,
+            Assert.Single(elementsResult.Definitions).Fingerprint);
+
+        var routes = ExecutableStorageRouteCompiler.Compile(elementsResult.Definitions);
+        var route = Assert.Single(routes.Routes);
+        var restored = ExecutableStorageRouteSerializer.Deserialize(
+            ExecutableStorageRouteSerializer.Serialize(route));
+
+        Assert.Equal(route, restored);
+        Assert.Equal(route.Fingerprint, restored.Fingerprint);
+
+        Assert.Equal(ProjectionCardinality.CollectionElements, Assert.Single(restored.ProjectedColumns).Definition.Cardinality);
+        Assert.Equal(8, Assert.Single(restored.ProjectedColumns).Definition.MaxCollectionElements);
+        var elementStorage = Assert.Single(restored.CollectionElementStorages);
+        Assert.Equal(ExecutableStorageObjectRole.CollectionElementStorage, elementStorage.Storage.Role);
+        Assert.Equal("redirect_uri__elements", elementStorage.Storage.Name.Identifier);
+        Assert.Same(Assert.Single(restored.ProjectedColumns), elementStorage.Projection);
+        Assert.Equal(
+            ["document_kind", "storage_scope", "id_lookup_key", "ordinal"],
+            elementStorage.OwnerOrdinalKey.Columns.Select(column => column.Column.LogicalName));
+        Assert.Equal("redirect_uri__owner_ordinal_unique", elementStorage.OwnerOrdinalKey.Name.Identifier);
+        Assert.Throws<ArgumentException>(() => new ExecutableCollectionElementKeyRoute(
+            elementStorage.OwnerOrdinalKey.Name,
+            elementStorage.OwnerOrdinalKey.Target,
+            elementStorage.OwnerOrdinalKey.Columns.Reverse()));
+        Assert.Throws<ArgumentException>(() => new ExecutableCollectionElementStorageRoute(
+            elementStorage.Storage,
+            elementStorage.Projection,
+            elementStorage.StorageScope,
+            elementStorage.DocumentKind,
+            elementStorage.IdComparisonKey,
+            elementStorage.IdLookupKey,
+            elementStorage.Ordinal,
+            elementStorage.Value,
+            elementStorage.OwnerOrdinalKey));
+        var canonical = ExecutableStorageRouteSerializer.Serialize(route);
+        const string documentKind =
+            "\"documentKind\":{\"logical\":\"document_kind\",\"identifier\":\"redirect_uri__document_kind\"}";
+        Assert.Contains(documentKind, canonical, StringComparison.Ordinal);
+        Assert.Throws<ArgumentException>(() => ExecutableStorageRouteSerializer.Deserialize(
+            canonical.Replace(
+                documentKind,
+                "\"documentKind\":{\"logical\":\"storage_scope\",\"identifier\":\"redirect_uri__document_kind\"}",
+                StringComparison.Ordinal)));
+        Assert.Throws<NotSupportedException>(() =>
+            RelationalPhysicalProjectionValues.Read(
+                "{\"redirectUris\":[\"https://one.example/callback\"]}",
+                restored.ProjectedColumns));
+
+        var values = RelationalPhysicalProjectionValues.ReadCollection(
+            "{\"redirectUris\":[\"https://one.example/callback\",\"https://two.example/callback\",\"https://one.example/callback\"]}",
+            Assert.Single(restored.ProjectedColumns));
+
+        Assert.Collection(
+            values,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal("https://one.example/callback", first.Value);
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal("https://two.example/callback", second.Value);
+            },
+            third =>
+            {
+                Assert.Equal(2, third.Ordinal);
+                Assert.Equal("https://one.example/callback", third.Value);
+            });
+    }
+
+    [Fact]
+    public void Collection_projections_resolve_distinct_storage_and_owner_key_names()
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable("applications",
+        [
+            new ProjectedColumnDefinition("redirect_uri", "redirectUris", PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements, MaxCollectionElements: 8),
+            new ProjectedColumnDefinition("scope", "scopes", PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements, MaxCollectionElements: 8)
+        ]);
+        var resolved = PhysicalStorageResolver.Resolve(
+            WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+        var route = Assert.Single(ExecutableStorageRouteCompiler.Compile(resolved.Definitions).Routes);
+
+        Assert.Equal(
+            ["redirect_uri__elements", "scope__elements"],
+            route.CollectionElementStorages.Select(storage => storage.Storage.Name.Identifier));
+        Assert.Equal(
+            ["redirect_uri__owner_ordinal_unique", "scope__owner_ordinal_unique"],
+            route.CollectionElementStorages.Select(storage => storage.OwnerOrdinalKey.Name.Identifier));
+    }
+
+    [Theory]
+    [InlineData("redirectUris..callback", PortablePhysicalType.String, null, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Json, null, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Int32, 10, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Boolean, null, "ordinal")]
+    public void Collection_element_projection_rejects_non_portable_path_type_length_and_collation(
+        string path,
+        PortablePhysicalType type,
+        int? length,
+        string? collation)
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                path,
+                type,
+                Length: length,
+                Collation: collation,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+
+        var result = PhysicalStorageResolver.Resolve(
+            WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-018");
+    }
+
+    [Theory]
+    [InlineData("{\"redirectUris\":[null]}")]
+    [InlineData("{\"redirectUris\":[42]}")]
+    [InlineData("{\"redirectUris\":[\"one\",\"two\",\"three\",\"four\",\"five\",\"six\",\"seven\",\"eight\",\"nine\"]}")]
+    public void Relational_collection_materialization_rejects_null_wrong_type_and_bound_overflow(string canonicalJson)
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                "redirectUris",
+                PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+        var route = Assert.Single(ExecutableStorageRouteCompiler.Compile(
+            PhysicalStorageResolver.Resolve(
+                WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity).Definitions).Routes);
+
+        Assert.Throws<InvalidDataException>(() => RelationalPhysicalProjectionValues.ReadCollection(
+            canonicalJson,
+            Assert.Single(route.ProjectedColumns)));
     }
 
     [Fact]

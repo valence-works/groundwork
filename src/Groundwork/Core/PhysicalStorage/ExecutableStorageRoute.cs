@@ -8,7 +8,8 @@ namespace Groundwork.Core.PhysicalStorage;
 public enum ExecutableStorageObjectRole
 {
     PrimaryStorage,
-    LinkedIndexStorage
+    LinkedIndexStorage,
+    CollectionElementStorage
 }
 
 public enum ExecutableMaintenanceOperation
@@ -172,6 +173,153 @@ public sealed record ExecutableProjectedColumnRoute(
     ExecutableColumnRoute Column,
     ExecutableStorageObjectRole Target,
     ProviderPhysicalObjectName Name);
+
+/// <summary>One provider-owned, typed element storage object for a bounded collection projection.</summary>
+public sealed class ExecutableCollectionElementStorageRoute : IEquatable<ExecutableCollectionElementStorageRoute>
+{
+    public ExecutableCollectionElementStorageRoute(
+        ExecutableStorageObjectRoute storage,
+        ExecutableProjectedColumnRoute projection,
+        ExecutableCollectionElementFieldRoute documentKind,
+        ExecutableCollectionElementFieldRoute storageScope,
+        ExecutableCollectionElementFieldRoute idComparisonKey,
+        ExecutableCollectionElementFieldRoute idLookupKey,
+        ExecutableCollectionElementFieldRoute ordinal,
+        ExecutableProjectedColumnRoute value,
+        ExecutableCollectionElementKeyRoute ownerOrdinalKey)
+    {
+        ArgumentNullException.ThrowIfNull(storage);
+        ArgumentNullException.ThrowIfNull(projection);
+        ArgumentNullException.ThrowIfNull(documentKind);
+        ArgumentNullException.ThrowIfNull(storageScope);
+        ArgumentNullException.ThrowIfNull(idComparisonKey);
+        ArgumentNullException.ThrowIfNull(idLookupKey);
+        ArgumentNullException.ThrowIfNull(ordinal);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(ownerOrdinalKey);
+        Storage = storage;
+        Projection = projection;
+        DocumentKind = documentKind;
+        StorageScope = storageScope;
+        IdComparisonKey = idComparisonKey;
+        IdLookupKey = idLookupKey;
+        Ordinal = ordinal;
+        Value = value;
+        OwnerOrdinalKey = ownerOrdinalKey;
+        if (Storage.Role != ExecutableStorageObjectRole.CollectionElementStorage ||
+            Value.Target != Storage.Role ||
+            Value.Name != Storage.Name ||
+            DocumentKind.Role != ExecutableCollectionElementFieldRole.DocumentKind ||
+            StorageScope.Role != ExecutableCollectionElementFieldRole.StorageScope ||
+            IdComparisonKey.Role != ExecutableCollectionElementFieldRole.IdentityComparison ||
+            IdLookupKey.Role != ExecutableCollectionElementFieldRole.IdentityLookup ||
+            Ordinal.Role != ExecutableCollectionElementFieldRole.Ordinal ||
+            !OwnerOrdinalKey.Columns.SequenceEqual([DocumentKind, StorageScope, IdLookupKey, Ordinal]))
+        {
+            throw new ArgumentException("Collection element storage fields and owner key do not match the required roles.");
+        }
+    }
+
+    public ExecutableStorageObjectRoute Storage { get; }
+    public ExecutableProjectedColumnRoute Projection { get; }
+    public ExecutableCollectionElementFieldRoute DocumentKind { get; }
+    public ExecutableCollectionElementFieldRoute StorageScope { get; }
+    public ExecutableCollectionElementFieldRoute IdComparisonKey { get; }
+    public ExecutableCollectionElementFieldRoute IdLookupKey { get; }
+    public ExecutableCollectionElementFieldRoute Ordinal { get; }
+    public ExecutableProjectedColumnRoute Value { get; }
+    public ExecutableCollectionElementKeyRoute OwnerOrdinalKey { get; }
+
+    public bool Equals(ExecutableCollectionElementStorageRoute? other) =>
+        other is not null &&
+        Storage == other.Storage &&
+        Projection == other.Projection &&
+        DocumentKind == other.DocumentKind &&
+        StorageScope == other.StorageScope &&
+        IdComparisonKey == other.IdComparisonKey &&
+        IdLookupKey == other.IdLookupKey &&
+        Ordinal == other.Ordinal &&
+        Value == other.Value &&
+        OwnerOrdinalKey.Equals(other.OwnerOrdinalKey);
+
+    public override bool Equals(object? obj) => Equals(obj as ExecutableCollectionElementStorageRoute);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Storage);
+        hash.Add(Projection);
+        hash.Add(DocumentKind);
+        hash.Add(StorageScope);
+        hash.Add(IdComparisonKey);
+        hash.Add(IdLookupKey);
+        hash.Add(Ordinal);
+        hash.Add(Value);
+        hash.Add(OwnerOrdinalKey);
+        return hash.ToHashCode();
+    }
+}
+
+public enum ExecutableCollectionElementFieldRole
+{
+    DocumentKind,
+    StorageScope,
+    IdentityComparison,
+    IdentityLookup,
+    Ordinal
+}
+
+public sealed record ExecutableCollectionElementFieldRoute(
+    ExecutableCollectionElementFieldRole Role,
+    ExecutableColumnRoute Column);
+
+/// <summary>Provider-resolved uniqueness evidence for one collection owner and source ordinal.</summary>
+public sealed class ExecutableCollectionElementKeyRoute : IEquatable<ExecutableCollectionElementKeyRoute>
+{
+    public ExecutableCollectionElementKeyRoute(
+        ProviderPhysicalObjectName name,
+        ExecutableStorageObjectRole target,
+        IEnumerable<ExecutableCollectionElementFieldRoute> columns)
+    {
+        Name = name;
+        Target = target;
+        Columns = Array.AsReadOnly(columns?.ToArray() ?? throw new ArgumentNullException(nameof(columns)));
+        ExecutableCollectionElementFieldRole[] expectedColumns =
+        [
+            ExecutableCollectionElementFieldRole.DocumentKind,
+            ExecutableCollectionElementFieldRole.StorageScope,
+            ExecutableCollectionElementFieldRole.IdentityLookup,
+            ExecutableCollectionElementFieldRole.Ordinal
+        ];
+        if (Name.ObjectKind != PhysicalObjectKind.PhysicalIndex ||
+            Target != ExecutableStorageObjectRole.CollectionElementStorage ||
+            !Columns.Select(column => column.Role).SequenceEqual(expectedColumns))
+        {
+            throw new ArgumentException(
+                "Collection element keys require a physical-index name and the ordered collection-storage columns " +
+                "'document_kind', 'storage_scope', 'id_lookup_key', and 'ordinal'.",
+                nameof(columns));
+        }
+    }
+
+    public ProviderPhysicalObjectName Name { get; }
+    public ExecutableStorageObjectRole Target { get; }
+    public IReadOnlyList<ExecutableCollectionElementFieldRoute> Columns { get; }
+
+    public bool Equals(ExecutableCollectionElementKeyRoute? other) => other is not null &&
+        Name == other.Name && Target == other.Target && Columns.SequenceEqual(other.Columns);
+
+    public override bool Equals(object? obj) => Equals(obj as ExecutableCollectionElementKeyRoute);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Name);
+        hash.Add(Target);
+        foreach (var column in Columns) hash.Add(column);
+        return hash.ToHashCode();
+    }
+}
 
 public sealed record ExecutableIndexColumnRoute(
     ExecutableColumnRoute Column,
@@ -344,6 +492,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         ExecutableKeyRoute primaryKey,
         ExecutableKeyRoute? auxiliaryKey,
         IReadOnlyList<ExecutableProjectedColumnRoute> projectedColumns,
+        IReadOnlyList<ExecutableCollectionElementStorageRoute> collectionElementStorages,
         IReadOnlyList<ExecutablePhysicalIndexRoute> indexes,
         IReadOnlyList<ExecutableMaintenanceRoute> maintenanceRoutes,
         IReadOnlyList<ExecutableQueryPathRoute> candidateQueryPaths,
@@ -365,6 +514,8 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         PrimaryKey = primaryKey;
         AuxiliaryKey = auxiliaryKey;
         ProjectedColumns = Array.AsReadOnly(projectedColumns.OrderBy(column => column.Definition.LogicalName, StringComparer.Ordinal).ToArray());
+        CollectionElementStorages = Array.AsReadOnly(collectionElementStorages
+            .OrderBy(storage => storage.Projection.Definition.LogicalName, StringComparer.Ordinal).ToArray());
         Indexes = Array.AsReadOnly(indexes.OrderBy(index => index.Identity, StringComparer.Ordinal).ToArray());
         MaintenanceRoutes = Array.AsReadOnly(maintenanceRoutes.OrderBy(route => route.Operation).ToArray());
         CandidateQueryPaths = Array.AsReadOnly(candidateQueryPaths
@@ -390,6 +541,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
     public ExecutableKeyRoute PrimaryKey { get; }
     public ExecutableKeyRoute? AuxiliaryKey { get; }
     public IReadOnlyList<ExecutableProjectedColumnRoute> ProjectedColumns { get; }
+    public IReadOnlyList<ExecutableCollectionElementStorageRoute> CollectionElementStorages { get; }
     public IReadOnlyList<ExecutablePhysicalIndexRoute> Indexes { get; }
     public IReadOnlyList<ExecutableMaintenanceRoute> MaintenanceRoutes { get; }
     public IReadOnlyList<ExecutableQueryPathRoute> CandidateQueryPaths { get; }
@@ -413,6 +565,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
             PrimaryKey,
             AuxiliaryKey,
             ProjectedColumns,
+            CollectionElementStorages,
             Indexes,
             MaintenanceRoutes,
             CandidateQueryPaths,
@@ -458,6 +611,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         PrimaryKey.Equals(other.PrimaryKey) &&
         Equals(AuxiliaryKey, other.AuxiliaryKey) &&
         ProjectedColumns.SequenceEqual(other.ProjectedColumns) &&
+        CollectionElementStorages.SequenceEqual(other.CollectionElementStorages) &&
         Indexes.SequenceEqual(other.Indexes) &&
         MaintenanceRoutes.SequenceEqual(other.MaintenanceRoutes) &&
         CandidateQueryPaths.SequenceEqual(other.CandidateQueryPaths) &&
@@ -485,6 +639,8 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         hash.Add(AuxiliaryKey);
         foreach (var column in ProjectedColumns)
             hash.Add(column);
+        foreach (var storage in CollectionElementStorages)
+            hash.Add(storage);
         foreach (var index in Indexes)
             hash.Add(index);
         foreach (var maintenance in MaintenanceRoutes)

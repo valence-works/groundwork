@@ -856,7 +856,17 @@ public static class PhysicalStorageResolver
                 (column.Scale is not null && column.Precision is not null && column.Scale > column.Precision) ||
                 (column.Type == PortablePhysicalType.Decimal &&
                  (column.Precision is null or > 28 || column.Scale is null)) ||
-                (column.Type != PortablePhysicalType.Decimal && column.Scale is not null))
+                (column.Type != PortablePhysicalType.Decimal && column.Scale is not null) ||
+                !Enum.IsDefined(column.Cardinality) ||
+                (column.Cardinality == ProjectionCardinality.Scalar && column.MaxCollectionElements is not null) ||
+                (column.Cardinality == ProjectionCardinality.CollectionElements &&
+                 (column.MaxCollectionElements is null or <= 0 ||
+                  column.DefaultValue is not null ||
+                  !column.IsNullable ||
+                  !CanonicalCollectionElementProjection.IsSupportedPath(column.Path) ||
+                  !CanonicalCollectionElementProjection.SupportsElementType(column.Type) ||
+                  (column.Type != PortablePhysicalType.String && column.Length is not null) ||
+                  (column.Type != PortablePhysicalType.String && column.Collation is not null))))
             {
                 diagnostics.Add(GroundworkDiagnostic.Error(
                     "GW-PHYSICAL-018",
@@ -1123,6 +1133,30 @@ public static class PhysicalStorageResolver
             x.LogicalName,
             unit.Identity,
             true)));
+        defaultNames.AddRange(definition.ProjectedColumns
+            .Where(column => column.Cardinality == ProjectionCardinality.CollectionElements)
+            .Select(column => (
+                PhysicalObjectKind.CollectionElementStorage,
+                ExecutableStorageRouteCompiler.CollectionElementStorageLogicalName(column.LogicalName),
+                unit.Identity,
+                true)));
+        defaultNames.AddRange(definition.ProjectedColumns
+            .Where(column => column.Cardinality == ProjectionCardinality.CollectionElements)
+            .Select(column => (
+                PhysicalObjectKind.PhysicalIndex,
+                ExecutableStorageRouteCompiler.CollectionElementOwnerOrdinalKeyLogicalName(column.LogicalName),
+                unit.Identity,
+                true)));
+        defaultNames.AddRange(definition.ProjectedColumns
+            .Where(column => column.Cardinality == ProjectionCardinality.CollectionElements)
+            .SelectMany(column => new[]
+            {
+                "document_kind", "storage_scope", "id_comparison_key", "id_lookup_key", "ordinal", "value"
+            }.Select(field => (
+                PhysicalObjectKind.CollectionElementField,
+                $"{column.LogicalName}__{field}",
+                unit.Identity,
+                true))));
         defaultNames.AddRange(definition.Indexes.Select(x => (
             PhysicalObjectKind.PhysicalIndex,
             x.LogicalName,

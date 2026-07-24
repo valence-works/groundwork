@@ -10,6 +10,9 @@ internal readonly record struct MongoDbPhysicalProjectionValue(bool IsPresent, B
     public static MongoDbPhysicalProjectionValue Omitted { get; } = new(false, BsonNull.Value);
 }
 
+/// <summary>One typed collection element ready for a provider-owned MongoDB element document.</summary>
+internal readonly record struct MongoDbCollectionElementProjectionValue(int Ordinal, BsonValue Value);
+
 /// <summary>
 /// One MongoDB projection boundary shared by live writes and canonical backfills. It preserves the
 /// distinction between an absent path and explicit JSON null while applying typed defaults.
@@ -21,10 +24,32 @@ internal static class MongoDbPhysicalProjectionValues
         IReadOnlyList<ExecutableProjectedColumnRoute> projections)
     {
         ArgumentNullException.ThrowIfNull(canonicalJson);
+        foreach (var projection in projections)
+            CanonicalCollectionElementProjection.RequireScalar(projection.Definition);
         using var document = JsonDocument.Parse(canonicalJson);
         return projections.ToDictionary(
             projection => projection,
             projection => Resolve(document.RootElement, projection));
+    }
+
+    /// <summary>
+    /// Materializes collection elements through MongoDB's normal projection conversion boundary.
+    /// The caller receives one non-null native value per source ordinal; duplicates are retained
+    /// rather than accidentally acquiring MongoDB multikey set semantics.
+    /// </summary>
+    public static IReadOnlyList<MongoDbCollectionElementProjectionValue> ResolveCollection(
+        string canonicalJson,
+        ExecutableProjectedColumnRoute projection)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(canonicalJson);
+        ArgumentNullException.ThrowIfNull(projection);
+        CanonicalCollectionElementProjection.RequireCollection(projection.Definition);
+
+        return CanonicalCollectionElementProjection.Read(canonicalJson, projection.Definition)
+            .Select(element => new MongoDbCollectionElementProjectionValue(
+                element.Ordinal,
+                ResolveValue(element.Value, projection, collectionElement: true)))
+            .ToArray();
     }
 
     private static MongoDbPhysicalProjectionValue Resolve(
@@ -46,21 +71,33 @@ internal static class MongoDbPhysicalProjectionValues
             return new(true, BsonNull.Value);
         }
 
+        return new(true, ResolveValue(source, projection, collectionElement: false));
+    }
+
+    private static BsonValue ResolveValue(
+        JsonElement source,
+        ExecutableProjectedColumnRoute projection,
+        bool collectionElement)
+    {
         try
         {
+            if (source.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                throw new FormatException("A collection-element projection cannot contain JSON null.");
             var value = projection.Definition.Type switch
             {
-                PortablePhysicalType.String => new BsonString(source.GetString()!),
-                PortablePhysicalType.Int32 => new BsonInt32(MongoDbExactNumericLiteral.Parse(NumberText(source)).ToInt32()),
-                PortablePhysicalType.Int64 => new BsonInt64(MongoDbExactNumericLiteral.Parse(NumberText(source)).ToInt64()),
-                PortablePhysicalType.Decimal => Decimal(projection, NumberText(source)),
+                PortablePhysicalType.String => new BsonString(source.GetString() ?? throw new FormatException(
+                    "A string collection-element projection requires a JSON string.")),
+                PortablePhysicalType.Int32 => new BsonInt32(MongoDbExactNumericLiteral.Parse(NumberText(source, collectionElement)).ToInt32()),
+                PortablePhysicalType.Int64 => new BsonInt64(MongoDbExactNumericLiteral.Parse(NumberText(source, collectionElement)).ToInt64()),
+                PortablePhysicalType.Decimal => Decimal(projection, NumberText(source, collectionElement)),
                 PortablePhysicalType.Boolean => new BsonBoolean(source.GetBoolean()),
                 PortablePhysicalType.DateTime or PortablePhysicalType.Guid or PortablePhysicalType.Binary =>
-                    new BsonString(source.GetString()!),
+                    new BsonString(source.GetString() ?? throw new FormatException(
+                        "A string-backed collection-element projection requires a JSON string.")),
                 PortablePhysicalType.Json => BsonDocument.Parse($"{{\"value\":{source.GetRawText()}}}")["value"],
                 _ => throw new ArgumentOutOfRangeException(nameof(projection), projection.Definition.Type, null)
             };
-            return new(true, Normalize(projection, value));
+            return Normalize(projection, value);
         }
         catch (Exception exception) when (exception is (FormatException or OverflowException or InvalidOperationException) &&
                                          exception is not PhysicalProjectionValueValidationException)
@@ -192,10 +229,10 @@ internal static class MongoDbPhysicalProjectionValues
         _ => throw new FormatException("A numeric projection requires a JSON number.")
     };
 
-    private static string NumberText(JsonElement value) => value.ValueKind switch
+    private static string NumberText(JsonElement value, bool requireJsonNumber = false) => value.ValueKind switch
     {
         JsonValueKind.Number => value.GetRawText(),
-        JsonValueKind.String => value.GetString()!,
+        JsonValueKind.String when !requireJsonNumber => value.GetString()!,
         _ => throw new FormatException("A numeric projection requires a JSON number or numeric string.")
     };
 

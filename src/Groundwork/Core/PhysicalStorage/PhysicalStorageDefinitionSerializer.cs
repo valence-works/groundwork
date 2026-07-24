@@ -162,6 +162,8 @@ public static class PhysicalStorageDefinitionSerializer
             WriteNullableString(writer, "collation", column.Collation);
             WriteNullableString(writer, "default", column.DefaultValue);
             writer.WriteString("rebuild", column.RebuildMode.ToString());
+            writer.WriteString("cardinality", column.Cardinality.ToString());
+            WriteNullableNumber(writer, "maxCollectionElements", column.MaxCollectionElements);
             writer.WriteEndObject();
         }
         writer.WriteEndArray();

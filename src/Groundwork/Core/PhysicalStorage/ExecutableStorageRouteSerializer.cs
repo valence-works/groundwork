@@ -38,6 +38,30 @@ public static class ExecutableStorageRouteSerializer
         var envelope = root.GetProperty("envelope");
         var discriminator = root.GetProperty("discriminator");
         var scopeKey = root.GetProperty("scopeKey");
+        var projectedColumns = root.GetProperty("projectedColumns").EnumerateArray().Select(ReadProjectedColumn).ToArray();
+        var collectionElementStorages = (root.TryGetProperty("collectionElementStorages", out var collectionElementStorageJson)
+                ? collectionElementStorageJson.EnumerateArray()
+                : Enumerable.Empty<JsonElement>())
+            .Select(element => new ExecutableCollectionElementStorageRoute(
+                ReadStorageObject(element.GetProperty("storage")),
+                projectedColumns.Single(projection => projection.Definition.LogicalName ==
+                    element.GetProperty("projection").GetString()),
+                new(ExecutableCollectionElementFieldRole.DocumentKind, ReadColumn(element.GetProperty("documentKind"))),
+                new(ExecutableCollectionElementFieldRole.StorageScope, ReadColumn(element.GetProperty("storageScope"))),
+                new(ExecutableCollectionElementFieldRole.IdentityComparison, ReadColumn(element.GetProperty("idComparisonKey"))),
+                new(ExecutableCollectionElementFieldRole.IdentityLookup, ReadColumn(element.GetProperty("idLookupKey"))),
+                new(ExecutableCollectionElementFieldRole.Ordinal, ReadColumn(element.GetProperty("ordinal"))),
+                new ExecutableProjectedColumnRoute(
+                    projectedColumns.Single(projection => projection.Definition.LogicalName == element.GetProperty("projection").GetString()).Definition,
+                    ReadColumn(element.GetProperty("value")),
+                    ExecutableStorageObjectRole.CollectionElementStorage,
+                    ReadStorageObject(element.GetProperty("storage")).Name),
+                new ExecutableCollectionElementKeyRoute(
+                    ReadName(element.GetProperty("ownerOrdinalKey").GetProperty("name")),
+                    ReadEnum<ExecutableStorageObjectRole>(element.GetProperty("ownerOrdinalKey"), "target"),
+                    element.GetProperty("ownerOrdinalKey").GetProperty("columns").EnumerateArray().Select((column, index) => new ExecutableCollectionElementFieldRoute(
+                        index switch { 0 => ExecutableCollectionElementFieldRole.DocumentKind, 1 => ExecutableCollectionElementFieldRole.StorageScope, 2 => ExecutableCollectionElementFieldRole.IdentityLookup, _ => ExecutableCollectionElementFieldRole.Ordinal }, ReadColumn(column))))))
+            .ToArray();
         var route = new ExecutableStorageRoute(
             new StorageUnitIdentity(root.GetProperty("storageUnit").GetString()!),
             ReadEnum<StorageUnitProvisioningMode>(root, "provisioningMode"),
@@ -72,7 +96,8 @@ public static class ExecutableStorageRouteSerializer
                 scopeKey.GetProperty("auxiliaryKey").GetBoolean()),
             ReadKey(root.GetProperty("primaryKey")),
             auxiliaryKey.ValueKind == JsonValueKind.Null ? null : ReadKey(auxiliaryKey),
-            root.GetProperty("projectedColumns").EnumerateArray().Select(ReadProjectedColumn).ToArray(),
+            projectedColumns,
+            collectionElementStorages,
             root.GetProperty("indexes").EnumerateArray().Select(ReadIndex).ToArray(),
             root.GetProperty("maintenance").EnumerateArray().Select(ReadMaintenance).ToArray(),
             root.GetProperty("queryPaths").EnumerateArray().Select(ReadQueryPath).ToArray(),
@@ -213,12 +238,44 @@ public static class ExecutableStorageRouteSerializer
                 WriteNullableString(writer, "collation", projection.Definition.Collation);
                 WriteNullableString(writer, "default", projection.Definition.DefaultValue);
                 writer.WriteString("rebuild", projection.Definition.RebuildMode.ToString());
+                writer.WriteString("cardinality", projection.Definition.Cardinality.ToString());
+                WriteNullableNumber(writer, "maxCollectionElements", projection.Definition.MaxCollectionElements);
                 writer.WriteString("target", projection.Target.ToString());
                 WriteColumn(writer, "column", projection.Column);
                 WriteName(writer, "name", projection.Name);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
+
+            if (route.CollectionElementStorages.Count != 0)
+            {
+                writer.WritePropertyName("collectionElementStorages");
+                writer.WriteStartArray();
+                foreach (var collection in route.CollectionElementStorages)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("projection", collection.Projection.Definition.LogicalName);
+                    WriteStorageObject(writer, "storage", collection.Storage);
+                    WriteColumn(writer, "documentKind", collection.DocumentKind.Column);
+                    WriteColumn(writer, "storageScope", collection.StorageScope.Column);
+                    WriteColumn(writer, "idComparisonKey", collection.IdComparisonKey.Column);
+                    WriteColumn(writer, "idLookupKey", collection.IdLookupKey.Column);
+                    WriteColumn(writer, "ordinal", collection.Ordinal.Column);
+                    WriteColumn(writer, "value", collection.Value.Column);
+                    writer.WritePropertyName("ownerOrdinalKey");
+                    writer.WriteStartObject();
+                    WriteName(writer, "name", collection.OwnerOrdinalKey.Name);
+                    writer.WriteString("target", collection.OwnerOrdinalKey.Target.ToString());
+                    writer.WritePropertyName("columns");
+                    writer.WriteStartArray();
+                    foreach (var column in collection.OwnerOrdinalKey.Columns)
+                        WriteColumnValue(writer, column.Column);
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+            }
 
             writer.WritePropertyName("indexes");
             writer.WriteStartArray();
@@ -322,7 +379,11 @@ public static class ExecutableStorageRouteSerializer
             element.GetProperty("nullable").GetBoolean(),
             ReadNullableString(element, "collation"),
             ReadNullableString(element, "default"),
-            ReadEnum<ProjectionRebuildMode>(element, "rebuild"));
+            ReadEnum<ProjectionRebuildMode>(element, "rebuild"),
+            element.TryGetProperty("cardinality", out var cardinality)
+                ? Enum.Parse<ProjectionCardinality>(cardinality.GetString()!)
+                : ProjectionCardinality.Scalar,
+            ReadNullableInt32(element, "maxCollectionElements"));
         return new ExecutableProjectedColumnRoute(
             definition,
             ReadColumn(element.GetProperty("column")),

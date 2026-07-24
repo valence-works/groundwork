@@ -1190,6 +1190,125 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         Assert.Equal(1, trueCount);
     }
 
+    [Fact]
+    public async Task Collection_element_storage_uses_typed_non_nullable_value_and_exact_owner_ordinal_key()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var target = CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: false,
+            includeCollection: true).Target;
+        var storage = target.Routes.Single().CollectionElementStorages.Single();
+
+        var first = await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var restart = await PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection));
+        var columns = await CollectionTableColumnsAsync(connection, storage.Storage.Name.Identifier);
+
+        Assert.Equal(PhysicalSchemaApplicationOutcome.Applied, first.Outcome);
+        Assert.Equal(PhysicalSchemaApplicationOutcome.NoChanges, restart.Outcome);
+        foreach (var owner in CollectionOwnerColumns(storage))
+        {
+            var column = Assert.Single(columns.Where(column => column.Name == owner.Identifier));
+            Assert.True(column.IsNotNull, $"Collection owner field '{owner.Identifier}' must be non-null.");
+        }
+        var value = Assert.Single(columns.Where(column => column.Name == storage.Value.Column.Identifier));
+        Assert.Equal("TEXT", value.Type);
+        Assert.True(value.IsNotNull);
+        Assert.Equal(
+            storage.OwnerOrdinalKey.Columns.Select(column => column.Column.Identifier),
+            columns.Where(column => column.PrimaryKeyOrder > 0)
+                .OrderBy(column => column.PrimaryKeyOrder)
+                .Select(column => column.Name));
+    }
+
+    [Theory]
+    [InlineData("missing-owner-column")]
+    [InlineData("nullable-value")]
+    [InlineData("wrong-value-type")]
+    [InlineData("wrong-value-default")]
+    [InlineData("wrong-value-collation")]
+    [InlineData("wrong-owner-ordinal-key-order")]
+    public async Task Collection_element_storage_rejects_schema_drift(string drift)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var target = CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: false,
+            includeCollection: true).Target;
+        var storage = target.Routes.Single().CollectionElementStorages.Single();
+
+        await ExecuteSqlAsync(connection, CollectionElementTableSql(storage, drift));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection)));
+
+        Assert.Contains(storage.Storage.Name.Identifier, exception.Message, StringComparison.Ordinal);
+    }
+
+    private static IReadOnlyList<ExecutableColumnRoute> CollectionOwnerColumns(
+        ExecutableCollectionElementStorageRoute storage) =>
+    [
+        storage.DocumentKind.Column,
+        storage.StorageScope.Column,
+        storage.IdComparisonKey.Column,
+        storage.IdLookupKey.Column,
+        storage.Ordinal.Column
+    ];
+
+    private static string CollectionElementTableSql(
+        ExecutableCollectionElementStorageRoute storage,
+        string drift)
+    {
+        var ownerColumns = CollectionOwnerColumns(storage);
+        var definitions = ownerColumns
+            .Where(column => drift != "missing-owner-column" || column.Identifier != storage.IdComparisonKey.Column.Identifier)
+            .Select(column =>
+                $"{Q(column.Identifier)} {(column.Identifier == storage.Ordinal.Column.Identifier ? "INTEGER" : "TEXT")} NOT NULL")
+            .ToList();
+        var value = drift switch
+        {
+            "nullable-value" => "TEXT COLLATE NOCASE NULL",
+            "wrong-value-type" => "INTEGER COLLATE NOCASE NOT NULL",
+            "wrong-value-default" => "TEXT COLLATE NOCASE NOT NULL DEFAULT 'unexpected'",
+            "wrong-value-collation" => "TEXT COLLATE BINARY NOT NULL",
+            _ => "TEXT COLLATE NOCASE NOT NULL"
+        };
+        definitions.Add($"{Q(storage.Value.Column.Identifier)} {value}");
+        var key = drift == "wrong-owner-ordinal-key-order"
+            ? storage.OwnerOrdinalKey.Columns.Reverse().Select(column => column.Column)
+            : storage.OwnerOrdinalKey.Columns.Select(column => column.Column);
+        definitions.Add($"PRIMARY KEY ({string.Join(", ", key.Select(column => Q(column.Identifier)))})");
+        return $"CREATE TABLE {Q(storage.Storage.Name.Identifier)} ({string.Join(", ", definitions)});";
+    }
+
+    private static async Task ExecuteSqlAsync(SqliteConnection connection, string sql)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<IReadOnlyList<CollectionTableColumn>> CollectionTableColumnsAsync(
+        SqliteConnection connection,
+        string table)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({Q(table)});";
+        var columns = new List<CollectionTableColumn>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            columns.Add(new CollectionTableColumn(
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetInt64(3) != 0,
+                reader.GetInt64(5)));
+        }
+        return columns;
+    }
+
     private static string Q(string identifier) =>
         $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
@@ -1211,13 +1330,26 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
         QueryPagingSupport categoryPaging = QueryPagingSupport.Offset,
         QueryPagingSupport compoundPaging = QueryPagingSupport.None,
-        bool includeLatestPerCategory = false)
+        bool includeLatestPerCategory = false,
+        bool includeCollection = false)
     {
         var template = SqliteTestManifests.MetadataManifest();
         var columns = new List<ProjectedColumnDefinition>
         {
             new("category", "category", PortablePhysicalType.String, Length: 200, IsNullable: categoryNullable)
         };
+        if (includeCollection)
+        {
+            columns.Add(new ProjectedColumnDefinition(
+                "permissions",
+                "permissions",
+                PortablePhysicalType.String,
+                Length: 128,
+                IsNullable: true,
+                Collation: "NOCASE",
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8));
+        }
         var categoryIndexColumns = new List<PhysicalIndexColumnDefinition>();
         if (scoped)
             categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
@@ -1530,4 +1662,6 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         }
         throw new InvalidOperationException($"Column '{table}.{column}' is missing.");
     }
+
+    private sealed record CollectionTableColumn(string Name, string Type, bool IsNotNull, long PrimaryKeyOrder);
 }

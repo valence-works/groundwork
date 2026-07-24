@@ -549,6 +549,29 @@ public sealed class PhysicalSchemaDiffPlannerTests
     }
 
     [Fact]
+    public void Collection_element_storage_is_an_explicit_schema_operation_before_projected_columns()
+    {
+        var target = CreateTarget(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includeSecondProjection: false,
+            collectionProjection: true);
+        Assert.Single(Assert.Single(target.Routes).CollectionElementStorages);
+
+        var plan = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, PlannedAt);
+
+        Assert.True(plan.IsApplicable, JoinDiagnostics(plan));
+        var create = Assert.Single(plan.Operations.OfType<CreateCollectionElementStorageOperation>());
+        Assert.Equal("category", create.Storage.Projection.Definition.LogicalName);
+        Assert.Equal("category__elements", create.Storage.Storage.Name.Identifier);
+        Assert.Empty(plan.Operations.OfType<AddProjectedColumnOperation>());
+        Assert.Empty(plan.Operations.OfType<FinalizeProjectedColumnOperation>());
+        Assert.Empty(plan.Operations.OfType<BackfillCanonicalJsonOperation>());
+        Assert.Equal(ExecutableStorageObjectRole.CollectionElementStorage, create.Storage.Value.Target);
+        Assert.Equal("ordinal", create.Storage.Ordinal.Column.LogicalName);
+        Assert.Equal("value", create.Storage.Value.Column.LogicalName);
+    }
+
+    [Fact]
     public void DurableSerializationRejectsARewrittenTargetFingerprint()
     {
         var target = CreateTarget(PhysicalStorageForm.PhysicalEntityTable, includeSecondProjection: false);
@@ -704,7 +727,8 @@ public sealed class PhysicalSchemaDiffPlannerTests
         StorageManifestVersion? manifestVersion = null,
         ProviderIdentity? provider = null,
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
-        bool dedicatedWithoutLinked = false)
+        bool dedicatedWithoutLinked = false,
+        bool collectionProjection = false)
     {
         var template = SampleManifests.MetadataManifest();
         var projectedColumns = new List<ProjectedColumnDefinition>
@@ -714,7 +738,9 @@ public sealed class PhysicalSchemaDiffPlannerTests
                 "category",
                 PortablePhysicalType.String,
                 Length: 200,
-                IsNullable: false,
+                IsNullable: collectionProjection,
+                Cardinality: collectionProjection ? ProjectionCardinality.CollectionElements : ProjectionCardinality.Scalar,
+                MaxCollectionElements: collectionProjection ? 8 : null,
                 RebuildMode: rebuildMode)
         };
         var indexes = new List<PhysicalIndexDefinition>

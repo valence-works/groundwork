@@ -488,6 +488,19 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Fact]
+    public void Provider_normalization_scopes_collection_element_fields_separately()
+    {
+        var context = new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("workItem"),
+            PhysicalObjectKind.CollectionElementField,
+            "resource_value");
+
+        Assert.Equal(
+            "mongodb:workItem:collection-element-fields",
+            MongoDbPhysicalNameNormalizer.Instance.GetCollisionScope(context));
+    }
+
+    [Fact]
     public void Provider_normalization_truncates_unicode_letters_by_UTF8_bytes()
     {
         var logicalName = string.Concat(Enumerable.Repeat("界", 100));
@@ -669,6 +682,166 @@ public sealed class MongoDbPhysicalStorageModelTests
             [projection])[projection].Value.AsInt64;
 
         Assert.Equal(first + 1, second);
+    }
+
+    [Fact]
+    public void Collection_projection_conversion_preserves_ordinals_duplicates_and_native_value_types()
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int64,
+            valueKind: IndexValueKind.Number,
+            path: "resources",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var projection = Assert.Single(model.Routes).ProjectedColumns.Single(column =>
+            column.Definition.Path == "resources");
+
+        var values = MongoDbPhysicalProjectionValues.ResolveCollection(
+            "{\"resources\":[42,9007199254740991,42]}", projection);
+
+        Assert.Collection(
+            values,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal(42L, first.Value.AsInt64);
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal(9007199254740991L, second.Value.AsInt64);
+            },
+            third =>
+            {
+                Assert.Equal(2, third.Ordinal);
+                Assert.Equal(42L, third.Value.AsInt64);
+            });
+    }
+
+    [Fact]
+    public void Collection_element_validator_requires_all_synthetic_members_and_an_int32_number_value()
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int32,
+            valueKind: IndexValueKind.Number,
+            path: "states",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+        var schema = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage)["$jsonSchema"].AsBsonDocument;
+        var properties = schema["properties"].AsBsonDocument;
+
+        Assert.Equal(
+            [
+                storage.DocumentKind.Column.Identifier,
+                storage.StorageScope.Column.Identifier,
+                storage.IdComparisonKey.Column.Identifier,
+                storage.IdLookupKey.Column.Identifier,
+                storage.Ordinal.Column.Identifier,
+                storage.Value.Column.Identifier
+            ],
+            schema["required"].AsBsonArray.Select(value => value.AsString));
+        Assert.Equal("int", properties[storage.Value.Column.Identifier]["bsonType"].AsString);
+        Assert.Equal(
+            storage.OwnerOrdinalKey.Columns.Select(field => field.Column.Identifier),
+            MongoDbPhysicalSchemaExecutor.CollectionElementOwnerOrdinalIndexKeys(storage).Names);
+    }
+
+    [Theory]
+    [InlineData(PortablePhysicalType.String, IndexValueKind.Keyword, "{\"values\":[\"open\"]}", BsonType.String, "string")]
+    [InlineData(PortablePhysicalType.Int32, IndexValueKind.Number, "{\"values\":[42]}", BsonType.Int32, "int")]
+    [InlineData(PortablePhysicalType.Int64, IndexValueKind.Number, "{\"values\":[42000000000]}", BsonType.Int64, "long")]
+    [InlineData(PortablePhysicalType.Decimal, IndexValueKind.Number, "{\"values\":[1.25]}", BsonType.Decimal128, "decimal")]
+    [InlineData(PortablePhysicalType.Boolean, IndexValueKind.Boolean, "{\"values\":[true]}", BsonType.Boolean, "bool")]
+    [InlineData(PortablePhysicalType.DateTime, IndexValueKind.DateTime, "{\"values\":[\"2026-01-01T01:00:00+01:00\"]}", BsonType.Int64, "long")]
+    [InlineData(PortablePhysicalType.Guid, IndexValueKind.Keyword, "{\"values\":[\"20b7b527-8799-45b2-8f43-aa742308da8c\"]}", BsonType.String, "string")]
+    [InlineData(PortablePhysicalType.Binary, IndexValueKind.Keyword, "{\"values\":[\"AQID\"]}", BsonType.Binary, "binData")]
+    public void Collection_element_validator_bson_type_matches_the_runtime_conversion_boundary(
+        PortablePhysicalType type,
+        IndexValueKind valueKind,
+        string canonicalJson,
+        BsonType expectedRuntimeType,
+        string expectedValidatorType)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: type,
+            valueKind: valueKind,
+            path: "values",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var storage = Assert.Single(Assert.Single(model.Routes).CollectionElementStorages);
+        var runtimeValue = Assert.Single(MongoDbPhysicalProjectionValues.ResolveCollection(
+            canonicalJson,
+            storage.Projection)).Value;
+        var validatorType = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage)
+            ["$jsonSchema"].AsBsonDocument["properties"].AsBsonDocument
+            [storage.Value.Column.Identifier].AsBsonDocument["bsonType"].AsString;
+
+        Assert.Equal(expectedRuntimeType, runtimeValue.BsonType);
+        Assert.Equal(expectedValidatorType, validatorType);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("simple")]
+    [InlineData("ordinal")]
+    [InlineData("binary")]
+    public void Collection_element_validator_accepts_portable_simple_binary_collation_aliases(string? collation)
+    {
+        var storage = CollectionElementStorageWithCollation(collation);
+
+        _ = MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage);
+    }
+
+    [Theory]
+    [InlineData("nocase")]
+    [InlineData("en")]
+    public void Collection_element_validator_rejects_non_binary_collation(string collation)
+    {
+        var storage = CollectionElementStorageWithCollation(collation);
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbPhysicalSchemaExecutor.CollectionElementValidator(storage));
+
+        Assert.Contains(collation, exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static ExecutableCollectionElementStorageRoute CollectionElementStorageWithCollation(string? collation) =>
+        Assert.Single(Assert.Single(MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.String,
+            valueKind: IndexValueKind.Keyword,
+            path: "values",
+            isNullable: true,
+            collation: collation,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4).Routes).CollectionElementStorages);
+
+    [Theory]
+    [InlineData("{\"resources\":[null]}")]
+    [InlineData("{\"resources\":[\"42\"]}")]
+    [InlineData("{\"resources\":[1,2,3,4,5]}")]
+    public void Collection_projection_conversion_rejects_null_wrong_type_and_bound_overflow(string canonicalJson)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int64,
+            valueKind: IndexValueKind.Number,
+            path: "resources",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var projection = Assert.Single(model.Routes).ProjectedColumns.Single(column =>
+            column.Definition.Path == "resources");
+
+        Assert.Throws<InvalidDataException>(() => MongoDbPhysicalProjectionValues.ResolveCollection(
+            canonicalJson, projection));
     }
 
     [Fact]

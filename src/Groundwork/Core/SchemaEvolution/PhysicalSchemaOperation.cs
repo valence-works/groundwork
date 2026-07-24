@@ -12,6 +12,7 @@ public enum PhysicalSchemaOperationKind
 {
     CreatePrimaryStorage,
     CreateLinkedStorage,
+    CreateCollectionElementStorage,
     CreatePhysicalEntityStorage,
     AddProjectedColumn,
     FinalizeProjectedColumn,
@@ -136,6 +137,26 @@ public sealed class CreateLinkedStorageOperation : PhysicalSchemaOperation
     public ExecutableStorageRoute Route { get; }
 
     public ExecutableStorageObjectRoute Storage => Route.LinkedIndexStorage!;
+}
+
+/// <summary>Creates one typed provider-owned element storage object for a collection projection.</summary>
+public sealed class CreateCollectionElementStorageOperation : PhysicalSchemaOperation
+{
+    internal CreateCollectionElementStorageOperation(
+        ExecutableStorageRoute route,
+        ExecutableCollectionElementStorageRoute storage)
+        : base(
+            PhysicalSchemaOperationKind.CreateCollectionElementStorage,
+            route.StorageUnit,
+            storage.Projection.Definition.LogicalName,
+            PhysicalSchemaOperationCanonicalizer.CollectionElementStorage(storage))
+    {
+        Route = route;
+        Storage = storage;
+    }
+
+    public ExecutableStorageRoute Route { get; }
+    public ExecutableCollectionElementStorageRoute Storage { get; }
 }
 
 public sealed class CreatePhysicalEntityStorageOperation : PhysicalSchemaOperation
@@ -411,6 +432,8 @@ internal static class PhysicalSchemaOperationStorage
             ExecutableStorageObjectRole.PrimaryStorage => route.PrimaryStorage,
             ExecutableStorageObjectRole.LinkedIndexStorage => route.LinkedIndexStorage ??
                 throw new InvalidOperationException($"Route '{route.StorageUnit.Value}' has no linked index storage."),
+            ExecutableStorageObjectRole.CollectionElementStorage => throw new InvalidOperationException(
+                "Collection element storage is projection-specific; resolve it from CreateCollectionElementStorageOperation."),
             _ => throw new ArgumentOutOfRangeException(nameof(target), target, null)
         };
 }
@@ -531,6 +554,25 @@ public sealed class RecordPhysicalSchemaAppliedStateOperation : PhysicalSchemaOp
 
 internal static class PhysicalSchemaOperationCanonicalizer
 {
+    public static string CollectionElementStorage(ExecutableCollectionElementStorageRoute storage) => string.Join(
+        '\u001f',
+        [
+            Storage(storage.Storage),
+            Column(storage.DocumentKind.Column),
+            Column(storage.StorageScope.Column),
+            Column(storage.IdComparisonKey.Column),
+            Column(storage.IdLookupKey.Column),
+            Column(storage.Ordinal.Column),
+            ProjectedColumn(storage.Value),
+            storage.OwnerOrdinalKey.Name.ObjectKind.ToString(),
+            storage.OwnerOrdinalKey.Name.FeatureDefaultLogicalName,
+            storage.OwnerOrdinalKey.Name.LogicalName,
+            storage.OwnerOrdinalKey.Name.Identifier,
+            storage.OwnerOrdinalKey.Name.CollisionScope,
+            storage.OwnerOrdinalKey.Name.NamingOwner.Value,
+            storage.OwnerOrdinalKey.Target.ToString(),
+            .. storage.OwnerOrdinalKey.Columns.Select(column => Column(column.Column))
+        ]);
     public static string PrimaryStorage(ExecutableStorageRoute route) => string.Join(
         '\u001f',
         new[]

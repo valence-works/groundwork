@@ -112,7 +112,11 @@ public static class PhysicalSchemaDiffPlanner
             if (route.LinkedIndexStorage is not null)
                 operations.Add(new CreateLinkedStorageOperation(route));
 
-            foreach (var column in route.ProjectedColumns)
+            operations.AddRange(route.CollectionElementStorages.Select(storage =>
+                new CreateCollectionElementStorageOperation(route, storage)));
+
+            foreach (var column in route.ProjectedColumns.Where(column =>
+                         column.Definition.Cardinality == ProjectionCardinality.Scalar))
             {
                 var addColumn = new AddProjectedColumnOperation(route, column);
                 operations.Add(addColumn);
@@ -299,7 +303,20 @@ public static class PhysicalSchemaDiffPlanner
         }
 
         names.AddRange(route.ProjectedColumns.Select(column =>
-            new PhysicalSchemaResolvedName("ProjectedColumn", column.Definition.LogicalName, column.Column.Identifier, column.Target)));
+            column.Definition.Cardinality == ProjectionCardinality.Scalar
+                ? new PhysicalSchemaResolvedName("ProjectedColumn", column.Definition.LogicalName, column.Column.Identifier, column.Target)
+                : null).Where(name => name is not null).Cast<PhysicalSchemaResolvedName>());
+        names.AddRange(route.CollectionElementStorages.SelectMany(storage => new[]
+        {
+            ObjectName(storage.Storage.Name, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionDocumentKind", storage.DocumentKind.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionStorageScope", storage.StorageScope.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionIdComparisonKey", storage.IdComparisonKey.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionIdLookupKey", storage.IdLookupKey.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionOrdinal", storage.Ordinal.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ColumnName("CollectionValue", storage.Value.Column, ExecutableStorageObjectRole.CollectionElementStorage),
+            ObjectName(storage.OwnerOrdinalKey.Name, ExecutableStorageObjectRole.CollectionElementStorage)
+        }));
         names.AddRange(route.Indexes.Select(index =>
             new PhysicalSchemaResolvedName("PhysicalIndex", index.Identity, index.Name.Identifier, index.Target)));
         return names
@@ -326,7 +343,8 @@ public static class PhysicalSchemaDiffPlanner
         PhysicalSchemaOperationKind.CreatePrimaryStorage => 0,
         PhysicalSchemaOperationKind.CreatePhysicalEntityStorage => 0,
         PhysicalSchemaOperationKind.CreateLinkedStorage => 1,
-        PhysicalSchemaOperationKind.AddProjectedColumn => 2,
+        PhysicalSchemaOperationKind.CreateCollectionElementStorage => 2,
+        PhysicalSchemaOperationKind.AddProjectedColumn => 3,
         // Existing canonical documents must be projected and required fields finalized before
         // unique indexes are created. Linked index backfills run after creation only to reconcile
         // the complete aggregate under the now-validated index definition.
