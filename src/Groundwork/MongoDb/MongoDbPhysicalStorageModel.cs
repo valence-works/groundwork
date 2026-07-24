@@ -277,7 +277,7 @@ public sealed class MongoDbPhysicalNameNormalizer : IProviderPhysicalNameNormali
         ArgumentNullException.ThrowIfNull(context);
         var name = context.LogicalName;
         var maximum = context.ObjectKind == PhysicalObjectKind.PhysicalIndex ? 120 : 120;
-        var isCollection = context.ObjectKind is PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage or PhysicalObjectKind.SchemaHistory;
+        var isCollection = context.ObjectKind is PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage or PhysicalObjectKind.CollectionElementStorage or PhysicalObjectKind.SchemaHistory;
         var invalid = string.IsNullOrWhiteSpace(name) ||
                       name.IndexOf('\0') >= 0 ||
                       (!isCollection && (name.Contains('.', StringComparison.Ordinal) || name.StartsWith('$'))) ||
@@ -312,11 +312,12 @@ public sealed class MongoDbPhysicalNameNormalizer : IProviderPhysicalNameNormali
 
     public string GetCollisionScope(ProviderPhysicalNameContext context) => context.ObjectKind switch
     {
-        PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage => "mongodb:collections",
+        PhysicalObjectKind.PrimaryStorage or PhysicalObjectKind.LinkedIndexStorage or PhysicalObjectKind.CollectionElementStorage => "mongodb:collections",
         PhysicalObjectKind.SchemaHistory => "mongodb:collections",
         PhysicalObjectKind.PhysicalIndex => $"mongodb:{context.StorageUnit.Value}:indexes",
         PhysicalObjectKind.EnvelopeField or PhysicalObjectKind.ProjectedField => $"mongodb:{context.StorageUnit.Value}:primary-fields",
         PhysicalObjectKind.LinkedIndexField or PhysicalObjectKind.LinkedProjectedField => $"mongodb:{context.StorageUnit.Value}:linked-fields",
+        PhysicalObjectKind.CollectionElementField => $"mongodb:{context.StorageUnit.Value}:collection-element-fields",
         _ => throw new ArgumentOutOfRangeException(nameof(context), context.ObjectKind, null)
     };
 }

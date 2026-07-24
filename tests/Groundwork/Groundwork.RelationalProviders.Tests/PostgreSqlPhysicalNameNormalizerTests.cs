@@ -14,6 +14,19 @@ namespace Groundwork.RelationalProviders.Tests;
 public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests
 {
     [Fact]
+    public void CollectionElementFieldsUseTheirDedicatedStorageUnitNamespace()
+    {
+        var context = new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("workItem"),
+            PhysicalObjectKind.CollectionElementField,
+            "resource_value");
+
+        Assert.Equal(
+            "workItem:collection-element-columns",
+            PostgreSqlGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+    }
+
+    [Fact]
     public void PhysicalIndexesUseStorageUnitQualifiedNamesInTheSchemaGlobalRelationNamespace()
     {
         var normalizer = PostgreSqlGroundworkCapabilities.PhysicalNames;

@@ -166,6 +166,59 @@ public static class ExecutableStorageRouteCompiler
             projections.Add(new ExecutableProjectedColumnRoute(projection, column, projectedTarget, name));
         }
 
+        var collectionElementStorages = new List<ExecutableCollectionElementStorageRoute>();
+        foreach (var projection in projections.Where(projection =>
+                     projection.Definition.Cardinality == ProjectionCardinality.CollectionElements))
+        {
+            var featureDefault = CollectionElementStorageLogicalName(projection.Definition.LogicalName);
+            expectedNames.Add((PhysicalObjectKind.CollectionElementStorage, featureDefault));
+            var name = RequireName(
+                providerDefinition,
+                PhysicalObjectKind.CollectionElementStorage,
+                featureDefault,
+                target,
+                diagnostics);
+            if (name is null)
+                continue;
+            ExecutableColumnRoute? Field(string suffix)
+            {
+                var featureDefault = $"{projection.Definition.LogicalName}__{suffix}";
+                expectedNames.Add((PhysicalObjectKind.CollectionElementField, featureDefault));
+                var fieldName = RequireName(
+                    providerDefinition,
+                    PhysicalObjectKind.CollectionElementField,
+                    featureDefault,
+                    target,
+                    diagnostics);
+                return fieldName is null ? null : new ExecutableColumnRoute(suffix, fieldName.Identifier);
+            }
+            var documentKind = Field("document_kind");
+            var storageScope = Field("storage_scope");
+            var idComparison = Field("id_comparison_key");
+            var idLookup = Field("id_lookup_key");
+            var ordinal = Field("ordinal");
+            var value = Field("value");
+            if (new[] { documentKind, storageScope, idComparison, idLookup, ordinal, value }.Any(field => field is null))
+                continue;
+            collectionElementStorages.Add(new ExecutableCollectionElementStorageRoute(
+                new ExecutableStorageObjectRoute(
+                    ExecutableStorageObjectRole.CollectionElementStorage,
+                    name,
+                    definition.SchemaVersion,
+                    definition.Evolution),
+                projection,
+                documentKind!,
+                storageScope!,
+                idComparison!,
+                idLookup!,
+                ordinal!,
+                new ExecutableProjectedColumnRoute(
+                    projection.Definition,
+                    value!,
+                    ExecutableStorageObjectRole.CollectionElementStorage,
+                    name)));
+        }
+
         var indexes = new List<ExecutablePhysicalIndexRoute>();
         foreach (var index in definition.Indexes)
         {
@@ -280,6 +333,7 @@ public static class ExecutableStorageRouteCompiler
             primaryKey,
             auxiliaryKey,
             projections,
+            collectionElementStorages,
             indexes,
             maintenance,
             queryPaths,
@@ -288,6 +342,9 @@ public static class ExecutableStorageRouteCompiler
             fingerprint: string.Empty);
         return route.WithFingerprint(ExecutableStorageRouteSerializer.CreateFingerprint(route));
     }
+
+    internal static string CollectionElementStorageLogicalName(string projectionLogicalName) =>
+        $"{projectionLogicalName}__elements";
 
     private static ExecutableDocumentEnvelopeRoute? CompileEnvelope(
         ProviderPhysicalTableDefinition definition,

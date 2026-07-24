@@ -5,6 +5,9 @@ using Groundwork.Core.PhysicalStorage;
 
 namespace Groundwork.Relational.Physicalization;
 
+/// <summary>One typed collection element ready for a provider-owned element row.</summary>
+public sealed record RelationalCollectionElementProjectionValue(int Ordinal, object Value);
+
 /// <summary>
 /// Converts authoritative canonical JSON into portable typed projection values. Live maintenance
 /// and provider backfills use this one conversion boundary so they cannot produce different rows.
@@ -24,6 +27,26 @@ public static class RelationalPhysicalProjectionValues
             column => column.Definition.LogicalName,
             column => Read(document.RootElement, column.Definition),
             StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// Materializes every immediate canonical collection element through the same portable type
+    /// boundary used by relational writers. Ordinals intentionally preserve duplicates and source
+    /// order, so a later element-row writer can use an owner/ordinal key without set semantics.
+    /// </summary>
+    public static IReadOnlyList<RelationalCollectionElementProjectionValue> ReadCollection(
+        string canonicalJson,
+        ExecutableProjectedColumnRoute projection)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(canonicalJson);
+        ArgumentNullException.ThrowIfNull(projection);
+        CanonicalCollectionElementProjection.RequireCollection(projection.Definition);
+
+        return CanonicalCollectionElementProjection.Read(canonicalJson, projection.Definition)
+            .Select(element => new RelationalCollectionElementProjectionValue(
+                element.Ordinal,
+                ReadCollectionValue(element.Value, projection.Definition)))
+            .ToArray();
     }
 
     public static object ConvertScalar(string value, PortablePhysicalType type)
@@ -189,6 +212,38 @@ public static class RelationalPhysicalProjectionValues
         }
     }
 
+    private static object ReadCollectionValue(JsonElement element, ProjectedColumnDefinition definition)
+    {
+        try
+        {
+            if (element.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                throw new FormatException("A collection-element projection cannot contain JSON null.");
+            var value = definition.Type switch
+            {
+                PortablePhysicalType.String => element.GetString() ?? throw new FormatException(
+                    "A string collection-element projection requires a JSON string."),
+                PortablePhysicalType.Int32 or PortablePhysicalType.Int64 or PortablePhysicalType.Decimal =>
+                    ConvertScalar(CollectionNumberText(element), definition),
+                PortablePhysicalType.Boolean => ReadBoolean(element),
+                PortablePhysicalType.DateTime => ParseDateTime(element.GetString() ?? throw new FormatException(
+                    "A date-time collection-element projection requires a JSON string.")),
+                PortablePhysicalType.Guid => element.GetGuid(),
+                PortablePhysicalType.Binary => element.GetBytesFromBase64(),
+                _ => throw new ArgumentOutOfRangeException(nameof(definition), definition.Type, null)
+            };
+            if (value is string text && definition.Type == PortablePhysicalType.String)
+                PhysicalProjectionValueValidation.ValidateStringLength(text, definition);
+            return value;
+        }
+        catch (Exception exception) when (exception is (FormatException or InvalidOperationException or OverflowException) &&
+                                         exception is not PhysicalProjectionValueValidationException)
+        {
+            throw new InvalidDataException(
+                $"Canonical JSON collection path '{definition.Path}' cannot be converted to '{definition.Type}'.",
+                exception);
+        }
+    }
+
     private static bool ReadBoolean(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.True => true,
@@ -204,4 +259,8 @@ public static class RelationalPhysicalProjectionValues
         JsonValueKind.String => element.GetString()!,
         _ => throw new FormatException("A numeric projection requires a JSON number or numeric string.")
     };
+
+    private static string CollectionNumberText(JsonElement element) => element.ValueKind == JsonValueKind.Number
+        ? element.GetRawText()
+        : throw new FormatException("A numeric collection-element projection requires a JSON number.");
 }

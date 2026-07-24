@@ -12,6 +12,19 @@ namespace Groundwork.Sqlite.Tests;
 public sealed class SqlitePhysicalNameNormalizerTests
 {
     [Fact]
+    public void CollectionElementFieldsUseTheirDedicatedStorageUnitNamespace()
+    {
+        var context = new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("workItem"),
+            PhysicalObjectKind.CollectionElementField,
+            "resource_value");
+
+        Assert.Equal(
+            "workItem:collection-element-columns",
+            SqliteGroundworkCapabilities.PhysicalNames.GetCollisionScope(context));
+    }
+
+    [Fact]
     public void PhysicalIndexesUseStorageUnitQualifiedNamesInTheSchemaGlobalNamespace()
     {
         var normalizer = SqliteGroundworkCapabilities.PhysicalNames;

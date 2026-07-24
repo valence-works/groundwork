@@ -488,6 +488,19 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Fact]
+    public void Provider_normalization_scopes_collection_element_fields_separately()
+    {
+        var context = new ProviderPhysicalNameContext(
+            new StorageUnitIdentity("workItem"),
+            PhysicalObjectKind.CollectionElementField,
+            "resource_value");
+
+        Assert.Equal(
+            "mongodb:workItem:collection-element-fields",
+            MongoDbPhysicalNameNormalizer.Instance.GetCollisionScope(context));
+    }
+
+    [Fact]
     public void Provider_normalization_truncates_unicode_letters_by_UTF8_bytes()
     {
         var logicalName = string.Concat(Enumerable.Repeat("界", 100));
@@ -669,6 +682,63 @@ public sealed class MongoDbPhysicalStorageModelTests
             [projection])[projection].Value.AsInt64;
 
         Assert.Equal(first + 1, second);
+    }
+
+    [Fact]
+    public void Collection_projection_conversion_preserves_ordinals_duplicates_and_native_value_types()
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int64,
+            valueKind: IndexValueKind.Number,
+            path: "resources",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var projection = Assert.Single(model.Routes).ProjectedColumns.Single(column =>
+            column.Definition.Path == "resources");
+
+        var values = MongoDbPhysicalProjectionValues.ResolveCollection(
+            "{\"resources\":[42,9007199254740991,42]}", projection);
+
+        Assert.Collection(
+            values,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal(42L, first.Value.AsInt64);
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal(9007199254740991L, second.Value.AsInt64);
+            },
+            third =>
+            {
+                Assert.Equal(2, third.Ordinal);
+                Assert.Equal(42L, third.Value.AsInt64);
+            });
+    }
+
+    [Theory]
+    [InlineData("{\"resources\":[null]}")]
+    [InlineData("{\"resources\":[\"42\"]}")]
+    [InlineData("{\"resources\":[1,2,3,4,5]}")]
+    public void Collection_projection_conversion_rejects_null_wrong_type_and_bound_overflow(string canonicalJson)
+    {
+        var model = MongoDbPhysicalStorageConformanceTests.Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            projectedType: PortablePhysicalType.Int64,
+            valueKind: IndexValueKind.Number,
+            path: "resources",
+            isNullable: true,
+            cardinality: ProjectionCardinality.CollectionElements,
+            maxCollectionElements: 4);
+        var projection = Assert.Single(model.Routes).ProjectedColumns.Single(column =>
+            column.Definition.Path == "resources");
+
+        Assert.Throws<InvalidDataException>(() => MongoDbPhysicalProjectionValues.ResolveCollection(
+            canonicalJson, projection));
     }
 
     [Fact]

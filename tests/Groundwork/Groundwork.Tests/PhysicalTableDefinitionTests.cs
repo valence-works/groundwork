@@ -114,10 +114,88 @@ public sealed class PhysicalTableDefinitionTests
 
         Assert.Equal(ProjectionCardinality.CollectionElements, Assert.Single(restored.ProjectedColumns).Definition.Cardinality);
         Assert.Equal(8, Assert.Single(restored.ProjectedColumns).Definition.MaxCollectionElements);
+        var elementStorage = Assert.Single(restored.CollectionElementStorages);
+        Assert.Equal(ExecutableStorageObjectRole.CollectionElementStorage, elementStorage.Storage.Role);
+        Assert.Equal("redirect_uri__elements", elementStorage.Storage.Name.Identifier);
+        Assert.Same(Assert.Single(restored.ProjectedColumns), elementStorage.Projection);
         Assert.Throws<NotSupportedException>(() =>
             RelationalPhysicalProjectionValues.Read(
                 "{\"redirectUris\":[\"https://one.example/callback\"]}",
                 restored.ProjectedColumns));
+
+        var values = RelationalPhysicalProjectionValues.ReadCollection(
+            "{\"redirectUris\":[\"https://one.example/callback\",\"https://two.example/callback\",\"https://one.example/callback\"]}",
+            Assert.Single(restored.ProjectedColumns));
+
+        Assert.Collection(
+            values,
+            first =>
+            {
+                Assert.Equal(0, first.Ordinal);
+                Assert.Equal("https://one.example/callback", first.Value);
+            },
+            second =>
+            {
+                Assert.Equal(1, second.Ordinal);
+                Assert.Equal("https://two.example/callback", second.Value);
+            },
+            third =>
+            {
+                Assert.Equal(2, third.Ordinal);
+                Assert.Equal("https://one.example/callback", third.Value);
+            });
+    }
+
+    [Theory]
+    [InlineData("redirectUris..callback", PortablePhysicalType.String, null, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Json, null, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Int32, 10, null)]
+    [InlineData("redirectUris", PortablePhysicalType.Boolean, null, "ordinal")]
+    public void Collection_element_projection_rejects_non_portable_path_type_length_and_collation(
+        string path,
+        PortablePhysicalType type,
+        int? length,
+        string? collation)
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                path,
+                type,
+                Length: length,
+                Collation: collation,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+
+        var result = PhysicalStorageResolver.Resolve(
+            WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Code == "GW-PHYSICAL-018");
+    }
+
+    [Theory]
+    [InlineData("{\"redirectUris\":[null]}")]
+    [InlineData("{\"redirectUris\":[42]}")]
+    [InlineData("{\"redirectUris\":[\"one\",\"two\",\"three\",\"four\",\"five\",\"six\",\"seven\",\"eight\",\"nine\"]}")]
+    public void Relational_collection_materialization_rejects_null_wrong_type_and_bound_overflow(string canonicalJson)
+    {
+        var definition = PhysicalTableDefinition.PhysicalEntityTable(
+            "applications",
+            [new ProjectedColumnDefinition(
+                "redirect_uri",
+                "redirectUris",
+                PortablePhysicalType.String,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8)]);
+        var route = Assert.Single(ExecutableStorageRouteCompiler.Compile(
+            PhysicalStorageResolver.Resolve(
+                WithDefinition(definition), PhysicalNamePolicy.Identity, ProviderPhysicalNameNormalizer.Identity).Definitions).Routes);
+
+        Assert.Throws<InvalidDataException>(() => RelationalPhysicalProjectionValues.ReadCollection(
+            canonicalJson,
+            Assert.Single(route.ProjectedColumns)));
     }
 
     [Fact]

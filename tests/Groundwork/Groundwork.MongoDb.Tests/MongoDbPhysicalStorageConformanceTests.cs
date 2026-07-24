@@ -2274,7 +2274,9 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
         bool isUnique = false,
         MissingValueBehavior missingValueBehavior = MissingValueBehavior.Excluded,
         StringIdentityCasePolicy identityCasePolicy = StringIdentityCasePolicy.Ordinal,
-        QueryPagingSupport pagingSupport = QueryPagingSupport.Offset)
+        QueryPagingSupport pagingSupport = QueryPagingSupport.Offset,
+        ProjectionCardinality cardinality = ProjectionCardinality.Scalar,
+        int? maxCollectionElements = null)
     {
         var binding = new SharedStorageBinding("runtime");
         var projected = new ProjectedColumnDefinition(
@@ -2284,7 +2286,9 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
             Precision: projectedType == PortablePhysicalType.Decimal ? 18 : null,
             Scale: projectedType == PortablePhysicalType.Decimal ? 4 : null,
             IsNullable: isNullable,
-            DefaultValue: defaultValue);
+            DefaultValue: defaultValue,
+            Cardinality: cardinality,
+            MaxCollectionElements: maxCollectionElements);
         var indexIdentity = $"by-{path}";
         var physicalIndexColumns = new List<PhysicalIndexColumnDefinition>
         {

@@ -8,7 +8,8 @@ namespace Groundwork.Core.PhysicalStorage;
 public enum ExecutableStorageObjectRole
 {
     PrimaryStorage,
-    LinkedIndexStorage
+    LinkedIndexStorage,
+    CollectionElementStorage
 }
 
 public enum ExecutableMaintenanceOperation
@@ -172,6 +173,17 @@ public sealed record ExecutableProjectedColumnRoute(
     ExecutableColumnRoute Column,
     ExecutableStorageObjectRole Target,
     ProviderPhysicalObjectName Name);
+
+/// <summary>One provider-owned, typed element storage object for a bounded collection projection.</summary>
+public sealed record ExecutableCollectionElementStorageRoute(
+    ExecutableStorageObjectRoute Storage,
+    ExecutableProjectedColumnRoute Projection,
+    ExecutableColumnRoute DocumentKind,
+    ExecutableColumnRoute StorageScope,
+    ExecutableColumnRoute IdComparisonKey,
+    ExecutableColumnRoute IdLookupKey,
+    ExecutableColumnRoute Ordinal,
+    ExecutableProjectedColumnRoute Value);
 
 public sealed record ExecutableIndexColumnRoute(
     ExecutableColumnRoute Column,
@@ -344,6 +356,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         ExecutableKeyRoute primaryKey,
         ExecutableKeyRoute? auxiliaryKey,
         IReadOnlyList<ExecutableProjectedColumnRoute> projectedColumns,
+        IReadOnlyList<ExecutableCollectionElementStorageRoute> collectionElementStorages,
         IReadOnlyList<ExecutablePhysicalIndexRoute> indexes,
         IReadOnlyList<ExecutableMaintenanceRoute> maintenanceRoutes,
         IReadOnlyList<ExecutableQueryPathRoute> candidateQueryPaths,
@@ -365,6 +378,8 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         PrimaryKey = primaryKey;
         AuxiliaryKey = auxiliaryKey;
         ProjectedColumns = Array.AsReadOnly(projectedColumns.OrderBy(column => column.Definition.LogicalName, StringComparer.Ordinal).ToArray());
+        CollectionElementStorages = Array.AsReadOnly(collectionElementStorages
+            .OrderBy(storage => storage.Projection.Definition.LogicalName, StringComparer.Ordinal).ToArray());
         Indexes = Array.AsReadOnly(indexes.OrderBy(index => index.Identity, StringComparer.Ordinal).ToArray());
         MaintenanceRoutes = Array.AsReadOnly(maintenanceRoutes.OrderBy(route => route.Operation).ToArray());
         CandidateQueryPaths = Array.AsReadOnly(candidateQueryPaths
@@ -390,6 +405,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
     public ExecutableKeyRoute PrimaryKey { get; }
     public ExecutableKeyRoute? AuxiliaryKey { get; }
     public IReadOnlyList<ExecutableProjectedColumnRoute> ProjectedColumns { get; }
+    public IReadOnlyList<ExecutableCollectionElementStorageRoute> CollectionElementStorages { get; }
     public IReadOnlyList<ExecutablePhysicalIndexRoute> Indexes { get; }
     public IReadOnlyList<ExecutableMaintenanceRoute> MaintenanceRoutes { get; }
     public IReadOnlyList<ExecutableQueryPathRoute> CandidateQueryPaths { get; }
@@ -413,6 +429,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
             PrimaryKey,
             AuxiliaryKey,
             ProjectedColumns,
+            CollectionElementStorages,
             Indexes,
             MaintenanceRoutes,
             CandidateQueryPaths,
@@ -458,6 +475,7 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         PrimaryKey.Equals(other.PrimaryKey) &&
         Equals(AuxiliaryKey, other.AuxiliaryKey) &&
         ProjectedColumns.SequenceEqual(other.ProjectedColumns) &&
+        CollectionElementStorages.SequenceEqual(other.CollectionElementStorages) &&
         Indexes.SequenceEqual(other.Indexes) &&
         MaintenanceRoutes.SequenceEqual(other.MaintenanceRoutes) &&
         CandidateQueryPaths.SequenceEqual(other.CandidateQueryPaths) &&
@@ -485,6 +503,8 @@ public sealed class ExecutableStorageRoute : IEquatable<ExecutableStorageRoute>
         hash.Add(AuxiliaryKey);
         foreach (var column in ProjectedColumns)
             hash.Add(column);
+        foreach (var storage in CollectionElementStorages)
+            hash.Add(storage);
         foreach (var index in Indexes)
             hash.Add(index);
         foreach (var maintenance in MaintenanceRoutes)
