@@ -166,7 +166,9 @@ public sealed record DiagnosticQueryHandlerCapabilities(
     bool SupportsExactCount,
     bool SupportsLatestPerKey);
 
-public sealed record DiagnosticRecordStoreCapabilities(DiagnosticQueryHandlerCapabilities Query);
+public sealed record DiagnosticRecordStoreCapabilities(
+    DiagnosticQueryHandlerCapabilities Query,
+    DiagnosticGroupedQueryHandlerCapabilities GroupedQuery);
 
 public enum DiagnosticOperationKind
 {
@@ -553,7 +555,14 @@ public sealed record DiagnosticRecordStoreHandlers(
     IDiagnosticInspectHandler Inspect,
     IDiagnosticTrimHandler Trim)
 {
-    public DiagnosticRecordStoreCapabilities Capabilities => new(Query.Capabilities);
+    /// <summary>
+    /// A provider installs this only with a native grouped-reduction executor. The default rejects
+    /// requests before any provider I/O, so ordinary query handlers can never accidentally group
+    /// in the client.
+    /// </summary>
+    public IDiagnosticGroupedQueryHandler GroupedQuery { get; init; } = UnsupportedDiagnosticGroupedQueryHandler.Instance;
+
+    public DiagnosticRecordStoreCapabilities Capabilities => new(Query.Capabilities, GroupedQuery.Capabilities);
 }
 
 public interface IDiagnosticRecordStore
@@ -569,6 +578,11 @@ public interface IDiagnosticRecordStore
         DiagnosticRecordQuery query,
         CancellationToken cancellationToken = default) =>
         Handlers.Query.QueryAsync(query, cancellationToken);
+
+    ValueTask<DiagnosticRecordGroupPage> QueryGroupsAsync(
+        DiagnosticRecordGroupQuery query,
+        CancellationToken cancellationToken = default) =>
+        Handlers.GroupedQuery.QueryGroupsAsync(query, cancellationToken);
 
     ValueTask<DiagnosticStreamStatistics> InspectAsync(
         DiagnosticStreamInspectionRequest request,

@@ -28,6 +28,7 @@ public sealed class DiagnosticRecordInstrumentationTests
 
         await store.AppendAsync(Batch());
         await store.QueryAsync(new(Scope, Stream, 25, IncludeExactCount: true, LatestPerKeyField: "latest-key-secret"));
+        await store.QueryGroupsAsync(GroupQuery());
         await store.InspectAsync(new(Scope, Stream));
         await store.TrimAsync(Trim());
 
@@ -35,7 +36,7 @@ public sealed class DiagnosticRecordInstrumentationTests
         Assert.Equal("Groundwork.DiagnosticRecords", DiagnosticRecordTelemetry.MeterName);
         Assert.Equal("1.0.0", DiagnosticRecordTelemetry.Version);
         Assert.Equal(
-            ["groundwork.diagnostic_records.append", "groundwork.diagnostic_records.query", "groundwork.diagnostic_records.inspect", "groundwork.diagnostic_records.trim"],
+            ["groundwork.diagnostic_records.append", "groundwork.diagnostic_records.query", "groundwork.diagnostic_records.query_groups", "groundwork.diagnostic_records.inspect", "groundwork.diagnostic_records.trim"],
             capture.Activities.Select(x => x.OperationName));
         Assert.All(capture.Activities, activity =>
         {
@@ -49,7 +50,11 @@ public sealed class DiagnosticRecordInstrumentationTests
         AssertActivityOutcome(capture.Activities[0], "committed", "success");
         AssertActivityOutcome(capture.Activities[1], "success", "success");
         AssertActivityOutcome(capture.Activities[2], "success", "success");
-        AssertActivityOutcome(capture.Activities[3], "completed", "success");
+        AssertActivityOutcome(capture.Activities[3], "success", "success");
+        AssertActivityOutcome(capture.Activities[4], "completed", "success");
+        Assert.Equal(25, capture.Activities[2].GetTagItem(DiagnosticRecordTelemetry.Tags.GroupTake));
+        Assert.Equal(true, capture.Activities[2].GetTagItem(DiagnosticRecordTelemetry.Tags.GroupPredicatePresent));
+        Assert.Equal(false, capture.Activities[2].GetTagItem(DiagnosticRecordTelemetry.Tags.GroupContinuationPresent));
 
         AssertMeasurement(capture, DiagnosticRecordTelemetry.Instruments.AppendBatches, 1L,
             (DiagnosticRecordTelemetry.Tags.Disposition, DiagnosticRecordTelemetry.Dispositions.Accepted));
@@ -60,7 +65,7 @@ public sealed class DiagnosticRecordInstrumentationTests
         AssertMeasurement(capture, DiagnosticRecordTelemetry.Instruments.TrimDeletedRecords, 4L);
         Assert.Equal(2, capture.Measurements.Count(x =>
             x.Name == DiagnosticRecordTelemetry.Instruments.RetainedRecords && Equals(x.Value, 5L)));
-        Assert.Equal(4, capture.Measurements.Count(x => x.Name == DiagnosticRecordTelemetry.Instruments.OperationDuration));
+        Assert.Equal(5, capture.Measurements.Count(x => x.Name == DiagnosticRecordTelemetry.Instruments.OperationDuration));
         Assert.All(capture.Measurements, measurement =>
         {
             Assert.Equal("test-provider", measurement.Tags[DiagnosticRecordTelemetry.Tags.Provider]);
@@ -77,6 +82,7 @@ public sealed class DiagnosticRecordInstrumentationTests
         Assert.DoesNotContain("record-secret", serializedTelemetry, StringComparison.Ordinal);
         Assert.DoesNotContain("nonce-secret", serializedTelemetry, StringComparison.Ordinal);
         Assert.DoesNotContain("latest-key-secret", serializedTelemetry, StringComparison.Ordinal);
+        Assert.DoesNotContain("profile-secret", serializedTelemetry, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -108,6 +114,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Every_operation_classifies_provider_failures(string operation)
@@ -123,6 +130,7 @@ public sealed class DiagnosticRecordInstrumentationTests
             {
                 case "append": await store.AppendAsync(Batch()); break;
                 case "query": await store.QueryAsync(new(Scope, Stream, 1)); break;
+                case "query_groups": await store.QueryGroupsAsync(GroupQuery()); break;
                 case "inspect": await store.InspectAsync(new(Scope, Stream)); break;
                 case "trim": await store.TrimAsync(Trim()); break;
             }
@@ -136,6 +144,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public void Enabled_listeners_preserve_synchronous_provider_throws(string operation)
@@ -160,6 +169,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public void Disabled_listeners_preserve_synchronous_provider_throws(string operation)
@@ -175,6 +185,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public void Enabled_listeners_preserve_synchronous_null_request_validation(string operation)
@@ -197,6 +208,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public void Disabled_listeners_preserve_synchronous_null_request_validation(string operation)
@@ -211,6 +223,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Completed_failed_ValueTasks_remain_awaitable_instead_of_throwing_synchronously(string operation)
@@ -238,6 +251,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Completed_canceled_ValueTasks_remain_awaitable_and_canceled(string operation)
@@ -269,6 +283,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Completed_canceled_ValueTasks_without_a_requested_token_preserve_canceled_status(string operation)
@@ -292,6 +307,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Completed_operations_restore_the_callers_ambient_activity(string operation)
@@ -311,6 +327,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     [Theory]
     [InlineData("append")]
     [InlineData("query")]
+    [InlineData("query_groups")]
     [InlineData("inspect")]
     [InlineData("trim")]
     public async Task Incomplete_operations_restore_the_callers_ambient_activity(string operation)
@@ -369,7 +386,7 @@ public sealed class DiagnosticRecordInstrumentationTests
         Assert.Equal(DiagnosticAppendStatus.Committed, (await operation).Status);
         Assert.Equal(1, inner.AppendCalls);
         Assert.All(
-            [nameof(store.AppendAsync), nameof(store.QueryAsync), nameof(store.InspectAsync), nameof(store.TrimAsync)],
+            [nameof(store.AppendAsync), nameof(store.QueryAsync), nameof(store.QueryGroupsAsync), nameof(store.InspectAsync), nameof(store.TrimAsync)],
             methodName => Assert.Null(typeof(InstrumentedDiagnosticRecordStore).GetMethod(methodName)!
                 .GetCustomAttribute<System.Runtime.CompilerServices.AsyncStateMachineAttribute>()));
     }
@@ -407,6 +424,17 @@ public sealed class DiagnosticRecordInstrumentationTests
 
     private static DiagnosticTrimRequest Trim() => DiagnosticTrimRequest.Create(Scope, Stream, OperationId(), 5);
 
+    private static DiagnosticRecordGroupQuery GroupQuery() => new(
+        Scope,
+        Stream,
+        "profile-secret",
+        25,
+        new("start"),
+        new DiagnosticRecordGroupPredicate.Comparison(
+            "status",
+            DiagnosticPredicateOperator.Equal,
+            [DiagnosticFieldValue.Int64(2)]));
+
     private static DiagnosticOperationId OperationId() => new(Now, "nonce-secret");
 
     private static void InvokeWithoutAwait(
@@ -421,6 +449,9 @@ public sealed class DiagnosticRecordInstrumentationTests
                 break;
             case "query":
                 _ = store.QueryAsync(useNullRequest ? null! : new(Scope, Stream, 1));
+                break;
+            case "query_groups":
+                _ = store.QueryGroupsAsync(useNullRequest ? null! : GroupQuery());
                 break;
             case "inspect":
                 _ = store.InspectAsync(useNullRequest ? null! : new(Scope, Stream));
@@ -437,6 +468,7 @@ public sealed class DiagnosticRecordInstrumentationTests
     {
         "append" => store.AppendAsync(Batch()).AsTask(),
         "query" => store.QueryAsync(new(Scope, Stream, 1)).AsTask(),
+        "query_groups" => store.QueryGroupsAsync(GroupQuery()).AsTask(),
         "inspect" => store.InspectAsync(new(Scope, Stream)).AsTask(),
         "trim" => store.TrimAsync(Trim()).AsTask(),
         _ => throw new ArgumentOutOfRangeException(nameof(operation))
@@ -478,10 +510,11 @@ public sealed class DiagnosticRecordInstrumentationTests
         IDiagnosticRecordStore,
         IDiagnosticAppendHandler,
         IDiagnosticQueryHandler,
+        IDiagnosticGroupedQueryHandler,
         IDiagnosticInspectHandler,
         IDiagnosticTrimHandler
     {
-        public StubStore() => Handlers = new(this, this, this, this);
+        public StubStore() => Handlers = new(this, this, this, this) { GroupedQuery = this };
 
         public Exception? Failure { get; init; }
         public DiagnosticAppendStatus AppendStatus { get; init; } = DiagnosticAppendStatus.Committed;
@@ -495,6 +528,11 @@ public sealed class DiagnosticRecordInstrumentationTests
         public DiagnosticRecordStoreHandlers Handlers { get; }
         public DiagnosticQueryHandlerCapabilities Capabilities { get; } = new(
             Enum.GetValues<DiagnosticPredicateOperator>().ToHashSet(), true, true, true, true, true);
+        DiagnosticGroupedQueryHandlerCapabilities IDiagnosticGroupedQueryHandler.Capabilities { get; } = new(
+            true,
+            Enum.GetValues<DiagnosticGroupReducerKind>().ToHashSet(),
+            Enum.GetValues<DiagnosticPredicateOperator>().ToHashSet(),
+            true);
 
         public ValueTask<DiagnosticAppendResult> AppendAsync(DiagnosticRecordBatch batch, CancellationToken cancellationToken = default)
         {
@@ -530,6 +568,26 @@ public sealed class DiagnosticRecordInstrumentationTests
                 return FailAsync<DiagnosticRecordPage>(Failure);
             ThrowIfConfigured();
             var result = new DiagnosticRecordPage([], null, query.IncludeExactCount ? 5 : null);
+            if (Completion is not null)
+                return CompleteAfterAsync(Completion, result);
+            return CompleteAsynchronously ? CompleteAsync(result) : ValueTask.FromResult(result);
+        }
+
+        public ValueTask<DiagnosticRecordGroupPage> QueryGroupsAsync(
+            DiagnosticRecordGroupQuery query,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(query);
+            if (ReturnCompletedCancellationWithoutToken)
+                return CompleteCanceledWithoutToken<DiagnosticRecordGroupPage>();
+            if (CompletedCancellationToken is { } configuredCancellation)
+                return ValueTask.FromCanceled<DiagnosticRecordGroupPage>(configuredCancellation);
+            if (ReturnCompletedFailure)
+                return ValueTask.FromException<DiagnosticRecordGroupPage>(Failure!);
+            if (CompleteAsynchronously && Failure is not null)
+                return FailAsync<DiagnosticRecordGroupPage>(Failure);
+            ThrowIfConfigured();
+            var result = new DiagnosticRecordGroupPage([], null);
             if (Completion is not null)
                 return CompleteAfterAsync(Completion, result);
             return CompleteAsynchronously ? CompleteAsync(result) : ValueTask.FromResult(result);
@@ -672,6 +730,7 @@ public static class DiagnosticRecordInstrumentationAssertions
         var instrumented = Assert.IsType<InstrumentedDiagnosticRecordStore>(store.Handlers.Append);
 
         Assert.Same(instrumented, store.Handlers.Query);
+        Assert.Same(instrumented, store.Handlers.GroupedQuery);
         Assert.Same(instrumented, store.Handlers.Inspect);
         Assert.Same(instrumented, store.Handlers.Trim);
         Assert.Equal(new DiagnosticRecordTelemetryIdentity(provider, "diagnostic-records"), instrumented.Identity);

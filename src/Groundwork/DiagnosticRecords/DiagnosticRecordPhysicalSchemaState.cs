@@ -120,6 +120,49 @@ public sealed record DiagnosticRecordPhysicalSchemaState(
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
+            writer.WritePropertyName("groupReductionProfiles");
+            writer.WriteStartArray();
+            foreach (var profile in (definition.GroupReductionProfiles ?? []).OrderBy(profile => profile.Name, StringComparer.Ordinal))
+            {
+                writer.WriteStartObject();
+                writer.WriteString("name", profile.Name);
+                writer.WriteString("groupKeyField", profile.GroupKeyField);
+                writer.WriteNumber("maxTake", profile.MaxTake);
+                writer.WriteNumber("maxUnionValues", profile.MaxUnionValues);
+                writer.WritePropertyName("reducers");
+                writer.WriteStartArray();
+                foreach (var reducer in profile.Reducers.OrderBy(reducer => reducer.Alias, StringComparer.Ordinal))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("alias", reducer.Alias);
+                    writer.WriteNumber("kind", (int)reducer.Kind);
+                    writer.WriteString("field", reducer.Field);
+                    if (reducer.OrderField is null) writer.WriteNull("orderField"); else writer.WriteString("orderField", reducer.OrderField);
+                    if (reducer.OrderDirection is null) writer.WriteNull("orderDirection"); else writer.WriteNumber("orderDirection", (int)reducer.OrderDirection.Value);
+                    if (reducer.TieBreak is null) writer.WriteNull("tieBreak"); else writer.WriteNumber("tieBreak", (int)reducer.TieBreak.Value);
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+                writer.WritePropertyName("allowedPredicates");
+                writer.WriteStartArray();
+                foreach (var allowance in profile.AllowedPredicates.OrderBy(allowance => allowance.Alias, StringComparer.Ordinal))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("alias", allowance.Alias);
+                    writer.WritePropertyName("operators");
+                    writer.WriteStartArray();
+                    foreach (var operation in allowance.SupportedPredicates.Order()) writer.WriteNumberValue((int)operation);
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+                writer.WritePropertyName("orderableAliases");
+                writer.WriteStartArray();
+                foreach (var alias in profile.OrderableAliases.OrderBy(alias => alias, StringComparer.Ordinal)) writer.WriteStringValue(alias);
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
             writer.WriteString("comparisonAlgorithms", algorithmManifest);
             writer.WriteEndObject();
         }

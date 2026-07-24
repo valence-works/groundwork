@@ -63,7 +63,7 @@ uncertain-acknowledgement case so a caller can inspect or safely retry.
 
 ## Telemetry contract
 
-Every shipped provider routes its public store and all four entries in
+Every shipped provider routes its public store and all entries in
 `DiagnosticRecordStoreHandlers` through `InstrumentedDiagnosticRecordStore`. The decorator accepts
 an immutable, bounded `DiagnosticRecordTelemetryIdentity`; provider and store values contain at most
 64 lowercase ASCII letters, digits, periods, underscores, or hyphens. Application-owned handlers can
@@ -85,6 +85,7 @@ additive instruments or tags must remain bounded and non-sensitive.
 |---|---|---|
 | append | `groundwork.diagnostic_records.append` | `committed`, `replayed` |
 | query | `groundwork.diagnostic_records.query` | `success` |
+| query groups | `groundwork.diagnostic_records.query_groups` | `success` |
 | inspect | `groundwork.diagnostic_records.inspect` | `success` |
 | trim | `groundwork.diagnostic_records.trim` | `completed`, `replayed` |
 
@@ -92,7 +93,8 @@ Every activity carries `groundwork.diagnostic_records.operation`, `.provider`, `
 `.classification`, `.scope.kind`, and `.scope.present`; a non-null request also supplies `.stream`.
 Scope kind is the fixed value `tenant_scope`; scope presence is a boolean. Operation-specific
 activity tags expose only bounded shape: append batch size; query limit plus exact-count,
-latest-per-key, and continuation booleans; and trim keep-newest. Tenant id, storage-scope id, payload,
+latest-per-key, and continuation booleans; grouped-query take plus predicate/continuation booleans;
+and trim keep-newest. Tenant id, storage-scope id, payload,
 record id, operation nonce, fingerprint, exception message, and other request values are never
 recorded. Stream is intentionally present on activities for trace diagnosis but absent from metrics
 to prevent unbounded metric cardinality. A null request is passed unchanged to the underlying
@@ -140,6 +142,8 @@ exporter, sampling policy, dashboard, or host pipeline.
 - bounded batch, payload, record-id, field, query-limit, and predicate-node sizes;
 - portable scalar or multi-value fields, types, case policy, supported predicates, ordering, and
   latest-per-key support; and
+- named grouped-reduction profiles with one scalar string key, typed output aliases, closed reducers,
+  post-reduction predicate/order admission, finite take, and finite string-union bounds; and
 - an optional scalar `Int64` logical high-water field.
 
 Every record also has the built-in `$occurredAt` timestamp field. It supports equality, membership,
@@ -152,6 +156,13 @@ The query API contains no `IQueryable`, provider expression, offset, or arbitrar
 definition and `IDiagnosticQueryHandler.Capabilities`. Capability metadata therefore comes from the
 same executable handler that runs the query; an unsupported operation fails before execution and
 cannot silently fall back to client-side loading.
+
+`DiagnosticRecordGroupQuery` selects one named profile rather than supplying reducers. Profiles admit
+only timestamp minimum/maximum, `Int64` sum/maximum, bounded string set union, and `FirstBy`.
+`FirstBy` declares its order field and direction explicitly, then uses the ascending raw diagnostic
+cursor as its mandatory secondary tie-break. Group predicates execute against reduced aliases, and
+reduced pages use the declared alias plus group key as their total order. Exact count is intentionally
+absent from the grouped contract.
 
 String fields select one explicit comparison policy. `Ordinal` uses versioned UTF-16 keys.
 `AsciiIgnoreCase` accepts only U+0020 through U+007E and maps `A` through `Z` to `a` through `z`; it
@@ -205,13 +216,18 @@ store and a later operation retries. Async factories return an already-admitted 
 the same check explicitly.
 
 Continuation values carry the first page's committed cursor high-water, the exclusive last key,
-and a canonical fingerprint of both the query shape and stream definition. Concurrent or backdated
+and a canonical fingerprint of the query shape and its stream-definition contract. Grouped
+continuations bind the complete canonical stream-definition fingerprint and carry the last reduced
+sort value and group key; the group key is the total-order tie-break after the reduced sort value.
+Concurrent or backdated
 appends are excluded from the existing traversal, and a continuation cannot be reused with a
 different filter, order, limit, count, scope, stream, latest-per-key request, or definition version.
 Providers capture mutable requests before asynchronous work. `DiagnosticRecordQuerySnapshot` freezes
-nested predicate/value collections, while `DiagnosticRecordSnapshot` gives providers a reusable deep
-copy for append outcomes and query pages. Conformance requires returned collections to reject mutation
-so a caller cannot alter a later idempotent replay or another read.
+nested predicate/value collections; `DiagnosticRecordGroupQuerySnapshot` provides the same bounded,
+iterative deep capture for grouped predicates before validation or provider I/O.
+`DiagnosticRecordSnapshot` gives providers a reusable deep copy for append outcomes and query pages.
+Conformance requires returned collections to reject mutation so a caller cannot alter a later
+idempotent replay or another read.
 
 ## Provider conformance
 
