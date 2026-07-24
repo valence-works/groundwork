@@ -6,6 +6,25 @@ namespace Groundwork.PhysicalStorage.Benchmarks.Tests;
 public sealed class BenchmarkSubprocessCoordinatorTests
 {
     [Fact]
+    public void Confirmed_regression_worker_exit_is_not_accepted_as_success()
+    {
+        var response = new BenchmarkWorkerResponse(
+            BenchmarkRunProtocol.ProtocolVersion,
+            "group",
+            1,
+            BenchmarkExecutionRole.Measured,
+            Succeeded: true,
+            RunDirectory: "run",
+            ConsumerEvidence: "evidence",
+            FailureType: null);
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            BenchmarkSubprocessCoordinator.EnsureWorkerSucceeded(1, 2, response));
+
+        Assert.Contains("exit code 2", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Cancellation_terminates_and_awaits_the_worker_process_tree()
     {
         using var process = Process.Start(LongRunningProcess()) ??

@@ -130,16 +130,15 @@ public static class BenchmarkModelFactory
         ArgumentNullException.ThrowIfNull(provider);
         ArgumentNullException.ThrowIfNull(normalizer);
         var manifest = CreateManifest(form, instance, includeCategory);
-        var resolution = PhysicalStorageResolver.Resolve(manifest, NamePolicy(instance), normalizer);
-        if (!resolution.IsValid)
-            throw new InvalidOperationException(string.Join("; ", resolution.Diagnostics.Select(diagnostic => diagnostic.Message)));
-        var compilation = ExecutableStorageRouteCompiler.Compile(resolution.Definitions);
-        if (!compilation.IsValid)
-            throw new InvalidOperationException(string.Join("; ", compilation.Diagnostics.Select(diagnostic => diagnostic.Message)));
-        var route = compilation.Routes.Single();
+        var target = PhysicalSchemaTargetCompiler.Compile(
+            manifest,
+            provider,
+            normalizer,
+            NamePolicy(instance));
+        var route = target.Routes.Single();
         return new BenchmarkPhysicalModel(
             manifest,
-            new PhysicalSchemaTarget(manifest.Identity, manifest.Version, provider, [route]),
+            target,
             route);
     }
 

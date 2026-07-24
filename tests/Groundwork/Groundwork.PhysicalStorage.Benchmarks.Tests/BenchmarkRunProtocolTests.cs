@@ -124,7 +124,11 @@ public sealed class BenchmarkRunProtocolTests
             Ordinal: 1,
             IndependentRun: 0,
             BenchmarkExecutionRole.UntimedWarmup,
-            request);
+            request)
+        {
+            ExpectedGitCommit = "test-commit",
+            ExpectedGitTreeDigest = new('a', 64)
+        };
 
         var exception = Assert.Throws<InvalidOperationException>(() =>
             BenchmarkRunProtocol.ValidateInvocation(invocation));
@@ -148,7 +152,12 @@ public sealed class BenchmarkRunProtocolTests
             Succeeded: true,
             RunDirectory: "runs/000001",
             ConsumerEvidence: "runs/000001/reports/consumer-evidence.json",
-            FailureType: null);
+            FailureType: null)
+        {
+            GitCommit = invocation.ExpectedGitCommit,
+            GitTreeDigest = invocation.ExpectedGitTreeDigest,
+            Artifacts = TestArtifacts()
+        };
         response = mismatch switch
         {
             "protocol" => response with { ProtocolVersion = "unsupported" },
@@ -192,7 +201,12 @@ public sealed class BenchmarkRunProtocolTests
             Succeeded: true,
             RunDirectory: "runs/000001",
             ConsumerEvidence: consumerEvidence,
-            FailureType: null);
+            FailureType: null)
+        {
+            GitCommit = invocation.ExpectedGitCommit,
+            GitTreeDigest = invocation.ExpectedGitTreeDigest,
+            Artifacts = TestArtifacts()
+        };
 
         var exception = Assert.Throws<InvalidOperationException>(() =>
             BenchmarkSubprocessCoordinator.ValidateResponse(invocation, response));
@@ -223,6 +237,18 @@ public sealed class BenchmarkRunProtocolTests
             Ordinal: 1,
             IndependentRun: 1,
             BenchmarkExecutionRole.Measured,
-            request);
+            request)
+        {
+            ExpectedGitCommit = "test-commit",
+            ExpectedGitTreeDigest = new('a', 64)
+        };
     }
+
+    private static BenchmarkWorkerArtifactDigests TestArtifacts() => new(
+        "manifest.json",
+        new('a', 64),
+        "reports/elsa-migration-evidence.json",
+        new('b', 64),
+        "reports/consumer-evidence.json",
+        new('c', 64));
 }

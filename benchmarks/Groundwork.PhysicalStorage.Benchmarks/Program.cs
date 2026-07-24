@@ -25,7 +25,7 @@ internal static class Program
                 .RunAsync(command.Request!, cancellation.Token);
             Console.WriteLine($"Benchmark artifact group: {result.RunDirectory}");
             Console.WriteLine($"Independent workers: {result.WorkerCount}");
-            return 0;
+            return result.ConfirmedRegression ? 2 : 0;
         }
         catch (OperationCanceledException)
         {
@@ -68,7 +68,8 @@ internal static class Program
         return await BenchmarkSubprocessCoordinator.RunWorkerAsync(
             invocation,
             responsePath,
-            CancellationToken.None);
+            CancellationToken.None,
+            BenchmarkSubprocessCoordinator.DigestFile(requestPath));
     }
 
     private static string FindRepositoryRoot(string start)

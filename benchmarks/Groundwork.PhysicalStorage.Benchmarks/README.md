@@ -16,18 +16,24 @@ Before timing, every selected provider and storage form must prove:
 
 1. storage-scope isolation, optimistic concurrency, unit-of-work rollback, bounded query/count
    agreement, and mixed-direction ordering; and
-2. on a separately initialized and identically seeded disposable target, selection of the declared
-   index through provider-native `EXPLAIN`, `STATISTICS XML`, or MongoDB `explain`, with full scans
-   rejected for every applicable timed selection and count shape.
+2. on a separately initialized disposable target with the exact configured measured cardinality,
+   selectivity, and provider statistics, selection of the declared index through provider-native
+   `EXPLAIN`, `STATISTICS XML`, or MongoDB `explain`, with full scans rejected for every applicable
+   timed selection and count shape.
 
 The backfill workload has an additional post-measurement check. Outside the timed region, it uses
 the additive model to run the bounded query and directly queries the newly projected `category`
 field. Both counts must match the seeded migration row count.
 
-After the identical deterministic seed, a plan target may add internally consistent plan-only
-documents to reach a provider-specific optimizer floor and refresh statistics. SQL Server removes
-its larger temporary set after capture. Each plan target is disposable and distinct from the
-measured database, so optimizer assistance cannot mutate measured workload data or statistics.
+Relational statistics are finalized as part of deterministic seeding on both measured and plan
+targets. Correctness-gate documents are removed and statistics are finalized again before timing.
+Native-plan capture is read-only: it does not add or remove rows, change selectivity, or refresh
+statistics. A provider that chooses a scan for the configured measured shape fails the gate; the
+harness does not inflate a plan-only distribution to make the optimizer choose the declared index.
+
+After materialization, SQLite, SQL Server, and PostgreSQL stores are opened through their public
+production `OpenPhysicalAsync` factories. Factory admission must succeed before correctness gates
+or timing begin, and restart paths re-enter through the same admission boundary.
 
 These are harness correctness gates only. Passing them does not make performance evidence complete.
 
@@ -64,9 +70,34 @@ still requires controlled execution of the complete reviewed matrix, exact-HEAD 
 all four providers, and the Elsa-owned EF Core oracle.
 
 The GitHub workflow is named `Physical Storage Benchmark Evidence (Scaffolding)`. Pull requests run
-SQLite smoke evidence. Weekly/manual jobs run the four-provider scheduled scaffold on a controlled
-self-hosted runner. Both jobs upload non-promotable evidence and do not perform baseline download,
-candidate promotion, confirmation, or migration-decision gating.
+a deliberately narrow SQLite/shared-form smoke over five representative workloads. Weekly/manual
+runs split the four-provider scheduled scaffold into deterministic provider/form/dataset shards on
+the controlled self-hosted runner pool. Every artifact remains non-promotable; the workflow does
+not perform candidate promotion or migration-decision gating.
+
+The scheduled cardinality is calculated, not inferred:
+
+- `4 providers × 3 forms × 3 dataset sizes = 36` shards;
+- each shard has `14 workloads × (1 untimed warm-up + 3 measured repetitions) = 56` workers;
+- the complete schedule therefore has `2,016` workers: `504` warm-up and `1,512` measured; and
+- the mandatory 30-second measured floor alone is `1,512 × 30 = 45,360 seconds`, or 12.6 aggregate
+  measured hours before setup, seeding, validation, and artifact work.
+
+With all 36 shard slots available, each shard carries 42 measured workers and therefore 21 minutes
+of mandatory measured execution. The workflow budgets 20 minutes for one contract preflight, 280
+minutes for the parallel shard critical path, and 60 minutes for final verification/aggregation:
+360 minutes total execution budget, excluding external runner queueing. The controlled runner pool
+must supply the declared 36-way capacity for that worst-case critical-path calculation to hold.
+Reduced runner concurrency adds queue waves and increases end-to-end elapsed time; it does not
+change shard contents or invalidate otherwise complete evidence. The 280-minute limit is enforced
+per running shard job, not as a guarantee that the organization will schedule all shards at once.
+
+All 36 shard artifacts are retained separately and downloaded into a retained aggregate artifact.
+The final job checks the exact 2,016 request tuples, successful responses, consumer-evidence file
+digests, exact Git commit, and provider/form equality of the canonical result digest. It writes
+`coverage-verification.json` with `coverageVerified: true` only after every check succeeds. A
+missing, timed-out, duplicated, or unequal shard therefore cannot be described as complete
+scheduled coverage.
 
 ## Running the harness
 
@@ -89,7 +120,8 @@ dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks
   --independent-runs 3
 ```
 
-Run all cases represented by the scheduled scaffold:
+Run all cases represented by the scheduled scaffold locally (serial, and therefore at least 12.6
+hours of mandatory measured time before setup overhead):
 
 ```bash
 dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks -- run \
@@ -145,8 +177,11 @@ database-crash, power-loss, or disaster-recovery evidence.
 Each raw sample is one measured target invocation and retains the invocation's aggregate elapsed
 time for throughput and steady-state accounting. It also carries `operationLatencyNanoseconds`: one
 positive, directly timed observation for every operation reported by the target. Summary
-`operationLatencyP50Nanoseconds`, p95, and p99 values and latency bootstraps flatten those raw
-observations; they never divide an invocation duration by its operation count.
+`operationLatencyP50Nanoseconds`, p95, and p99 values flatten those raw observations within one
+worker; they never divide an invocation duration by its operation count. Run-group acceptance keeps
+workers as independent process clusters: it computes each process statistic, uses the median of the
+independent processes, and resamples processes before resampling observations within a selected
+process.
 
 An operation is the smallest semantically complete unit that the workload promises:
 
@@ -169,9 +204,12 @@ Consumer evidence binds this behavior as measurement protocol
 `direct-operation-latency/v1`; the protocol participates in each workload fingerprint so evidence
 produced by the former batch-mean implementation cannot compare as the same workload evidence.
 
-Regression comparisons remain available as diagnostic scaffolding. Current scheduled evidence is
-explicitly incompatible with gating because its evidence readiness is insufficient and its baseline
-eligibility is false. The committed baseline registry is empty and disabled.
+Regression comparisons consume a coordinator run-group root, never a single warm-up or measured
+worker directory. Candidate and baseline measured workers are matched by provider, storage form,
+workload, complete data shape, and independent-run number. Scheduled comparisons reject tuples
+with fewer than three independent measured processes. Current evidence remains non-promotable
+because its evidence readiness is insufficient and its baseline eligibility is false. The
+committed baseline registry is empty and disabled.
 
 ## Artifact contract
 
@@ -179,6 +217,7 @@ eligibility is false. The committed baseline registry is empty and disabled.
 run-group.json
 protocol/requests/<ordinal>.json
 protocol/responses/<ordinal>.json
+reports/regression.json (when --baseline is supplied)
 runs/<ordinal>/manifest.json
 runs/<ordinal>/metadata/configuration.json
 runs/<ordinal>/metadata/machine.json
@@ -211,8 +250,51 @@ do not contribute to the duration floor.
 `consumer-evidence.json` deliberately omits provider configuration values. It records a digest of
 the redacted provider configuration plus workload identity/version/fingerprint, provider identity
 and version, storage form, data shape, raw-sample digest, measurement digest, native-plan digest,
-and a provider/machine-independent correctness result digest. Elsa #646 can join on those fields
-without Groundwork embedding Elsa or EF domain code.
+and a provider/machine-independent correctness result digest.
+
+That correctness digest is SHA-256 over an ordered
+`groundwork.physical-storage.observable-result/v1` vector. Vector entries carry canonical sequence,
+stable identity, status, version, count, and payload outcomes. Provider identity/version,
+configuration, storage form, machine metadata, timestamps, and timings do not participate. The
+scheduled aggregate requires equality for every matching workload/data-shape group across all
+providers, forms, and independent runs before the timing artifacts are accepted as complete
+scaffold evidence. Elsa #646 can join on those fields without Groundwork embedding Elsa or EF
+domain code.
+
+The coordinator binds every worker request to the expected Git commit and worktree digest. The
+run-group manifest records SHA-256 digests for every request, response, worker manifest, Elsa
+evidence report, and measured consumer-evidence report. The verifier rejects path escapes, unknown
+JSON members, identity mismatches, Git drift, and digest mismatches before a group can be used as a
+baseline. Connection strings and provider secrets remain excluded.
+
+Machine metadata records CPU model, memory, storage/filesystem capacity, and power/governor state
+when the host exposes them, otherwise the literal `unavailable`. Provider metadata distinguishes
+declared configuration from effective settings and explicitly marks settings unavailable when the
+target cannot query them. Container sources include an immutable image digest when available and
+otherwise record `immutableDigest=unavailable`.
+
+## Independent review record
+
+Three adversarial reviewers examined the initial candidate from base `c6d40b589a9296b2ada461caf6b4b0d58da401bb`
+through `a7dea39d3c44809d32ff6c4313c6399424cc72e6` on distinct axes. All three blocked it:
+
+- correctness/mechanism found that server-provider targets bypassed production factory admission
+  and native-plan capture used a different, noise-inflated distribution;
+- evidence integrity found weak correctness digests and provenance, incomplete group schemas and
+  metadata, flattened-process statistics, and baseline comparison that did not require exact tuple
+  equality; and
+- scope/test preservation found that a serial 12.6-hour protocol could not fit the six-hour
+  workflow, group verification was incomplete, and child exit status was not propagated.
+
+The candidate was remediated by using the production factories and the same measured shape for
+native plans; emitting canonical observable-result vectors from real outcomes for all 14
+workloads; enforcing exact tuple/run identity, hierarchical process-first bootstrap statistics,
+strict group schemas/digests, and nonzero child-exit propagation; and sharding the scheduled matrix
+into 36 provider/form/cardinality jobs with an exact 2,016-worker aggregate verifier. The pull
+request smoke remains deliberately narrow and every workflow artifact remains non-promotable.
+
+The originating reviewers must re-verify the frozen remediation commit before merge. Their final
+verdicts and any further dispositions are recorded here when that gate completes.
 
 ## Remaining issue #50 acceptance work
 

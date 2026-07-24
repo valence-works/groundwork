@@ -9,6 +9,9 @@ automation:
 - `elsa-migration-evidence.schema.json` describes explicitly insufficient Groundwork-only evidence;
   it is not an Elsa migration decision.
 - `worker-invocation.schema.json` describes the immutable parent-to-worker subprocess request.
+- `worker-response.schema.json` describes the Git-bound response and artifact digest set.
+- `run-group.schema.json` describes the coordinator manifest and integrity index.
+- `run-group-regression.schema.json` describes process-cluster comparison results.
 - `consumer-evidence.schema.json` describes redacted evidence joinable by workload, provider, form,
   version, fingerprint, data shape, and result digest. It is always non-promotable until the
   external EF oracle is joined.

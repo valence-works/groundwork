@@ -77,6 +77,7 @@ public sealed record BenchmarkConsumerEvidenceReport(
                     configuration.Concurrency
                 });
                 var rawSamplesDigest = Digest(result.Samples);
+                var observableResultDigest = RequireObservableResultDigest(result);
                 var nativePlanArtifacts = result.PlanArtifacts
                     .SelectMany(artifact => new[] { artifact, $"{artifact}.assertions.json" })
                     .Select(artifact => RequireArtifact(layout, artifact))
@@ -88,14 +89,7 @@ public sealed record BenchmarkConsumerEvidenceReport(
                     workloadVersion,
                     MeasurementProtocol,
                     fingerprint,
-                    Digest(new
-                    {
-                        Contract = "groundwork.physical-storage.observable-result/v1",
-                        workloadIdentity,
-                        workloadVersion,
-                        DataShape = shape,
-                        result.Correctness
-                    }),
+                    observableResultDigest,
                     Digest(new
                     {
                         result.Correctness,
@@ -104,7 +98,11 @@ public sealed record BenchmarkConsumerEvidenceReport(
                     }),
                     $"groundwork.{Kebab(result.Case.Provider.ToString())}",
                     provider.Version,
-                    Digest(provider.Configuration.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToArray()),
+                    Digest(new
+                    {
+                        Configuration = provider.Configuration.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToArray(),
+                        EffectiveSettings = provider.EffectiveSettings.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToArray()
+                    }),
                     result.Case.StorageForm,
                     shape,
                     independentRun,
@@ -130,6 +128,26 @@ public sealed record BenchmarkConsumerEvidenceReport(
                 .Distinct(StringComparer.Ordinal)
                 .ToArray(),
             results);
+    }
+
+    private static string RequireObservableResultDigest(
+        BenchmarkCaseResult result)
+    {
+        if (result.ObservableResults is null || result.ObservableResults.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Consumer evidence for '{result.Case.Identity}' requires a non-empty observable result vector.");
+        }
+        try
+        {
+            return BenchmarkObservableResultVector.Create(result.ObservableResults).Digest;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidOperationException(
+                $"Consumer evidence for '{result.Case.Identity}' has a non-canonical observable result vector.",
+                exception);
+        }
     }
 
     private static string DigestFile(string path)

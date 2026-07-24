@@ -6,7 +6,11 @@ public sealed record BenchmarkWorkerInvocation(
     int Ordinal,
     int IndependentRun,
     BenchmarkExecutionRole Role,
-    BenchmarkRunRequest Request);
+    BenchmarkRunRequest Request)
+{
+    public string ExpectedGitCommit { get; init; } = string.Empty;
+    public string ExpectedGitTreeDigest { get; init; } = string.Empty;
+}
 
 public static class BenchmarkRunProtocol
 {
@@ -19,6 +23,9 @@ public static class BenchmarkRunProtocol
             throw new InvalidOperationException($"Unsupported worker protocol '{invocation.ProtocolVersion}'.");
         if (string.IsNullOrWhiteSpace(invocation.RunGroupId) || invocation.Ordinal <= 0)
             throw new InvalidOperationException("Worker invocation identity is incomplete.");
+        if (string.IsNullOrWhiteSpace(invocation.ExpectedGitCommit) ||
+            string.IsNullOrWhiteSpace(invocation.ExpectedGitTreeDigest))
+            throw new InvalidOperationException("Worker invocation Git provenance is incomplete.");
         if (invocation.Role != invocation.Request.Role)
             throw new InvalidOperationException("Worker envelope role must match the embedded request role.");
         if (invocation.IndependentRun != invocation.Request.IndependentRun)
@@ -42,12 +49,20 @@ public static class BenchmarkRunProtocol
 
     public static IReadOnlyList<BenchmarkWorkerInvocation> CreateInvocations(
         BenchmarkRunRequest request,
-        string runGroupId)
+        string runGroupId,
+        BenchmarkGitState? expectedGit = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrWhiteSpace(runGroupId);
         var dimensions = request.Dimensions ?? DimensionsFor(request);
+        expectedGit ??= BenchmarkMetadata.CaptureGit(request.RepositoryRoot);
         dimensions.Validate();
+        if (request.Configuration.Mode == BenchmarkRunMode.Scheduled &&
+            dimensions.IndependentRuns < RegressionPolicy.Scheduled.MinimumIndependentRuns)
+        {
+            throw new InvalidOperationException(
+                $"Scheduled run groups require at least {RegressionPolicy.Scheduled.MinimumIndependentRuns} independent measured processes.");
+        }
         var invocations = new List<BenchmarkWorkerInvocation>();
         var ordinal = 0;
         foreach (var shape in dimensions.CreateShapes())
@@ -85,8 +100,14 @@ public static class BenchmarkRunProtocol
                                     Dimensions = null,
                                     DataShape = shape,
                                     IndependentRun = independentRun,
-                                    Role = role
-                                });
+                                    Role = role,
+                                    BaselineRun = null,
+                                    RegressionConfirmationRun = false
+                                })
+                            {
+                                ExpectedGitCommit = expectedGit.Commit,
+                                ExpectedGitTreeDigest = expectedGit.TreeDigest
+                            };
                             ValidateInvocation(invocation);
                             invocations.Add(invocation);
                         }

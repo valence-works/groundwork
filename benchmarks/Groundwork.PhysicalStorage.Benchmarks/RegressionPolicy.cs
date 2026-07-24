@@ -2,6 +2,7 @@ namespace Groundwork.PhysicalStorage.Benchmarks;
 
 public sealed record RegressionPolicy(
     int MinimumSamples,
+    int MinimumIndependentRuns,
     int BootstrapIterations,
     double ConfidenceLevel,
     double LatencyBudget,
@@ -12,6 +13,7 @@ public sealed record RegressionPolicy(
 {
     public static RegressionPolicy Smoke { get; } = new(
         MinimumSamples: 5,
+        MinimumIndependentRuns: 1,
         BootstrapIterations: 1_000,
         ConfidenceLevel: 0.95,
         LatencyBudget: 1.00,
@@ -22,6 +24,7 @@ public sealed record RegressionPolicy(
 
     public static RegressionPolicy Scheduled { get; } = new(
         MinimumSamples: 20,
+        MinimumIndependentRuns: 3,
         BootstrapIterations: 5_000,
         ConfidenceLevel: 0.95,
         LatencyBudget: 0.10,
@@ -66,12 +69,36 @@ public static class RegressionEvaluator
         IReadOnlyList<BenchmarkSample> candidate,
         RegressionPolicy policy,
         int seed = BenchmarkProfiles.ReproducibleSeed)
+        => CompareIndependentRuns(
+            caseIdentity,
+            [baseline],
+            [candidate],
+            policy with { MinimumIndependentRuns = 1 },
+            seed);
+
+    public static RegressionEvaluation CompareIndependentRuns(
+        string caseIdentity,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> baselineRuns,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> candidateRuns,
+        RegressionPolicy policy,
+        int seed = BenchmarkProfiles.ReproducibleSeed)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(caseIdentity);
-        ArgumentNullException.ThrowIfNull(baseline);
-        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentNullException.ThrowIfNull(baselineRuns);
+        ArgumentNullException.ThrowIfNull(candidateRuns);
         ArgumentNullException.ThrowIfNull(policy);
-        if (baseline.Any(sample => !IsValid(sample)) || candidate.Any(sample => !IsValid(sample)))
+        if (baselineRuns.Count < policy.MinimumIndependentRuns ||
+            candidateRuns.Count < policy.MinimumIndependentRuns)
+        {
+            return new RegressionEvaluation(
+                caseIdentity,
+                false,
+                policy.RequiresConfirmation,
+                [],
+                [$"At least {policy.MinimumIndependentRuns} independent baseline and candidate processes are required."]);
+        }
+        if (baselineRuns.Any(run => run.Any(sample => !IsValid(sample))) ||
+            candidateRuns.Any(run => run.Any(sample => !IsValid(sample))))
         {
             return new RegressionEvaluation(
                 caseIdentity,
@@ -80,9 +107,8 @@ public static class RegressionEvaluator
                 [],
                 ["Baseline or candidate contains an invalid raw sample."]);
         }
-        var baselineLatency = OperationLatencies(baseline);
-        var candidateLatency = OperationLatencies(candidate);
-        if (baselineLatency.Length < policy.MinimumSamples || candidateLatency.Length < policy.MinimumSamples)
+        if (baselineRuns.Any(run => OperationLatencies(run).Length < policy.MinimumSamples) ||
+            candidateRuns.Any(run => OperationLatencies(run).Length < policy.MinimumSamples))
         {
             return new RegressionEvaluation(
                 caseIdentity,
@@ -95,25 +121,27 @@ public static class RegressionEvaluator
         var diagnostics = new List<string>();
         var metrics = new List<RegressionMetric>
         {
-            BootstrapMetric(
-                "operation_latency_p50_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+            HierarchicalBootstrapMetric(
+                "operation_latency_p50_ns", MetricDirection.LowerIsBetter, baselineRuns, candidateRuns,
+                static samples => OperationLatencies(samples),
                 0.50, policy.LatencyBudget, policy, seed),
-            BootstrapMetric(
-                "operation_latency_p95_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+            HierarchicalBootstrapMetric(
+                "operation_latency_p95_ns", MetricDirection.LowerIsBetter, baselineRuns, candidateRuns,
+                static samples => OperationLatencies(samples),
                 0.95, policy.LatencyBudget, policy, seed + 1),
-            BootstrapMetric(
+            HierarchicalBootstrapMetric(
                 "throughput_ops_per_second", MetricDirection.HigherIsBetter,
-                baseline.Select(sample => sample.ThroughputOperationsPerSecond).ToArray(),
-                candidate.Select(sample => sample.ThroughputOperationsPerSecond).ToArray(),
+                baselineRuns, candidateRuns,
+                static samples => samples.Select(sample => sample.ThroughputOperationsPerSecond).ToArray(),
                 0.50, policy.ThroughputBudget, policy, seed + 2)
         };
-        var baselineAllocations = baseline.Select(sample => sample.AllocatedBytesPerOperation).ToArray();
-        var candidateAllocations = candidate.Select(sample => sample.AllocatedBytesPerOperation).ToArray();
-        if (baselineAllocations.All(value => value > 0))
+        if (baselineRuns.All(run => run.All(sample => sample.AllocatedBytesPerOperation > 0)))
         {
-            metrics.Add(BootstrapMetric(
+            metrics.Add(HierarchicalBootstrapMetric(
                 "allocated_bytes_per_op", MetricDirection.LowerIsBetter,
-                baselineAllocations, candidateAllocations, 0.50,
+                baselineRuns, candidateRuns,
+                static samples => samples.Select(sample => sample.AllocatedBytesPerOperation).ToArray(),
+                0.50,
                 policy.AllocationBudget, policy, seed + 3));
         }
         else
@@ -121,33 +149,36 @@ public static class RegressionEvaluator
             diagnostics.Add("Allocation regression was not evaluated: baseline allocation contains a zero value.");
         }
 
-        AddStorageMetric(baseline, candidate, policy, seed + 4, metrics, diagnostics);
+        AddStorageMetric(baselineRuns, candidateRuns, policy, seed + 4, metrics, diagnostics);
 
         return new RegressionEvaluation(caseIdentity, true, policy.RequiresConfirmation, metrics, diagnostics);
     }
 
-    private static RegressionMetric BootstrapMetric(
+    private static RegressionMetric HierarchicalBootstrapMetric(
         string name,
         MetricDirection direction,
-        IReadOnlyList<double> baseline,
-        IReadOnlyList<double> candidate,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> baselineRuns,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> candidateRuns,
+        Func<IReadOnlyList<BenchmarkSample>, double[]> observations,
         double percentile,
         double budget,
         RegressionPolicy policy,
         int seed)
     {
-        var baselineValue = BenchmarkStatistics.Percentile(baseline, percentile);
-        var candidateValue = BenchmarkStatistics.Percentile(candidate, percentile);
+        var baselineValue = MedianProcessStatistic(baselineRuns, observations, percentile);
+        var candidateValue = MedianProcessStatistic(candidateRuns, observations, percentile);
         var ratios = new double[policy.BootstrapIterations];
         var random = new Random(seed);
         for (var iteration = 0; iteration < ratios.Length; iteration++)
         {
-            var baselineResample = Resample(baseline, random);
-            var candidateResample = Resample(candidate, random);
-            var denominator = BenchmarkStatistics.Percentile(baselineResample, percentile);
+            var baselineValueResampled = HierarchicalResampleStatistic(
+                baselineRuns, observations, percentile, random);
+            var candidateValueResampled = HierarchicalResampleStatistic(
+                candidateRuns, observations, percentile, random);
+            var denominator = baselineValueResampled;
             ratios[iteration] = denominator <= 0
                 ? double.PositiveInfinity
-                : BenchmarkStatistics.Percentile(candidateResample, percentile) / denominator;
+                : candidateValueResampled / denominator;
         }
 
         var alpha = (1 - policy.ConfidenceLevel) / 2;
@@ -171,46 +202,47 @@ public static class RegressionEvaluator
     }
 
     private static void AddStorageMetric(
-        IReadOnlyList<BenchmarkSample> baseline,
-        IReadOnlyList<BenchmarkSample> candidate,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> baselineRuns,
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> candidateRuns,
         RegressionPolicy policy,
         int seed,
         ICollection<RegressionMetric> metrics,
         ICollection<string> diagnostics)
     {
-        var baselineStorage = StorageObservations(baseline);
-        var candidateStorage = StorageObservations(candidate);
-        if (baselineStorage.Length == 0 && candidateStorage.Length == 0)
+        var baselineStorage = baselineRuns.Select(StorageObservations).ToArray();
+        var candidateStorage = candidateRuns.Select(StorageObservations).ToArray();
+        if (baselineStorage.All(run => run.Length == 0) && candidateStorage.All(run => run.Length == 0))
             return;
-        if (baselineStorage.Length < policy.MinimumSamples || candidateStorage.Length < policy.MinimumSamples)
+        if (baselineStorage.Any(run => run.Length < policy.MinimumSamples) ||
+            candidateStorage.Any(run => run.Length < policy.MinimumSamples))
         {
             diagnostics.Add(
                 $"Storage regression was not evaluated: at least {policy.MinimumSamples} storage observations are required.");
             return;
         }
 
-        var baselineValue = AggregateStorageRatio(baselineStorage);
+        var baselineValue = BenchmarkStatistics.Percentile(
+            baselineStorage.Select(AggregateStorageRatio).ToArray(), 0.50);
         if (baselineValue <= 0)
         {
             diagnostics.Add("Storage regression was not evaluated: the baseline has no positive storage growth.");
             return;
         }
 
-        var candidateValue = AggregateStorageRatio(candidateStorage);
+        var candidateValue = BenchmarkStatistics.Percentile(
+            candidateStorage.Select(AggregateStorageRatio).ToArray(), 0.50);
         var ratios = new double[policy.BootstrapIterations];
         var random = new Random(seed);
         var unstableBaseline = false;
         for (var iteration = 0; iteration < ratios.Length; iteration++)
         {
-            var baselineResample = Resample(baselineStorage, random);
-            var candidateResample = Resample(candidateStorage, random);
-            var denominator = AggregateStorageRatio(baselineResample);
+            var denominator = HierarchicalStorageStatistic(baselineStorage, random);
             if (denominator <= 0)
             {
                 unstableBaseline = true;
                 break;
             }
-            ratios[iteration] = AggregateStorageRatio(candidateResample) / denominator;
+            ratios[iteration] = HierarchicalStorageStatistic(candidateStorage, random) / denominator;
         }
         if (unstableBaseline)
         {
@@ -270,6 +302,44 @@ public static class RegressionEvaluator
 
     private static double AggregateStorageRatio(IReadOnlyList<StorageObservation> values) =>
         values.Sum(value => value.GrowthBytes) / (double)values.Sum(value => value.LogicalPayloadBytes);
+
+    private static double MedianProcessStatistic(
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> runs,
+        Func<IReadOnlyList<BenchmarkSample>, double[]> observations,
+        double percentile) =>
+        BenchmarkStatistics.Percentile(
+            runs.Select(run => BenchmarkStatistics.Percentile(observations(run), percentile)).ToArray(),
+            0.50);
+
+    private static double HierarchicalResampleStatistic(
+        IReadOnlyList<IReadOnlyList<BenchmarkSample>> runs,
+        Func<IReadOnlyList<BenchmarkSample>, double[]> observations,
+        double percentile,
+        Random random)
+    {
+        var processStatistics = new double[runs.Count];
+        for (var index = 0; index < processStatistics.Length; index++)
+        {
+            var selectedProcess = runs[random.Next(runs.Count)];
+            processStatistics[index] = BenchmarkStatistics.Percentile(
+                Resample(observations(selectedProcess), random),
+                percentile);
+        }
+        return BenchmarkStatistics.Percentile(processStatistics, 0.50);
+    }
+
+    private static double HierarchicalStorageStatistic(
+        IReadOnlyList<StorageObservation[]> runs,
+        Random random)
+    {
+        var processStatistics = new double[runs.Count];
+        for (var index = 0; index < processStatistics.Length; index++)
+        {
+            var selectedProcess = runs[random.Next(runs.Count)];
+            processStatistics[index] = AggregateStorageRatio(Resample(selectedProcess, random));
+        }
+        return BenchmarkStatistics.Percentile(processStatistics, 0.50);
+    }
 
     private static double[] Resample(IReadOnlyList<double> values, Random random)
     {

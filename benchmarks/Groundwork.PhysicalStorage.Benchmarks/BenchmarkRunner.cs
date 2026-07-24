@@ -200,6 +200,7 @@ public sealed class BenchmarkRunner
                             continue;
 
                         var samples = new List<BenchmarkSample>(request.Configuration.MeasurementIterations);
+                        BenchmarkObservableResultVector? observableResultVector = null;
                         long measuredOperations = 0;
                         long measuredElapsedNanoseconds = 0;
                         var minimumElapsedNanoseconds =
@@ -234,6 +235,10 @@ public sealed class BenchmarkRunner
                                 request.Configuration.Concurrency,
                                 cancellationToken);
                             ValidateExecution(execution, benchmarkCase);
+                            observableResultVector = RequireStableObservableResult(
+                                benchmarkCase,
+                                observableResultVector,
+                                execution.ObservableResultVector);
                             var elapsedNanoseconds = Math.Max(
                                 1,
                                 (long)Math.Round(timeProvider.GetElapsedTime(timestamp).TotalNanoseconds));
@@ -271,7 +276,8 @@ public sealed class BenchmarkRunner
                                 ? applicablePlans.ToArray()
                                 : [],
                             BenchmarkSummarizer.Summarize(benchmarkCase.Identity, samples),
-                            samples));
+                            samples,
+                            observableResultVector!.Results));
                     }
                 }
             }
@@ -363,6 +369,24 @@ public sealed class BenchmarkRunner
             throw new InvalidOperationException(
                 $"[{benchmarkCase.Identity}] target must return one positive raw latency observation per operation.");
         }
+    }
+
+    private static BenchmarkObservableResultVector RequireStableObservableResult(
+        BenchmarkCase benchmarkCase,
+        BenchmarkObservableResultVector? prior,
+        BenchmarkObservableResultVector? current)
+    {
+        if (current is null)
+        {
+            throw new InvalidOperationException(
+                $"[{benchmarkCase.Identity}] measured execution returned no canonical observable result vector.");
+        }
+        if (prior is not null && !prior.Digest.Equals(current.Digest, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"[{benchmarkCase.Identity}] observable results changed between measured iterations.");
+        }
+        return prior ?? current;
     }
 
     private static async Task<IReadOnlyList<RegressionEvaluation>> CompareBaselineAsync(

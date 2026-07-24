@@ -33,7 +33,8 @@ public sealed class PostgreSqlBenchmarkTarget(
         ["source"] = sourceDescription,
         ["schema_per_form"] = "true",
         ["pooling"] = new NpgsqlConnectionStringBuilder(serverConnectionString).Pooling.ToString(),
-        ["connection_lifetime"] = "per-operation concurrent production sessions"
+        ["connection_lifetime"] = "per-operation concurrent production sessions",
+        ["factory"] = nameof(PostgreSqlDocumentStoreFactory.OpenPhysicalAsync)
     };
 
     protected override ProviderIdentity GroundworkProvider => PostgreSqlGroundworkCapabilities.Provider;
@@ -45,21 +46,14 @@ public sealed class PostgreSqlBenchmarkTarget(
         IReadOnlyList<BenchmarkPlanRequest> requests,
         CancellationToken cancellationToken)
     {
-        await EnsurePlanScaleAsync(10_000, cancellationToken);
+        var store = RelationalTenantA;
         await using var connection = new NpgsqlConnection(ConnectionString);
         await connection.OpenAsync(cancellationToken);
-        await using (var statistics = connection.CreateCommand())
-        {
-            statistics.CommandText = Model.Route.LinkedIndexStorage is null
-                ? $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)};"
-                : $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)}; ANALYZE {Q(Model.Route.LinkedIndexStorage.Name.Identifier)};";
-            await statistics.ExecuteNonQueryAsync(cancellationToken);
-        }
         var indexName = Model.Route.Indexes.Single().Name.Identifier;
         var evidence = new List<NativePlanEvidence>(requests.Count);
         foreach (var request in requests)
         {
-            var rendered = RenderPlan(request);
+            var rendered = RenderPlan(request, store);
             await using var command = connection.CreateCommand();
             command.CommandText = $"EXPLAIN (FORMAT JSON) {rendered.CommandText}";
             foreach (var (name, value) in rendered.Parameters)
@@ -140,10 +134,18 @@ public sealed class PostgreSqlBenchmarkTarget(
 
     protected override IPhysicalSchemaExecutor CreateExecutor() => new PostgreSqlPhysicalSchemaExecutor(ConnectionString);
 
-    protected override RelationalPhysicalDocumentStore CreateStore(
+    protected override async Task<RelationalPhysicalDocumentStore> OpenStoreAsync(
         StorageManifest manifest,
-        IReadOnlyList<ExecutableStorageRoute> routes,
-        DocumentStoreAccess access) => new PostgreSqlPhysicalDocumentStore(ConnectionString, manifest, routes, access);
+        IPhysicalNamePolicy namePolicy,
+        DocumentStoreAccess access,
+        CancellationToken cancellationToken) =>
+        await PostgreSqlDocumentStoreFactory.OpenPhysicalAsync(
+            ConnectionString,
+            manifest,
+            GroundworkProvider,
+            access,
+            namePolicy,
+            cancellationToken: cancellationToken);
 
     protected override async Task<string> ReadProviderVersionAsync(CancellationToken cancellationToken)
     {
@@ -172,6 +174,19 @@ public sealed class PostgreSqlBenchmarkTarget(
     }
 
     protected override void ClearPools() => NpgsqlConnection.ClearAllPools();
+
+    protected override async Task FinalizeSeedAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var statistics = connection.CreateCommand();
+        statistics.CommandText = Model.Route.LinkedIndexStorage is null
+            ? $"SET default_statistics_target = 10000; ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)};"
+            : $"SET default_statistics_target = 10000; " +
+              $"ANALYZE {Q(Model.Route.PrimaryStorage.Name.Identifier)}; " +
+              $"ANALYZE {Q(Model.Route.LinkedIndexStorage.Name.Identifier)};";
+        await statistics.ExecuteNonQueryAsync(cancellationToken);
+    }
 
     private static string Q(string value) => $"\"{value.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 }

@@ -30,4 +30,26 @@ public sealed class BenchmarkModelFactoryTests
         Assert.Equal(BenchmarkModelFactory.QueryIdentity,
             Assert.Single(model.Manifest.StorageUnits.Single().PhysicalStorage!.BoundedQueries).Identity);
     }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public void Relational_model_uses_the_exact_production_factory_compilation(PhysicalStorageForm form)
+    {
+        const string instance = "factory-admission";
+        var model = BenchmarkModelFactory.CompileRelational(
+            form,
+            instance,
+            SqliteGroundworkCapabilities.Provider,
+            SqliteGroundworkCapabilities.PhysicalNames);
+        var factoryTarget = Groundwork.Core.SchemaEvolution.PhysicalSchemaTargetCompiler.Compile(
+            model.Manifest,
+            SqliteGroundworkCapabilities.Provider,
+            SqliteGroundworkCapabilities.PhysicalNames,
+            BenchmarkModelFactory.NamePolicy(instance));
+
+        Assert.Equal(factoryTarget.Fingerprint, model.Target.Fingerprint);
+        Assert.Equal(factoryTarget.Routes.Single().Indexes.Single(), model.Route.Indexes.Single());
+    }
 }

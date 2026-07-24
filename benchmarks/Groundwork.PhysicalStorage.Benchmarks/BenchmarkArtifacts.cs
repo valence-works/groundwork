@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -20,12 +21,28 @@ public sealed record BenchmarkMachineMetadata(
     string HarnessVersion,
     string GitCommit,
     bool GitDirty,
-    DateTimeOffset CapturedAtUtc);
+    DateTimeOffset CapturedAtUtc)
+{
+    public string GitTreeDigest { get; init; } = "unavailable";
+    public string CpuModel { get; init; } = "unavailable";
+    public string Memory { get; init; } = "unavailable";
+    public string Storage { get; init; } = "unavailable";
+    public string PowerManagement { get; init; } = "unavailable";
+}
+
+public sealed record BenchmarkGitState(string Commit, bool Dirty, string TreeDigest);
 
 public sealed record BenchmarkProviderMetadata(
     BenchmarkProvider Provider,
     string Version,
-    IReadOnlyDictionary<string, string> Configuration);
+    IReadOnlyDictionary<string, string> Configuration)
+{
+    public IReadOnlyDictionary<string, string> EffectiveSettings { get; init; } =
+        new Dictionary<string, string>
+        {
+            ["captureStatus"] = "unavailable:not-exposed-by-provider-target"
+        };
+}
 
 public sealed record BenchmarkRunFailure(string Type, string Message);
 
@@ -57,7 +74,8 @@ public sealed record BenchmarkCaseResult(
     CorrectnessGateResult Correctness,
     IReadOnlyList<string> PlanArtifacts,
     BenchmarkCaseSummary Summary,
-    IReadOnlyList<BenchmarkSample> Samples);
+    IReadOnlyList<BenchmarkSample> Samples,
+    IReadOnlyList<BenchmarkObservableResult>? ObservableResults = null);
 
 public sealed record BenchmarkRunReport(
     string SchemaVersion,
@@ -387,7 +405,7 @@ public static class BenchmarkMetadata
 
     public static BenchmarkMachineMetadata Capture(string repositoryRoot)
     {
-        var git = ReadGit(repositoryRoot);
+        var git = CaptureGit(repositoryRoot);
         return new BenchmarkMachineMetadata(
             RuntimeInformation.OSDescription,
             Environment.MachineName,
@@ -400,24 +418,111 @@ public static class BenchmarkMetadata
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
             git.Commit,
             git.Dirty,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow)
+        {
+            GitTreeDigest = git.TreeDigest,
+            CpuModel = CaptureCpuModel(),
+            Memory = CaptureMemory(),
+            Storage = CaptureStorage(repositoryRoot),
+            PowerManagement = CapturePowerManagement()
+        };
     }
 
-    private static (string Commit, bool Dirty) ReadGit(string repositoryRoot)
+    public static BenchmarkGitState CaptureGit(string repositoryRoot)
     {
         try
         {
             var commit = RunGit(repositoryRoot, "rev-parse HEAD").Trim();
             var dirty = !string.IsNullOrWhiteSpace(RunGit(repositoryRoot, "status --porcelain"));
-            return (commit, dirty);
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            digest.AppendData(Encoding.UTF8.GetBytes(commit));
+            digest.AppendData(RunGitBytes(repositoryRoot, "diff --binary --no-ext-diff HEAD --"));
+            var untracked = RunGitBytes(repositoryRoot, "ls-files --others --exclude-standard -z");
+            digest.AppendData(untracked);
+            foreach (var relative in Encoding.UTF8.GetString(untracked)
+                         .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+                         .Order(StringComparer.Ordinal))
+            {
+                var path = Path.GetFullPath(Path.Combine(repositoryRoot, relative));
+                if (File.Exists(path))
+                    digest.AppendData(File.ReadAllBytes(path));
+            }
+            return new BenchmarkGitState(commit, dirty, Convert.ToHexStringLower(digest.GetHashAndReset()));
         }
         catch
         {
-            return ("unknown", true);
+            return new BenchmarkGitState(
+                "unknown",
+                true,
+                Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes("unavailable"))));
         }
     }
 
+    private static string CaptureCpuModel() =>
+        FirstAvailable(
+            () => OperatingSystem.IsMacOS() ? Run("sysctl", "-n machdep.cpu.brand_string").Trim() : null,
+            () => OperatingSystem.IsMacOS() ? Run("sysctl", "-n hw.model").Trim() : null,
+            () => File.ReadLines("/proc/cpuinfo")
+                .FirstOrDefault(line => line.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
+                ?.Split(':', 2)[1].Trim());
+
+    private static string CaptureMemory() =>
+        FirstAvailable(
+            () => OperatingSystem.IsMacOS() ? $"{Run("sysctl", "-n hw.memsize").Trim()} bytes" : null,
+            () => File.ReadLines("/proc/meminfo")
+                .FirstOrDefault(line => line.StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
+                ?.Trim());
+
+    private static string CaptureStorage(string repositoryRoot)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(repositoryRoot))!;
+            var drive = new DriveInfo(root);
+            var fileSystem = OperatingSystem.IsMacOS()
+                ? Run("stat", $"-f %T {Quote(repositoryRoot)}").Trim()
+                : Run("stat", $"-f -c %T {Quote(repositoryRoot)}").Trim();
+            return $"filesystem={fileSystem};totalBytes={drive.TotalSize};availableBytes={drive.AvailableFreeSpace}";
+        }
+        catch
+        {
+            return "unavailable";
+        }
+    }
+
+    private static string CapturePowerManagement() =>
+        FirstAvailable(
+            () => File.Exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+                ? $"governor={File.ReadAllText("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").Trim()}"
+                : null,
+            () => OperatingSystem.IsMacOS()
+                ? $"lowPowerMode={Run("pmset", "-g custom")
+                    .Split('\n')
+                    .FirstOrDefault(line => line.Contains("lowpowermode", StringComparison.OrdinalIgnoreCase))
+                    ?.Trim() ?? "unavailable"}"
+                : null);
+
+    private static string FirstAvailable(params Func<string?>[] readers)
+    {
+        foreach (var reader in readers)
+        {
+            try
+            {
+                var value = reader();
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value;
+            }
+            catch
+            {
+            }
+        }
+        return "unavailable";
+    }
+
     private static string RunGit(string repositoryRoot, string arguments)
+        => Encoding.UTF8.GetString(RunGitBytes(repositoryRoot, arguments));
+
+    private static byte[] RunGitBytes(string repositoryRoot, string arguments)
     {
         using var process = Process.Start(new ProcessStartInfo("git", arguments)
         {
@@ -426,10 +531,28 @@ public static class BenchmarkMetadata
             RedirectStandardError = true,
             UseShellExecute = false
         }) ?? throw new InvalidOperationException("Unable to start git.");
+        using var output = new MemoryStream();
+        process.StandardOutput.BaseStream.CopyTo(output);
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(process.StandardError.ReadToEnd());
+        return output.ToArray();
+    }
+
+    private static string Run(string fileName, string arguments)
+    {
+        using var process = Process.Start(new ProcessStartInfo(fileName, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        }) ?? throw new InvalidOperationException($"Unable to start '{fileName}'.");
         var output = process.StandardOutput.ReadToEnd();
         process.WaitForExit();
         if (process.ExitCode != 0)
             throw new InvalidOperationException(process.StandardError.ReadToEnd());
         return output;
     }
+
+    private static string Quote(string value) => $"\"{value.Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
 }

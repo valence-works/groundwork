@@ -4,16 +4,22 @@
   "title": "Groundwork physical-storage independent worker invocation v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocolVersion", "runGroupId", "ordinal", "independentRun", "role", "request"],
+  "required": ["protocolVersion", "runGroupId", "ordinal", "independentRun", "role", "request", "expectedGitCommit", "expectedGitTreeDigest"],
   "properties": {
     "protocolVersion": { "const": "groundwork.physical-storage.worker/v1" },
     "runGroupId": { "type": "string", "minLength": 1 },
     "ordinal": { "type": "integer", "minimum": 1 },
     "independentRun": { "type": "integer", "minimum": 0 },
     "role": { "enum": ["untimedWarmup", "measured"] },
+    "expectedGitCommit": { "type": "string", "minLength": 1 },
+    "expectedGitTreeDigest": { "$ref": "#/$defs/digest" },
     "request": { "$ref": "#/$defs/request" }
   },
   "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "request": {
       "type": "object",
       "additionalProperties": false,

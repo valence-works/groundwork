@@ -77,7 +77,8 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                 new CorrectnessGateResult(true, true, true, true, true),
                 [],
                 BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
-                [sample])],
+                [sample],
+                ObservableResults(benchmarkCase, sample.Operations))],
             [],
             new BaselineEligibility(false, ["The Elsa EF oracle has not been joined."]),
             new BenchmarkDataShape(100_000, 1_024, 1_000));
@@ -137,7 +138,8 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                     new CorrectnessGateResult(true, true, true, true, true),
                     [],
                     BenchmarkSummarizer.Summarize(alternateCase.Identity, [alternateSample]),
-                    [alternateSample])
+                    [alternateSample],
+                    ObservableResults(alternateCase, alternateSample.Operations))
             ]
         };
         var alternate = Assert.Single(BenchmarkConsumerEvidenceReport.Create(
@@ -153,6 +155,68 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
         Assert.Equal(result.WorkloadFingerprint, alternate.WorkloadFingerprint);
         Assert.Equal(result.ResultDigest, alternate.ResultDigest);
         Assert.NotEqual(result.MeasurementDigest, alternate.MeasurementDigest);
+    }
+
+    [Fact]
+    public async Task Consumer_result_digest_changes_when_the_observable_result_vector_changes()
+    {
+        var layout = new ArtifactLayout(root);
+        var benchmarkCase = new BenchmarkCase(
+            BenchmarkProvider.Sqlite,
+            PhysicalStorageForm.SharedDocuments,
+            BenchmarkWorkload.IndexedQuery);
+        var sample = new BenchmarkSample(
+            0, 1, 1_000, 40, 1, 0, 0, null, null, new Dictionary<string, long>(), [100]);
+        var machine = new BenchmarkMachineMetadata(
+            "test-os", "benchmark-host", "Arm64", ".NET 10", "Release", 8, true, 1_000_000_000,
+            "1.0.0", "abcdef", false, DateTimeOffset.UnixEpoch);
+        var providers = new[]
+        {
+            new BenchmarkProviderMetadata(
+                BenchmarkProvider.Sqlite,
+                "3.50.4",
+                new Dictionary<string, string>())
+        };
+        var originalVector = new[]
+        {
+            new BenchmarkObservableResult(0, "seed-00000001", "selected", 1, 2, """{"status":"open"}"""),
+            new BenchmarkObservableResult(1, "seed-00000002", "selected", 1, 2, """{"status":"open"}""")
+        };
+
+        await using var writer = new BenchmarkArtifactWriter(layout);
+        var original = Create(originalVector);
+        var changed = Create(
+        [
+            originalVector[0],
+            originalVector[1] with { Payload = """{"status":"closed"}""" }
+        ]);
+
+        Assert.NotEqual(original.ResultDigest, changed.ResultDigest);
+        return;
+
+        BenchmarkConsumerEvidenceResult Create(IReadOnlyList<BenchmarkObservableResult> observableResults)
+        {
+            var report = new BenchmarkRunReport(
+                BenchmarkProfiles.SchemaVersion,
+                "test-run",
+                BenchmarkRunMode.Scheduled,
+                [new BenchmarkCaseResult(
+                    benchmarkCase,
+                    new CorrectnessGateResult(true, true, true, true, true),
+                    [],
+                    BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
+                    [sample],
+                    observableResults)],
+                [],
+                new BaselineEligibility(false, ["The Elsa EF oracle has not been joined."]),
+                new BenchmarkDataShape(1_000, 0, 5_000));
+            return Assert.Single(BenchmarkConsumerEvidenceReport.Create(
+                report,
+                BenchmarkProfiles.Scheduled,
+                machine,
+                providers,
+                layout).Results);
+        }
     }
 
     [Fact]
@@ -174,7 +238,8 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                 new CorrectnessGateResult(true, true, true, true, true),
                 ["../outside-plan.json"],
                 BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
-                [sample])],
+                [sample],
+                ObservableResults(benchmarkCase, sample.Operations))],
             [],
             new BaselineEligibility(false, ["The Elsa EF oracle has not been joined."]),
             new BenchmarkDataShape(100_000, 0, 1_000));
@@ -220,7 +285,8 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                 new CorrectnessGateResult(true, true, true, true, true),
                 ["plans/sqlite/entity/missing.json"],
                 BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
-                [sample])],
+                [sample],
+                ObservableResults(benchmarkCase, sample.Operations))],
             [],
             new BaselineEligibility(false, ["The Elsa EF oracle has not been joined."]),
             new BenchmarkDataShape(100_000, 0, 1_000));
@@ -299,7 +365,8 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                     new CorrectnessGateResult(true, true, true, true, true),
                     [artifact],
                     BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
-                    [sample])],
+                    [sample],
+                    ObservableResults(benchmarkCase, sample.Operations))],
                 [],
                 new BaselineEligibility(false, ["The Elsa EF oracle has not been joined."]),
                 new BenchmarkDataShape(100_000, 0, 1_000));
@@ -417,6 +484,19 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
 
         await Assert.ThrowsAsync<JsonException>(() => BenchmarkArtifactWriter.ReadRawAsync(root, CancellationToken.None));
     }
+
+    private static IReadOnlyList<BenchmarkObservableResult> ObservableResults(
+        BenchmarkCase benchmarkCase,
+        int operations) =>
+    [
+        new BenchmarkObservableResult(
+            0,
+            $"{benchmarkCase.Workload}-result",
+            "validated",
+            1,
+            operations,
+            null)
+    ];
 
     public ValueTask DisposeAsync()
     {

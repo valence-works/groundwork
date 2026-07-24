@@ -304,7 +304,17 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
                 0,
                 2,
                 new Dictionary<string, long>(),
-                Enumerable.Repeat(100L, invalidOperationLatencies ? operations - 1 : operations).ToArray()));
+                Enumerable.Repeat(100L, invalidOperationLatencies ? operations - 1 : operations).ToArray(),
+                BenchmarkObservableResultVector.Create(
+                [
+                    new BenchmarkObservableResult(
+                        0,
+                        $"{workload}-result",
+                        "validated",
+                        1,
+                        operations,
+                        null)
+                ])));
         }
 
         public Task ValidateIterationAsync(BenchmarkWorkload workload, CancellationToken cancellationToken) => Task.CompletedTask;

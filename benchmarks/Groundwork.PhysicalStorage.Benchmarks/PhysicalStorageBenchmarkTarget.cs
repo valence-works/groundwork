@@ -16,6 +16,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
     private readonly ConcurrentDictionary<BenchmarkWorkload, ConcurrentQueue<string>> preparedIds = new();
+    private readonly ConcurrentDictionary<BenchmarkWorkload, BenchmarkObservableResultVector> observableResults = new();
     private readonly string instance;
     private long generatedId;
     private int seededCount;
@@ -82,6 +83,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             await unitOfWork.CommitAsync(cancellationToken);
         }
         seededCount = count;
+        await FinalizeSeedAsync(cancellationToken);
     }
 
     public async Task<CorrectnessGateResult> RunCorrectnessGateAsync(CancellationToken cancellationToken)
@@ -138,6 +140,23 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         var mixedOrder = ranks.SequenceEqual(ranks.OrderDescending());
         if (!mixedOrder)
             throw new InvalidOperationException("Correctness gate failed: compound descending rank order is not preserved.");
+
+        RequireStatus(await TenantA.DeleteAsync(
+                new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, sharedId, ExpectedVersion: 1),
+                cancellationToken),
+            DocumentStoreWriteStatus.Deleted,
+            "tenant A correctness-gate cleanup");
+        RequireStatus(await TenantB.DeleteAsync(
+                new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, sharedId, ExpectedVersion: 1),
+                cancellationToken),
+            DocumentStoreWriteStatus.Deleted,
+            "tenant B correctness-gate cleanup");
+        RequireStatus(await TenantB.DeleteAsync(
+                new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, tenantBSentinelId, ExpectedVersion: 1),
+                cancellationToken),
+            DocumentStoreWriteStatus.Deleted,
+            "tenant B correctness-gate sentinel cleanup");
+        await FinalizeSeedAsync(cancellationToken);
 
         return new CorrectnessGateResult(true, true, true, true, true);
     }
@@ -216,7 +235,14 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                 cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(workload), workload, null)
         };
-        return execution with { OperationLatencyNanoseconds = operationLatencies };
+        var observed = execution.ObservableResultVector ??
+                       throw new InvalidOperationException(
+                           $"Workload '{workload}' returned no observable result vector.");
+        return execution with
+        {
+            OperationLatencyNanoseconds = operationLatencies,
+            ObservableResultVector = observableResults.GetOrAdd(workload, observed)
+        };
     }
 
     public virtual Task ValidateIterationAsync(
@@ -238,27 +264,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
 
     protected virtual Task ResetClientStateAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    protected async Task EnsurePlanScaleAsync(int minimumRows, CancellationToken cancellationToken)
-    {
-        if (minimumRows <= seededCount)
-            return;
-        const int batchSize = 1_000;
-        for (var offset = seededCount; offset < minimumRows; offset += batchSize)
-        {
-            await using var unitOfWork = await TenantA.BeginAsync(
-                DocumentCommitScope.Of(BenchmarkModelFactory.DocumentKind),
-                cancellationToken);
-            for (var index = offset; index < Math.Min(minimumRows, offset + batchSize); index++)
-            {
-                RequireStatus(await unitOfWork.SaveAsync(
-                        Save($"plan-scale-{index:D8}", Payload("__groundwork_plan_noise__", index, "plan-scale")),
-                        cancellationToken),
-                    DocumentStoreWriteStatus.Saved,
-                    "plan-scale insert");
-            }
-            await unitOfWork.CommitAsync(cancellationToken);
-        }
-    }
+    protected virtual Task FinalizeSeedAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     protected abstract Task<WorkloadExecution> ExecuteBackfillMigrationAsync(CancellationToken cancellationToken);
 
@@ -292,12 +298,43 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             throw new InvalidOperationException($"{operation} returned {result.Status}; expected {expected}.");
     }
 
+    protected static BenchmarkObservableResultVector BackfillObservableResult(
+        string outcome,
+        long rows)
+    {
+        var results = new BenchmarkObservableResultBuilder();
+        results.Add(
+            "backfill-migration",
+            LowerCamel(outcome),
+            version: null,
+            count: rows,
+            payload: """{"category":"migration"}""");
+        return results.Build();
+    }
+
+    protected static BenchmarkObservableResultVector RestartObservableResult(
+        string outcome,
+        IReadOnlyList<DocumentEnvelope> documents)
+    {
+        var results = new BenchmarkObservableResultBuilder();
+        results.Add(
+            "client-restart-validation",
+            LowerCamel(outcome),
+            version: null,
+            count: documents.Count,
+            payload: null);
+        foreach (var document in documents)
+            results.AddDocument(document, "loaded");
+        return results.Build();
+    }
+
     private async Task<WorkloadExecution> PointReadBatchAsync(
         int operations,
         bool resetClient,
         ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
+        var observedDocuments = new List<DocumentEnvelope>(operations);
         await ObserveAsync(async () =>
         {
             if (resetClient)
@@ -310,9 +347,19 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                     cancellationToken);
                 if (document is null)
                     throw new InvalidOperationException("Point-read workload lost a seeded document.");
+                observedDocuments.Add(document);
             }
         }, operationLatencies);
-        return Execution(1);
+        var results = new BenchmarkObservableResultBuilder();
+        results.Add(
+            "point-read-batch",
+            resetClient ? "client-reset-completed" : "reused-client-completed",
+            version: null,
+            count: observedDocuments.Count,
+            payload: null);
+        foreach (var document in observedDocuments)
+            results.AddDocument(document, "loaded");
+        return Execution(1, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> IndexedQueriesAsync(
@@ -321,6 +368,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var result = await ObserveAsync(
@@ -328,8 +376,13 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                 operationLatencies);
             if (result.TotalCount <= 0)
                 throw new InvalidOperationException("Indexed query workload returned no seeded documents.");
+            AddQueryResults(
+                results,
+                $"query-{index:D4}",
+                result,
+                ordered: includeOrdering);
         }
-        return Execution(operations);
+        return Execution(operations, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> InsertsAsync(
@@ -339,17 +392,22 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         CancellationToken cancellationToken)
     {
         long payloadBytes = 0;
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var payload = Payload("open", index, "write", payloadPadding);
             payloadBytes += Encoding.UTF8.GetByteCount(payload);
-            RequireStatus(await ObserveAsync(
-                    () => TenantA.SaveAsync(Save(NewId("insert"), payload), cancellationToken),
-                    operationLatencies),
+            var result = await ObserveAsync(
+                () => TenantA.SaveAsync(Save(NewId("insert"), payload), cancellationToken),
+                operationLatencies);
+            var document = RequireSavedDocument(
+                result,
                 DocumentStoreWriteStatus.Saved,
-                "insert workload");
+                "insert workload",
+                payload);
+            results.AddDocument(document, Status(result.Status), $"insert-{index:D4}");
         }
-        return Execution(operations, payloadBytes, operations);
+        return Execution(operations, payloadBytes, operations, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> UpdatesAsync(
@@ -359,18 +417,23 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     {
         var queue = RequiredQueue(BenchmarkWorkload.Update);
         long payloadBytes = 0;
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.Update);
             var payload = Payload("closed", index, "updated", payloadPaddingBytes);
             payloadBytes += Encoding.UTF8.GetByteCount(payload);
-            RequireStatus(await ObserveAsync(
-                    () => TenantA.SaveAsync(Save(id, payload, expectedVersion: 1), cancellationToken),
-                    operationLatencies),
+            var result = await ObserveAsync(
+                () => TenantA.SaveAsync(Save(id, payload, expectedVersion: 1), cancellationToken),
+                operationLatencies);
+            var document = RequireSavedDocument(
+                result,
                 DocumentStoreWriteStatus.Saved,
-                "update workload");
+                "update workload",
+                payload);
+            results.AddDocument(document, Status(result.Status), $"update-{index:D4}");
         }
-        return Execution(operations, payloadBytes, operations);
+        return Execution(operations, payloadBytes, operations, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> DeletesAsync(
@@ -379,18 +442,32 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         CancellationToken cancellationToken)
     {
         var queue = RequiredQueue(BenchmarkWorkload.Delete);
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.Delete);
-            RequireStatus(await ObserveAsync(
-                    () => TenantA.DeleteAsync(
-                        new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, id, ExpectedVersion: 1),
-                        cancellationToken),
-                    operationLatencies),
+            var result = await ObserveAsync(
+                () => TenantA.DeleteAsync(
+                    new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, id, ExpectedVersion: 1),
+                    cancellationToken),
+                operationLatencies);
+            RequireStatus(
+                result,
                 DocumentStoreWriteStatus.Deleted,
                 "delete workload");
+            if (!string.Equals(result.AuthoritativeId, id, StringComparison.Ordinal))
+                throw new InvalidOperationException("Delete workload returned a different authoritative identity.");
+            results.Add(
+                $"delete-{index:D4}",
+                Status(result.Status),
+                version: null,
+                count: 1,
+                payload: null);
         }
-        return Execution(operations, logicalMutations: operations);
+        return Execution(
+            operations,
+            logicalMutations: operations,
+            observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> UnitOfWorkAsync(
@@ -399,6 +476,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         CancellationToken cancellationToken)
     {
         long payloadBytes = 0;
+        var results = new BenchmarkObservableResultBuilder();
         await ObserveAsync(async () =>
         {
             await using var unitOfWork = await TenantA.BeginAsync(
@@ -408,13 +486,19 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             {
                 var payload = Payload("open", index, "uow", payloadPaddingBytes);
                 payloadBytes += Encoding.UTF8.GetByteCount(payload);
-                RequireStatus(await unitOfWork.SaveAsync(Save(NewId("uow"), payload), cancellationToken),
+                var result = await unitOfWork.SaveAsync(
+                    Save(NewId("uow"), payload),
+                    cancellationToken);
+                var document = RequireSavedDocument(
+                    result,
                     DocumentStoreWriteStatus.Saved,
-                    "unit-of-work workload");
+                    "unit-of-work workload",
+                    payload);
+                results.AddDocument(document, Status(result.Status), $"unit-of-work-{index:D4}");
             }
             await unitOfWork.CommitAsync(cancellationToken);
         }, operationLatencies);
-        return Execution(1, payloadBytes, operations);
+        return Execution(1, payloadBytes, operations, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> ConflictsAsync(
@@ -423,18 +507,29 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         CancellationToken cancellationToken)
     {
         var queue = RequiredQueue(BenchmarkWorkload.OptimisticConcurrency);
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.OptimisticConcurrency);
-            RequireStatus(await ObserveAsync(
-                    () => TenantA.SaveAsync(
-                        Save(id, Payload("closed", index, "stale", payloadPaddingBytes), expectedVersion: 0),
-                        cancellationToken),
-                    operationLatencies),
+            var result = await ObserveAsync(
+                () => TenantA.SaveAsync(
+                    Save(id, Payload("closed", index, "stale", payloadPaddingBytes), expectedVersion: 0),
+                    cancellationToken),
+                operationLatencies);
+            RequireStatus(
+                result,
                 DocumentStoreWriteStatus.ConcurrencyConflict,
                 "optimistic-concurrency workload");
+            if (result.Document is not null)
+                throw new InvalidOperationException("Concurrency-conflict workload returned a document as if it were saved.");
+            results.Add(
+                $"optimistic-concurrency-{index:D4}",
+                Status(result.Status),
+                version: null,
+                count: 1,
+                payload: null);
         }
-        return Execution(operations);
+        return Execution(operations, observableResultVector: results.Build());
     }
 
     private async Task<WorkloadExecution> ConcurrentCreatesAsync(
@@ -444,6 +539,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         CancellationToken cancellationToken)
     {
         long payloadBytes = 0;
+        var observed = new BenchmarkObservableResultBuilder();
         for (var batch = 0; batch < batches; batch++)
         {
             var id = NewId("concurrent");
@@ -454,7 +550,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                 var payload = Payload("open", index, "concurrent", payloadPaddingBytes);
                 var timestamp = Stopwatch.GetTimestamp();
                 var result = await TenantA.SaveAsync(Save(id, payload), cancellationToken);
-                return (Result: result, Payload: payload, Latency: ElapsedNanoseconds(timestamp));
+                return (Attempt: index, Result: result, Payload: payload, Latency: ElapsedNanoseconds(timestamp));
             }).ToArray();
             start.SetResult();
             var results = await Task.WhenAll(attempts);
@@ -463,11 +559,27 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             {
                 throw new InvalidOperationException("Concurrent-create workload did not converge to one successful create.");
             }
+            var winner = results.Single(result => result.Result.Status == DocumentStoreWriteStatus.Saved);
+            var winnerDocument = RequireSavedDocument(
+                winner.Result,
+                DocumentStoreWriteStatus.Saved,
+                "concurrent-create winner",
+                winner.Payload);
             payloadBytes += results.Sum(result => Encoding.UTF8.GetByteCount(result.Payload));
             foreach (var result in results)
                 operationLatencies.Add(result.Latency);
+            observed.Add(
+                $"concurrent-create-{batch:D4}",
+                $"saved:1;concurrency-conflict:{concurrency - 1}",
+                winnerDocument.Version,
+                concurrency,
+                NormalizeConcurrentPayload(winnerDocument.ContentJson, concurrency));
         }
-        return Execution(batches * concurrency, payloadBytes, batches);
+        return Execution(
+            batches * concurrency,
+            payloadBytes,
+            batches,
+            observableResultVector: observed.Build());
     }
 
     private async Task<WorkloadExecution> PaginationAndCountAsync(
@@ -476,6 +588,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
+        var results = new BenchmarkObservableResultBuilder();
         for (var index = 0; index < operations; index++)
         {
             var skip = (iteration + index) % Math.Max(1, seededCount / 4);
@@ -488,11 +601,136 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                 operationLatencies);
             if (page.TotalCount != count)
                 throw new InvalidOperationException("Pagination/count workload observed inconsistent totals.");
+            AddQueryResults(results, $"page-{index:D4}", page, ordered: true);
+            results.Add(
+                $"count-{index:D4}",
+                "counted",
+                version: null,
+                count: count,
+                payload: null);
         }
-        return Execution(operations * 2);
+        return Execution(operations * 2, observableResultVector: results.Build());
     }
 
     private static int ReadRank(string json) => JsonDocument.Parse(json).RootElement.GetProperty("rank").GetInt32();
+
+    private static void AddQueryResults(
+        BenchmarkObservableResultBuilder results,
+        string identity,
+        DocumentQueryResult query,
+        bool ordered)
+    {
+        results.Add(
+            identity,
+            "returned",
+            version: null,
+            count: query.TotalCount,
+            payload: JsonSerializer.Serialize(
+                new { returnedCount = query.Documents.Count },
+                JsonOptions));
+
+        if (!ordered)
+        {
+            for (var index = 0; index < query.Documents.Count; index++)
+            {
+                var document = query.Documents[index];
+                results.Add(
+                    $"{identity}/match-{index:D4}",
+                    "selected",
+                    document.Version,
+                    count: 1,
+                    payload: NormalizeUnorderedQueryPayload(document.ContentJson));
+            }
+            return;
+        }
+
+        var documents = query.Documents
+            .Select(document => (Document: document, Rank: ReadRank(document.ContentJson)))
+            .ToArray();
+        if (!documents.Select(item => item.Rank).SequenceEqual(
+                documents.Select(item => item.Rank).OrderDescending()))
+        {
+            throw new InvalidOperationException("Ordered query workload returned documents out of rank order.");
+        }
+        foreach (var item in documents
+                     .OrderByDescending(item => item.Rank)
+                     .ThenBy(item => item.Document.Id, StringComparer.Ordinal))
+        {
+            results.AddDocument(item.Document, "selected");
+        }
+    }
+
+    private static string NormalizeUnorderedQueryPayload(string payload)
+    {
+        using var document = JsonDocument.Parse(payload);
+        var root = document.RootElement;
+        var status = root.GetProperty("status").GetString();
+        if (!string.Equals(status, "open", StringComparison.Ordinal))
+            throw new InvalidOperationException("Indexed query returned a document outside the open-status predicate.");
+        var padding = root.GetProperty("padding");
+        return JsonSerializer.Serialize(
+            new
+            {
+                status,
+                paddingBytes = padding.ValueKind == JsonValueKind.Null
+                    ? 0
+                    : padding.GetString()!.Length
+            },
+            JsonOptions);
+    }
+
+    private static string NormalizeConcurrentPayload(string payload, int concurrency)
+    {
+        using var document = JsonDocument.Parse(payload);
+        var root = document.RootElement;
+        var status = root.GetProperty("status").GetString();
+        var rank = root.GetProperty("rank").GetInt32();
+        var category = root.GetProperty("category").GetString();
+        var padding = root.GetProperty("padding");
+        if (!string.Equals(status, "open", StringComparison.Ordinal) ||
+            !string.Equals(category, "concurrent", StringComparison.Ordinal) ||
+            rank < 0 ||
+            rank >= concurrency)
+        {
+            throw new InvalidOperationException(
+                "Concurrent-create winner payload was not one of the competing canonical payloads.");
+        }
+        return JsonSerializer.Serialize(
+            new
+            {
+                status,
+                category,
+                winnerRankRange = $"0..{concurrency - 1}",
+                paddingBytes = padding.ValueKind == JsonValueKind.Null
+                    ? 0
+                    : padding.GetString()!.Length
+            },
+            JsonOptions);
+    }
+
+    private static DocumentEnvelope RequireSavedDocument(
+        DocumentStoreWriteResult result,
+        DocumentStoreWriteStatus expected,
+        string operation,
+        string expectedPayload)
+    {
+        RequireStatus(result, expected, operation);
+        var document = result.Document ??
+                       throw new InvalidOperationException(
+                           $"{operation} returned no saved document outcome.");
+        if (!string.Equals(document.ContentJson, expectedPayload, StringComparison.Ordinal))
+            throw new InvalidOperationException($"{operation} returned a different payload than it persisted.");
+        return document;
+    }
+
+    private static string Status(DocumentStoreWriteStatus status)
+        => LowerCamel(status.ToString());
+
+    private static string LowerCamel(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        return $"{char.ToLowerInvariant(value[0])}{value[1..]}";
+    }
 
     private string NewId(string prefix) => $"{instance}-{prefix}-{Interlocked.Increment(ref generatedId):D12}";
 
@@ -511,14 +749,16 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         long logicalPayloadBytes = 0,
         long logicalMutations = 0,
         long? roundTrips = null,
-        IReadOnlyDictionary<string, long>? providerWork = null) =>
+        IReadOnlyDictionary<string, long>? providerWork = null,
+        BenchmarkObservableResultVector? observableResultVector = null) =>
         new(
             operations,
             logicalPayloadBytes,
             logicalMutations,
             roundTrips,
             providerWork ?? new Dictionary<string, long>(),
-            []);
+            [],
+            observableResultVector);
 
     private static async Task<T> ObserveAsync<T>(
         Func<Task<T>> operation,

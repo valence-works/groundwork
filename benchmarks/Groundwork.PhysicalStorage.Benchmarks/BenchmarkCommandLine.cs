@@ -22,8 +22,8 @@ public static class BenchmarkCommandLine
           --selectivity-bps <list>        Query selectivity in basis points (1..9999)
           --independent-runs <count>       Measured worker repetitions (smoke: 1, scheduled: 3)
           --output <directory>            Artifact run directory
-          --baseline <run-or-jsonl>       Compare with a v1 run; raw JSONL is smoke-only
-          --confirm-regression            Diagnostic scaffold; current insufficient evidence is non-gating
+          --baseline <run-group>          Compare with a verified coordinator run-group root
+          --confirm-regression            Return exit 2 when the group confirms a regression
           --no-containers                 Require external provider connection strings
           --help                          Show this help
 
@@ -122,6 +122,12 @@ public static class BenchmarkCommandLine
             ParseIntegers(selectivityBasisPoints, defaultDimensions.QuerySelectivityBasisPoints, "--selectivity-bps", minimum: 1),
             ParseInteger(independentRuns, defaultDimensions.IndependentRuns, "--independent-runs", minimum: 1));
         dimensions.Validate();
+        if (configuration.Mode == BenchmarkRunMode.Scheduled &&
+            dimensions.IndependentRuns < RegressionPolicy.Scheduled.MinimumIndependentRuns)
+        {
+            throw new ArgumentException(
+                $"Scheduled profile requires at least {RegressionPolicy.Scheduled.MinimumIndependentRuns} independent runs.");
+        }
         return new BenchmarkCommand(
             false,
             new BenchmarkRunRequest(

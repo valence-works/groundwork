@@ -121,6 +121,14 @@ public static class BaselineCompatibilityEvaluator
             diagnostics.Add("Candidate and baseline stopwatch frequency differ.");
         if (!candidate.HarnessVersion.Equals(baseline.HarnessVersion, StringComparison.Ordinal))
             diagnostics.Add("Candidate and baseline harness version differ.");
+        if (!candidate.CpuModel.Equals(baseline.CpuModel, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline CPU model differ.");
+        if (!candidate.Memory.Equals(baseline.Memory, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline memory metadata differ.");
+        if (!candidate.Storage.Equals(baseline.Storage, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline storage/filesystem metadata differ.");
+        if (!candidate.PowerManagement.Equals(baseline.PowerManagement, StringComparison.Ordinal))
+            diagnostics.Add("Candidate and baseline power/governor metadata differ.");
     }
 
     private static void CompareProviders(
@@ -142,6 +150,8 @@ public static class BaselineCompatibilityEvaluator
                 diagnostics.Add($"Candidate and baseline provider version differ for {candidateProvider.Provider}.");
             if (!SameConfiguration(candidateProvider.Configuration, baselineProvider.Configuration))
                 diagnostics.Add($"Candidate and baseline provider configuration differ for {candidateProvider.Provider}.");
+            if (!SameConfiguration(candidateProvider.EffectiveSettings, baselineProvider.EffectiveSettings))
+                diagnostics.Add($"Candidate and baseline effective database settings differ for {candidateProvider.Provider}.");
         }
     }
 

@@ -58,7 +58,8 @@ public sealed record WorkloadExecution(
     long LogicalMutations,
     long? RoundTrips,
     IReadOnlyDictionary<string, long> ProviderWork,
-    IReadOnlyList<long> OperationLatencyNanoseconds);
+    IReadOnlyList<long> OperationLatencyNanoseconds,
+    BenchmarkObservableResultVector? ObservableResultVector = null);
 
 public interface IPhysicalStorageBenchmarkTarget : IAsyncDisposable
 {

@@ -84,6 +84,34 @@ public sealed class RegressionEvaluatorTests
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("invalid", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Scheduled_gate_uses_process_median_and_enforces_three_independent_processes()
+    {
+        var baseline = new[]
+        {
+            Samples(30, 1_000),
+            Samples(30, 1_000),
+            Samples(30, 100_000)
+        };
+        var candidate = new[]
+        {
+            Samples(30, 1_300),
+            Samples(30, 1_300),
+            Samples(30, 1)
+        };
+
+        var result = RegressionEvaluator.CompareIndependentRuns(
+            "sqlite/entity/read", baseline, candidate, RegressionPolicy.Scheduled);
+        var underpowered = RegressionEvaluator.CompareIndependentRuns(
+            "sqlite/entity/read", baseline[..2], candidate[..2], RegressionPolicy.Scheduled);
+
+        var latency = Assert.Single(result.Metrics, metric => metric.Name == "operation_latency_p50_ns");
+        Assert.Equal(1_000, latency.Baseline);
+        Assert.Equal(1_300, latency.Candidate);
+        Assert.False(underpowered.IsComparable);
+        Assert.Contains("3 independent", Assert.Single(underpowered.Diagnostics), StringComparison.Ordinal);
+    }
+
     private static BenchmarkSample[] Samples(int count, long elapsedNanoseconds) =>
         Enumerable.Range(0, count)
             .Select(iteration => new BenchmarkSample(
