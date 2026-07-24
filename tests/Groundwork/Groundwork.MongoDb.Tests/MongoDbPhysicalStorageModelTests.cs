@@ -132,6 +132,39 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Theory]
+    [InlineData("wrong-target")]
+    [InlineData("wrong-index")]
+    [InlineData("collection-scan")]
+    public void Native_mutation_plan_inspector_fails_closed_on_target_or_index_drift(string drift)
+    {
+        var binding = Assert.Single(
+            IdentityModel(includeMutation: true).MutationBindingsByStorageUnit.Values.SelectMany(bindings => bindings));
+        var selector = binding.Schema.Primary;
+        var stage = drift == "collection-scan"
+            ? new BsonDocument("stage", "COLLSCAN")
+            : new BsonDocument
+            {
+                ["stage"] = "IXSCAN",
+                ["indexName"] = drift == "wrong-index" ? "wrong_index" : selector.Index.Identifier
+            };
+        var explanation = new BsonDocument
+        {
+            ["queryPlanner"] = new BsonDocument
+            {
+                ["namespace"] = $"groundwork.{(drift == "wrong-target" ? "wrong_collection" : selector.StorageObject.Identifier)}",
+                ["winningPlan"] = stage
+            }
+        };
+
+        Assert.Throws<InvalidOperationException>(() =>
+            MongoDbNativeMutationPlanInspector.Inspect(
+                explanation,
+                "groundwork",
+                selector,
+                new BsonDocument()));
+    }
+
+    [Theory]
     [InlineData(PortableQueryOperation.GreaterThan)]
     [InlineData(PortableQueryOperation.StartsWith)]
     public void Ordered_identity_mutation_selector_certifies_only_the_comparison_evidence(
@@ -394,7 +427,6 @@ public sealed class MongoDbPhysicalStorageModelTests
     }
 
     [Theory]
-    [InlineData(PortableQueryOperation.Contains)]
     [InlineData(PortableQueryOperation.NotContains)]
     [InlineData(PortableQueryOperation.StartsWith)]
     public void Query_compilation_preserves_provider_diagnostics_for_case_insensitive_regex_operations(

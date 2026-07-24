@@ -482,9 +482,12 @@ public sealed class SqlitePhysicalSchemaExecutorTests
             PhysicalSchemaApplication.ApplyAsync(additive.Target, executor));
 
         Assert.Contains("priority", exception.Message);
+        // The single-transaction batch rolls the staged column back with the rest of the plan.
         var route = additive.Target.Routes.Single();
         var priority = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "priority");
-        Assert.Equal(0L, await ColumnNotNullAsync(connection, route.PrimaryStorage.Name.Identifier, priority.Column.Identifier));
+        Assert.DoesNotContain(
+            priority.Column.Identifier,
+            await ColumnNamesAsync(connection, route.PrimaryStorage.Name.Identifier));
     }
 
     [Fact]
@@ -814,6 +817,70 @@ public sealed class SqlitePhysicalSchemaExecutorTests
     }
 
     [Fact]
+    public async Task BatchApplyRollsBackEveryOperationWhenTrailingValidationFails()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var target = CreateModel(
+            PhysicalStorageForm.PhysicalEntityTable,
+            includePriority: true,
+            categoryNullable: true).Target;
+        var route = target.Routes.Single();
+        var byCategory = route.Indexes.Single(index => index.Identity == "by-category");
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"""
+                {CompatiblePreexistingTableSql(route, "double")}
+                CREATE INDEX {Quote(byCategory.Name.Identifier)} ON {Quote(route.PrimaryStorage.Name.Identifier)}
+                ({Quote(route.Envelope.Id.Identifier)});
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+        var priority = route.ProjectedColumns.Single(column => column.Definition.LogicalName == "priority");
+        var byPriority = route.Indexes.Single(index => index.Identity == "by-priority");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            PhysicalSchemaApplication.ApplyAsync(target, new SqlitePhysicalSchemaExecutor(connection)));
+
+        Assert.DoesNotContain(
+            priority.Column.Identifier,
+            await ColumnNamesAsync(connection, route.PrimaryStorage.Name.Identifier));
+        Assert.False(await IndexExistsAsync(connection, byPriority.Name.Identifier));
+        await using var operations = connection.CreateCommand();
+        operations.CommandText = "SELECT COUNT(*) FROM groundwork_physical_schema_operations;";
+        Assert.Equal(0L, Convert.ToInt64(await operations.ExecuteScalarAsync()));
+        await using var state = connection.CreateCommand();
+        state.CommandText = "SELECT COUNT(*) FROM groundwork_physical_schema_state;";
+        Assert.Equal(0L, Convert.ToInt64(await state.ExecuteScalarAsync()));
+    }
+
+    [Fact]
+    public async Task BatchApplyReplaysPriorDurableAcknowledgementsWithoutReapplying()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var target = CreateModel(PhysicalStorageForm.PhysicalEntityTable, includePriority: true).Target;
+        var executor = new SqlitePhysicalSchemaExecutor(connection);
+        var operations = PhysicalSchemaDiffPlanner.Plan(target, PhysicalSchemaHistoryState.Empty, DateTimeOffset.UtcNow)
+            .Operations
+            .Where(operation => operation is not RecordPhysicalSchemaAppliedStateOperation)
+            .ToArray();
+
+        IReadOnlyList<PhysicalSchemaOperationAcknowledgement> first;
+        IReadOnlyList<PhysicalSchemaOperationAcknowledgement> replay;
+        await using (var applicationLock = await executor.AcquireApplicationLockAsync(target.Identity, CancellationToken.None))
+            first = await executor.ApplyOperationBatchAsync(target.Identity, operations, applicationLock, CancellationToken.None);
+        await using (var applicationLock = await executor.AcquireApplicationLockAsync(target.Identity, CancellationToken.None))
+            replay = await executor.ApplyOperationBatchAsync(target.Identity, operations, applicationLock, CancellationToken.None);
+
+        Assert.Equal(operations.Select(operation => operation.Identity), first.Select(item => item.Identity));
+        Assert.Equal(first, replay);
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM groundwork_physical_schema_operations;";
+        Assert.Equal((long)operations.Length, Convert.ToInt64(await count.ExecuteScalarAsync()));
+    }
+
+    [Fact]
     public async Task ProviderNamesCannotCollideWithReservedRelationalEnvelopeColumns()
     {
         var normalizer = new DelegateProviderPhysicalNameNormalizer(context =>
@@ -983,17 +1050,16 @@ public sealed class SqlitePhysicalSchemaExecutorTests
         Assert.Equal("z-collision", exception.RequestedId);
         Assert.Equal("Retained-Collision-Id", exception.RetainedId);
         Assert.Equal(route.LinkedRelationship.Identity.Project("z-collision").LookupKey, exception.LookupKey);
+        // The single-transaction batch rolls the whole additive plan back, so the linked rows and
+        // schema return to their pre-apply shape.
         var priority = additive.Target.Routes.Single().ProjectedColumns
             .Single(column => column.Definition.LogicalName == "priority");
-        await using var readProjection = connection.CreateCommand();
-        readProjection.CommandText =
-            $"SELECT {Q(priority.Column.Identifier)} FROM {Q(route.LinkedIndexStorage.Name.Identifier)} " +
-            $"ORDER BY {Q(route.LinkedRelationship.DocumentId.Identifier)};";
-        await using var reader = await readProjection.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
-        Assert.True(reader.IsDBNull(0));
-        Assert.True(await reader.ReadAsync());
-        Assert.True(reader.IsDBNull(0));
+        Assert.DoesNotContain(
+            priority.Column.Identifier,
+            await ColumnNamesAsync(connection, route.LinkedIndexStorage.Name.Identifier));
+        await using var count = connection.CreateCommand();
+        count.CommandText = $"SELECT COUNT(*) FROM {Q(route.LinkedIndexStorage.Name.Identifier)};";
+        Assert.Equal(2L, Convert.ToInt64(await count.ExecuteScalarAsync()));
     }
 
     [Theory]

@@ -1872,9 +1872,9 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData(PortableQueryOperation.Contains)]
     [InlineData(PortableQueryOperation.NotContains)]
-    public void Scale_bearing_case_insensitive_substring_query_is_rejected_before_traffic(
+    [InlineData(PortableQueryOperation.StartsWith)]
+    public void Scale_bearing_uncertified_pattern_query_is_rejected_before_traffic(
         PortableQueryOperation operation)
     {
         var model = Model(
@@ -1889,6 +1889,102 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
 
         Assert.Contains(operation.ToString(), exception.Message, StringComparison.Ordinal);
         Assert.Contains("indexed", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Scale_bearing_contains_on_indexed_keyword_member_is_certified()
+    {
+        // Parity with the relational providers, which certify the identical declared route and serve
+        // Contains as LOWER(col) LIKE '%v%' inside a scope-prefix-bounded covering-index scan. For
+        // MongoDB the equivalent is an IXSCAN bounded by the storage-scope prefix with a
+        // case-insensitive escaped regex applied in-index to the keyword member.
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.Contains },
+            BoundedQueryExecutionClass.ScaleBearing,
+            valueKind: IndexValueKind.Keyword);
+
+        var store = new MongoDbPhysicalDocumentStore(
+            Database(),
+            model,
+            DocumentStoreAccess.Scoped(new("tenant-a")));
+
+        Assert.NotNull(store);
+    }
+
+    [Fact]
+    public void Scale_bearing_contains_on_unindexed_field_is_rejected_before_traffic()
+    {
+        // A keyword field with no matching ordered physical index cannot serve Contains without a
+        // collection scan, so the scale-bearing contract still refuses it before any traffic (no
+        // silent COLLSCAN) — the route never compiles into an executable model.
+        var exception = Assert.Throws<InvalidOperationException>(UnindexedKeywordContainsModel);
+
+        Assert.Contains("physical index", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(PhysicalStorageForm.SharedDocuments)]
+    [InlineData(PhysicalStorageForm.DedicatedDocumentTable)]
+    [InlineData(PhysicalStorageForm.PhysicalEntityTable)]
+    public async Task Scale_bearing_contains_matches_relational_case_insensitive_literal_semantics(
+        PhysicalStorageForm form)
+    {
+        var database = Database();
+        var model = Model(
+            form,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.Contains },
+            BoundedQueryExecutionClass.ScaleBearing,
+            valueKind: IndexValueKind.Keyword);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var tenantA = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        var tenantB = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-b")));
+
+        await tenantA.SaveAsync(new SaveDocumentRequest("workItem", "case", "1", """{"status":"ALPHA"}"""));
+        await tenantA.SaveAsync(new SaveDocumentRequest("workItem", "dot", "1", """{"status":"a.c"}"""));
+        await tenantA.SaveAsync(new SaveDocumentRequest("workItem", "trap", "1", """{"status":"aXc"}"""));
+        await tenantA.SaveAsync(new SaveDocumentRequest("workItem", "miss", "1", """{"status":"zzz"}"""));
+        // Scope isolation: an identical value seeded under another tenant must never leak.
+        await tenantB.SaveAsync(new SaveDocumentRequest("workItem", "leak", "1", """{"status":"a.c"}"""));
+
+        // Case-insensitive: a lowercase needle matches the uppercase value.
+        var caseInsensitive = await tenantA.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Contains("status", "alph"))]));
+        Assert.Equal(["case"], caseInsensitive.Documents.Select(document => document.Id).Order());
+
+        // Regex metacharacters are matched literally: "a.c" matches "a.c" but not "aXc".
+        var literal = await tenantA.QueryAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Contains("status", "a.c"))]));
+        Assert.Equal(["dot"], literal.Documents.Select(document => document.Id).Order());
+        Assert.DoesNotContain(literal.Documents, document => document.Id == "trap");
+
+        // Scope isolation: the tenant-b document with the same value is never returned to tenant-a.
+        Assert.DoesNotContain(literal.Documents, document => document.Id == "leak");
+    }
+
+    [Fact]
+    public async Task Scale_bearing_contains_winning_plan_is_a_scoped_index_scan()
+    {
+        var database = Database();
+        var model = Model(
+            PhysicalStorageForm.PhysicalEntityTable,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Equal, PortableQueryOperation.Contains },
+            BoundedQueryExecutionClass.ScaleBearing,
+            valueKind: IndexValueKind.Keyword);
+        await new MongoDbGroundworkMaterializer(database).MaterializeAsync(model);
+        var store = new MongoDbPhysicalDocumentStore(database, model, DocumentStoreAccess.Scoped(new("tenant-a")));
+        await store.SaveAsync(new SaveDocumentRequest("workItem", "1", "1", """{"status":"open"}"""));
+
+        var explanation = await store.ExplainAsync(new DocumentQuery(
+            "workItem", "list-by-status",
+            [DocumentQueryClause.Of(DocumentQueryComparison.Contains("status", "pen"))]));
+
+        var page = explanation.Commands.Single(command =>
+            command.Kind == PhysicalDocumentQueryCommandKind.Page);
+        Assert.Contains("IXSCAN", page.NativePlan, StringComparison.Ordinal);
+        Assert.DoesNotContain("COLLSCAN", page.NativePlan, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -2254,6 +2350,41 @@ public sealed class MongoDbPhysicalStorageConformanceTests : IAsyncLifetime
                 : []
         };
         return MongoDbPhysicalStorageModel.Compile(manifest);
+    }
+
+    private static MongoDbPhysicalStorageModel UnindexedKeywordContainsModel()
+    {
+        const string path = "status";
+        var projected = new ProjectedColumnDefinition(path, path, PortablePhysicalType.String);
+        var definition = PhysicalTableDefinition.PhysicalEntityTable("work_items", [projected], indexes: []);
+        var logical = new LogicalIndexDeclaration(
+            $"by-{path}", [new IndexField(path)], IndexValueKind.Keyword, false, MissingValueBehavior.Excluded);
+        var query = new BoundedQueryDeclaration(
+            $"list-by-{path}",
+            logical.Identity,
+            new HashSet<PortableQueryOperation> { PortableQueryOperation.Contains },
+            QuerySortSupport.Ascending,
+            QueryPagingSupport.Offset,
+            BoundedQueryExecutionClass.ScaleBearing,
+            supportsTotalCount: true);
+        var unit = new StorageUnit(
+            new StorageUnitIdentity("workItem"), "Work item", StorageIntent.PortableDocument(),
+            LifecyclePolicy.Mutable, IdentityPolicy.StringId(), TenancyPolicy.Scoped,
+            ConcurrencyPolicy.Optimistic(), SerializationPolicy.Json(), [], [], PhysicalizationPolicy.Portable)
+        {
+            PhysicalStorage = new StorageUnitPhysicalStorage(
+                StorageUnitProvisioningMode.Declared,
+                PhysicalStoragePolicy.Explicit(definition),
+                [logical],
+                [query])
+        };
+        return MongoDbPhysicalStorageModel.Compile(new StorageManifest(
+            new StorageManifestIdentity("mongo.unindexed-keyword-contains"),
+            new StorageManifestOwner("tests"),
+            new StorageManifestVersion("1"),
+            [unit],
+            new HashSet<string>(),
+            []));
     }
 
     private static MongoDbPhysicalStorageModel LatestPerKeyModel(PhysicalStorageForm form)

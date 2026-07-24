@@ -30,16 +30,38 @@ public static class SqlServerPhysicalQueryRuntime
         ProviderIdentity provider,
         SqlServerPhysicalQueryExplainHooks hooks)
     {
+        ArgumentNullException.ThrowIfNull(store);
+        return CompilePlanSet(manifest, route, provider, hooks).Bind(store);
+    }
+
+    /// <summary>
+    /// Compiles a connection-independent plan set once so a session-per-operation consumer can bind it to
+    /// a fresh store on each open without recompiling the admitted catalog.
+    /// </summary>
+    public static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider) => CompilePlanSet(manifest, route, provider, new SqlServerPhysicalQueryExplainHooks());
+
+    internal static RelationalPhysicalQueryPlanSet CompilePlanSet(
+        StorageManifest manifest,
+        ExecutableStorageRoute route,
+        ProviderIdentity provider,
+        SqlServerPhysicalQueryExplainHooks hooks)
+    {
         ArgumentNullException.ThrowIfNull(hooks);
-        return
-        RelationalPhysicalQueryRuntime.CreateWithExplainer(
-            store,
+        return RelationalPhysicalQueryRuntime.CompilePlanSet(
             manifest,
             route,
             provider,
             "sqlserver",
             (command, cancellationToken) => ExplainAsync(command, hooks, cancellationToken));
     }
+
+    internal static Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
+        DbCommand command,
+        CancellationToken cancellationToken) =>
+        ExplainAsync(command, new SqlServerPhysicalQueryExplainHooks(), cancellationToken);
 
     private static async Task<RelationalPhysicalNativeQueryPlan> ExplainAsync(
         DbCommand command,
@@ -51,7 +73,7 @@ public static class SqlServerPhysicalQueryRuntime
         Exception? primaryFailure = null;
         try
         {
-            await SetStatisticsXmlAsync(connection, enabled: true, cancellationToken);
+            await SetStatisticsXmlAsync(connection, command.Transaction, enabled: true, cancellationToken);
             await InvokeAsync(hooks.AfterEnableAcknowledged, cancellationToken);
             await InvokeAsync(hooks.BeforeRead, command, cancellationToken);
             var plans = await ExecuteAndReadPlansAsync(command, cancellationToken);
@@ -70,7 +92,7 @@ public static class SqlServerPhysicalQueryRuntime
             try
             {
                 await InvokeAsync(hooks.BeforeDisable, CancellationToken.None);
-                await SetStatisticsXmlAsync(connection, enabled: false, CancellationToken.None);
+                await SetStatisticsXmlAsync(connection, command.Transaction, enabled: false, CancellationToken.None);
             }
             catch (Exception cleanupFailure)
             {
@@ -115,10 +137,12 @@ public static class SqlServerPhysicalQueryRuntime
 
     private static async Task SetStatisticsXmlAsync(
         DbConnection connection,
+        DbTransaction? transaction,
         bool enabled,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = $"SET STATISTICS XML {(enabled ? "ON" : "OFF")};";
         await command.ExecuteNonQueryAsync(cancellationToken);
     }

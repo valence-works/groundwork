@@ -210,7 +210,20 @@ public sealed class SqliteDocumentIdentityAcceptanceTests : DocumentIdentityAcce
                 async () => await connection.DisposeAsync(),
                 mutations,
                 query => ExplainQueryAsync(connection, documents, manifest, target, route, query),
-                mutation => ExplainMutationAsync(connection, documents, manifest, target, route, mutation));
+                mutation => ExplainMutationAsync(connection, documents, manifest, target, route, mutation),
+                observer => RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                    new RelationalPhysicalMutationRuntimeContext(
+                        documents,
+                        manifest,
+                        route,
+                        target.Provider,
+                        SqliteGroundworkCapabilities.Provider.Name,
+                        "sqlite"),
+                    (identity, command, preparedRestrictionRowCount) =>
+                    {
+                        observer(identity, command.CommandText, preparedRestrictionRowCount);
+                        return ValueTask.CompletedTask;
+                    }));
         }
         catch
         {

@@ -226,12 +226,12 @@ public sealed class PhysicalMutationSelectorCertification
     public PhysicalMutationSelectorCertification(
         ExecutableStorageObjectRole target,
         ProviderPhysicalObjectName storageObject,
-        ProviderPhysicalObjectName index,
+        ProviderPhysicalObjectName? index,
         IReadOnlyDictionary<string, string> fieldIdentifiers)
     {
         Target = target;
         StorageObject = storageObject ?? throw new ArgumentNullException(nameof(storageObject));
-        Index = index ?? throw new ArgumentNullException(nameof(index));
+        Index = index;
         FieldIdentifiers = (fieldIdentifiers ?? throw new ArgumentNullException(nameof(fieldIdentifiers)))
             .ToFrozenDictionary(StringComparer.Ordinal);
     }
@@ -240,7 +240,7 @@ public sealed class PhysicalMutationSelectorCertification
 
     public ProviderPhysicalObjectName StorageObject { get; }
 
-    public ProviderPhysicalObjectName Index { get; }
+    public ProviderPhysicalObjectName? Index { get; }
 
     public IReadOnlyDictionary<string, string> FieldIdentifiers { get; }
 }
@@ -310,6 +310,53 @@ public sealed class PhysicalMutationExecutionCertification
     }
 }
 
+/// <summary>
+/// Provider-owned certification for one ordered native-evidence command and its exact selector set.
+/// </summary>
+public sealed class PhysicalMutationEvidenceStageCertification
+{
+    public PhysicalMutationEvidenceStageCertification(
+        PhysicalDocumentMutationCommandKind kind,
+        string identity,
+        IReadOnlyList<PhysicalMutationSelectorCertification> selectors)
+    {
+        var expectedIdentity = kind switch
+        {
+            PhysicalDocumentMutationCommandKind.Selection =>
+                PhysicalDocumentMutationCommandIdentities.Selection,
+            PhysicalDocumentMutationCommandKind.CandidateDiscovery =>
+                PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+            PhysicalDocumentMutationCommandKind.PredicateRecheck =>
+                PhysicalDocumentMutationCommandIdentities.PredicateRecheck,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
+        };
+        if (!string.Equals(identity, expectedIdentity, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Mutation evidence command kind '{kind}' requires identity '{expectedIdentity}'.",
+                nameof(identity));
+        }
+        ArgumentNullException.ThrowIfNull(selectors);
+        if (selectors.Count == 0 ||
+            selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
+        {
+            throw new ArgumentException(
+                "A mutation evidence stage requires a non-empty, target-unique selector set.",
+                nameof(selectors));
+        }
+
+        Kind = kind;
+        Identity = identity;
+        Selectors = Array.AsReadOnly(selectors.ToArray());
+    }
+
+    public PhysicalDocumentMutationCommandKind Kind { get; }
+
+    public string Identity { get; }
+
+    public IReadOnlyList<PhysicalMutationSelectorCertification> Selectors { get; }
+}
+
 public sealed class PhysicalMutationHandlerCertification
 {
     private readonly PhysicalQueryHandlerCertification predicate;
@@ -319,7 +366,8 @@ public sealed class PhysicalMutationHandlerCertification
 
     public PhysicalMutationHandlerCertification(
         PhysicalMutationPlan plan,
-        PhysicalMutationExecutionCertification? execution = null)
+        PhysicalMutationExecutionCertification? execution = null,
+        IReadOnlyList<PhysicalMutationEvidenceStageCertification>? evidenceStages = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         MutationIdentity = plan.MutationIdentity;
@@ -347,6 +395,44 @@ public sealed class PhysicalMutationHandlerCertification
         if (execution is not null && !execution.Certifies(plan))
             throw new ArgumentException("Executable mutation certification does not match the compiled mutation plan.", nameof(execution));
         Execution = execution;
+        var expectedSelectors = ExpectedSelectors(plan, execution);
+        var stages = evidenceStages?.ToArray() ??
+        [
+            new PhysicalMutationEvidenceStageCertification(
+                PhysicalDocumentMutationCommandKind.Selection,
+                PhysicalDocumentMutationCommandIdentities.Selection,
+                expectedSelectors)
+        ];
+        if (stages.Length == 0 ||
+            stages.GroupBy(stage => stage.Identity, StringComparer.Ordinal).Any(group => group.Count() != 1))
+        {
+            throw new ArgumentException(
+                "Mutation evidence stages must be non-empty and have unique identities.",
+                nameof(evidenceStages));
+        }
+        var expectedByTarget = expectedSelectors.ToDictionary(selector => selector.Target);
+        foreach (var selector in stages.SelectMany(stage => stage.Selectors))
+        {
+            if (!expectedByTarget.TryGetValue(selector.Target, out var expected) ||
+                selector.StorageObject != expected.StorageObject ||
+                selector.Index != expected.Index)
+            {
+                throw new ArgumentException(
+                    "Mutation evidence stages must use only selectors certified for the compiled mutation plan.",
+                    nameof(evidenceStages));
+            }
+        }
+        if (!stages.SelectMany(stage => stage.Selectors)
+                .Select(selector => selector.Target)
+                .Distinct()
+                .Order()
+                .SequenceEqual(expectedByTarget.Keys.Order()))
+        {
+            throw new ArgumentException(
+                "Mutation evidence stages must cover every selector certified for the compiled mutation plan.",
+                nameof(evidenceStages));
+        }
+        EvidenceStages = Array.AsReadOnly(stages);
     }
 
     public string MutationIdentity { get; }
@@ -354,6 +440,8 @@ public sealed class PhysicalMutationHandlerCertification
     public BoundedMutationActionKind ActionKind { get; }
 
     public PhysicalMutationExecutionCertification? Execution { get; }
+
+    public IReadOnlyList<PhysicalMutationEvidenceStageCertification> EvidenceStages { get; }
 
     internal bool Certifies(PhysicalMutationPlan plan)
     {
@@ -369,6 +457,38 @@ public sealed class PhysicalMutationHandlerCertification
         return transitionPath == transition?.Path &&
                transitionTarget == transition?.TargetValue &&
                allowedSourceValues.SequenceEqual(transition?.AllowedSourceValues ?? []);
+    }
+
+    private static IReadOnlyList<PhysicalMutationSelectorCertification> ExpectedSelectors(
+        PhysicalMutationPlan plan,
+        PhysicalMutationExecutionCertification? execution)
+    {
+        if (execution is not null)
+        {
+            return execution.Linked is null
+                ? [execution.Primary]
+                : [execution.Primary, execution.Linked];
+        }
+
+        var selectors = new List<PhysicalMutationSelectorCertification>
+        {
+            new(
+                ExecutableStorageObjectRole.PrimaryStorage,
+                plan.Predicate.PrimaryObject,
+                plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+                    ? null
+                    : plan.Predicate.IndexName,
+                new Dictionary<string, string>())
+        };
+        if (plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary)
+        {
+            selectors.Add(new PhysicalMutationSelectorCertification(
+                ExecutableStorageObjectRole.LinkedIndexStorage,
+                plan.Predicate.LookupObject,
+                plan.Predicate.IndexName!,
+                new Dictionary<string, string>()));
+        }
+        return selectors;
     }
 }
 
@@ -393,21 +513,30 @@ public interface IPhysicalDocumentMutationHandler
 /// Resolves and validates the complete named mutation before dispatching to a provider handler.
 /// Unknown names, shapes, effects, routes, and capability claims fail before provider I/O.
 /// </summary>
-public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStore
+public sealed class PhysicalMutationDocumentStore : IPhysicalDocumentMutationExplainer
 {
     private readonly IReadOnlyDictionary<string, PhysicalMutationPlan> plans;
     private readonly IReadOnlyDictionary<string, IPhysicalDocumentMutationHandler> handlers;
+    private readonly PhysicalDocumentMutationExplainExecutor? explain;
+    private readonly PhysicalDocumentMutationInvocationFingerprintResolver? invocationFingerprint;
 
     public PhysicalMutationDocumentStore(
         ExecutableStorageRoute route,
         StorageUnitPhysicalStorage storage,
         PhysicalQueryPlannerCapabilities predicateCapabilities,
-        IReadOnlyList<IPhysicalDocumentMutationHandler> handlers)
+        IReadOnlyList<IPhysicalDocumentMutationHandler> handlers,
+        PhysicalDocumentMutationExplainExecutor? explain = null,
+        PhysicalDocumentMutationInvocationFingerprintResolver? invocationFingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(route);
         ArgumentNullException.ThrowIfNull(storage);
         ArgumentNullException.ThrowIfNull(predicateCapabilities);
         ArgumentNullException.ThrowIfNull(handlers);
+        if ((explain is null) != (invocationFingerprint is null))
+        {
+            throw new ArgumentException(
+                "Provider-native mutation explanation and invocation fingerprint resolution must be configured together.");
+        }
 
         var byIdentity = handlers
             .GroupBy(handler => handler.Identity, StringComparer.Ordinal)
@@ -450,6 +579,8 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
 
         plans = compilation.Plans.ToFrozenDictionary(plan => plan.MutationIdentity, StringComparer.Ordinal);
         this.handlers = byIdentity.ToFrozenDictionary(group => group.Key, group => group.Value[0], StringComparer.Ordinal);
+        this.explain = explain;
+        this.invocationFingerprint = invocationFingerprint;
     }
 
     public Task<BoundedMutationResult> ExecuteAsync(
@@ -476,6 +607,97 @@ public sealed class PhysicalMutationDocumentStore : IBoundedDocumentMutationStor
 
         ValidateRuntimeShape(mutation, plan);
         return plan;
+    }
+
+    public PhysicalMutationPlan ResolvePlan(DocumentMutation mutation) => Admit(mutation);
+
+    public async Task<PhysicalDocumentMutationExplanation> ExplainAsync(
+        DocumentMutation mutation,
+        CancellationToken cancellationToken = default)
+    {
+        var plan = Admit(mutation);
+        if (explain is null)
+        {
+            throw new NotSupportedException(
+                $"Bounded mutation '{mutation.MutationIdentity}' has no provider-native evidence runtime.");
+        }
+
+        var evidence = await explain(mutation, plan, cancellationToken);
+        if (!ReferenceEquals(evidence.Plan, plan) && !evidence.Plan.Equals(plan))
+            throw new InvalidOperationException("Provider-native mutation evidence returned a different admitted plan.");
+        var expectedFingerprint = invocationFingerprint!(mutation, plan);
+        if (!string.Equals(
+                evidence.RuntimeInvocationFingerprint,
+                expectedFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' returned a different invocation fingerprint.");
+        }
+        ValidateEvidence(plan, handlers[plan.HandlerIdentity], evidence);
+        return evidence;
+    }
+
+    private static void ValidateEvidence(
+        PhysicalMutationPlan plan,
+        IPhysicalDocumentMutationHandler handler,
+        PhysicalDocumentMutationExplanation evidence)
+    {
+        if (plan.Predicate.IndexName is null)
+        {
+            throw new InvalidOperationException(
+                $"Bounded mutation '{plan.MutationIdentity}' has no declared physical index.");
+        }
+        var certification = handler.Certifications.Single(candidate => candidate.Certifies(plan));
+        var commandStamps = evidence.Commands.Select(command => (command.Kind, command.Identity)).ToArray();
+        var expectedCommandStamps = certification.EvidenceStages
+            .Select(stage => (stage.Kind, stage.Identity))
+            .ToArray();
+        if (!commandStamps.SequenceEqual(expectedCommandStamps))
+        {
+            throw new InvalidOperationException(
+                $"Provider-native mutation evidence for '{plan.MutationIdentity}' did not return the exact selector command sequence.");
+        }
+        foreach (var (command, stage) in evidence.Commands.Zip(certification.EvidenceStages))
+        {
+            if (command.Kind != PhysicalDocumentMutationCommandKind.Selection &&
+                string.IsNullOrWhiteSpace(command.RenderedCommand))
+            {
+                throw new InvalidOperationException(
+                    $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not stamp " +
+                    "the exact rendered execution-stage command.");
+            }
+            var expectedForCommand = stage.Selectors;
+            if (command.Selectors.Count != expectedForCommand.Count ||
+                command.Selectors.GroupBy(selector => selector.Target).Any(group => group.Count() != 1))
+            {
+                throw new InvalidOperationException(
+                    $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not return " +
+                    "the exact certified selector set.");
+            }
+            foreach (var selector in expectedForCommand)
+            {
+                var observed = command.Selectors.SingleOrDefault(candidate => candidate.Target == selector.Target);
+                if (observed is null ||
+                    observed.StorageObject != selector.StorageObject ||
+                    observed.Index != selector.Index ||
+                    !string.Equals(
+                        observed.ObservedStorageObjectIdentifier,
+                        selector.StorageObject.Identifier,
+                        StringComparison.Ordinal) ||
+                    (selector.Index is not null &&
+                     !string.Equals(
+                         observed.ObservedIndexIdentifier,
+                         selector.Index.Identifier,
+                         StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Provider-native mutation command '{command.Identity}' for '{plan.MutationIdentity}' did not prove " +
+                        $"certified selector '{selector.Target}/{selector.StorageObject.Identifier}/" +
+                        $"{selector.Index?.Identifier ?? "<provider-owned>"}'.");
+                }
+            }
+        }
     }
 
     private static bool SupportsProfile(

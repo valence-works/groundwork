@@ -309,7 +309,7 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
     }
 
     [Fact]
-    public async Task Bounded_mutation_selector_uses_the_declared_physical_index()
+    public async Task Bounded_mutation_explains_the_exact_execution_stages_with_the_declared_physical_index()
     {
         var model = RelationalPhysicalStorageTestModels.Create(
             PhysicalStorageForm.PhysicalEntityTable,
@@ -336,15 +336,36 @@ public sealed partial class PostgreSqlRelationalPhysicalStorageConformanceTests(
             model.Target.Provider,
             PostgreSqlGroundworkCapabilities.Provider.Name,
             "postgresql");
-        var selection = RelationalPhysicalMutationRuntime.BuildSelectionCommand(
+        var request = new DocumentMutation("configurationDocument", "revoke-pending", "explain");
+        var evidence = await PostgreSqlPhysicalMutationRuntime
+            .Create(store, model.Manifest, route, model.Target.Provider)
+            .ExplainAsync(request);
+        var executed = new List<(string Identity, string CommandText, long? PreparedRestrictionRowCount)>();
+        var execution = RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
             mutationContext,
-            new DocumentMutation("configurationDocument", "revoke-pending", "explain"));
-
-        var plan = await ExplainAsync(selection);
+            (identity, command, preparedRestrictionRowCount) =>
+            {
+                executed.Add((identity, command.CommandText, preparedRestrictionRowCount));
+                return ValueTask.CompletedTask;
+            });
 
         var expectedIndex = route.Indexes.Single(index => index.Identity == "by-category").Name.Identifier;
-        Assert.True(plan.Contains(expectedIndex, StringComparison.Ordinal), plan);
-        Assert.DoesNotContain("Seq Scan", plan, StringComparison.Ordinal);
+        var result = await execution.ExecuteAsync(request);
+        Assert.Equal(BoundedMutationStatus.Completed, result.Status);
+        Assert.Equal(1, result.AffectedCount);
+        Assert.Equal(
+            evidence.Commands.Select(command => (
+                command.Identity,
+                command.RenderedCommand!,
+                command.PreparedRestrictionRowCount)),
+            executed);
+        Assert.Null(evidence.Commands[0].PreparedRestrictionRowCount);
+        Assert.True(evidence.Commands[1].PreparedRestrictionRowCount > 0);
+        Assert.All(evidence.Commands, command =>
+        {
+            Assert.Contains(expectedIndex, command.NativePlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("Seq Scan", command.NativePlan, StringComparison.Ordinal);
+        });
     }
 
     [Fact]

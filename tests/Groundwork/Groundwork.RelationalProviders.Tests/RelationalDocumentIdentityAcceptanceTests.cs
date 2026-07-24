@@ -310,6 +310,16 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
     protected override IPhysicalSchemaExecutor CreateSchemaExecutor() =>
         new PostgreSqlPhysicalSchemaExecutor(fixture.Container.GetConnectionString());
 
+    protected override async Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture identityFixture)
+    {
+        await SeedPlanNoiseAsync(identityFixture.Route);
+        await using var connection = new NpgsqlConnection(fixture.Container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var analyze = connection.CreateCommand();
+        analyze.CommandText = $"ANALYZE {Quote(identityFixture.Route.PrimaryStorage.Name.Identifier)};";
+        await analyze.ExecuteNonQueryAsync();
+    }
+
     protected override DocumentIdentityAcceptanceFixture CreateFixture(
         StorageManifest manifest,
         PhysicalSchemaTarget target,
@@ -330,7 +340,20 @@ public sealed class PostgreSqlDocumentIdentityAcceptanceTests(PostgreSqlPhysical
                 ? PostgreSqlPhysicalMutationRuntime.Create(documents, manifest, route, target.Provider)
                 : null,
             query => ExplainQueryAsync(documents, manifest, target, route, query),
-            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
+            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation),
+            observer => RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    documents,
+                    manifest,
+                    route,
+                    target.Provider,
+                    PostgreSqlGroundworkCapabilities.Provider.Name,
+                    "postgresql"),
+                (identity, command, preparedRestrictionRowCount) =>
+                {
+                    observer(identity, command.CommandText, preparedRestrictionRowCount);
+                    return ValueTask.CompletedTask;
+                }));
     }
 
     internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(
@@ -466,6 +489,16 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
     protected override IPhysicalSchemaExecutor CreateSchemaExecutor() =>
         new SqlServerPhysicalSchemaExecutor(fixture.Container.GetConnectionString());
 
+    protected override async Task PrepareMutationNativeEvidenceAsync(DocumentIdentityAcceptanceFixture identityFixture)
+    {
+        await SeedPlanNoiseAsync(identityFixture.Route);
+        await using var connection = new SqlConnection(fixture.Container.GetConnectionString());
+        await connection.OpenAsync();
+        await using var statistics = connection.CreateCommand();
+        statistics.CommandText = $"UPDATE STATISTICS {Quote(identityFixture.Route.PrimaryStorage.Name.Identifier)};";
+        await statistics.ExecuteNonQueryAsync();
+    }
+
     protected override DocumentIdentityAcceptanceFixture CreateFixture(
         StorageManifest manifest,
         PhysicalSchemaTarget target,
@@ -486,7 +519,20 @@ public sealed class SqlServerDocumentIdentityAcceptanceTests(SqlServerPhysicalSt
                 ? SqlServerPhysicalMutationRuntime.Create(documents, manifest, route, target.Provider)
                 : null,
             query => ExplainQueryAsync(documents, manifest, target, route, query),
-            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation));
+            mutation => ExplainMutationAsync(documents, manifest, target, route, mutation),
+            observer => RelationalPhysicalMutationRuntime.CreateWithSelectionObserver(
+                new RelationalPhysicalMutationRuntimeContext(
+                    documents,
+                    manifest,
+                    route,
+                    target.Provider,
+                    SqlServerGroundworkCapabilities.Provider.Name,
+                    "sqlserver"),
+                (identity, command, preparedRestrictionRowCount) =>
+                {
+                    observer(identity, command.CommandText, preparedRestrictionRowCount);
+                    return ValueTask.CompletedTask;
+                }));
     }
 
     internal override async Task<RelationalIdentityNativeExplain> ExplainNativeAsync(

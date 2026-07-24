@@ -241,7 +241,7 @@ public sealed class MongoDbPhysicalDocumentStore :
                 hooks,
                 transactionCapability)
         };
-        return new PhysicalQueryDocumentStore(route, storage, capabilities, handlers);
+        return PhysicalQueryDocumentStore.FromCompiledPlans(plans.Plans, capabilities, handlers);
     }
 
     private static void ValidateTypedPaths(
@@ -300,7 +300,7 @@ public sealed class MongoDbPhysicalDocumentStore :
         foreach (var query in storage.BoundedQueries.Where(query =>
                      query.ExecutionClass == BoundedQueryExecutionClass.ScaleBearing))
         {
-            var unsupported = MongoDbScaleBearingOperationValidation.UnsupportedOperations(storage, query);
+            var unsupported = MongoDbScaleBearingOperationValidation.UnsupportedQueryOperations(storage, query);
             if (unsupported.Length == 0)
                 continue;
 

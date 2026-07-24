@@ -71,6 +71,15 @@ internal sealed class RelationalPhysicalMutationTransaction(DbTransaction transa
 public abstract class RelationalPhysicalDocumentDialect
 {
     public virtual void ValidateRoute(ExecutableStorageRoute route) => ArgumentNullException.ThrowIfNull(route);
+
+    /// <summary>
+    /// Discriminator that separates precompiled write-path SQL by dialect. Rendered mutation SQL is a pure
+    /// function of the route and this dialect's formatting, so the default type identity is a safe cache key
+    /// for the current (instance-state-free) dialects. A provider whose mutation SQL depends on instance
+    /// configuration must override this to fold that configuration into the key.
+    /// </summary>
+    public virtual string MutationSqlCacheDiscriminator => GetType().FullName ?? GetType().Name;
+
     public abstract string QuoteIdentifier(string identifier);
     public virtual string ExactIdentityPredicate(IReadOnlyList<RelationalPhysicalIdentityPredicatePart> parts)
     {
@@ -238,6 +247,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     private readonly RelationalSessionFactory? sessionFactory;
     private readonly StorageManifest manifest;
     private readonly IReadOnlyDictionary<string, ExecutableStorageRoute> routes;
+    private readonly IReadOnlyDictionary<string, RelationalPhysicalMutationSql> mutationSql;
     private readonly RelationalPhysicalDocumentDialect dialect;
     private readonly IStorageScopeObserver scopeObserver;
     private readonly Func<CancellationToken, ValueTask>? beforeNonSuccessAbort;
@@ -331,6 +341,12 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             RelationalPhysicalStorageColumns.Validate(route);
             dialect.ValidateRoute(route);
         }
+        // Render the deterministic write-path SQL once per admitted route so no save/update/delete
+        // re-interpolates identical statements inside its transaction critical section.
+        mutationSql = this.routes.ToDictionary(
+            pair => pair.Key,
+            pair => RelationalPhysicalMutationSqlCache.Shared.GetOrCompile(dialect, pair.Value),
+            StringComparer.Ordinal);
     }
 
     public DocumentStoreAccess Access { get; }
@@ -414,6 +430,11 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             ? route
             : throw new InvalidOperationException($"Document kind '{documentKind}' has no executable storage route.");
 
+    private RelationalPhysicalMutationSql GetMutationSql(string documentKind) =>
+        mutationSql.TryGetValue(documentKind, out var sql)
+            ? sql
+            : throw new InvalidOperationException($"Document kind '{documentKind}' has no compiled mutation SQL.");
+
     internal DocumentScopeSelection ResolveQueryScope(string documentKind) =>
         DocumentStoreScopeResolver.Resolve(GetUnit(documentKind), Access, StorageScopeOperation.Query, scopeObserver, allowAcrossScopes: true);
 
@@ -431,6 +452,13 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     internal Task<T> ExecutePhysicalQueryAsync<T>(Func<DbConnection, CancellationToken, Task<T>> action, CancellationToken cancellationToken) =>
         ExecuteAsync(action, cancellationToken);
+
+    internal async ValueTask<IRelationalPhysicalMutationTransaction> BeginPhysicalMutationTransactionAsync(
+        DbConnection connection,
+        CancellationToken cancellationToken) =>
+        createMutationTransaction(
+            await dialect.BeginMutationTransactionAsync(connection, cancellationToken)) ??
+        throw new InvalidOperationException("The physical mutation transaction factory returned null.");
 
     internal async Task<T> ExecutePhysicalMutationAsync<T>(
         Func<DbConnection, DbTransaction, CancellationToken, Task<T>> action,
@@ -675,6 +703,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     {
         var unit = GetUnit(request.DocumentKind);
         var route = GetRoute(request.DocumentKind);
+        var sql = GetMutationSql(request.DocumentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Save);
         var existing = await LoadForWriteAsync(
             transaction.Connection!,
@@ -697,8 +726,8 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         try
         {
             var affected = existing is null
-                ? await InsertPrimaryAsync(route, request, scope, version, createdAt, now, projectedValues, transaction, ct)
-                : await UpdatePrimaryAsync(route, request, scope, version, now, projectedValues, transaction, ct);
+                ? await InsertPrimaryAsync(route, sql, request, scope, version, createdAt, now, projectedValues, transaction, ct)
+                : await UpdatePrimaryAsync(route, sql, request, scope, version, now, projectedValues, transaction, ct);
             if (affected != 1)
             {
                 if (existing is null)
@@ -719,7 +748,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 }
                 return request.ExpectedVersion is null ? DocumentStoreWriteResult.NotFound : DocumentStoreWriteResult.ConcurrencyConflict;
             }
-            await MaintainLinkedAsync(route, request, scope, projectedValues, transaction, ct);
+            await MaintainLinkedAsync(route, sql, request, scope, projectedValues, transaction, ct);
         }
         catch (DbException exception) when (dialect.IsUniqueConstraintException(exception))
         {
@@ -753,6 +782,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     {
         var unit = GetUnit(request.DocumentKind);
         var route = GetRoute(request.DocumentKind);
+        var sql = GetMutationSql(request.DocumentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Delete);
         var existing = await LoadForWriteAsync(
             transaction.Connection!,
@@ -767,10 +797,10 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             return DocumentStoreWriteResult.ConcurrencyConflict;
 
         if (route.LinkedIndexStorage is not null)
-            await DeleteLinkedAsync(route, request.Id, scope, transaction, ct);
+            await DeleteLinkedAsync(route, sql, request.Id, scope, transaction, ct);
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"DELETE FROM {Q(route.PrimaryStorage.Name.Identifier)} WHERE {IdentityPredicate(route, request.ExpectedVersion is not null)};",
+            sql.DeletePrimary(request.ExpectedVersion is not null),
             transaction);
         AddIdentityParameters(command, route, request.Id, scope);
         if (request.ExpectedVersion is not null)
@@ -782,6 +812,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task<int> InsertPrimaryAsync(
         ExecutableStorageRoute route,
+        RelationalPhysicalMutationSql sql,
         SaveDocumentRequest request,
         DocumentScopeSelection scope,
         long version,
@@ -791,29 +822,12 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var projections = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage).ToArray();
-        var columns = RelationalPhysicalEnvelopeRowLayout.PersistedColumns(route)
-            .Concat([RelationalPhysicalStorageColumns.CreatedUtc, RelationalPhysicalStorageColumns.UpdatedUtc])
-            .Concat(projections.Select(column => column.Column.Identifier))
-            .ToArray();
-        var parameters = columns.Select((_, index) => P($"v{index}")).ToArray();
-        var lookupIdentity = new RelationalPhysicalIdentityPredicatePart[]
-        {
-            new(route.Discriminator.Column.Identifier, null, P("kind")),
-            new(route.ScopeKey.Column.Identifier, null, P("scope")),
-            new(route.Envelope.Identity.LookupKey.Identifier, null, P("idLookup"))
-        };
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            dialect.InsertPrimaryIfAbsent(
-                route.PrimaryStorage.Name.Identifier,
-                columns,
-                parameters,
-                route.PrimaryKey.Columns.Select(column => column.Identifier).ToArray(),
-                lookupIdentity),
+            sql.InsertPrimary,
             transaction);
         var values = EnvelopeValues(route, request, scope, version).Concat<object?>([createdAt.ToString("O"), updatedAt.ToString("O")])
-            .Concat(ProjectedValues(projectedValues, projections));
+            .Concat(ProjectedValues(projectedValues, sql.PrimaryProjections));
         AddValues(command, values);
         AddIdentityParameters(command, route, request.Id, scope);
         try
@@ -835,6 +849,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task<int> UpdatePrimaryAsync(
         ExecutableStorageRoute route,
+        RelationalPhysicalMutationSql sql,
         SaveDocumentRequest request,
         DocumentScopeSelection scope,
         long version,
@@ -843,23 +858,20 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         DbTransaction transaction,
         CancellationToken ct)
     {
-        var projections = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.PrimaryStorage).ToArray();
-        var assignments = new List<(string Column, object? Value)>
+        var values = new List<object?>
         {
-            (route.Envelope.SchemaVersion.Identifier, request.SchemaVersion),
-            (route.Envelope.Version.Identifier, version),
-            (route.Envelope.CanonicalJson.Identifier, request.ContentJson),
-            (RelationalPhysicalStorageColumns.UpdatedUtc, updatedAt.ToString("O"))
+            request.SchemaVersion,
+            version,
+            request.ContentJson,
+            updatedAt.ToString("O")
         };
-        assignments.AddRange(projections.Zip(ProjectedValues(projectedValues, projections), (column, value) => (column.Column.Identifier, value)));
+        values.AddRange(ProjectedValues(projectedValues, sql.PrimaryProjections));
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"UPDATE {Q(route.PrimaryStorage.Name.Identifier)} SET " +
-            string.Join(", ", assignments.Select((item, index) => $"{Q(item.Column)} = {P($"v{index}")}")) +
-            $" WHERE {IdentityPredicate(route, request.ExpectedVersion is not null)};",
+            sql.UpdatePrimary(request.ExpectedVersion is not null),
             transaction);
-        for (var index = 0; index < assignments.Count; index++)
-            AddPhysicalParameter(command, $"v{index}", assignments[index].Value);
+        for (var index = 0; index < values.Count; index++)
+            AddPhysicalParameter(command, $"v{index}", values[index]);
         AddIdentityParameters(command, route, request.Id, scope);
         if (request.ExpectedVersion is not null)
             AddPhysicalParameter(command, "expectedVersion", request.ExpectedVersion.Value);
@@ -868,6 +880,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task MaintainLinkedAsync(
         ExecutableStorageRoute route,
+        RelationalPhysicalMutationSql sql,
         SaveDocumentRequest request,
         DocumentScopeSelection scope,
         IReadOnlyDictionary<string, object?> projectedValues,
@@ -876,18 +889,9 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     {
         if (route.LinkedIndexStorage is null)
             return;
-        await DeleteLinkedAsync(route, request.Id, scope, transaction, ct);
+        await DeleteLinkedAsync(route, sql, request.Id, scope, transaction, ct);
         var relationship = route.LinkedRelationship!;
         var identity = relationship.Identity.Project(request.Id);
-        var projections = route.ProjectedColumns.Where(column => column.Target == ExecutableStorageObjectRole.LinkedIndexStorage).ToArray();
-        var columns = new[]
-        {
-            relationship.DocumentKind.Identifier,
-            relationship.StorageScope.Identifier,
-            relationship.Identity.OriginalId.Identifier,
-            relationship.Identity.ComparisonKey.Identifier,
-            relationship.Identity.LookupKey.Identifier
-        }.Concat(projections.Select(column => column.Column.Identifier)).ToArray();
         var values = new object?[]
             {
                 route.Discriminator.Value,
@@ -896,11 +900,10 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
                 dialect.ConvertDocumentIdentityComparison(identity.ComparisonKey),
                 dialect.ConvertDocumentIdentityLookup(identity.LookupKey)
             }
-            .Concat(ProjectedValues(projectedValues, projections));
+            .Concat(ProjectedValues(projectedValues, sql.LinkedProjections));
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"INSERT INTO {Q(route.LinkedIndexStorage.Name.Identifier)} ({string.Join(", ", columns.Select(Q))}) " +
-            $"VALUES ({string.Join(", ", columns.Select((_, index) => P($"v{index}")))});",
+            sql.LinkedInsert!,
             transaction);
         AddValues(command, values);
         try
@@ -920,6 +923,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task DeleteLinkedAsync(
         ExecutableStorageRoute route,
+        RelationalPhysicalMutationSql sql,
         string id,
         DocumentScopeSelection scope,
         DbTransaction transaction,
@@ -927,17 +931,10 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
     {
         var relationship = route.LinkedRelationship!;
         var identity = relationship.Identity.Project(id);
-        await EnsureLinkedIdentityEvidenceAsync(route, identity, scope, transaction, ct);
+        await EnsureLinkedIdentityEvidenceAsync(route, sql, identity, scope, transaction, ct);
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"DELETE FROM {Q(route.LinkedIndexStorage!.Name.Identifier)} WHERE " +
-            dialect.ExactIdentityPredicate(
-            [
-                new(relationship.DocumentKind.Identifier, null, P("kind")),
-                new(relationship.StorageScope.Identifier, null, P("scope")),
-                new(relationship.Identity.LookupKey.Identifier, null, P("idLookup")),
-                new(relationship.Identity.ComparisonKey.Identifier, null, P("idComparison"))
-            ]) + ";",
+            sql.LinkedDelete!,
             transaction);
         AddPhysicalParameter(command, "kind", route.Discriminator.Value);
         AddPhysicalParameter(command, "scope", scope.StorageKey!);
@@ -948,6 +945,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
 
     private async Task EnsureLinkedIdentityEvidenceAsync(
         ExecutableStorageRoute route,
+        RelationalPhysicalMutationSql sql,
         PortableStringIdentityProjection identity,
         DocumentScopeSelection scope,
         DbTransaction transaction,
@@ -956,14 +954,7 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         var relationship = route.LinkedRelationship!;
         await using var command = CreatePhysicalCommand(
             transaction.Connection!,
-            $"SELECT {Q(relationship.DocumentId.Identifier)}, {Q(relationship.Identity.ComparisonKey.Identifier)} " +
-            $"FROM {Q(route.LinkedIndexStorage!.Name.Identifier)} WHERE " +
-            dialect.ExactIdentityPredicate(
-            [
-                new(relationship.DocumentKind.Identifier, null, P("kind")),
-                new(relationship.StorageScope.Identifier, null, P("scope")),
-                new(relationship.Identity.LookupKey.Identifier, null, P("idLookup"))
-            ]) + ";",
+            sql.LinkedEvidenceSelect!,
             transaction);
         AddPhysicalParameter(command, "kind", route.Discriminator.Value);
         AddPhysicalParameter(command, "scope", scope.StorageKey!);
@@ -996,20 +987,9 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
         var unit = GetUnit(documentKind);
         var route = GetRoute(documentKind);
         var scope = ResolveScope(unit, StorageScopeOperation.Load);
-        var source = lockForWrite
-            ? dialect.MutationQuerySource(
-                route.PrimaryStorage.Name.Identifier,
-                "p",
-                indexIdentifier: null)
-            : Q(route.PrimaryStorage.Name.Identifier);
-        var sql =
-            $"SELECT {string.Join(", ", RelationalPhysicalEnvelopeRowLayout.SelectionColumns(route).Select(Q))} " +
-            $"FROM {source} WHERE {IdentityLookupPredicate(route)}";
-        if (lockForWrite)
-            sql = dialect.CompleteMutationSelection(sql, includesLinkedStorage: false);
         await using var command = CreatePhysicalCommand(
             currentConnection,
-            $"{sql};",
+            GetMutationSql(documentKind).Load(lockForWrite),
             transaction);
         AddIdentityParameters(command, route, id, scope);
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -1043,24 +1023,6 @@ public class RelationalPhysicalDocumentStore : IDocumentStore
             await WriteInterceptor(RelationalPhysicalWriteExecutionPoint.AfterPrimaryLock, operation, connection, transaction, ct);
         return document;
     }
-
-    private string IdentityPredicate(ExecutableStorageRoute route, bool includeVersion) =>
-        dialect.ExactIdentityPredicate(
-        [
-            new(route.Discriminator.Column.Identifier, null, P("kind")),
-            new(route.ScopeKey.Column.Identifier, null, P("scope")),
-            new(route.Envelope.Identity.LookupKey.Identifier, null, P("idLookup")),
-            new(route.Envelope.Identity.ComparisonKey.Identifier, null, P("idComparison"))
-        ]) +
-        (includeVersion ? $" AND {Q(route.Envelope.Version.Identifier)} = {P("expectedVersion")}" : string.Empty);
-
-    private string IdentityLookupPredicate(ExecutableStorageRoute route) =>
-        dialect.ExactIdentityPredicate(
-        [
-            new(route.Discriminator.Column.Identifier, null, P("kind")),
-            new(route.ScopeKey.Column.Identifier, null, P("scope")),
-            new(route.Envelope.Identity.LookupKey.Identifier, null, P("idLookup"))
-        ]);
 
     private void AddIdentityParameters(DbCommand command, ExecutableStorageRoute route, string id, DocumentScopeSelection scope)
     {

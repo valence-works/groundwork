@@ -14,6 +14,7 @@ namespace Groundwork.Relational.Documents;
 internal enum RelationalPhysicalMutationExecutionPoint
 {
     BeforeSelection,
+    AfterSelectionTablesPrepared,
     AfterCandidateDiscovery,
     BeforePrimaryLocks,
     AfterPrimaryLocks,
@@ -29,6 +30,17 @@ internal delegate ValueTask RelationalPhysicalMutationInterceptor(
     DbConnection connection,
     DbTransaction transaction,
     CancellationToken cancellationToken);
+
+internal delegate ValueTask RelationalPhysicalMutationSelectionObserver(
+    string identity,
+    RelationalPhysicalQueryCommand command,
+    long? preparedRestrictionRowCount);
+
+internal sealed record RelationalPhysicalMutationSelectionStage(
+    PhysicalDocumentMutationCommandKind Kind,
+    string Identity,
+    RelationalPhysicalQueryCommand Command,
+    IReadOnlyList<ExecutableStorageObjectRole> Selectors);
 
 /// <summary>
 /// Relational executor for one certified bounded mutation source. Selection is rendered by the
@@ -51,13 +63,14 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
     private readonly RelationalPhysicalDocumentStore store;
     private readonly RelationalPhysicalDocumentQueryHandler predicateBuilder;
     private readonly RelationalPhysicalMutationInterceptor? intercept;
+    private readonly RelationalPhysicalMutationSelectionObserver? selectionObserver;
 
     internal RelationalPhysicalDocumentMutationHandler(
         string identity,
         PhysicalQuerySourceKind source,
         RelationalPhysicalDocumentStore store,
         IReadOnlyList<PhysicalMutationHandlerCertification> certifications)
-        : this(identity, source, store, certifications, null)
+        : this(identity, source, store, certifications, null, null)
     {
     }
 
@@ -66,7 +79,8 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         PhysicalQuerySourceKind source,
         RelationalPhysicalDocumentStore store,
         IReadOnlyList<PhysicalMutationHandlerCertification> certifications,
-        RelationalPhysicalMutationInterceptor? intercept)
+        RelationalPhysicalMutationInterceptor? intercept,
+        RelationalPhysicalMutationSelectionObserver? selectionObserver = null)
     {
         Identity = string.IsNullOrWhiteSpace(identity)
             ? throw new ArgumentException("A handler identity is required.", nameof(identity))
@@ -76,6 +90,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         Certifications = Array.AsReadOnly(
             (certifications ?? throw new ArgumentNullException(nameof(certifications))).ToArray());
         this.intercept = intercept;
+        this.selectionObserver = selectionObserver;
         predicateBuilder = new RelationalPhysicalDocumentQueryHandler(identity, source, store, []);
     }
 
@@ -189,7 +204,36 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             cancellationToken);
     }
 
-    internal static PhysicalMutationHandlerCertification Certify(PhysicalMutationPlan plan) => new(plan);
+    internal static PhysicalMutationHandlerCertification Certify(PhysicalMutationPlan plan)
+    {
+        var primary = new PhysicalMutationSelectorCertification(
+            ExecutableStorageObjectRole.PrimaryStorage,
+            plan.Predicate.PrimaryObject,
+            plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+                ? null
+                : plan.Predicate.IndexName,
+            new Dictionary<string, string>());
+        var linked = plan.Predicate.AccessKind == PhysicalQueryAccessKind.LinkedIndexThenPrimary
+            ? new PhysicalMutationSelectorCertification(
+                ExecutableStorageObjectRole.LinkedIndexStorage,
+                plan.Predicate.LookupObject,
+                plan.Predicate.IndexName!,
+                new Dictionary<string, string>())
+            : null;
+        return new PhysicalMutationHandlerCertification(
+            plan,
+            evidenceStages:
+            [
+                new(
+                    PhysicalDocumentMutationCommandKind.CandidateDiscovery,
+                    PhysicalDocumentMutationCommandIdentities.CandidateDiscovery,
+                    linked is null ? [primary] : [linked]),
+                new(
+                    PhysicalDocumentMutationCommandKind.PredicateRecheck,
+                    PhysicalDocumentMutationCommandIdentities.PredicateRecheck,
+                    linked is null ? [primary] : [primary, linked])
+            ]);
+    }
 
     internal RelationalPhysicalQueryCommand BuildSelectionCommand(
         DocumentMutation mutation,
@@ -231,6 +275,113 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             predicate.PredicateFieldIdentifiers);
     }
 
+    internal IReadOnlyList<RelationalPhysicalMutationSelectionStage> BuildSelectionStages(
+        DocumentMutation mutation,
+        PhysicalMutationPlan plan,
+        DocumentScopeSelection scope)
+    {
+        var certification = Certifications.Single(candidate => candidate.Certifies(plan));
+        return certification.EvidenceStages.Select(stage => new RelationalPhysicalMutationSelectionStage(
+            stage.Kind,
+            stage.Identity,
+            stage.Kind switch
+            {
+                PhysicalDocumentMutationCommandKind.CandidateDiscovery =>
+                    BuildSelectionCommand(mutation, plan, scope, identityOnly: true),
+                PhysicalDocumentMutationCommandKind.PredicateRecheck =>
+                    BuildSelectionCommand(mutation, plan, scope, ProvisionalTableExpression),
+                _ => throw new InvalidOperationException(
+                    $"Relational mutation handler '{Identity}' has unsupported evidence stage '{stage.Kind}'.")
+            },
+            stage.Selectors.Select(selector => selector.Target).ToArray())).ToArray();
+    }
+
+    internal async Task PrepareSelectionStagesAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await DropSelectionTablesAsync(connection, transaction, cancellationToken);
+        await CreateSelectionTableAsync(connection, transaction, DiscoveryTableExpression, cancellationToken);
+        await CreateSelectionTableAsync(connection, transaction, CandidateTableExpression, cancellationToken);
+        await CreateSelectionTableAsync(connection, transaction, ProvisionalTableExpression, cancellationToken);
+        await CreateSelectionTableAsync(connection, transaction, SelectionTableExpression, cancellationToken);
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.AfterSelectionTablesPrepared,
+            connection,
+            transaction,
+            cancellationToken);
+    }
+
+    internal async Task PopulatePredicateRecheckInputsAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        DocumentMutation mutation,
+        RelationalPhysicalMutationSelectionStage candidateDiscovery,
+        CancellationToken cancellationToken)
+    {
+        var route = store.GetRoute(mutation.DocumentKind);
+        await InsertSelectionAsync(
+            connection,
+            transaction,
+            DiscoveryTableExpression,
+            candidateDiscovery,
+            cancellationToken);
+        await ThrowIfDiscoveryIdentityCollisionAsync(connection, transaction, route, cancellationToken);
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.AfterCandidateDiscovery,
+            connection,
+            transaction,
+            cancellationToken);
+        await InsertCandidatePrimaryRowsAsync(connection, transaction, route, cancellationToken);
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.BeforePrimaryLocks,
+            connection,
+            transaction,
+            cancellationToken);
+        await LockRowsAsync(
+            connection,
+            transaction,
+            route,
+            CandidateTableExpression,
+            linked: false,
+            cancellationToken);
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.AfterPrimaryLocks,
+            connection,
+            transaction,
+            cancellationToken);
+
+        await InsertCurrentPrimaryRowsAsync(connection, transaction, route, cancellationToken);
+        if (route.LinkedIndexStorage is not null)
+        {
+            await LockRowsAsync(
+                connection,
+                transaction,
+                route,
+                ProvisionalTableExpression,
+                linked: true,
+                cancellationToken);
+        }
+        await InterceptAsync(
+            RelationalPhysicalMutationExecutionPoint.AfterLinkedLocks,
+            connection,
+            transaction,
+            cancellationToken);
+    }
+
+    internal Task<long> CountPreparedRestrictionRowsAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        CancellationToken cancellationToken) =>
+        CountSelectionAsync(connection, transaction, ProvisionalTableExpression, cancellationToken);
+
+    internal async Task CleanupSelectionStagesAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        CancellationToken cancellationToken) =>
+        await DropSelectionTablesAsync(connection, transaction, cancellationToken);
+
     internal RelationalPhysicalQueryCommand BuildOperationReadCommand(
         DocumentMutation mutation,
         PhysicalMutationPlan plan,
@@ -269,50 +420,20 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         // are then locked primary-first in stable identity order, followed by linked rows in the
         // same order. The final predicate recheck binds the selected version and incarnation used
         // by DML; completion of that recheck is the mutation's linearization point.
-        var route = store.GetRoute(mutation.DocumentKind);
-        await DropSelectionTablesAsync(connection, transaction, ct);
-        await CreateSelectionTableAsync(connection, transaction, DiscoveryTableExpression, ct);
-        await CreateSelectionTableAsync(connection, transaction, CandidateTableExpression, ct);
-        await CreateSelectionTableAsync(connection, transaction, ProvisionalTableExpression, ct);
-        await CreateSelectionTableAsync(connection, transaction, SelectionTableExpression, ct);
-
-        await InsertSelectionAsync(
+        var selectionStages = BuildSelectionStages(mutation, plan, scope);
+        await PrepareSelectionStagesAsync(connection, transaction, ct);
+        await PopulatePredicateRecheckInputsAsync(
             connection,
             transaction,
-            DiscoveryTableExpression,
-            BuildSelectionCommand(mutation, plan, scope, identityOnly: true),
+            mutation,
+            selectionStages[0],
             ct);
-        await ThrowIfDiscoveryIdentityCollisionAsync(connection, transaction, route, ct);
-        await InterceptAsync(RelationalPhysicalMutationExecutionPoint.AfterCandidateDiscovery, connection, transaction, ct);
-        await InsertCandidatePrimaryRowsAsync(connection, transaction, route, ct);
-        await InterceptAsync(RelationalPhysicalMutationExecutionPoint.BeforePrimaryLocks, connection, transaction, ct);
-        await LockRowsAsync(
-            connection,
-            transaction,
-            route,
-            CandidateTableExpression,
-            linked: false,
-            ct);
-        await InterceptAsync(RelationalPhysicalMutationExecutionPoint.AfterPrimaryLocks, connection, transaction, ct);
-
-        await InsertCurrentPrimaryRowsAsync(connection, transaction, route, ct);
-        if (route.LinkedIndexStorage is not null)
-        {
-            await LockRowsAsync(
-                connection,
-                transaction,
-                route,
-                ProvisionalTableExpression,
-                linked: true,
-                ct);
-        }
-        await InterceptAsync(RelationalPhysicalMutationExecutionPoint.AfterLinkedLocks, connection, transaction, ct);
 
         await InsertSelectionAsync(
             connection,
             transaction,
             SelectionTableExpression,
-            BuildSelectionCommand(mutation, plan, scope, ProvisionalTableExpression),
+            selectionStages[1],
             ct);
     }
 
@@ -340,14 +461,24 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
         DbConnection connection,
         DbTransaction transaction,
         string tableExpression,
-        RelationalPhysicalQueryCommand selection,
-        CancellationToken ct) =>
+        RelationalPhysicalMutationSelectionStage selection,
+        CancellationToken ct)
+    {
+        if (selectionObserver is not null)
+        {
+            long? preparedRestrictionRowCount =
+                selection.Kind == PhysicalDocumentMutationCommandKind.PredicateRecheck
+                    ? await CountPreparedRestrictionRowsAsync(connection, transaction, ct)
+                    : null;
+            await selectionObserver(selection.Identity, selection.Command, preparedRestrictionRowCount);
+        }
         await ExecuteAsync(
             connection,
             transaction,
-            $"INSERT INTO {tableExpression} ({SelectionColumns}) {selection.CommandText};",
-            selection.Parameters,
+            $"INSERT INTO {tableExpression} ({SelectionColumns}) {selection.Command.CommandText};",
+            selection.Command.Parameters,
             ct);
+    }
 
     private async Task InsertCurrentPrimaryRowsAsync(
         DbConnection connection,
@@ -466,14 +597,21 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
             await intercept(point, connection, transaction, ct);
     }
 
+    private Task<long> CountSelectionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        CancellationToken ct) =>
+        CountSelectionAsync(connection, transaction, SelectionTableExpression, ct);
+
     private async Task<long> CountSelectionAsync(
         DbConnection connection,
         DbTransaction transaction,
+        string tableExpression,
         CancellationToken ct)
     {
         await using var command = RelationalPhysicalDocumentStore.CreatePhysicalCommand(
             connection,
-            $"SELECT COUNT(*) FROM {SelectionTableExpression};",
+            $"SELECT COUNT(*) FROM {tableExpression};",
             transaction);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -735,7 +873,7 @@ internal sealed class RelationalPhysicalDocumentMutationHandler : IPhysicalDocum
 
     private async Task<int> ExecuteAsync(
         DbConnection connection,
-        DbTransaction transaction,
+        DbTransaction? transaction,
         string sql,
         IReadOnlyList<(string Name, object? Value)> parameters,
         CancellationToken ct)
