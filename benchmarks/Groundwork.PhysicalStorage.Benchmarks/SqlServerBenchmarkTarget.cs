@@ -1,3 +1,4 @@
+using System.Data;
 using Groundwork.Core.Capabilities;
 using Groundwork.Core.Manifests;
 using Groundwork.Core.PhysicalStorage;
@@ -215,7 +216,7 @@ public sealed class SqlServerBenchmarkTarget(
                     transaction,
                     primaryTable,
                     primaryColumns,
-                    primaryId,
+                    Model.Route.Envelope.Identity,
                     $"s.{Q(status.Column.Identifier)} = @queryStatus",
                     new Dictionary<string, object> { ["queryStatus"] = "open" },
                     status.Column.Identifier,
@@ -246,7 +247,7 @@ public sealed class SqlServerBenchmarkTarget(
                     transaction,
                     primaryTable,
                     primaryColumns,
-                    primaryId,
+                    Model.Route.Envelope.Identity,
                     $"s.{Q(Model.Route.Envelope.DocumentKind.Identifier)} = @sourceKind AND " +
                     $"s.{Q(Model.Route.Envelope.StorageScope.Identifier)} = @sourceScope AND " +
                     $"s.{Q(primaryId)} = @sourceId",
@@ -268,7 +269,7 @@ public sealed class SqlServerBenchmarkTarget(
                     transaction,
                     linkedTable!,
                     linkedColumns,
-                    linkedId!,
+                    relationship.Identity,
                     $"s.{Q(relationship.DocumentKind.Identifier)} = @sourceKind AND " +
                     $"s.{Q(relationship.StorageScope.Identifier)} = @sourceScope AND " +
                     $"s.{Q(linkedId!)} = @sourceId",
@@ -353,7 +354,7 @@ public sealed class SqlServerBenchmarkTarget(
         SqlTransaction transaction,
         string table,
         IReadOnlyList<string> columns,
-        string idColumn,
+        ExecutableDocumentIdentityRoute identity,
         string sourcePredicate,
         IReadOnlyDictionary<string, object> sourceParameters,
         string? statusColumn,
@@ -362,28 +363,67 @@ public sealed class SqlServerBenchmarkTarget(
         int noiseRows,
         CancellationToken cancellationToken)
     {
+        // The physical primary key uses the projected lookup identity, so cloned rows must replace
+        // the original, comparison, and lookup fields as one canonical identity.
+        const string identityTable = "#groundwork_plan_noise_identity";
+        await using (var create = connection.CreateCommand())
+        {
+            create.Transaction = transaction;
+            create.CommandText = $"""
+                CREATE TABLE {identityTable} (
+                    original_id nvarchar(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    comparison_key varbinary(1350) NOT NULL,
+                    lookup_key binary(32) NOT NULL,
+                    PRIMARY KEY NONCLUSTERED (lookup_key)
+                );
+                """;
+            await create.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var identities = new DataTable();
+        identities.Columns.Add("original_id", typeof(string));
+        identities.Columns.Add("comparison_key", typeof(byte[]));
+        identities.Columns.Add("lookup_key", typeof(byte[]));
+        for (var sequence = 1; sequence <= noiseRows; sequence++)
+        {
+            var projected = BenchmarkPlanNoiseIdentity.Create(identity, prefix, sequence);
+            identities.Rows.Add(
+                projected.OriginalId,
+                Convert.FromHexString(projected.Projection.ComparisonKey),
+                Convert.FromHexString(projected.Projection.LookupKey));
+        }
+
+        using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.CheckConstraints, transaction)
+               {
+                   DestinationTableName = identityTable,
+                   BatchSize = 4096
+               })
+        {
+            foreach (DataColumn column in identities.Columns)
+                bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+            await bulkCopy.WriteToServerAsync(identities, cancellationToken);
+        }
+
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
             WITH source AS (
                 SELECT TOP (1) * FROM {Q(table)} s WHERE {sourcePredicate}
-            ), numbers AS (
-                SELECT TOP (@noiseRows) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-                FROM sys.all_objects a CROSS JOIN sys.all_objects b
             )
             INSERT INTO {Q(table)} ({string.Join(", ", columns.Select(Q))})
-            SELECT {string.Join(", ", columns.Select(column => column == idColumn
-                ? "CONCAT(@prefix, n.n)"
+            SELECT {string.Join(", ", columns.Select(column => column == identity.OriginalId.Identifier
+                ? "n.original_id"
+                : column == identity.ComparisonKey.Identifier ? "n.comparison_key"
+                : column == identity.LookupKey.Identifier ? "n.lookup_key"
                 : column == statusColumn ? "@noiseStatus"
                 : column == canonicalJsonColumn ? $"JSON_MODIFY(s.{Q(column)}, '$.status', @noiseStatus)"
                 : $"s.{Q(column)}"))}
-            FROM source s CROSS JOIN numbers n;
+            FROM source s CROSS JOIN {identityTable} n;
+            DROP TABLE {identityTable};
             """;
         foreach (var (name, value) in sourceParameters)
             command.Parameters.AddWithValue($"@{name}", value);
         command.Parameters.AddWithValue("@noiseStatus", "__groundwork_plan_noise__");
-        command.Parameters.AddWithValue("@prefix", prefix);
-        command.Parameters.AddWithValue("@noiseRows", noiseRows);
         return await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
