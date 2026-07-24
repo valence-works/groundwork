@@ -40,6 +40,8 @@ public static class BaselineEligibilityEvaluator
             diagnostics.Add("Future baseline activation also requires every workload.");
         if (machine.GitDirty || machine.GitCommit.Equals("unknown", StringComparison.OrdinalIgnoreCase))
             diagnostics.Add("Future baseline activation also requires a known, clean Git commit.");
+        diagnostics.Add(
+            "Current harness scaffold is explicitly non-promotable: immutable container/image digests and effective database settings are unavailable.");
 
         var expected = BenchmarkMatrix.Create(BenchmarkProfiles.Scheduled)
             .Select(benchmarkCase => benchmarkCase.Identity)

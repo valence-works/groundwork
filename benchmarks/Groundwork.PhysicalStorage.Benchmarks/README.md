@@ -18,8 +18,11 @@ Before timing, every selected provider and storage form must prove:
    agreement, and mixed-direction ordering; and
 2. on a separately initialized disposable target with the exact configured measured cardinality,
    selectivity, and provider statistics, selection of the declared index through provider-native
-   `EXPLAIN`, `STATISTICS XML`, or MongoDB `explain`, with full scans rejected for every applicable
-   timed selection and count shape.
+   `EXPLAIN`, `STATISTICS XML`, or MongoDB `explain`, with a full scan of the predicate-bearing
+   indexed relation rejected for every applicable timed selection and count shape. A linked form
+   may still use an optimizer-selected scan of its separate primary payload relation after the
+   linked predicate index has selected the bounded owner set; treating that as predicate fallback
+   would be a false positive.
 
 The backfill workload has an additional post-measurement check. Outside the timed region, it uses
 the additive model to run the bounded query and directly queries the newly projected `category`
@@ -304,7 +307,8 @@ verdicts and any further dispositions are recorded here when that gate completes
 - Join the Groundwork results with an Elsa-owned EF Core oracle using matched workloads and controls.
 - Complete reliable provider database-work/round-trip signals and concurrent-load evidence.
 - Define, approve, integrity-protect, and exercise the immutable-baseline workflow.
-- Add actual crash/failure recovery workloads only if issue #50 requires those semantics.
+- Capture actual crash/failure recovery evidence required by issue #50. Client pool reset/reopen
+  validation is not crash or failure recovery evidence and does not close that acceptance work.
 
 Until all applicable items are ratified and complete, the harness stays non-promotable and
 non-decisional.

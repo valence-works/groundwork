@@ -52,15 +52,45 @@ public sealed record BenchmarkConsumerEvidenceReport(
         ArgumentNullException.ThrowIfNull(machine);
         ArgumentNullException.ThrowIfNull(providers);
         ArgumentNullException.ThrowIfNull(layout);
-        var shape = report.DataShape ??
-                    new BenchmarkDataShape(configuration.DatasetSize, 0, 5_000);
+        var results = CreateResults(report, configuration, machine, providers, layout, independentRun);
+
+        return new BenchmarkConsumerEvidenceReport(
+            ContractVersion,
+            report.RunId,
+            Promotable: false,
+            ExternalOracleJoinRequired: true,
+            machine.GitCommit,
+            machine.GitDirty,
+            layout.RelativePath(layout.RawMeasurements),
+            DigestFile(layout.RawMeasurements),
+            report.BaselineEligibility.Diagnostics
+                .Append("The external oracle join and accepted-shape verdict are required before promotion.")
+                .Distinct(StringComparer.Ordinal)
+                .ToArray(),
+            results);
+    }
+
+    public static IReadOnlyList<BenchmarkConsumerEvidenceResult> CreateResults(
+        BenchmarkRunReport report,
+        BenchmarkRunConfiguration configuration,
+        BenchmarkMachineMetadata machine,
+        IReadOnlyList<BenchmarkProviderMetadata> providers,
+        ArtifactLayout layout,
+        int independentRun = 1)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(machine);
+        ArgumentNullException.ThrowIfNull(providers);
+        ArgumentNullException.ThrowIfNull(layout);
+        var shape = report.DataShape ?? new BenchmarkDataShape(configuration.DatasetSize, 0, 5_000);
         shape.Validate();
         var results = report.Cases
             .OrderBy(result => result.Case.Identity, StringComparer.Ordinal)
             .Select(result =>
             {
                 var provider = providers.Single(metadata => metadata.Provider == result.Case.Provider);
-                var workloadIdentity = $"groundwork.physical-storage/{Kebab(result.Case.Workload.ToString())}";
+                var workloadIdentity = WorkloadIdentity(result.Case.Workload);
                 var workloadVersion = "1.1";
                 var fingerprint = Digest(new
                 {
@@ -96,7 +126,7 @@ public sealed record BenchmarkConsumerEvidenceReport(
                         result.Summary,
                         RawSamplesDigest = rawSamplesDigest
                     }),
-                    $"groundwork.{Kebab(result.Case.Provider.ToString())}",
+                    ProviderIdentity(result.Case.Provider),
                     provider.Version,
                     Digest(new
                     {
@@ -114,20 +144,46 @@ public sealed record BenchmarkConsumerEvidenceReport(
             })
             .ToArray();
 
-        return new BenchmarkConsumerEvidenceReport(
-            ContractVersion,
-            report.RunId,
-            Promotable: false,
-            ExternalOracleJoinRequired: true,
-            machine.GitCommit,
-            machine.GitDirty,
-            layout.RelativePath(layout.RawMeasurements),
-            DigestFile(layout.RawMeasurements),
-            report.BaselineEligibility.Diagnostics
-                .Append("The external oracle join and accepted-shape verdict are required before promotion.")
-                .Distinct(StringComparer.Ordinal)
-                .ToArray(),
-            results);
+        return results;
+    }
+
+    /// <summary>
+    /// Rebuilds every claimed digest from the immutable run inputs. Hashing the
+    /// consumer-evidence file alone is insufficient: otherwise its result and plan
+    /// claims could remain internally stale after another artifact was modified.
+    /// </summary>
+    public static void VerifyBoundClaims(
+        BenchmarkRunReport report,
+        BenchmarkRunConfiguration configuration,
+        BenchmarkMachineMetadata machine,
+        IReadOnlyList<BenchmarkProviderMetadata> providers,
+        ArtifactLayout layout,
+        BenchmarkConsumerEvidenceReport actual)
+    {
+        var independentRuns = actual.Results
+            .Select(result => result.IndependentRun)
+            .Distinct()
+            .ToArray();
+        if (independentRuns.Length > 1 ||
+            independentRuns.Length == 1 && independentRuns[0] <= 0)
+        {
+            throw new InvalidOperationException(
+                "Consumer evidence must bind exactly one positive independent-run identity.");
+        }
+        var expected = Create(
+            report,
+            configuration,
+            machine,
+            providers,
+            layout,
+            independentRuns.Length == 0 ? 1 : independentRuns[0]);
+        if (!CryptographicOperations.FixedTimeEquals(
+                SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(expected, BenchmarkJson.CompactOptions)),
+                SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(actual, BenchmarkJson.CompactOptions))))
+        {
+            throw new InvalidOperationException(
+                "Consumer evidence digest claims do not match the bound run artifacts.");
+        }
     }
 
     private static string RequireObservableResultDigest(
@@ -208,4 +264,10 @@ public sealed record BenchmarkConsumerEvidenceReport(
         }
         return builder.ToString();
     }
+
+    internal static string ProviderIdentity(BenchmarkProvider provider) =>
+        $"groundwork.{Kebab(provider.ToString())}";
+
+    internal static string WorkloadIdentity(BenchmarkWorkload workload) =>
+        $"groundwork.physical-storage/{Kebab(workload.ToString())}";
 }

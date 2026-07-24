@@ -46,6 +46,16 @@ public sealed record BenchmarkProviderMetadata(
 
 public sealed record BenchmarkRunFailure(string Type, string Message);
 
+public sealed record BenchmarkArtifactDigest(string Path, string Digest);
+
+public sealed record BenchmarkArtifactIntegrity(
+    string SchemaVersion,
+    string RunId,
+    IReadOnlyList<BenchmarkArtifactDigest> Artifacts)
+{
+    public const string ContractVersion = "groundwork.physical-storage.artifact-integrity/v1";
+}
+
 public sealed record BenchmarkRunManifest(
     string SchemaVersion,
     string RunId,
@@ -65,7 +75,8 @@ public sealed record BenchmarkRunManifest(
     string? BaselineRun,
     bool RegressionConfirmationRun,
     BenchmarkRunFailure? Failure,
-    string? ConsumerEvidence = null);
+    string? ConsumerEvidence = null,
+    string? ArtifactIntegrity = null);
 
 public sealed record RawBenchmarkRecord(BenchmarkCase Case, BenchmarkSample Sample);
 
@@ -205,6 +216,49 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         CancellationToken cancellationToken) =>
         WriteImmutableJsonAsync(Layout.ConsumerEvidenceJson, report, cancellationToken);
 
+    public async Task WriteArtifactIntegrityAsync(
+        BenchmarkRunManifest manifest,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!manifest.Status.Equals("completed", StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(manifest.ArtifactIntegrity))
+        {
+            throw new InvalidOperationException("Only a completed manifest with an integrity location can be sealed.");
+        }
+
+        await rawWriter.FlushAsync(cancellationToken);
+        var required = new List<string>
+        {
+            Layout.RelativePath(Layout.Manifest),
+            manifest.RawMeasurements,
+            manifest.Summary,
+            manifest.ElsaMigrationEvidence,
+            manifest.MachineMetadata,
+            manifest.ProviderMetadata,
+            manifest.Configuration
+        };
+        if (manifest.ConsumerEvidence is not null)
+            required.Add(manifest.ConsumerEvidence);
+        foreach (var plan in manifest.PlanArtifacts)
+        {
+            required.Add(plan);
+            required.Add($"{plan}.assertions.json");
+        }
+
+        var artifacts = required
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(relative => new BenchmarkArtifactDigest(
+                relative,
+                DigestFile(ResolveArtifact(Layout, relative))))
+            .ToArray();
+        await WriteImmutableJsonAsync(
+            Layout.ArtifactIntegrityJson,
+            new BenchmarkArtifactIntegrity(BenchmarkArtifactIntegrity.ContractVersion, manifest.RunId, artifacts),
+            cancellationToken);
+    }
+
     public async Task AppendSampleAsync(RawBenchmarkRecord record, CancellationToken cancellationToken)
     {
         var line = JsonSerializer.Serialize(record, BenchmarkJson.CompactOptions);
@@ -278,13 +332,32 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
             return new BenchmarkBaseline(records, null, null, null, null, null);
 
         var root = Path.GetFullPath(runOrRawPath);
+        var manifest = await ReadJsonAsync<BenchmarkRunManifest>(Path.Combine(root, "manifest.json"), cancellationToken);
+        var layout = new ArtifactLayout(root);
+        if (string.IsNullOrWhiteSpace(manifest.ArtifactIntegrity))
+            throw new InvalidOperationException("Baseline run has no artifact-integrity ledger.");
+        var integrity = await ReadJsonAsync<BenchmarkArtifactIntegrity>(
+            ResolveArtifact(layout, manifest.ArtifactIntegrity), cancellationToken);
+        VerifyArtifactIntegrity(layout, manifest, integrity);
+        var configuration = await ReadJsonAsync<BenchmarkRunConfiguration>(Path.Combine(root, "metadata", "configuration.json"), cancellationToken);
+        var machine = await ReadJsonAsync<BenchmarkMachineMetadata>(Path.Combine(root, "metadata", "machine.json"), cancellationToken);
+        var providers = await ReadJsonAsync<IReadOnlyList<BenchmarkProviderMetadata>>(Path.Combine(root, "metadata", "providers.json"), cancellationToken);
+        var evidence = await ReadJsonAsync<ElsaMigrationEvidenceReport>(Path.Combine(root, "reports", "elsa-migration-evidence.json"), cancellationToken);
+        var report = await ReadJsonAsync<BenchmarkRunReport>(Path.Combine(root, "reports", "summary.json"), cancellationToken);
+        var consumer = manifest.ConsumerEvidence is null
+            ? null
+            : await ReadJsonAsync<BenchmarkConsumerEvidenceReport>(ResolveArtifact(layout, manifest.ConsumerEvidence), cancellationToken);
+        if (consumer is null)
+            throw new InvalidOperationException("Baseline run has no canonical consumer evidence.");
+        BenchmarkConsumerEvidenceReport.VerifyBoundClaims(report, configuration, machine, providers, layout, consumer);
         return new BenchmarkBaseline(
             records,
-            await ReadJsonAsync<BenchmarkRunManifest>(Path.Combine(root, "manifest.json"), cancellationToken),
-            await ReadJsonAsync<BenchmarkRunConfiguration>(Path.Combine(root, "metadata", "configuration.json"), cancellationToken),
-            await ReadJsonAsync<BenchmarkMachineMetadata>(Path.Combine(root, "metadata", "machine.json"), cancellationToken),
-            await ReadJsonAsync<IReadOnlyList<BenchmarkProviderMetadata>>(Path.Combine(root, "metadata", "providers.json"), cancellationToken),
-            await ReadJsonAsync<ElsaMigrationEvidenceReport>(Path.Combine(root, "reports", "elsa-migration-evidence.json"), cancellationToken));
+            manifest,
+            configuration,
+            machine,
+            providers,
+            evidence,
+            consumer);
     }
 
     private static async Task WriteJsonAsync<T>(string path, T value, CancellationToken cancellationToken)
@@ -337,6 +410,56 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         return await JsonSerializer.DeserializeAsync<T>(stream, BenchmarkJson.Options, cancellationToken)
                ?? throw new InvalidOperationException($"Baseline provenance artifact '{path}' is null.");
+    }
+
+    private static void VerifyArtifactIntegrity(
+        ArtifactLayout layout,
+        BenchmarkRunManifest manifest,
+        BenchmarkArtifactIntegrity integrity)
+    {
+        if (integrity.SchemaVersion != BenchmarkArtifactIntegrity.ContractVersion ||
+            integrity.RunId != manifest.RunId || integrity.Artifacts.Count == 0 ||
+            integrity.Artifacts.Select(item => item.Path).Distinct(StringComparer.Ordinal).Count() != integrity.Artifacts.Count)
+        {
+            throw new InvalidOperationException("Baseline artifact-integrity ledger semantics are invalid.");
+        }
+        var required = new[]
+        {
+            layout.RelativePath(layout.Manifest), manifest.RawMeasurements, manifest.Summary,
+            manifest.ElsaMigrationEvidence, manifest.MachineMetadata, manifest.ProviderMetadata,
+            manifest.Configuration
+        }.Concat(manifest.ConsumerEvidence is null ? [] : [manifest.ConsumerEvidence])
+         .Concat(manifest.PlanArtifacts.SelectMany(plan => new[] { plan, $"{plan}.assertions.json" }))
+         .ToHashSet(StringComparer.Ordinal);
+        if (!required.SetEquals(integrity.Artifacts.Select(item => item.Path)))
+            throw new InvalidOperationException("Baseline artifact-integrity ledger does not bind the complete required artifact set.");
+        foreach (var artifact in integrity.Artifacts)
+        {
+            var path = ResolveArtifact(layout, artifact.Path);
+            if (!File.Exists(path) || !CryptographicOperations.FixedTimeEquals(
+                    Convert.FromHexString(artifact.Digest),
+                    SHA256.HashData(File.ReadAllBytes(path))))
+            {
+                throw new InvalidOperationException($"Baseline artifact integrity verification failed for '{artifact.Path}'.");
+            }
+        }
+    }
+
+    private static string ResolveArtifact(ArtifactLayout layout, string relative)
+    {
+        if (string.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative))
+            throw new InvalidOperationException("Artifact paths must be non-empty and relative.");
+        var root = Path.GetFullPath(layout.Root);
+        var path = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+        if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Artifact path '{relative}' escapes the run root.");
+        return path;
+    }
+
+    private static string DigestFile(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexStringLower(SHA256.HashData(stream));
     }
 
     private static string Markdown(BenchmarkRunReport report)

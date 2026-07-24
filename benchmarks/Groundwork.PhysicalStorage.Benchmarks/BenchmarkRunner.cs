@@ -96,7 +96,8 @@ public sealed class BenchmarkRunner
             null,
             request.Role == BenchmarkExecutionRole.Measured
                 ? layout.RelativePath(layout.ConsumerEvidenceJson)
-                : null);
+                : null,
+            layout.RelativePath(layout.ArtifactIntegrityJson));
         await writer.WriteManifestAsync(manifest, cancellationToken);
         await writer.WriteMachineAsync(machine, cancellationToken);
         await writer.WriteConfigurationAsync(executionConfiguration, cancellationToken);
@@ -201,6 +202,7 @@ public sealed class BenchmarkRunner
 
                         var samples = new List<BenchmarkSample>(request.Configuration.MeasurementIterations);
                         BenchmarkObservableResultVector? observableResultVector = null;
+                        var iterationObservableResults = new List<(int Iteration, BenchmarkObservableResultVector Vector)>();
                         long measuredOperations = 0;
                         long measuredElapsedNanoseconds = 0;
                         var minimumElapsedNanoseconds =
@@ -238,7 +240,9 @@ public sealed class BenchmarkRunner
                             observableResultVector = RequireStableObservableResult(
                                 benchmarkCase,
                                 observableResultVector,
-                                execution.ObservableResultVector);
+                                execution.ObservableResultVector,
+                                workload);
+                            iterationObservableResults.Add((globalIteration, execution.ObservableResultVector!));
                             var elapsedNanoseconds = Math.Max(
                                 1,
                                 (long)Math.Round(timeProvider.GetElapsedTime(timestamp).TotalNanoseconds));
@@ -277,7 +281,7 @@ public sealed class BenchmarkRunner
                                 : [],
                             BenchmarkSummarizer.Summarize(benchmarkCase.Identity, samples),
                             samples,
-                            observableResultVector!.Results));
+                            BenchmarkObservableResultVector.AggregateIterations(iterationObservableResults).Results));
                     }
                 }
             }
@@ -294,6 +298,8 @@ public sealed class BenchmarkRunner
                     request.Configuration.Mode == BenchmarkRunMode.Scheduled
                         ? RegressionPolicy.Scheduled
                         : RegressionPolicy.Smoke,
+                    layout,
+                    request.IndependentRun,
                     cancellationToken);
             var baselineEligibility = BaselineEligibilityEvaluator.Evaluate(
                 executionConfiguration,
@@ -331,6 +337,7 @@ public sealed class BenchmarkRunner
                 PlanArtifacts = planArtifacts.Distinct(StringComparer.Ordinal).ToArray()
             };
             await writer.WriteManifestAsync(manifest, cancellationToken);
+            await writer.WriteArtifactIntegrityAsync(manifest, cancellationToken);
             TryDeleteDirectory(scratch);
             var confirmedRegression = request.RegressionConfirmationRun &&
                                       regressions.Any(evaluation => evaluation.Regressed && evaluation.RequiresConfirmation);
@@ -374,14 +381,18 @@ public sealed class BenchmarkRunner
     private static BenchmarkObservableResultVector RequireStableObservableResult(
         BenchmarkCase benchmarkCase,
         BenchmarkObservableResultVector? prior,
-        BenchmarkObservableResultVector? current)
+        BenchmarkObservableResultVector? current,
+        BenchmarkWorkload workload)
     {
         if (current is null)
         {
             throw new InvalidOperationException(
                 $"[{benchmarkCase.Identity}] measured execution returned no canonical observable result vector.");
         }
-        if (prior is not null && !prior.Digest.Equals(current.Digest, StringComparison.Ordinal))
+        // Pagination deliberately selects a deterministic but iteration-varying page.
+        // Its complete iteration-aware aggregate is retained in the case evidence.
+        if (workload != BenchmarkWorkload.PaginationAndCount &&
+            prior is not null && !prior.Digest.Equals(current.Digest, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 $"[{benchmarkCase.Identity}] observable results changed between measured iterations.");
@@ -396,6 +407,8 @@ public sealed class BenchmarkRunner
         BenchmarkMachineMetadata candidateMachine,
         IReadOnlyList<BenchmarkProviderMetadata> candidateProviders,
         RegressionPolicy policy,
+        ArtifactLayout candidateLayout,
+        int independentRun,
         CancellationToken cancellationToken)
     {
         var baseline = await BenchmarkArtifactWriter.ReadBaselineAsync(baselineRun, cancellationToken);
@@ -406,28 +419,64 @@ public sealed class BenchmarkRunner
             baseline);
         if (!compatibility.IsCompatible)
         {
-            return candidate.Select(result => new RegressionEvaluation(
-                    result.Case.Identity,
-                    false,
-                    policy.RequiresConfirmation,
-                    [],
-                    compatibility.Diagnostics))
-                .ToArray();
+            throw new InvalidOperationException(
+                $"Baseline comparison rejected: {string.Join(" ", compatibility.Diagnostics)}");
         }
+
+        var candidateEvidence = BenchmarkConsumerEvidenceReport.CreateResults(
+            new BenchmarkRunReport(
+                BenchmarkProfiles.SchemaVersion,
+                "candidate-comparison",
+                candidateConfiguration.Mode,
+                candidate,
+                [],
+                new BaselineEligibility(false, []),
+                candidateConfiguration.DataShape),
+            candidateConfiguration,
+            candidateMachine,
+            candidateProviders,
+            candidateLayout,
+            independentRun);
+        var baselineEvidence = baseline.ConsumerEvidence!.Results;
 
         var groups = baseline.Records.GroupBy(record => record.Case.Identity, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => (IReadOnlyList<BenchmarkSample>)group.Select(record => record.Sample).ToArray(), StringComparer.Ordinal);
-        return candidate.Select(result => groups.TryGetValue(result.Case.Identity, out var baselineSamples)
-                ? WithDiagnostics(
-                    RegressionEvaluator.Compare(result.Case.Identity, baselineSamples, result.Samples, policy),
-                    compatibility.Diagnostics)
-                : new RegressionEvaluation(
-                    result.Case.Identity,
-                    false,
-                    policy.RequiresConfirmation,
-                    [],
-                    ["No matching case exists in the baseline run."]))
+        foreach (var result in candidate)
+        {
+            if (!SemanticsMatch(result.Case, candidateEvidence, baselineEvidence))
+            {
+                throw new InvalidOperationException(
+                    $"Baseline comparison rejected: canonical workload fingerprint or result semantics differ for '{result.Case.Identity}'.");
+            }
+            if (!groups.ContainsKey(result.Case.Identity))
+            {
+                throw new InvalidOperationException(
+                    $"Baseline comparison rejected: no matching exact case exists for '{result.Case.Identity}'.");
+            }
+        }
+        return candidate.Select(result =>
+                WithDiagnostics(
+                    RegressionEvaluator.Compare(result.Case.Identity, groups[result.Case.Identity], result.Samples, policy),
+                    compatibility.Diagnostics))
             .ToArray();
+    }
+
+    private static bool SemanticsMatch(
+        BenchmarkCase benchmarkCase,
+        IReadOnlyList<BenchmarkConsumerEvidenceResult> candidate,
+        IReadOnlyList<BenchmarkConsumerEvidenceResult> baseline)
+    {
+        var provider = BenchmarkConsumerEvidenceReport.ProviderIdentity(benchmarkCase.Provider);
+        var workload = BenchmarkConsumerEvidenceReport.WorkloadIdentity(benchmarkCase.Workload);
+        var candidateResult = candidate.SingleOrDefault(result => result.ProviderIdentity == provider &&
+            result.StorageForm == benchmarkCase.StorageForm && result.WorkloadIdentity == workload);
+        var baselineResult = baseline.SingleOrDefault(result => result.ProviderIdentity == provider &&
+            result.StorageForm == benchmarkCase.StorageForm && result.WorkloadIdentity == workload);
+        return candidateResult is not null && baselineResult is not null &&
+               candidateResult.WorkloadFingerprint == baselineResult.WorkloadFingerprint &&
+               candidateResult.ResultDigest == baselineResult.ResultDigest &&
+               candidateResult.ProviderConfigurationDigest == baselineResult.ProviderConfigurationDigest &&
+               candidateResult.NativePlanDigest == baselineResult.NativePlanDigest;
     }
 
     private static RegressionEvaluation WithDiagnostics(

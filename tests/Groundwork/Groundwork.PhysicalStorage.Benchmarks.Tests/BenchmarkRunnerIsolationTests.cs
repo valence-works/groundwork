@@ -193,6 +193,30 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
         Assert.Contains("one positive raw latency observation per operation", exception.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Measured_run_rejects_later_observable_result_drift_instead_of_reusing_the_first_vector()
+    {
+        var environment = new RecordingEnvironment(driftObservableResults: true);
+        var configuration = BenchmarkProfiles.Smoke with
+        {
+            DatasetSize = 10,
+            MigrationDatasetSize = 1,
+            MeasurementIterations = 5,
+            OperationsPerIteration = 1,
+            Providers = [BenchmarkProvider.Sqlite],
+            StorageForms = [PhysicalStorageForm.SharedDocuments]
+        };
+        var runner = new BenchmarkRunner(null, () => environment);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RunAsync(
+            new BenchmarkRunRequest(
+                FindRepositoryRoot(), configuration, [BenchmarkWorkload.IndexedQuery], output, null,
+                AllowContainers: false, RegressionConfirmationRun: false),
+            CancellationToken.None));
+
+        Assert.Contains("observable results changed", exception.Message, StringComparison.Ordinal);
+    }
+
     public ValueTask DisposeAsync()
     {
         if (Directory.Exists(output))
@@ -211,7 +235,8 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
     private sealed class RecordingEnvironment(
         ManualTimeProvider? clock = null,
         TimeSpan? executionDuration = null,
-        bool invalidOperationLatencies = false) : IBenchmarkProviderEnvironment
+        bool invalidOperationLatencies = false,
+        bool driftObservableResults = false) : IBenchmarkProviderEnvironment
     {
         public List<RecordingTarget> Targets { get; } = [];
 
@@ -233,7 +258,8 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
                 instance,
                 clock,
                 executionDuration,
-                invalidOperationLatencies);
+                invalidOperationLatencies,
+                driftObservableResults);
             Targets.Add(target);
             return target;
         }
@@ -247,7 +273,8 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
         string instance,
         ManualTimeProvider? clock,
         TimeSpan? executionDuration,
-        bool invalidOperationLatencies) : IPhysicalStorageBenchmarkTarget
+        bool invalidOperationLatencies,
+        bool driftObservableResults) : IPhysicalStorageBenchmarkTarget
     {
         public BenchmarkProvider Provider => provider;
         public PhysicalStorageForm StorageForm => storageForm;
@@ -310,7 +337,7 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
                     new BenchmarkObservableResult(
                         0,
                         $"{workload}-result",
-                        "validated",
+                        driftObservableResults && iteration > 0 ? "drifted" : "validated",
                         1,
                         operations,
                         null)

@@ -126,6 +126,62 @@ public sealed class BaselineCompatibilityEvaluatorTests
         Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Contains("sample count", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Comparison_rejects_effective_settings_that_omit_declared_configuration()
+    {
+        var incomplete = sqlite with
+        {
+            Configuration = new Dictionary<string, string>
+            {
+                ["journal_mode"] = "wal",
+                ["foreign_keys"] = "on"
+            },
+            EffectiveSettings = new Dictionary<string, string> { ["journal_mode"] = "wal" }
+        };
+
+        var result = BaselineCompatibilityEvaluator.Evaluate(
+            candidateConfiguration,
+            machine,
+            [incomplete],
+            Baseline(machine, incomplete, withMeasurements: true));
+
+        Assert.False(result.IsCompatible);
+        Assert.Contains(
+            result.Diagnostics,
+            diagnostic => diagnostic.Contains("effective settings do not include every declared", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Comparison_rejects_testcontainer_source_without_a_sha256_image_digest()
+    {
+        var sqlServer = new BenchmarkProviderMetadata(
+            BenchmarkProvider.SqlServer,
+            "16.0",
+            new Dictionary<string, string>
+            {
+                ["source"] = "testcontainer:mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04",
+                ["pooling"] = "True"
+            })
+        {
+            EffectiveSettings = new Dictionary<string, string>
+            {
+                ["source"] = "testcontainer:mcr.microsoft.com/mssql/server:2022-CU21-ubuntu-22.04",
+                ["pooling"] = "True"
+            }
+        };
+
+        var result = BaselineCompatibilityEvaluator.Evaluate(
+            candidateConfiguration with { Providers = [BenchmarkProvider.SqlServer] },
+            machine,
+            [sqlServer],
+            Baseline(machine, sqlServer, withMeasurements: true));
+
+        Assert.False(result.IsCompatible);
+        Assert.Contains(
+            result.Diagnostics,
+            diagnostic => diagnostic.Contains("immutable image digest", StringComparison.Ordinal));
+    }
+
     private BenchmarkBaseline Baseline(
         BenchmarkMachineMetadata baselineMachine,
         BenchmarkProviderMetadata provider,

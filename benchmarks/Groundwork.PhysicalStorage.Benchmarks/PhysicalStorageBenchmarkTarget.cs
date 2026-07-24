@@ -16,7 +16,6 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
     private readonly ConcurrentDictionary<BenchmarkWorkload, ConcurrentQueue<string>> preparedIds = new();
-    private readonly ConcurrentDictionary<BenchmarkWorkload, BenchmarkObservableResultVector> observableResults = new();
     private readonly string instance;
     private long generatedId;
     private int seededCount;
@@ -241,7 +240,10 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         return execution with
         {
             OperationLatencyNanoseconds = operationLatencies,
-            ObservableResultVector = observableResults.GetOrAdd(workload, observed)
+            // Never substitute an earlier vector here. The runner must see the result
+            // produced by this exact iteration so a later correctness drift cannot be
+            // hidden behind a first-observation cache.
+            ObservableResultVector = observed
         };
     }
 
@@ -631,15 +633,15 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
 
         if (!ordered)
         {
-            for (var index = 0; index < query.Documents.Count; index++)
+            foreach (var document in query.Documents
+                         .OrderBy(document => document.Id, StringComparer.Ordinal))
             {
-                var document = query.Documents[index];
                 results.Add(
-                    $"{identity}/match-{index:D4}",
+                    $"{identity}/match/{document.Id}",
                     "selected",
                     document.Version,
                     count: 1,
-                    payload: NormalizeUnorderedQueryPayload(document.ContentJson));
+                    payload: CanonicalUnorderedQueryPayload(document.ContentJson));
             }
             return;
         }
@@ -660,23 +662,47 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         }
     }
 
-    private static string NormalizeUnorderedQueryPayload(string payload)
+    private static string CanonicalUnorderedQueryPayload(string payload)
     {
         using var document = JsonDocument.Parse(payload);
         var root = document.RootElement;
         var status = root.GetProperty("status").GetString();
         if (!string.Equals(status, "open", StringComparison.Ordinal))
             throw new InvalidOperationException("Indexed query returned a document outside the open-status predicate.");
-        var padding = root.GetProperty("padding");
-        return JsonSerializer.Serialize(
-            new
-            {
-                status,
-                paddingBytes = padding.ValueKind == JsonValueKind.Null
-                    ? 0
-                    : padding.GetString()!.Length
-            },
-            JsonOptions);
+        return CanonicalJson(root);
+    }
+
+    private static string CanonicalJson(JsonElement value)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+            WriteCanonicalJson(writer, value);
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteCanonicalJson(Utf8JsonWriter writer, JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject().OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(writer, property.Value);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                    WriteCanonicalJson(writer, item);
+                writer.WriteEndArray();
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
+        }
     }
 
     private static string NormalizeConcurrentPayload(string payload, int concurrency)

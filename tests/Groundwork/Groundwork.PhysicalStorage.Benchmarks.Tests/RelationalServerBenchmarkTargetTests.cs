@@ -50,7 +50,7 @@ public sealed class RelationalServerBenchmarkTargetTests(
 
     [Theory]
     [MemberData(nameof(ProviderForms))]
-    public async Task Native_plan_capture_never_changes_the_server_measured_shape(
+    public async Task Native_plan_gate_accepts_the_exact_scheduled_server_shape_without_changing_it(
         BenchmarkProvider provider,
         PhysicalStorageForm form)
     {
@@ -63,20 +63,44 @@ public sealed class RelationalServerBenchmarkTargetTests(
         await target.InitializeAsync(CancellationToken.None);
         await target.SeedAsync(
             BenchmarkProfiles.ReproducibleSeed,
-            new BenchmarkDataShape(250, 0, 100),
+            new BenchmarkDataShape(1_000, 0, 5_000),
             CancellationToken.None);
         var beforePlans = await target.CaptureStorageAsync(CancellationToken.None);
 
-        var planFailure = await Record.ExceptionAsync(() =>
-            target.RunNativePlanGatesAsync(
-                BenchmarkPlanRequests.ForWorkloads([BenchmarkWorkload.IndexedQuery]),
-                CancellationToken.None));
+        var evidence = await target.RunNativePlanGatesAsync(
+            BenchmarkPlanRequests.ForWorkloads([BenchmarkWorkload.IndexedQuery]),
+            CancellationToken.None);
         var afterPlans = await target.CaptureStorageAsync(CancellationToken.None);
 
-        if (planFailure is not null)
-            Assert.Contains("native-plan gate rejected", planFailure.Message, StringComparison.Ordinal);
+        Assert.Equal(2, evidence.Count);
         Assert.Equal(beforePlans.PrimaryRows, afterPlans.PrimaryRows);
         Assert.Equal(beforePlans.LinkedRows, afterPlans.LinkedRows);
+    }
+
+    [Fact]
+    public void PostgreSql_plan_gate_allows_a_primary_payload_scan_when_the_linked_predicate_relation_uses_its_index()
+    {
+        const string plan =
+            """[{"Plan":{"Node Type":"Hash Join","Plans":[{"Node Type":"Seq Scan","Relation Name":"documents"},{"Node Type":"Index Scan","Relation Name":"document_lookup","Index Name":"by_status"}]}}]""";
+
+        Assert.True(PostgreSqlBenchmarkTarget.UsesDeclaredIndexWithoutScanningIndexedRelation(
+            plan,
+            "by_status",
+            "document_lookup"));
+    }
+
+    [Theory]
+    [InlineData(
+        """[{"Plan":{"Node Type":"Seq Scan","Relation Name":"document_lookup","Plans":[{"Node Type":"Index Scan","Relation Name":"other","Index Name":"by_status"}]}}]""")]
+    [InlineData(
+        """[{"Plan":{"Node Type":"Seq Scan","Relation Name":"documents"}}]""")]
+    public void PostgreSql_plan_gate_rejects_a_scan_of_the_predicate_relation_or_a_missing_declared_index(
+        string plan)
+    {
+        Assert.False(PostgreSqlBenchmarkTarget.UsesDeclaredIndexWithoutScanningIndexedRelation(
+            plan,
+            "by_status",
+            "document_lookup"));
     }
 
     private static async Task DropSqlServerIndexAsync(

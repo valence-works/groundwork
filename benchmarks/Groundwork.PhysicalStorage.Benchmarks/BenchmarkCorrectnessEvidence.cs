@@ -65,6 +65,31 @@ public sealed class BenchmarkObservableResultVector
 
         return new BenchmarkObservableResultVector(Array.AsReadOnly(canonical));
     }
+
+    /// <summary>
+    /// Retains every measured iteration in a deterministic, iteration-aware result
+    /// contract. This is deliberately not a set or a first-vector cache: pagination
+    /// observes different deterministic pages on successive iterations.
+    /// </summary>
+    public static BenchmarkObservableResultVector AggregateIterations(
+        IEnumerable<(int Iteration, BenchmarkObservableResultVector Vector)> iterations)
+    {
+        ArgumentNullException.ThrowIfNull(iterations);
+        var canonical = iterations
+            .OrderBy(item => item.Iteration)
+            .SelectMany(item => item.Vector.Results.Select(result => new BenchmarkObservableResult(
+                0,
+                $"iteration-{item.Iteration:D6}/{result.Identity}",
+                result.Status,
+                result.Version,
+                result.Count,
+                result.Payload)))
+            .Select((result, sequence) => result with { Sequence = sequence })
+            .ToArray();
+        if (canonical.Length == 0)
+            throw new ArgumentException("Measured observable iteration evidence cannot be empty.", nameof(iterations));
+        return Create(canonical);
+    }
 }
 
 internal sealed class BenchmarkObservableResultBuilder

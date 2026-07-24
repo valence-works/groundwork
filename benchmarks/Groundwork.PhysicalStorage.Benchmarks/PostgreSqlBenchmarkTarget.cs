@@ -8,6 +8,7 @@ using Groundwork.PostgreSql.Documents;
 using Groundwork.PostgreSql.PhysicalStorage;
 using Groundwork.Relational.Documents;
 using Npgsql;
+using System.Text.Json;
 
 namespace Groundwork.PhysicalStorage.Benchmarks;
 
@@ -59,8 +60,8 @@ public sealed class PostgreSqlBenchmarkTarget(
             foreach (var (name, value) in rendered.Parameters)
                 command.Parameters.AddWithValue(name, value ?? DBNull.Value);
             var plan = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
-            if (!plan.Contains(indexName, StringComparison.OrdinalIgnoreCase) ||
-                plan.Contains("\"Node Type\": \"Seq Scan\"", StringComparison.OrdinalIgnoreCase))
+            var indexedRelation = (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier;
+            if (!UsesDeclaredIndexWithoutScanningIndexedRelation(plan, indexName, indexedRelation))
             {
                 throw new InvalidOperationException(
                     $"PostgreSQL native-plan gate rejected {request.Workload}/{request.Operation}. Expected index '{indexName}'.{Environment.NewLine}{plan}");
@@ -68,11 +69,64 @@ public sealed class PostgreSqlBenchmarkTarget(
             evidence.Add(new NativePlanEvidence(
                 request,
                 Provider.ToString(), StorageForm.ToString(), BenchmarkModelFactory.QueryIdentity,
-                (Model.Route.LinkedIndexStorage ?? Model.Route.PrimaryStorage).Name.Identifier,
+                indexedRelation,
                 indexName, plan,
-                ["declared index is selected", "Seq Scan is absent", "query shape is rendered by the certified production handler"]));
+                [
+                    "declared index is selected on the predicate-bearing relation",
+                    "the predicate-bearing relation is not sequentially scanned",
+                    "an optimizer-selected scan of a separate primary payload relation is permitted for linked forms",
+                    "query shape is rendered by the certified production handler"
+                ]));
         }
         return evidence;
+    }
+
+    internal static bool UsesDeclaredIndexWithoutScanningIndexedRelation(
+        string plan,
+        string indexName,
+        string indexedRelation)
+    {
+        if (string.IsNullOrWhiteSpace(plan) ||
+            string.IsNullOrWhiteSpace(indexName) ||
+            string.IsNullOrWhiteSpace(indexedRelation))
+        {
+            return false;
+        }
+
+        using var document = JsonDocument.Parse(plan);
+        var declaredIndexSelected = false;
+        var indexedRelationScanned = false;
+        Visit(document.RootElement);
+        return declaredIndexSelected && !indexedRelationScanned;
+
+        void Visit(JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                var nodeType = element.TryGetProperty("Node Type", out var nodeTypeElement)
+                    ? nodeTypeElement.GetString()
+                    : null;
+                var relation = element.TryGetProperty("Relation Name", out var relationElement)
+                    ? relationElement.GetString()
+                    : null;
+                var selectedIndex = element.TryGetProperty("Index Name", out var indexElement)
+                    ? indexElement.GetString()
+                    : null;
+                declaredIndexSelected |= string.Equals(selectedIndex, indexName, StringComparison.OrdinalIgnoreCase);
+                indexedRelationScanned |=
+                    string.Equals(nodeType, "Seq Scan", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(relation, indexedRelation, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in element.EnumerateObject())
+                    Visit(property.Value);
+            }
+            else if (element.ValueKind == JsonValueKind.Array)
+                foreach (var child in element.EnumerateArray())
+                    Visit(child);
+        }
     }
 
     public override async Task<StorageSnapshot> CaptureStorageAsync(CancellationToken cancellationToken)

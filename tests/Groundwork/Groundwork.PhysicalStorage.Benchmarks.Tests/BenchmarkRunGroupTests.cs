@@ -141,6 +141,27 @@ public sealed class BenchmarkRunGroupTests : IDisposable
     }
 
     [Fact]
+    public async Task Comparison_rejects_independent_runs_with_different_canonical_result_semantics()
+    {
+        var baselineRoot = Path.Combine(scratch, "semantic-baseline");
+        var candidateRoot = Path.Combine(scratch, "semantic-candidate");
+        await WriteGroupAsync(baselineRoot, "baseline", 1_000);
+        var candidate = await WriteGroupAsync(
+            candidateRoot,
+            "candidate",
+            1_000,
+            semanticResultForRun: run => run == 2 ? "drifted-result" : "result");
+
+        var report = await BenchmarkRunGroupRegressionEvaluator.CompareAsync(
+            candidateRoot, candidate, baselineRoot, RegressionPolicy.Scheduled, CancellationToken.None);
+
+        var evaluation = Assert.Single(report.Evaluations);
+        Assert.False(evaluation.IsComparable);
+        Assert.Contains(evaluation.Diagnostics, diagnostic =>
+            diagnostic.Contains("canonical result semantics", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Comparison_rejects_a_candidate_with_an_extra_tuple()
     {
         var baselineRoot = Path.Combine(scratch, "extra-baseline");
@@ -197,7 +218,8 @@ public sealed class BenchmarkRunGroupTests : IDisposable
         long latency,
         bool writeManifest = true,
         IReadOnlyList<BenchmarkWorkload>? workloads = null,
-        IReadOnlyList<int>? independentRunIds = null)
+        IReadOnlyList<int>? independentRunIds = null,
+        Func<int, string>? semanticResultForRun = null)
     {
         const string commit = "test-commit";
         var treeDigest = new string('a', 64);
@@ -293,7 +315,8 @@ public sealed class BenchmarkRunGroupTests : IDisposable
                     invocation,
                     manifestPath,
                     rawPath,
-                    consumerPath);
+                    consumerPath,
+                    semanticResultForRun?.Invoke(independentRun) ?? "result");
 
                 var artifacts = new BenchmarkWorkerArtifactDigests(
                     "manifest.json",
@@ -455,11 +478,13 @@ public sealed class BenchmarkRunGroupTests : IDisposable
         BenchmarkWorkerInvocation invocation,
         string manifestPath,
         string rawPath,
-        string consumerPath)
+        string consumerPath,
+        string semanticResult = "result")
     {
         var runId = $"{invocation.RunGroupId}-{invocation.Ordinal}";
         if (invocation.Role == BenchmarkExecutionRole.Measured)
         {
+            var tuple = BenchmarkRunTuple.From(invocation);
             await WriteJsonAsync(
                 consumerPath,
                 new BenchmarkConsumerEvidenceReport(
@@ -472,7 +497,24 @@ public sealed class BenchmarkRunGroupTests : IDisposable
                     "raw/measurements.jsonl",
                     Digest(rawPath),
                     ["test evidence"],
-                    []));
+                    [new BenchmarkConsumerEvidenceResult(
+                        BenchmarkConsumerEvidenceReport.WorkloadIdentity(tuple.Workload),
+                        "test",
+                        BenchmarkConsumerEvidenceReport.MeasurementProtocol,
+                        "fingerprint",
+                        semanticResult,
+                        "measurement",
+                        BenchmarkConsumerEvidenceReport.ProviderIdentity(tuple.Provider),
+                        "test-provider",
+                        "provider",
+                        tuple.StorageForm,
+                        tuple.DataShape,
+                        invocation.IndependentRun,
+                        30,
+                        300,
+                        "raw",
+                        [],
+                        "plans")]));
         }
         await WriteJsonAsync(
             manifestPath,
@@ -529,6 +571,7 @@ public sealed class BenchmarkRunGroupTests : IDisposable
 
     private static string Digest(string path) =>
         Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(path)));
+
 
     private static string Relative(string root, string path) =>
         Path.GetRelativePath(root, path).Replace(Path.DirectorySeparatorChar, '/');

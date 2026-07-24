@@ -75,6 +75,48 @@ public sealed class BenchmarkSchemaTests
                 .TryGetProperty("normalizedBatchLatencyNanosecondsPerOperation", out _));
     }
 
+    [Fact]
+    public void Serialized_manifest_satisfies_the_strict_v1_schema_contract()
+    {
+        var manifest = new BenchmarkRunManifest(
+            BenchmarkProfiles.SchemaVersion,
+            "schema-fixture",
+            "completed",
+            BenchmarkRunMode.Smoke,
+            DateTimeOffset.UnixEpoch,
+            DateTimeOffset.UnixEpoch,
+            "0123456789abcdef",
+            false,
+            "raw/measurements.jsonl",
+            "reports/summary.json",
+            "reports/elsa-migration-evidence.json",
+            "metadata/machine.json",
+            "metadata/providers.json",
+            "metadata/configuration.json",
+            [],
+            null,
+            false,
+            null,
+            null,
+            "reports/artifact-integrity.json");
+        using var schema = Read(
+            "benchmarks/Groundwork.PhysicalStorage.Benchmarks/schemas/v1/run-manifest.schema.json");
+        using var serialized = JsonDocument.Parse(JsonSerializer.Serialize(manifest, BenchmarkJson.CompactOptions));
+        var contract = schema.RootElement;
+        var payload = serialized.RootElement;
+        var properties = contract.GetProperty("properties");
+
+        foreach (var required in contract.GetProperty("required").EnumerateArray())
+            Assert.True(payload.TryGetProperty(required.GetString()!, out _), $"Serialized manifest omitted '{required}'.");
+        foreach (var property in payload.EnumerateObject())
+            Assert.True(properties.TryGetProperty(property.Name, out _), $"Schema forbids serialized property '{property.Name}'.");
+
+        var artifactIntegrity = properties.GetProperty("artifactIntegrity");
+        Assert.Equal("string", artifactIntegrity.GetProperty("type").GetString());
+        Assert.True(artifactIntegrity.GetProperty("minLength").GetInt32() > 0);
+        Assert.Equal("reports/artifact-integrity.json", payload.GetProperty("artifactIntegrity").GetString());
+    }
+
     private static JsonDocument Read(string relativePath) =>
         JsonDocument.Parse(File.ReadAllText(Path.Combine(RepositoryRoot, relativePath)));
 

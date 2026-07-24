@@ -44,9 +44,10 @@ public sealed class SqliteBenchmarkObservableEvidenceTests : IAsyncDisposable
         Assert.NotEmpty(benchmarkCase.ObservableResults);
         Assert.Contains(
             benchmarkCase.ObservableResults,
-            item => item.Identity.StartsWith("query-0000/match-", StringComparison.Ordinal) &&
+            item => item.Identity.StartsWith("iteration-000000/query-0000/match/seed-", StringComparison.Ordinal) &&
                     item.Version == 1 &&
-                    item.Payload == """{"status":"open","paddingBytes":0}""");
+                    item.Payload is not null &&
+                    item.Payload.Contains("\"status\":\"open\"", StringComparison.Ordinal));
 
         var evidencePath = Path.Combine(output, "reports", "consumer-evidence.json");
         var evidence = JsonSerializer.Deserialize<BenchmarkConsumerEvidenceReport>(
@@ -100,7 +101,10 @@ public sealed class SqliteBenchmarkObservableEvidenceTests : IAsyncDisposable
             digests.Add(observable.Digest);
         }
 
-        Assert.Equal(digests[0], digests[1]);
+        if (workload == BenchmarkWorkload.PaginationAndCount)
+            Assert.NotEqual(digests[0], digests[1]);
+        else
+            Assert.Equal(digests[0], digests[1]);
     }
 
     public static TheoryData<BenchmarkWorkload> AllWorkloads =>

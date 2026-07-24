@@ -9,6 +9,16 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), $"groundwork-artifact-test-{Guid.NewGuid():N}");
 
+    [Theory]
+    [InlineData(BenchmarkProvider.Sqlite, "groundwork.sqlite")]
+    [InlineData(BenchmarkProvider.SqlServer, "groundwork.sql-server")]
+    [InlineData(BenchmarkProvider.PostgreSql, "groundwork.postgre-sql")]
+    [InlineData(BenchmarkProvider.MongoDb, "groundwork.mongo-db")]
+    public void Provider_identity_uses_the_same_canonical_mapping_for_every_provider(
+        BenchmarkProvider provider,
+        string expected) =>
+        Assert.Equal(expected, BenchmarkConsumerEvidenceReport.ProviderIdentity(provider));
+
     [Fact]
     public async Task Raw_measurements_are_one_json_object_per_line_and_round_trip_as_a_baseline()
     {
@@ -217,6 +227,62 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
                 providers,
                 layout).Results);
         }
+    }
+
+    [Fact]
+    public async Task Bound_claim_verification_preserves_the_measured_independent_run()
+    {
+        var layout = new ArtifactLayout(root);
+        var benchmarkCase = new BenchmarkCase(
+            BenchmarkProvider.Sqlite,
+            PhysicalStorageForm.SharedDocuments,
+            BenchmarkWorkload.Insert);
+        var sample = new BenchmarkSample(
+            0, 1, 1_000, 40, 1, 0, 1, null, null, new Dictionary<string, long>(), [100]);
+        var report = new BenchmarkRunReport(
+            BenchmarkProfiles.SchemaVersion,
+            "test-run",
+            BenchmarkRunMode.Smoke,
+            [new BenchmarkCaseResult(
+                benchmarkCase,
+                new CorrectnessGateResult(true, true, true, true, true),
+                [],
+                BenchmarkSummarizer.Summarize(benchmarkCase.Identity, [sample]),
+                [sample],
+                ObservableResults(benchmarkCase, sample.Operations))],
+            [],
+            new BaselineEligibility(false, ["Smoke run."]),
+            BenchmarkProfiles.Smoke.DataShape);
+        var machine = new BenchmarkMachineMetadata(
+            "test-os", "benchmark-host", "Arm64", ".NET 10", "Release", 8, true, 1_000_000_000,
+            "1.0.0", "abcdef", false, DateTimeOffset.UnixEpoch);
+        var providers = new[]
+        {
+            new BenchmarkProviderMetadata(
+                BenchmarkProvider.Sqlite,
+                "3.50.4",
+                new Dictionary<string, string>())
+        };
+
+        await using (var writer = new BenchmarkArtifactWriter(layout))
+            await writer.AppendSampleAsync(new RawBenchmarkRecord(benchmarkCase, sample), CancellationToken.None);
+        var evidence = BenchmarkConsumerEvidenceReport.Create(
+            report,
+            BenchmarkProfiles.Smoke,
+            machine,
+            providers,
+            layout,
+            independentRun: 2);
+
+        BenchmarkConsumerEvidenceReport.VerifyBoundClaims(
+            report,
+            BenchmarkProfiles.Smoke,
+            machine,
+            providers,
+            layout,
+            evidence);
+
+        Assert.Equal(2, Assert.Single(evidence.Results).IndependentRun);
     }
 
     [Fact]
@@ -451,7 +517,9 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
             [],
             null,
             false,
-            null);
+            null,
+            layout.RelativePath(layout.ConsumerEvidenceJson),
+            layout.RelativePath(layout.ArtifactIntegrityJson));
 
         await using (var writer = new BenchmarkArtifactWriter(layout))
         {
@@ -460,6 +528,11 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
             await writer.WriteProvidersAsync(providers, CancellationToken.None);
             await writer.WriteConfigurationAsync(BenchmarkProfiles.Smoke, CancellationToken.None);
             await writer.WriteReportAsync(report, CancellationToken.None);
+            await writer.WriteConsumerEvidenceAsync(
+                BenchmarkConsumerEvidenceReport.Create(report, BenchmarkProfiles.Smoke, machine, providers, layout),
+                CancellationToken.None);
+            await writer.WriteManifestAsync(manifest, CancellationToken.None);
+            await writer.WriteArtifactIntegrityAsync(manifest, CancellationToken.None);
         }
 
         var baseline = await BenchmarkArtifactWriter.ReadBaselineAsync(root, CancellationToken.None);
@@ -468,6 +541,11 @@ public sealed class BenchmarkArtifactWriterTests : IAsyncDisposable
         Assert.Equal("test-run", baseline.Manifest!.RunId);
         Assert.Equal(BenchmarkProfiles.ReproducibleSeed, baseline.Configuration!.Seed);
         Assert.Equal(BenchmarkProvider.Sqlite, Assert.Single(baseline.Providers!).Provider);
+
+        await File.AppendAllTextAsync(layout.SummaryJson, Environment.NewLine);
+        var tampered = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            BenchmarkArtifactWriter.ReadBaselineAsync(root, CancellationToken.None));
+        Assert.Contains("integrity verification failed", tampered.Message, StringComparison.Ordinal);
     }
 
     [Fact]

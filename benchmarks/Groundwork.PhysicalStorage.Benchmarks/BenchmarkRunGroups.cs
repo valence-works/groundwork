@@ -342,6 +342,9 @@ public static class BenchmarkRunGroupRegressionEvaluator
             var providers = await BenchmarkRunGroupVerifier.ReadAsync<IReadOnlyList<BenchmarkProviderMetadata>>(
                 Path.Combine(workerRoot, "metadata", "providers.json"),
                 cancellationToken);
+            var consumer = await BenchmarkRunGroupVerifier.ReadAsync<BenchmarkConsumerEvidenceReport>(
+                Path.Combine(workerRoot, "reports", "consumer-evidence.json"),
+                cancellationToken);
             var matching = raw
                 .Where(record => record.Case.Provider == tuple.Provider &&
                                  record.Case.StorageForm == tuple.StorageForm &&
@@ -358,11 +361,18 @@ public static class BenchmarkRunGroupRegressionEvaluator
                 throw new InvalidOperationException(
                     "Measured worker raw data does not satisfy its iteration, operation, and duration floors.");
             }
+            var semanticEvidence = consumer.Results.SingleOrDefault(result =>
+                result.ProviderIdentity == BenchmarkConsumerEvidenceReport.ProviderIdentity(tuple.Provider) &&
+                result.StorageForm == tuple.StorageForm &&
+                result.DataShape == tuple.DataShape &&
+                result.WorkloadIdentity == BenchmarkConsumerEvidenceReport.WorkloadIdentity(tuple.Workload))
+                ?? throw new InvalidOperationException("Measured worker has no canonical consumer result for its exact tuple.");
             result.Add(new BenchmarkProcessEvidence(
                 tuple,
                 entry.IndependentRun,
                 matching,
-                ComparabilityDigest(configuration, machine, providers)));
+                ComparabilityDigest(configuration, machine, providers),
+                SemanticDigest(semanticEvidence)));
         }
         return result.ToArray();
     }
@@ -394,7 +404,38 @@ public static class BenchmarkRunGroupRegressionEvaluator
                     $"Candidate and baseline comparability metadata differ for independent run {candidateProcess.IndependentRun}.");
             }
         }
+        RequireStableSemantics(candidate, "Candidate", diagnostics);
+        RequireStableSemantics(baseline, "Baseline", diagnostics);
+        if (diagnostics.Count == 0 && candidate[0].SemanticDigest != baseline[0].SemanticDigest)
+        {
+            diagnostics.Add(
+                "Candidate and baseline workload fingerprint, canonical result semantics, provider configuration, or native-plan digest differ.");
+        }
         return diagnostics;
+    }
+
+    private static void RequireStableSemantics(
+        IReadOnlyList<BenchmarkProcessEvidence> processes,
+        string source,
+        ICollection<string> diagnostics)
+    {
+        if (processes.Select(process => process.SemanticDigest).Distinct(StringComparer.Ordinal).Count() != 1)
+        {
+            diagnostics.Add(
+                $"{source} independent runs disagree on workload fingerprint or canonical result semantics.");
+        }
+    }
+
+    private static string SemanticDigest(BenchmarkConsumerEvidenceResult evidence)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            evidence.WorkloadFingerprint,
+            evidence.ResultDigest,
+            evidence.ProviderConfigurationDigest,
+            evidence.NativePlanDigest
+        }, BenchmarkJson.CompactOptions);
+        return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
     private static string ComparabilityDigest(
@@ -430,6 +471,7 @@ public static class BenchmarkRunGroupRegressionEvaluator
         BenchmarkRunTuple Tuple,
         int IndependentRun,
         IReadOnlyList<BenchmarkSample> Samples,
-        string ComparabilityDigest);
+        string ComparabilityDigest,
+        string SemanticDigest);
 
 }
