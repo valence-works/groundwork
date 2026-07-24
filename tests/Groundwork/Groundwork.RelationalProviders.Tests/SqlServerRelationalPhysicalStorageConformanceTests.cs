@@ -28,7 +28,7 @@ public sealed class SqlServerPhysicalStorageContainer : IAsyncLifetime
     public Task DisposeAsync() => Container.DisposeAsync().AsTask();
 }
 
-public sealed partial class SqlServerRelationalPhysicalStorageConformanceTests(
+public sealed class SqlServerRelationalPhysicalStorageConformanceTests(
     SqlServerPhysicalStorageContainer fixture)
     : RelationalServerPhysicalIdentityConformance, IClassFixture<SqlServerPhysicalStorageContainer>
 {
