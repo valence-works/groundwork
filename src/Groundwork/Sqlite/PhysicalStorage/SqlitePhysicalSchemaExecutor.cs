@@ -302,6 +302,9 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             case CreateLinkedStorageOperation create:
                 await CreateLinkedAsync(create.Route, transaction, cancellationToken, validateObjects);
                 break;
+            case CreateCollectionElementStorageOperation create:
+                await CreateCollectionElementAsync(create.Storage, transaction, cancellationToken, validateObjects);
+                break;
             case AddProjectedColumnOperation add:
                 RelationalPhysicalStorageColumns.Validate(add.Route);
                 await AddColumnAsync(add.Storage.Name.Identifier, add.Column.Column.Identifier, add.Column.Definition, transaction, cancellationToken, validateObjects);
@@ -386,6 +389,56 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             ct);
         if (validateObjects)
             await ValidateLinkedStorageAsync(route, transaction, ct);
+    }
+
+    private async Task CreateCollectionElementAsync(
+        ExecutableCollectionElementStorageRoute storage,
+        DbTransaction transaction,
+        CancellationToken ct,
+        bool validateObjects)
+    {
+        var key = storage.OwnerOrdinalKey.Columns.Select(field => field.Column).ToArray();
+        var columns = new[]
+        {
+            $"{Q(storage.DocumentKind.Column.Identifier)} TEXT NOT NULL",
+            $"{Q(storage.StorageScope.Column.Identifier)} TEXT NOT NULL",
+            $"{Q(storage.IdComparisonKey.Column.Identifier)} TEXT NOT NULL",
+            $"{Q(storage.IdLookupKey.Column.Identifier)} TEXT NOT NULL",
+            $"{Q(storage.Ordinal.Column.Identifier)} INTEGER NOT NULL",
+            ProjectedColumnSql(storage.Value.Column.Identifier, storage.Value.Definition with { IsNullable = false }),
+            $"PRIMARY KEY ({string.Join(", ", key.Select(column => Q(column.Identifier)))})"
+        };
+        await ExecuteAsync($"CREATE TABLE IF NOT EXISTS {Q(storage.Storage.Name.Identifier)} ({string.Join(", ", columns)});", transaction, ct);
+        if (validateObjects)
+            await ValidateCollectionElementAsync(storage, transaction, ct);
+    }
+
+    private async Task ValidateCollectionElementAsync(ExecutableCollectionElementStorageRoute storage, DbTransaction transaction, CancellationToken ct)
+    {
+        var key = storage.OwnerOrdinalKey.Columns.Select(field => field.Column).ToArray();
+        var order = key.Select((column, index) => (column.Identifier, index + 1)).ToDictionary(item => item.Identifier, item => item.Item2, StringComparer.Ordinal);
+        var expected = new[]
+        {
+            RequiredText(storage.DocumentKind.Column.Identifier, order), RequiredText(storage.StorageScope.Column.Identifier, order),
+            RequiredText(storage.IdComparisonKey.Column.Identifier, order), RequiredText(storage.IdLookupKey.Column.Identifier, order),
+            new ExpectedColumn(storage.Ordinal.Column.Identifier, "INTEGER", true, null, order.GetValueOrDefault(storage.Ordinal.Column.Identifier)),
+            new ExpectedColumn(
+                storage.Value.Column.Identifier,
+                SqlType(storage.Value.Definition.Type),
+                true,
+                SqlDefaultLiteral(storage.Value.Definition with { IsNullable = false }),
+                0)
+        };
+        await ValidateTableColumnsAsync(
+            storage.Storage.Name.Identifier,
+            expected,
+            key,
+            transaction,
+            ct,
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                [storage.Value.Column.Identifier] = SqliteCollation(storage.Value.Definition.Collation)
+            });
     }
 
     private async Task AddColumnAsync(
@@ -717,8 +770,19 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
                 throw new InvalidOperationException($"Physical linked storage '{route.LinkedIndexStorage.Name.Identifier}' is missing.");
             if (route.LinkedIndexStorage is not null)
                 await ValidateLinkedStorageAsync(route, transaction, ct);
+            foreach (var storage in route.CollectionElementStorages)
+            {
+                if (!await TableExistsAsync(storage.Storage.Name.Identifier, transaction, ct))
+                {
+                    throw new InvalidOperationException(
+                        $"Collection-element storage '{storage.Storage.Name.Identifier}' is missing.");
+                }
+                await ValidateCollectionElementAsync(storage, transaction, ct);
+            }
             foreach (var column in route.ProjectedColumns)
             {
+                if (column.Definition.Cardinality == ProjectionCardinality.CollectionElements)
+                    continue;
                 var table = column.Target == ExecutableStorageObjectRole.PrimaryStorage
                     ? route.PrimaryStorage.Name.Identifier
                     : route.LinkedIndexStorage!.Name.Identifier;
@@ -787,7 +851,8 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
         IReadOnlyList<ExpectedColumn> expected,
         IReadOnlyList<ExecutableColumnRoute> expectedPrimaryKey,
         DbTransaction transaction,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<string, string?>? expectedCollations = null)
     {
         var actual = await ReadColumnsAsync(table, transaction, ct);
         foreach (var column in expected)
@@ -795,7 +860,12 @@ public sealed class SqlitePhysicalSchemaExecutor : IPhysicalSchemaExecutor, IPhy
             if (!actual.TryGetValue(column.Name, out var found))
                 throw new InvalidOperationException($"Physical column '{table}.{column.Name}' is missing.");
             EnsureColumnCompatible(table, column, found);
-            await ValidateColumnCollationAsync(table, column.Name, expectedCollation: null, transaction, ct);
+            await ValidateColumnCollationAsync(
+                table,
+                column.Name,
+                expectedCollations is null ? null : expectedCollations.GetValueOrDefault(column.Name),
+                transaction,
+                ct);
         }
 
         var actualPrimaryKey = actual.Values.Where(column => column.PrimaryKeyOrder > 0)
