@@ -143,7 +143,7 @@ public abstract class RelationalServerBenchmarkTarget : PhysicalStorageBenchmark
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
+        return Execution(1, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
     }
 
     protected override Task ResetClientStateAsync(CancellationToken cancellationToken)

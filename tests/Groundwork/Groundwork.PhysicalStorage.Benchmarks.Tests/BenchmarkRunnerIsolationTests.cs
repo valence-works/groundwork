@@ -44,10 +44,46 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
         Assert.Equal(0, plans.CorrectnessCalls);
         Assert.Equal(0, measured.PlanCalls);
         Assert.Equal(1, plans.PlanCalls);
-        Assert.True(measured.ExecuteCalls > 0);
+        Assert.Equal(configuration.MeasurementIterations, measured.ExecuteCalls);
         Assert.Equal(0, plans.ExecuteCalls);
         Assert.True(measured.Disposed);
         Assert.True(plans.Disposed);
+    }
+
+    [Fact]
+    public async Task Untimed_warmup_process_executes_only_warmup_iterations_and_emits_no_consumer_evidence()
+    {
+        var environment = new RecordingEnvironment();
+        var configuration = BenchmarkProfiles.Smoke with
+        {
+            DatasetSize = 10,
+            MigrationDatasetSize = 1,
+            WarmupIterations = 2,
+            MeasurementIterations = 5,
+            OperationsPerIteration = 1,
+            Providers = [BenchmarkProvider.Sqlite],
+            StorageForms = [PhysicalStorageForm.SharedDocuments]
+        };
+        var runner = new BenchmarkRunner(null, () => environment);
+
+        var result = await runner.RunAsync(
+            new BenchmarkRunRequest(
+                FindRepositoryRoot(),
+                configuration,
+                [BenchmarkWorkload.Insert],
+                output,
+                null,
+                AllowContainers: false,
+                RegressionConfirmationRun: false,
+                DataShape: new BenchmarkDataShape(10, 0, 5_000),
+                IndependentRun: 0,
+                Role: BenchmarkExecutionRole.UntimedWarmup),
+            CancellationToken.None);
+
+        var target = Assert.Single(environment.Targets);
+        Assert.Equal(configuration.WarmupIterations, target.ExecuteCalls);
+        Assert.Empty(result.Report.Cases);
+        Assert.False(File.Exists(Path.Combine(output, "reports", "consumer-evidence.json")));
     }
 
     [Fact]
@@ -84,6 +120,79 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
         Assert.True(measured.Disposed);
     }
 
+    [Fact]
+    public async Task Measured_run_continues_whole_samples_until_operation_and_steady_state_floors_are_met()
+    {
+        var clock = new ManualTimeProvider();
+        var environment = new RecordingEnvironment(clock, TimeSpan.FromMilliseconds(500));
+        var configuration = BenchmarkProfiles.Smoke with
+        {
+            DatasetSize = 10,
+            MigrationDatasetSize = 1,
+            WarmupIterations = 1,
+            MeasurementIterations = 5,
+            OperationsPerIteration = 25,
+            MinimumMeasuredOperations = 100,
+            MinimumSteadyStateDurationSeconds = 3,
+            Providers = [BenchmarkProvider.Sqlite],
+            StorageForms = [PhysicalStorageForm.SharedDocuments]
+        };
+        var runner = new BenchmarkRunner(null, () => environment, clock);
+
+        var result = await runner.RunAsync(
+            new BenchmarkRunRequest(
+                FindRepositoryRoot(),
+                configuration,
+                [BenchmarkWorkload.Insert],
+                output,
+                null,
+                AllowContainers: false,
+                RegressionConfirmationRun: false),
+            CancellationToken.None);
+
+        var measured = Assert.Single(environment.Targets);
+        var samples = Assert.Single(result.Report.Cases).Samples;
+        Assert.Equal(6, measured.ExecuteCalls);
+        Assert.Equal(6, samples.Count);
+        Assert.Equal(150, samples.Sum(sample => sample.Operations));
+        Assert.Equal(150, samples.Sum(sample => sample.OperationLatencyNanoseconds.Count));
+        Assert.All(samples, sample =>
+            Assert.Equal(Enumerable.Repeat(100L, 25), sample.OperationLatencyNanoseconds));
+        Assert.Equal(3_000_000_000, samples.Sum(sample => sample.ElapsedNanoseconds));
+        var raw = await BenchmarkArtifactWriter.ReadRawAsync(output, CancellationToken.None);
+        Assert.Equal(150, raw.Sum(record => record.Sample.OperationLatencyNanoseconds.Count));
+    }
+
+    [Fact]
+    public async Task Measured_run_rejects_a_target_that_does_not_return_one_latency_per_operation()
+    {
+        var environment = new RecordingEnvironment(invalidOperationLatencies: true);
+        var configuration = BenchmarkProfiles.Smoke with
+        {
+            DatasetSize = 10,
+            MigrationDatasetSize = 1,
+            WarmupIterations = 1,
+            MeasurementIterations = 5,
+            OperationsPerIteration = 2,
+            Providers = [BenchmarkProvider.Sqlite],
+            StorageForms = [PhysicalStorageForm.SharedDocuments]
+        };
+        var runner = new BenchmarkRunner(null, () => environment);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RunAsync(
+            new BenchmarkRunRequest(
+                FindRepositoryRoot(),
+                configuration,
+                [BenchmarkWorkload.Insert],
+                output,
+                null,
+                AllowContainers: false,
+                RegressionConfirmationRun: false),
+            CancellationToken.None));
+
+        Assert.Contains("one positive raw latency observation per operation", exception.Message, StringComparison.Ordinal);
+    }
+
     public ValueTask DisposeAsync()
     {
         if (Directory.Exists(output))
@@ -99,7 +208,10 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
         return directory?.FullName ?? throw new DirectoryNotFoundException("Could not locate the Groundwork repository root.");
     }
 
-    private sealed class RecordingEnvironment : IBenchmarkProviderEnvironment
+    private sealed class RecordingEnvironment(
+        ManualTimeProvider? clock = null,
+        TimeSpan? executionDuration = null,
+        bool invalidOperationLatencies = false) : IBenchmarkProviderEnvironment
     {
         public List<RecordingTarget> Targets { get; } = [];
 
@@ -115,7 +227,13 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
             string scratchDirectory,
             int migrationDatasetSize)
         {
-            var target = new RecordingTarget(provider, form, instance);
+            var target = new RecordingTarget(
+                provider,
+                form,
+                instance,
+                clock,
+                executionDuration,
+                invalidOperationLatencies);
             Targets.Add(target);
             return target;
         }
@@ -126,7 +244,10 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
     private sealed class RecordingTarget(
         BenchmarkProvider provider,
         PhysicalStorageForm storageForm,
-        string instance) : IPhysicalStorageBenchmarkTarget
+        string instance,
+        ManualTimeProvider? clock,
+        TimeSpan? executionDuration,
+        bool invalidOperationLatencies) : IPhysicalStorageBenchmarkTarget
     {
         public BenchmarkProvider Provider => provider;
         public PhysicalStorageForm StorageForm => storageForm;
@@ -175,7 +296,15 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
             CancellationToken cancellationToken)
         {
             ExecuteCalls++;
-            return Task.FromResult(new WorkloadExecution(operations, 0, 0, 2, new Dictionary<string, long>()));
+            if (executionDuration is not null)
+                clock!.Advance(executionDuration.Value);
+            return Task.FromResult(new WorkloadExecution(
+                operations,
+                0,
+                0,
+                2,
+                new Dictionary<string, long>(),
+                Enumerable.Repeat(100L, invalidOperationLatencies ? operations - 1 : operations).ToArray()));
         }
 
         public Task ValidateIterationAsync(BenchmarkWorkload workload, CancellationToken cancellationToken) => Task.CompletedTask;
@@ -188,5 +317,20 @@ public sealed class BenchmarkRunnerIsolationTests : IAsyncDisposable
             Disposed = true;
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => timestamp;
+
+        public override DateTimeOffset GetUtcNow() =>
+            DateTimeOffset.UnixEpoch.AddTicks(timestamp);
+
+        public void Advance(TimeSpan duration) =>
+            timestamp += duration.Ticks;
     }
 }

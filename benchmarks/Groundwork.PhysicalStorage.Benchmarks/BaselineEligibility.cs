@@ -49,9 +49,12 @@ public static class BaselineEligibilityEvaluator
             actual.Distinct(StringComparer.Ordinal).Count() != actual.Length ||
             !expected.SetEquals(actual))
             diagnostics.Add("Future baseline activation also requires one result for every scheduled-scaffold case.");
-        if (cases.Any(result => result.Samples.Count != BenchmarkProfiles.Scheduled.MeasurementIterations ||
-                                result.Summary.SampleCount != BenchmarkProfiles.Scheduled.MeasurementIterations))
-            diagnostics.Add($"Future baseline activation also requires exactly {BenchmarkProfiles.Scheduled.MeasurementIterations} measured samples per scaffold case.");
+        if (cases.Any(result => !MeetsMeasurementFloors(result, BenchmarkProfiles.Scheduled)))
+        {
+            diagnostics.Add(
+                "Future baseline activation also requires every case to satisfy the scheduled " +
+                "sample-count, operation-count, and steady-state duration floors.");
+        }
         if (cases.Any(result => !AllPassed(result.Correctness)))
             diagnostics.Add("Future baseline activation also requires all correctness gates to pass.");
         if (cases.Any(result =>
@@ -73,9 +76,26 @@ public static class BaselineEligibilityEvaluator
                configuration.MigrationDatasetSize == scheduled.MigrationDatasetSize &&
                configuration.WarmupIterations == scheduled.WarmupIterations &&
                configuration.MeasurementIterations == scheduled.MeasurementIterations &&
+               configuration.MinimumMeasuredOperations == scheduled.MinimumMeasuredOperations &&
+               configuration.MinimumSteadyStateDurationSeconds == scheduled.MinimumSteadyStateDurationSeconds &&
                configuration.OperationsPerIteration == scheduled.OperationsPerIteration &&
                configuration.Concurrency == scheduled.Concurrency;
     }
+
+    private static bool MeetsMeasurementFloors(
+        BenchmarkCaseResult result,
+        BenchmarkRunConfiguration configuration) =>
+        result.Samples.Count >= configuration.MeasurementIterations &&
+        result.Summary.SampleCount == result.Samples.Count &&
+        result.Summary.OperationLatencyObservationCount ==
+        result.Samples.Sum(sample => sample.OperationLatencyNanoseconds?.Count ?? 0) &&
+        result.Samples.Sum(sample => (long)sample.Operations) >= configuration.MinimumMeasuredOperations &&
+        result.Samples.All(sample =>
+            sample.OperationLatencyNanoseconds is not null &&
+            sample.OperationLatencyNanoseconds.Count == sample.Operations &&
+            sample.OperationLatencyNanoseconds.All(latency => latency > 0)) &&
+        result.Samples.Sum(sample => sample.ElapsedNanoseconds) >=
+        configuration.MinimumSteadyStateDurationSeconds * 1_000_000_000L;
 
     private static bool SameSet<T>(IEnumerable<T> actual, IEnumerable<T> expected) where T : notnull =>
         actual.ToHashSet().SetEquals(expected);

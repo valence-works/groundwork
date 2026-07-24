@@ -5,10 +5,10 @@ Groundwork's production document-store path across SQLite, SQL Server, PostgreSQ
 the three physical storage forms. It materializes real manifests, creates real storage, uses
 production sessions and bounded-query translation, and records provider-native query plans.
 
-It does **not** complete issue #50. The current profiles are not a ratified performance matrix,
-contain no EF Core comparison, cannot be promoted as baselines, and cannot make an Elsa migration
-go/no-go decision. `reports/elsa-migration-evidence.json` records this as `readiness: insufficient`
-and lists the missing acceptance evidence.
+It does **not** complete issue #50. The scheduled protocol now carries the ratified 1K/100K/1M
+dataset dimension and the accepted one-warm-up/three-measured-process scheduled protocol, but
+concrete payload/selectivity vectors remain explicit inputs until they are ratified. The harness contains no EF Core comparison, cannot promote
+baselines, and cannot make an Elsa migration go/no-go decision.
 
 ## Current correctness and plan gates
 
@@ -31,25 +31,37 @@ measured database, so optimizer assistance cannot mutate measured workload data 
 
 These are harness correctness gates only. Passing them does not make performance evidence complete.
 
-## Diagnostic profiles
+## Matrix and independent-run protocol
 
-The profiles provide repeatable harness controls, not the final issue #50 matrix:
+The profiles provide repeatable controls. Each provider/form/workload/data-shape/repetition tuple is
+serialized as an immutable worker request and measured in a separate process:
 
 | Control | Smoke | Scheduled scaffold |
 |---|---:|---:|
 | Seed | 20260713 | 20260713 |
-| Primary dataset | 250 | 10,000 |
+| Primary dataset | 250 | 1,000; 100,000; 1,000,000 |
+| Payload padding | 0 bytes | 0 bytes (explicit control value) |
+| Query selectivity | 5,000 basis points | 5,000 basis points (explicit control value) |
+| Untimed warm-up processes | 1 per tuple | 1 per tuple |
+| Independent measured processes | 1 | 3 |
 | Migration dataset | 100 | 5,000 |
 | Warmup iterations | 2 | 5 |
-| Measured iterations | 7 | 30 |
+| Minimum measured iterations | 7 | 30 |
+| Minimum measured operations | 1 | 100 |
+| Minimum steady-state execution | 0 seconds | 30 seconds |
 | Operations per measured batch | 10 | 100 |
 | Concurrency | 4 | 16 |
 | Default providers | SQLite | All four |
 | Storage forms | All three | All three |
 
+Use `--payload-padding-bytes`, `--selectivity-bps`, and `--independent-runs` to supply reviewed
+overrides without changing code. These values are recorded in worker requests, fingerprints, and
+consumer evidence; providing payload/selectivity values does not ratify them or make a run
+promotable.
+
 Both profiles always emit `baselineEligibility.eligible: false`. Diagnostics explain that issue #50
-still requires the 1K/100K/1M matrix across payload sizes and query selectivity, exact-HEAD live
-evidence from all four providers, and the Elsa-owned EF Core oracle.
+still requires controlled execution of the complete reviewed matrix, exact-HEAD live evidence from
+all four providers, and the Elsa-owned EF Core oracle.
 
 The GitHub workflow is named `Physical Storage Benchmark Evidence (Scaffolding)`. Pull requests run
 SQLite smoke evidence. Weekly/manual jobs run the four-provider scheduled scaffold on a controlled
@@ -71,7 +83,10 @@ dotnet run -c Release --project benchmarks/Groundwork.PhysicalStorage.Benchmarks
   --profile scheduled \
   --providers postgresql \
   --forms entity \
-  --workloads indexed-query,mixed-compound-ordering
+  --workloads indexed-query,mixed-compound-ordering \
+  --payload-padding-bytes 0,1024 \
+  --selectivity-bps 1000,5000 \
+  --independent-runs 3
 ```
 
 Run all cases represented by the scheduled scaffold:
@@ -127,19 +142,32 @@ database-crash, power-loss, or disaster-recovery evidence.
 
 ## Metric semantics
 
-Each raw sample is one measured batch. The harness records elapsed time and operation count, then
-normalizes that batch mean to nanoseconds per operation. Summary p50/p95/p99 values are percentiles
-across those normalized **batch means**:
+Each raw sample is one measured target invocation and retains the invocation's aggregate elapsed
+time for throughput and steady-state accounting. It also carries `operationLatencyNanoseconds`: one
+positive, directly timed observation for every operation reported by the target. Summary
+`operationLatencyP50Nanoseconds`, p95, and p99 values and latency bootstraps flatten those raw
+observations; they never divide an invocation duration by its operation count.
 
-- `normalizedBatchLatencyNanosecondsPerOperation` on a raw sample;
-- `normalizedBatchLatencyP50NanosecondsPerOperation`, p95, and p99 on summaries/evidence.
+An operation is the smallest semantically complete unit that the workload promises:
 
-They are not percentiles of individual-operation latency because the harness does not record an
-individual latency distribution. Reports also contain aggregate throughput, allocation per
-operation, observable round trips, net storage growth per logical payload byte, net physical-row
-growth per logical mutation, provider work signals, and native-plan evidence where observable. These
-are net cardinality/storage ratios, not database write-amplification measurements. A missing
-round-trip signal is `null`, never zero.
+- point-read batch: the complete reused-client or reset-client batch (including reset when selected);
+- indexed/mixed query, insert, update, delete, stale write, and storage-growth: one store call;
+- unit of work: one begin/save-batch/commit transaction;
+- concurrent create: one competing create attempt;
+- pagination and count: one page query or one count query;
+- backfill: one complete materialization/backfill application;
+- client restart validation: one client/factory/pool restart plus its durable-read validation batch.
+
+The scheduled process therefore continues whole invocations until it has at least 100 of these raw
+operation observations and at least 30 seconds of measured target execution. Reports also contain
+aggregate throughput, allocation per operation, observable round trips, net storage growth per
+logical payload byte, net physical-row growth per logical mutation, provider work signals, and
+native-plan evidence where observable. These are net cardinality/storage ratios, not database
+write-amplification measurements. A missing round-trip signal is `null`, never zero.
+
+Consumer evidence binds this behavior as measurement protocol
+`direct-operation-latency/v1`; the protocol participates in each workload fingerprint so evidence
+produced by the former batch-mean implementation cannot compare as the same workload evidence.
 
 Regression comparisons remain available as diagnostic scaffolding. Current scheduled evidence is
 explicitly incompatible with gating because its evidence readiness is insufficient and its baseline
@@ -148,17 +176,20 @@ eligibility is false. The committed baseline registry is empty and disabled.
 ## Artifact contract
 
 ```text
-manifest.json
-metadata/configuration.json
-metadata/machine.json
-metadata/providers.json
-plans/<provider>/<form>/<workload>-<selection|count>.<native-extension>
-plans/<provider>/<form>/<workload>-<selection|count>.<native-extension>.assertions.json
-raw/measurements.jsonl
-reports/summary.json
-reports/summary.md
-reports/regression.json
-reports/elsa-migration-evidence.json
+run-group.json
+protocol/requests/<ordinal>.json
+protocol/responses/<ordinal>.json
+runs/<ordinal>/manifest.json
+runs/<ordinal>/metadata/configuration.json
+runs/<ordinal>/metadata/machine.json
+runs/<ordinal>/metadata/providers.json
+runs/<ordinal>/plans/<provider>/<form>/<workload>-<selection|count>.<native-extension>
+runs/<ordinal>/raw/measurements.jsonl
+runs/<ordinal>/reports/summary.json
+runs/<ordinal>/reports/summary.md
+runs/<ordinal>/reports/regression.json
+runs/<ordinal>/reports/elsa-migration-evidence.json
+runs/<ordinal>/reports/consumer-evidence.json
 ```
 
 The v1 JSON Schemas live in [`schemas/v1`](schemas/v1). The evidence report deliberately exposes:
@@ -171,10 +202,22 @@ The v1 JSON Schemas live in [`schemas/v1`](schemas/v1). The evidence report deli
 
 No artifact in this slice is a migration decision or baseline-promotion authorization.
 
+Measured workers do not repeat warm-up iterations internally. The preceding warm-up worker executes
+the configured untimed warm-up iterations and emits no consumer evidence. Measured workers continue
+writing whole raw samples until the iteration, operation-count, and steady-state execution-duration
+floors are all satisfied; setup, schema materialization, seeding, correctness, and validation time
+do not contribute to the duration floor.
+
+`consumer-evidence.json` deliberately omits provider configuration values. It records a digest of
+the redacted provider configuration plus workload identity/version/fingerprint, provider identity
+and version, storage form, data shape, raw-sample digest, measurement digest, native-plan digest,
+and a provider/machine-independent correctness result digest. Elsa #646 can join on those fields
+without Groundwork embedding Elsa or EF domain code.
+
 ## Remaining issue #50 acceptance work
 
-- Execute the ratified 1K/100K/1M dataset matrix across multiple payload sizes and selectivity
-  values, including the entity-form benefit classification.
+- Ratify concrete payload-size and selectivity vectors, then execute them across
+  the 1K/100K/1M dataset matrix, including the entity-form benefit classification.
 - Capture exact-HEAD live evidence from SQLite, SQL Server, PostgreSQL, and MongoDB.
 - Join the Groundwork results with an Elsa-owned EF Core oracle using matched workloads and controls.
 - Complete reliable provider database-work/round-trip signals and concurrent-load evidence.

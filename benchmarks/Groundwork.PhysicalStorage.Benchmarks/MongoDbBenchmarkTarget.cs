@@ -255,7 +255,7 @@ public sealed class MongoDbBenchmarkTarget(
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["factory_restart_validations"] = 1 });
+        return Execution(1, providerWork: new Dictionary<string, long> { ["factory_restart_validations"] = 1 });
     }
 
     private async Task OpenStoresAsync(CancellationToken cancellationToken)

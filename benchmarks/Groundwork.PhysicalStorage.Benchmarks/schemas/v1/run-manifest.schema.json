@@ -36,6 +36,7 @@
     "machineMetadata": { "type": "string", "minLength": 1 },
     "providerMetadata": { "type": "string", "minLength": 1 },
     "configuration": { "type": "string", "minLength": 1 },
+    "consumerEvidence": { "type": ["string", "null"], "minLength": 1 },
     "planArtifacts": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

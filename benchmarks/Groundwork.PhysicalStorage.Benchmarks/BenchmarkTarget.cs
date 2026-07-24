@@ -57,7 +57,8 @@ public sealed record WorkloadExecution(
     long LogicalPayloadBytes,
     long LogicalMutations,
     long? RoundTrips,
-    IReadOnlyDictionary<string, long> ProviderWork);
+    IReadOnlyDictionary<string, long> ProviderWork,
+    IReadOnlyList<long> OperationLatencyNanoseconds);
 
 public interface IPhysicalStorageBenchmarkTarget : IAsyncDisposable
 {
@@ -68,6 +69,8 @@ public interface IPhysicalStorageBenchmarkTarget : IAsyncDisposable
 
     Task InitializeAsync(CancellationToken cancellationToken);
     Task SeedAsync(int seed, int count, CancellationToken cancellationToken);
+    Task SeedAsync(int seed, BenchmarkDataShape shape, CancellationToken cancellationToken) =>
+        SeedAsync(seed, shape.DatasetSize, cancellationToken);
     Task<CorrectnessGateResult> RunCorrectnessGateAsync(CancellationToken cancellationToken);
     Task<IReadOnlyList<NativePlanEvidence>> RunNativePlanGatesAsync(
         IReadOnlyList<BenchmarkPlanRequest> requests,

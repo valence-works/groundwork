@@ -303,7 +303,7 @@ public sealed class SqliteBenchmarkTarget(
                 throw new InvalidOperationException("Client-restart validation could not load durable seeded data.");
             }
         }
-        return Execution(operations, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
+        return Execution(1, providerWork: new Dictionary<string, long> { ["schema_restart_validations"] = 1 });
     }
 
     private void OpenStores()

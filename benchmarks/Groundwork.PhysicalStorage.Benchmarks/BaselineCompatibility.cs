@@ -83,9 +83,12 @@ public static class BaselineCompatibilityEvaluator
         if (candidate.Mode != baseline.Mode ||
             candidate.Seed != baseline.Seed ||
             candidate.DatasetSize != baseline.DatasetSize ||
+            candidate.DataShape != baseline.DataShape ||
             candidate.MigrationDatasetSize != baseline.MigrationDatasetSize ||
             candidate.WarmupIterations != baseline.WarmupIterations ||
             candidate.MeasurementIterations != baseline.MeasurementIterations ||
+            candidate.MinimumMeasuredOperations != baseline.MinimumMeasuredOperations ||
+            candidate.MinimumSteadyStateDurationSeconds != baseline.MinimumSteadyStateDurationSeconds ||
             candidate.OperationsPerIteration != baseline.OperationsPerIteration ||
             candidate.Concurrency != baseline.Concurrency)
             diagnostics.Add("Candidate and baseline fixed profile controls differ.");
@@ -168,12 +171,28 @@ public static class BaselineCompatibilityEvaluator
         var groups = baseline.Records
             .GroupBy(record => record.Case.Identity, StringComparer.Ordinal)
             .ToArray();
-        if (groups.Length == 0 || groups.Any(group => group.Count() != configuration.MeasurementIterations))
-            diagnostics.Add("Baseline raw measurements must contain exactly the configured sample count per case.");
+        if (groups.Length == 0 || groups.Any(group =>
+                group.Count() < configuration.MeasurementIterations ||
+                group.Sum(record => (long)record.Sample.Operations) < configuration.MinimumMeasuredOperations ||
+                group.Sum(record => record.Sample.ElapsedNanoseconds) <
+                configuration.MinimumSteadyStateDurationSeconds * 1_000_000_000L))
+        {
+            diagnostics.Add(
+                "Baseline raw measurements must satisfy the configured sample count, operation count, " +
+                "and steady-state duration floors per case.");
+        }
         if (baseline.Records.Any(record =>
                 !configuration.Providers.Contains(record.Case.Provider) ||
                 !configuration.StorageForms.Contains(record.Case.StorageForm)))
             diagnostics.Add("Baseline raw measurements contain a case outside the configured provider/form matrix.");
+        if (baseline.Records.Any(record =>
+                record.Sample.OperationLatencyNanoseconds is null ||
+                record.Sample.OperationLatencyNanoseconds.Count != record.Sample.Operations ||
+                record.Sample.OperationLatencyNanoseconds.Any(latency => latency <= 0)))
+        {
+            diagnostics.Add(
+                "Baseline raw measurements must contain one positive raw latency observation per operation.");
+        }
 
         var rawCases = groups.Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
         var evidenceCases = evidence.Cases.Select(item => item.CaseIdentity).ToArray();

@@ -157,8 +157,8 @@ public sealed class BaselineCompatibilityEvaluatorTests
                     .Select(iteration => new RawBenchmarkRecord(
                         benchmarkCase,
                         new BenchmarkSample(
-                            iteration, 1, 1_000, 100, 1, 0, 0, null, null,
-                            new Dictionary<string, long>()))))
+                            iteration, 4, 1_000_000_000, 100, 1, 0, 0, null, null,
+                            new Dictionary<string, long>(), [100, 200, 300, 400]))))
                 .ToArray()
             : [];
         var evidence = new ElsaMigrationEvidenceReport(
@@ -177,6 +177,7 @@ public sealed class BaselineCompatibilityEvaluatorTests
                         benchmarkCase.Provider,
                         benchmarkCase.StorageForm,
                         benchmarkCase.Workload,
+                        BenchmarkProfiles.Scheduled.MeasurementIterations * 4,
                         1_000,
                         1_000,
                         1_000,

@@ -17,6 +17,10 @@ public static class BenchmarkCommandLine
           --providers <list>              sqlite,sqlserver,postgresql,mongodb or all
           --forms <list>                  shared,dedicated,entity or all
           --workloads <list>              Kebab-case workload names or all
+          --dataset-sizes <list>          Dataset cardinalities (scheduled default: 1000,100000,1000000)
+          --payload-padding-bytes <list>  Explicit payload-padding dimension
+          --selectivity-bps <list>        Query selectivity in basis points (1..9999)
+          --independent-runs <count>       Measured worker repetitions (smoke: 1, scheduled: 3)
           --output <directory>            Artifact run directory
           --baseline <run-or-jsonl>       Compare with a v1 run; raw JSONL is smoke-only
           --confirm-regression            Diagnostic scaffold; current insufficient evidence is non-gating
@@ -40,6 +44,10 @@ public static class BenchmarkCommandLine
         string? providers = null;
         string? forms = null;
         string? workloads = null;
+        string? datasetSizes = null;
+        string? payloadPaddingBytes = null;
+        string? selectivityBasisPoints = null;
+        string? independentRuns = null;
         string? output = null;
         string? baseline = null;
         var allowContainers = true;
@@ -60,6 +68,18 @@ public static class BenchmarkCommandLine
                     break;
                 case "--workloads":
                     workloads = Value(args, ref index, argument);
+                    break;
+                case "--dataset-sizes":
+                    datasetSizes = Value(args, ref index, argument);
+                    break;
+                case "--payload-padding-bytes":
+                    payloadPaddingBytes = Value(args, ref index, argument);
+                    break;
+                case "--selectivity-bps":
+                    selectivityBasisPoints = Value(args, ref index, argument);
+                    break;
+                case "--independent-runs":
+                    independentRuns = Value(args, ref index, argument);
                     break;
                 case "--output":
                     output = Value(args, ref index, argument);
@@ -93,6 +113,15 @@ public static class BenchmarkCommandLine
             workloads,
             Enum.GetValues<BenchmarkWorkload>(),
             value => Normalize(value.ToString()));
+        var defaultDimensions = configuration.Mode == BenchmarkRunMode.Scheduled
+            ? BenchmarkProfiles.ScheduledDimensions
+            : BenchmarkProfiles.SmokeDimensions;
+        var dimensions = new BenchmarkMatrixDimensions(
+            ParseIntegers(datasetSizes, defaultDimensions.DatasetSizes, "--dataset-sizes", minimum: 1),
+            ParseIntegers(payloadPaddingBytes, defaultDimensions.PayloadPaddingBytes, "--payload-padding-bytes", minimum: 0),
+            ParseIntegers(selectivityBasisPoints, defaultDimensions.QuerySelectivityBasisPoints, "--selectivity-bps", minimum: 1),
+            ParseInteger(independentRuns, defaultDimensions.IndependentRuns, "--independent-runs", minimum: 1));
+        dimensions.Validate();
         return new BenchmarkCommand(
             false,
             new BenchmarkRunRequest(
@@ -102,7 +131,8 @@ public static class BenchmarkCommandLine
                 output,
                 baseline,
                 allowContainers,
-                confirmation));
+                confirmation,
+                dimensions));
     }
 
     private static IReadOnlyList<BenchmarkProvider> ParseProviders(
@@ -153,6 +183,29 @@ public static class BenchmarkCommandLine
 
     private static string[] Split(string value) =>
         value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+    private static IReadOnlyList<int> ParseIntegers(
+        string? value,
+        IReadOnlyList<int> defaults,
+        string option,
+        int minimum)
+    {
+        if (value is null)
+            return defaults;
+        return Split(value)
+            .Select(item => ParseInteger(item, defaultValue: 0, option, minimum))
+            .Distinct()
+            .ToArray();
+    }
+
+    private static int ParseInteger(string? value, int defaultValue, string option, int minimum)
+    {
+        if (value is null)
+            return defaultValue;
+        if (!int.TryParse(value, out var parsed) || parsed < minimum)
+            throw new ArgumentException($"Option '{option}' requires an integer of at least {minimum}.");
+        return parsed;
+    }
 
     private static string Normalize(string value) =>
         new(value.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());

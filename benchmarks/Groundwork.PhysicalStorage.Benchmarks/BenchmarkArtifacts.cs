@@ -47,7 +47,8 @@ public sealed record BenchmarkRunManifest(
     IReadOnlyList<string> PlanArtifacts,
     string? BaselineRun,
     bool RegressionConfirmationRun,
-    BenchmarkRunFailure? Failure);
+    BenchmarkRunFailure? Failure,
+    string? ConsumerEvidence = null);
 
 public sealed record RawBenchmarkRecord(BenchmarkCase Case, BenchmarkSample Sample);
 
@@ -64,16 +65,18 @@ public sealed record BenchmarkRunReport(
     BenchmarkRunMode Mode,
     IReadOnlyList<BenchmarkCaseResult> Cases,
     IReadOnlyList<RegressionEvaluation> Regressions,
-    BaselineEligibility BaselineEligibility);
+    BaselineEligibility BaselineEligibility,
+    BenchmarkDataShape? DataShape = null);
 
 public sealed record ElsaMigrationEvidenceCase(
     string CaseIdentity,
     BenchmarkProvider Provider,
     Groundwork.Core.PhysicalStorage.PhysicalStorageForm StorageForm,
     BenchmarkWorkload Workload,
-    double NormalizedBatchLatencyP50NanosecondsPerOperation,
-    double NormalizedBatchLatencyP95NanosecondsPerOperation,
-    double NormalizedBatchLatencyP99NanosecondsPerOperation,
+    int OperationLatencyObservationCount,
+    double OperationLatencyP50Nanoseconds,
+    double OperationLatencyP95Nanoseconds,
+    double OperationLatencyP99Nanoseconds,
     double ThroughputOperationsPerSecond,
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
@@ -115,9 +118,10 @@ public sealed record ElsaMigrationEvidenceReport(
                 result.Case.Provider,
                 result.Case.StorageForm,
                 result.Case.Workload,
-                result.Summary.NormalizedBatchLatencyP50NanosecondsPerOperation,
-                result.Summary.NormalizedBatchLatencyP95NanosecondsPerOperation,
-                result.Summary.NormalizedBatchLatencyP99NanosecondsPerOperation,
+                result.Summary.OperationLatencyObservationCount,
+                result.Summary.OperationLatencyP50Nanoseconds,
+                result.Summary.OperationLatencyP95Nanoseconds,
+                result.Summary.OperationLatencyP99Nanoseconds,
                 result.Summary.ThroughputOperationsPerSecond,
                 result.Summary.AllocatedBytesPerOperation,
                 result.Summary.RoundTripsPerOperation,
@@ -177,6 +181,11 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
 
     public Task WriteConfigurationAsync(BenchmarkRunConfiguration configuration, CancellationToken cancellationToken) =>
         WriteJsonAsync(Layout.Configuration, configuration, cancellationToken);
+
+    public Task WriteConsumerEvidenceAsync(
+        BenchmarkConsumerEvidenceReport report,
+        CancellationToken cancellationToken) =>
+        WriteImmutableJsonAsync(Layout.ConsumerEvidenceJson, report, cancellationToken);
 
     public async Task AppendSampleAsync(RawBenchmarkRecord record, CancellationToken cancellationToken)
     {
@@ -277,6 +286,16 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         }
     }
 
+    private static async Task WriteImmutableJsonAsync<T>(
+        string path,
+        T value,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        await JsonSerializer.SerializeAsync(stream, value, BenchmarkJson.Options, cancellationToken);
+    }
+
     private static async Task WriteTextAsync(string path, string value, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -312,15 +331,15 @@ public sealed class BenchmarkArtifactWriter : IAsyncDisposable
         builder.AppendLine($"Mode: `{report.Mode}`");
         builder.AppendLine($"Baseline eligible: `{report.BaselineEligibility.Eligible}`");
         builder.AppendLine();
-        builder.AppendLine("| Provider | Form | Workload | normalized batch p50 (ms/op) | normalized batch p95 (ms/op) | normalized batch p99 (ms/op) | ops/s | B/op | round trips/op | storage delta | net storage/logical payload | plan |");
+        builder.AppendLine("| Provider | Form | Workload | raw operation p50 (ms) | raw operation p95 (ms) | raw operation p99 (ms) | ops/s | B/op | round trips/op | storage delta | net storage/logical payload | plan |");
         builder.AppendLine("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         foreach (var result in report.Cases.OrderBy(result => result.Case.Identity, StringComparer.Ordinal))
         {
             var summary = result.Summary;
             builder.AppendLine(
                 $"| {result.Case.Provider} | {result.Case.StorageForm} | {result.Case.Workload} | " +
-                $"{summary.NormalizedBatchLatencyP50NanosecondsPerOperation / 1_000_000:F3} | {summary.NormalizedBatchLatencyP95NanosecondsPerOperation / 1_000_000:F3} | " +
-                $"{summary.NormalizedBatchLatencyP99NanosecondsPerOperation / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
+                $"{summary.OperationLatencyP50Nanoseconds / 1_000_000:F3} | {summary.OperationLatencyP95Nanoseconds / 1_000_000:F3} | " +
+                $"{summary.OperationLatencyP99Nanoseconds / 1_000_000:F3} | {summary.ThroughputOperationsPerSecond:F1} | " +
                 $"{summary.AllocatedBytesPerOperation:F1} | {Format(summary.RoundTripsPerOperation)} | " +
                 $"{Format(summary.StorageGrowthBytes)} | {Format(summary.NetStorageGrowthBytesPerLogicalPayloadByte)} | " +
                 $"{FormatPlans(result.PlanArtifacts)} |");

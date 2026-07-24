@@ -71,15 +71,6 @@ public static class RegressionEvaluator
         ArgumentNullException.ThrowIfNull(baseline);
         ArgumentNullException.ThrowIfNull(candidate);
         ArgumentNullException.ThrowIfNull(policy);
-        if (baseline.Count < policy.MinimumSamples || candidate.Count < policy.MinimumSamples)
-        {
-            return new RegressionEvaluation(
-                caseIdentity,
-                false,
-                policy.RequiresConfirmation,
-                [],
-                [$"At least {policy.MinimumSamples} baseline and candidate samples are required."]);
-        }
         if (baseline.Any(sample => !IsValid(sample)) || candidate.Any(sample => !IsValid(sample)))
         {
             return new RegressionEvaluation(
@@ -89,17 +80,26 @@ public static class RegressionEvaluator
                 [],
                 ["Baseline or candidate contains an invalid raw sample."]);
         }
+        var baselineLatency = OperationLatencies(baseline);
+        var candidateLatency = OperationLatencies(candidate);
+        if (baselineLatency.Length < policy.MinimumSamples || candidateLatency.Length < policy.MinimumSamples)
+        {
+            return new RegressionEvaluation(
+                caseIdentity,
+                false,
+                policy.RequiresConfirmation,
+                [],
+                [$"At least {policy.MinimumSamples} baseline and candidate operation-latency observations are required."]);
+        }
 
-        var baselineLatency = baseline.Select(sample => sample.NormalizedBatchLatencyNanosecondsPerOperation).ToArray();
-        var candidateLatency = candidate.Select(sample => sample.NormalizedBatchLatencyNanosecondsPerOperation).ToArray();
         var diagnostics = new List<string>();
         var metrics = new List<RegressionMetric>
         {
             BootstrapMetric(
-                "normalized_batch_latency_p50_ns_per_operation", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+                "operation_latency_p50_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
                 0.50, policy.LatencyBudget, policy, seed),
             BootstrapMetric(
-                "normalized_batch_latency_p95_ns_per_operation", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
+                "operation_latency_p95_ns", MetricDirection.LowerIsBetter, baselineLatency, candidateLatency,
                 0.95, policy.LatencyBudget, policy, seed + 1),
             BootstrapMetric(
                 "throughput_ops_per_second", MetricDirection.HigherIsBetter,
@@ -246,12 +246,21 @@ public static class RegressionEvaluator
     private static bool IsValid(BenchmarkSample sample) =>
         sample.Operations > 0 &&
         sample.ElapsedNanoseconds > 0 &&
+        sample.OperationLatencyNanoseconds is not null &&
+        sample.OperationLatencyNanoseconds.Count == sample.Operations &&
+        sample.OperationLatencyNanoseconds.All(latency => latency > 0) &&
         sample.AllocatedBytes >= 0 &&
         (!sample.RoundTrips.HasValue || sample.RoundTrips.Value >= 0) &&
         sample.LogicalPayloadBytes >= 0 &&
         sample.LogicalMutations >= 0 &&
         ValidStorage(sample.StorageBefore) &&
         ValidStorage(sample.StorageAfter);
+
+    private static double[] OperationLatencies(IEnumerable<BenchmarkSample> samples) =>
+        samples
+            .SelectMany(sample => sample.OperationLatencyNanoseconds ?? [])
+            .Select(latency => (double)latency)
+            .ToArray();
 
     private static bool ValidStorage(StorageSnapshot? snapshot) => snapshot is null ||
         snapshot.TotalBytes >= 0 &&

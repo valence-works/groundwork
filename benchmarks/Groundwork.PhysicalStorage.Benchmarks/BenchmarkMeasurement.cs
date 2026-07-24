@@ -17,8 +17,10 @@ public sealed record BenchmarkSample(
     long LogicalMutations,
     StorageSnapshot? StorageBefore,
     StorageSnapshot? StorageAfter,
-    IReadOnlyDictionary<string, long> ProviderWork)
+    IReadOnlyDictionary<string, long> ProviderWork,
+    IReadOnlyList<long> OperationLatencyNanoseconds)
 {
+    [System.Text.Json.Serialization.JsonIgnore]
     public double NormalizedBatchLatencyNanosecondsPerOperation => (double)ElapsedNanoseconds / Operations;
     public double ThroughputOperationsPerSecond => Operations * 1_000_000_000d / ElapsedNanoseconds;
     public double AllocatedBytesPerOperation => (double)AllocatedBytes / Operations;
@@ -27,16 +29,27 @@ public sealed record BenchmarkSample(
 public sealed record BenchmarkCaseSummary(
     string CaseIdentity,
     int SampleCount,
-    double NormalizedBatchLatencyP50NanosecondsPerOperation,
-    double NormalizedBatchLatencyP95NanosecondsPerOperation,
-    double NormalizedBatchLatencyP99NanosecondsPerOperation,
+    int OperationLatencyObservationCount,
+    double OperationLatencyP50Nanoseconds,
+    double OperationLatencyP95Nanoseconds,
+    double OperationLatencyP99Nanoseconds,
     double ThroughputOperationsPerSecond,
     double AllocatedBytesPerOperation,
     double? RoundTripsPerOperation,
     long? StorageGrowthBytes,
     double? NetStorageGrowthBytesPerLogicalPayloadByte,
     double? NetPhysicalRowGrowthPerLogicalMutation,
-    IReadOnlyDictionary<string, double> ProviderWorkPerOperation);
+    IReadOnlyDictionary<string, double> ProviderWorkPerOperation)
+{
+    // Compatibility aliases for v1 consumers. Values now come from raw operation
+    // observations; they are never derived by dividing a batch duration.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double NormalizedBatchLatencyP50NanosecondsPerOperation => OperationLatencyP50Nanoseconds;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double NormalizedBatchLatencyP95NanosecondsPerOperation => OperationLatencyP95Nanoseconds;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double NormalizedBatchLatencyP99NanosecondsPerOperation => OperationLatencyP99Nanoseconds;
+}
 
 public static class BenchmarkSummarizer
 {
@@ -46,11 +59,21 @@ public static class BenchmarkSummarizer
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
             throw new ArgumentException("At least one sample is required.", nameof(samples));
-        if (samples.Any(sample => sample.Operations <= 0 || sample.ElapsedNanoseconds <= 0))
-            throw new ArgumentException("Every sample must contain positive operations and elapsed time.", nameof(samples));
+        if (samples.Any(sample =>
+                sample.Operations <= 0 ||
+                sample.ElapsedNanoseconds <= 0 ||
+                sample.OperationLatencyNanoseconds is null ||
+                sample.OperationLatencyNanoseconds.Count != sample.Operations ||
+                sample.OperationLatencyNanoseconds.Any(latency => latency <= 0)))
+        {
+            throw new ArgumentException(
+                "Every sample must contain one positive raw latency observation per operation.",
+                nameof(samples));
+        }
 
-        var normalizedBatchLatency = samples
-            .Select(sample => sample.NormalizedBatchLatencyNanosecondsPerOperation)
+        var operationLatency = samples
+            .SelectMany(sample => sample.OperationLatencyNanoseconds)
+            .Select(latency => (double)latency)
             .ToArray();
         var totalOperations = samples.Sum(sample => (long)sample.Operations);
         var totalElapsed = samples.Sum(sample => sample.ElapsedNanoseconds);
@@ -74,9 +97,10 @@ public static class BenchmarkSummarizer
         return new BenchmarkCaseSummary(
             caseIdentity,
             samples.Count,
-            BenchmarkStatistics.Percentile(normalizedBatchLatency, 0.50),
-            BenchmarkStatistics.Percentile(normalizedBatchLatency, 0.95),
-            BenchmarkStatistics.Percentile(normalizedBatchLatency, 0.99),
+            operationLatency.Length,
+            BenchmarkStatistics.Percentile(operationLatency, 0.50),
+            BenchmarkStatistics.Percentile(operationLatency, 0.95),
+            BenchmarkStatistics.Percentile(operationLatency, 0.99),
             totalOperations * 1_000_000_000d / totalElapsed,
             totalAllocated / (double)totalOperations,
             observableRoundTrips.Length == 0

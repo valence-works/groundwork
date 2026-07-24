@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ValenceWorks/Groundwork/benchmarks/physical-storage/v1/consumer-evidence.schema.json",
+  "title": "Groundwork physical-storage consumer evidence v1",
+  "description": "Redacted Groundwork evidence that remains non-promotable until an external EF oracle is joined.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "promotable",
+    "externalOracleJoinRequired",
+    "gitCommit",
+    "gitDirty",
+    "rawMeasurements",
+    "rawMeasurementsDigest",
+    "nonPromotableReasons",
+    "results"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "groundwork.physical-storage.consumer-evidence/v1" },
+    "runId": { "type": "string", "minLength": 1 },
+    "promotable": { "const": false },
+    "externalOracleJoinRequired": { "const": true },
+    "gitCommit": { "type": "string", "minLength": 1 },
+    "gitDirty": { "type": "boolean" },
+    "rawMeasurements": { "type": "string", "minLength": 1 },
+    "rawMeasurementsDigest": { "$ref": "#/$defs/digest" },
+    "nonPromotableReasons": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/result" }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "dataShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["datasetSize", "payloadPaddingBytes", "querySelectivityBasisPoints", "identity"],
+      "properties": {
+        "datasetSize": { "type": "integer", "minimum": 1 },
+        "payloadPaddingBytes": { "type": "integer", "minimum": 0 },
+        "querySelectivityBasisPoints": { "type": "integer", "minimum": 1, "maximum": 9999 },
+        "identity": { "type": "string", "minLength": 1 }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workloadIdentity",
+        "workloadVersion",
+        "measurementProtocol",
+        "workloadFingerprint",
+        "resultDigest",
+        "measurementDigest",
+        "providerIdentity",
+        "providerVersion",
+        "providerConfigurationDigest",
+        "storageForm",
+        "dataShape",
+        "independentRun",
+        "rawSampleCount",
+        "rawOperationLatencyCount",
+        "rawSamplesDigest",
+        "nativePlanArtifacts",
+        "nativePlanDigest"
+      ],
+      "properties": {
+        "workloadIdentity": { "type": "string", "minLength": 1 },
+        "workloadVersion": { "type": "string", "minLength": 1 },
+        "measurementProtocol": { "const": "direct-operation-latency/v1" },
+        "workloadFingerprint": { "$ref": "#/$defs/digest" },
+        "resultDigest": { "$ref": "#/$defs/digest" },
+        "measurementDigest": { "$ref": "#/$defs/digest" },
+        "providerIdentity": { "type": "string", "pattern": "^groundwork\\." },
+        "providerVersion": { "type": "string", "minLength": 1 },
+        "providerConfigurationDigest": { "$ref": "#/$defs/digest" },
+        "storageForm": { "enum": ["sharedDocuments", "dedicatedDocumentTable", "physicalEntityTable"] },
+        "dataShape": { "$ref": "#/$defs/dataShape" },
+        "independentRun": { "type": "integer", "minimum": 1 },
+        "rawSampleCount": { "type": "integer", "minimum": 1 },
+        "rawOperationLatencyCount": { "type": "integer", "minimum": 1 },
+        "rawSamplesDigest": { "$ref": "#/$defs/digest" },
+        "nativePlanArtifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "nativePlanDigest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

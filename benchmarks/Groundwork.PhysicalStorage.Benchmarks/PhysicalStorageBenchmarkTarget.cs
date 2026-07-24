@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Groundwork.Core.PhysicalStorage;
@@ -18,6 +19,8 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     private readonly string instance;
     private long generatedId;
     private int seededCount;
+    private int selectedDocumentCount;
+    private int payloadPaddingBytes;
 
     protected PhysicalStorageBenchmarkTarget(
         BenchmarkProvider provider,
@@ -41,8 +44,19 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
 
     public abstract Task InitializeAsync(CancellationToken cancellationToken);
 
-    public virtual async Task SeedAsync(int seed, int count, CancellationToken cancellationToken)
+    public virtual Task SeedAsync(int seed, int count, CancellationToken cancellationToken) =>
+        SeedAsync(seed, new BenchmarkDataShape(count, 0, 5_000), cancellationToken);
+
+    public virtual async Task SeedAsync(
+        int seed,
+        BenchmarkDataShape shape,
+        CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(shape);
+        shape.Validate();
+        var count = shape.DatasetSize;
+        payloadPaddingBytes = shape.PayloadPaddingBytes;
+        selectedDocumentCount = shape.GetSelectedDocumentCount();
         var random = new Random(seed);
         const int batchSize = 100;
         for (var offset = 0; offset < count; offset += batchSize)
@@ -53,9 +67,13 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             var upper = Math.Min(count, offset + batchSize);
             for (var index = offset; index < upper; index++)
             {
-                var status = index % 2 == 0 ? "open" : "closed";
+                var status = shape.IsSelectedDocument(index) ? "open" : "closed";
                 var rank = random.Next(0, Math.Max(1, count));
-                var payload = Payload(status, rank, index % 5 == 0 ? "priority" : "ordinary");
+                var payload = Payload(
+                    status,
+                    rank,
+                    index % 5 == 0 ? "priority" : "ordinary",
+                    payloadPaddingBytes);
                 var result = await unitOfWork.SaveAsync(
                     Save($"seed-{index:D8}", payload),
                     cancellationToken);
@@ -111,7 +129,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         if (!rollbackWorked)
             throw new InvalidOperationException("Correctness gate failed: rolled-back write is visible.");
 
-        var expectedTenantAOpenCount = (seededCount + 1L) / 2L + 1L;
+        var expectedTenantAOpenCount = selectedDocumentCount + 1L;
         var query = Query(skip: 0, take: (int)Math.Min(25, Math.Max(1, expectedTenantAOpenCount)));
         var page = await QueriesA.QueryAsync(query, cancellationToken);
         var count = await QueriesA.CountAsync(query.Select(BoundedQueryResultOperation.Count), cancellationToken);
@@ -142,7 +160,9 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         for (var index = 0; index < total; index++)
         {
             var id = NewId($"prepare-{workload}");
-            RequireStatus(await TenantA.SaveAsync(Save(id, Payload("open", index, "prepared")), cancellationToken),
+            RequireStatus(await TenantA.SaveAsync(
+                    Save(id, Payload("open", index, "prepared", payloadPaddingBytes)),
+                    cancellationToken),
                 DocumentStoreWriteStatus.Saved,
                 "workload preparation");
             queue.Enqueue(id);
@@ -159,24 +179,45 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
         int iteration,
         int operations,
         int concurrency,
-        CancellationToken cancellationToken) => workload switch
+        CancellationToken cancellationToken)
+    {
+        var operationLatencies = new List<long>();
+        var execution = workload switch
         {
-            BenchmarkWorkload.ClientResetPointReadBatch => await PointReadBatchAsync(operations, resetClient: true, cancellationToken),
-            BenchmarkWorkload.ReusedClientPointReadBatch => await PointReadBatchAsync(operations, resetClient: false, cancellationToken),
-            BenchmarkWorkload.IndexedQuery => await IndexedQueriesAsync(operations, includeOrdering: false, cancellationToken),
-            BenchmarkWorkload.MixedCompoundOrdering => await IndexedQueriesAsync(operations, includeOrdering: true, cancellationToken),
-            BenchmarkWorkload.Insert => await InsertsAsync(operations, payloadPadding: 0, cancellationToken),
-            BenchmarkWorkload.Update => await UpdatesAsync(operations, cancellationToken),
-            BenchmarkWorkload.Delete => await DeletesAsync(operations, cancellationToken),
-            BenchmarkWorkload.UnitOfWork => await UnitOfWorkAsync(operations, cancellationToken),
-            BenchmarkWorkload.ConcurrentCreate => await ConcurrentCreatesAsync(operations, concurrency, cancellationToken),
-            BenchmarkWorkload.OptimisticConcurrency => await ConflictsAsync(operations, cancellationToken),
-            BenchmarkWorkload.PaginationAndCount => await PaginationAndCountAsync(operations, iteration, cancellationToken),
-            BenchmarkWorkload.BackfillMigration => await ExecuteBackfillMigrationAsync(cancellationToken),
-            BenchmarkWorkload.ClientRestartValidation => await ExecuteClientRestartValidationAsync(operations, cancellationToken),
-            BenchmarkWorkload.StorageGrowth => await InsertsAsync(operations, payloadPadding: 1_024, cancellationToken),
+            BenchmarkWorkload.ClientResetPointReadBatch => await PointReadBatchAsync(
+                operations, resetClient: true, operationLatencies, cancellationToken),
+            BenchmarkWorkload.ReusedClientPointReadBatch => await PointReadBatchAsync(
+                operations, resetClient: false, operationLatencies, cancellationToken),
+            BenchmarkWorkload.IndexedQuery => await IndexedQueriesAsync(
+                operations, includeOrdering: false, operationLatencies, cancellationToken),
+            BenchmarkWorkload.MixedCompoundOrdering => await IndexedQueriesAsync(
+                operations, includeOrdering: true, operationLatencies, cancellationToken),
+            BenchmarkWorkload.Insert => await InsertsAsync(
+                operations, payloadPaddingBytes, operationLatencies, cancellationToken),
+            BenchmarkWorkload.Update => await UpdatesAsync(operations, operationLatencies, cancellationToken),
+            BenchmarkWorkload.Delete => await DeletesAsync(operations, operationLatencies, cancellationToken),
+            BenchmarkWorkload.UnitOfWork => await UnitOfWorkAsync(operations, operationLatencies, cancellationToken),
+            BenchmarkWorkload.ConcurrentCreate => await ConcurrentCreatesAsync(
+                operations, concurrency, operationLatencies, cancellationToken),
+            BenchmarkWorkload.OptimisticConcurrency => await ConflictsAsync(
+                operations, operationLatencies, cancellationToken),
+            BenchmarkWorkload.PaginationAndCount => await PaginationAndCountAsync(
+                operations, iteration, operationLatencies, cancellationToken),
+            BenchmarkWorkload.BackfillMigration => await ObserveAsync(
+                () => ExecuteBackfillMigrationAsync(cancellationToken),
+                operationLatencies),
+            BenchmarkWorkload.ClientRestartValidation => await ObserveAsync(
+                () => ExecuteClientRestartValidationAsync(operations, cancellationToken),
+                operationLatencies),
+            BenchmarkWorkload.StorageGrowth => await InsertsAsync(
+                operations,
+                payloadPadding: payloadPaddingBytes == 0 ? 1_024 : payloadPaddingBytes,
+                operationLatencies,
+                cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(workload), workload, null)
         };
+        return execution with { OperationLatencyNanoseconds = operationLatencies };
+    }
 
     public virtual Task ValidateIterationAsync(
         BenchmarkWorkload workload,
@@ -251,108 +292,145 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             throw new InvalidOperationException($"{operation} returned {result.Status}; expected {expected}.");
     }
 
-    private async Task<WorkloadExecution> PointReadBatchAsync(int operations, bool resetClient, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> PointReadBatchAsync(
+        int operations,
+        bool resetClient,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
-        if (resetClient)
-            await ResetClientStateAsync(cancellationToken);
-        for (var index = 0; index < operations; index++)
+        await ObserveAsync(async () =>
         {
-            var document = await TenantA.LoadAsync(
-                BenchmarkModelFactory.DocumentKind,
-                $"seed-{index % seededCount:D8}",
-                cancellationToken);
-            if (document is null)
-                throw new InvalidOperationException("Point-read workload lost a seeded document.");
-        }
-        return Execution(operations);
+            if (resetClient)
+                await ResetClientStateAsync(cancellationToken);
+            for (var index = 0; index < operations; index++)
+            {
+                var document = await TenantA.LoadAsync(
+                    BenchmarkModelFactory.DocumentKind,
+                    $"seed-{index % seededCount:D8}",
+                    cancellationToken);
+                if (document is null)
+                    throw new InvalidOperationException("Point-read workload lost a seeded document.");
+            }
+        }, operationLatencies);
+        return Execution(1);
     }
 
     private async Task<WorkloadExecution> IndexedQueriesAsync(
         int operations,
         bool includeOrdering,
+        ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
         for (var index = 0; index < operations; index++)
         {
-            var result = await QueriesA.QueryAsync(Query(take: 20, includeOrdering: includeOrdering), cancellationToken);
+            var result = await ObserveAsync(
+                () => QueriesA.QueryAsync(Query(take: 20, includeOrdering: includeOrdering), cancellationToken),
+                operationLatencies);
             if (result.TotalCount <= 0)
                 throw new InvalidOperationException("Indexed query workload returned no seeded documents.");
         }
         return Execution(operations);
     }
 
-    private async Task<WorkloadExecution> InsertsAsync(int operations, int payloadPadding, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> InsertsAsync(
+        int operations,
+        int payloadPadding,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
         long payloadBytes = 0;
         for (var index = 0; index < operations; index++)
         {
             var payload = Payload("open", index, "write", payloadPadding);
             payloadBytes += Encoding.UTF8.GetByteCount(payload);
-            RequireStatus(await TenantA.SaveAsync(Save(NewId("insert"), payload), cancellationToken),
+            RequireStatus(await ObserveAsync(
+                    () => TenantA.SaveAsync(Save(NewId("insert"), payload), cancellationToken),
+                    operationLatencies),
                 DocumentStoreWriteStatus.Saved,
                 "insert workload");
         }
         return Execution(operations, payloadBytes, operations);
     }
 
-    private async Task<WorkloadExecution> UpdatesAsync(int operations, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> UpdatesAsync(
+        int operations,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
         var queue = RequiredQueue(BenchmarkWorkload.Update);
         long payloadBytes = 0;
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.Update);
-            var payload = Payload("closed", index, "updated");
+            var payload = Payload("closed", index, "updated", payloadPaddingBytes);
             payloadBytes += Encoding.UTF8.GetByteCount(payload);
-            RequireStatus(await TenantA.SaveAsync(Save(id, payload, expectedVersion: 1), cancellationToken),
+            RequireStatus(await ObserveAsync(
+                    () => TenantA.SaveAsync(Save(id, payload, expectedVersion: 1), cancellationToken),
+                    operationLatencies),
                 DocumentStoreWriteStatus.Saved,
                 "update workload");
         }
         return Execution(operations, payloadBytes, operations);
     }
 
-    private async Task<WorkloadExecution> DeletesAsync(int operations, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> DeletesAsync(
+        int operations,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
         var queue = RequiredQueue(BenchmarkWorkload.Delete);
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.Delete);
-            RequireStatus(await TenantA.DeleteAsync(
-                    new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, id, ExpectedVersion: 1),
-                    cancellationToken),
+            RequireStatus(await ObserveAsync(
+                    () => TenantA.DeleteAsync(
+                        new DeleteDocumentRequest(BenchmarkModelFactory.DocumentKind, id, ExpectedVersion: 1),
+                        cancellationToken),
+                    operationLatencies),
                 DocumentStoreWriteStatus.Deleted,
                 "delete workload");
         }
         return Execution(operations, logicalMutations: operations);
     }
 
-    private async Task<WorkloadExecution> UnitOfWorkAsync(int operations, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> UnitOfWorkAsync(
+        int operations,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
-        await using var unitOfWork = await TenantA.BeginAsync(
-            DocumentCommitScope.Of(BenchmarkModelFactory.DocumentKind),
-            cancellationToken);
         long payloadBytes = 0;
-        for (var index = 0; index < operations; index++)
+        await ObserveAsync(async () =>
         {
-            var payload = Payload("open", index, "uow");
-            payloadBytes += Encoding.UTF8.GetByteCount(payload);
-            RequireStatus(await unitOfWork.SaveAsync(Save(NewId("uow"), payload), cancellationToken),
-                DocumentStoreWriteStatus.Saved,
-                "unit-of-work workload");
-        }
-        await unitOfWork.CommitAsync(cancellationToken);
-        return Execution(operations, payloadBytes, operations);
+            await using var unitOfWork = await TenantA.BeginAsync(
+                DocumentCommitScope.Of(BenchmarkModelFactory.DocumentKind),
+                cancellationToken);
+            for (var index = 0; index < operations; index++)
+            {
+                var payload = Payload("open", index, "uow", payloadPaddingBytes);
+                payloadBytes += Encoding.UTF8.GetByteCount(payload);
+                RequireStatus(await unitOfWork.SaveAsync(Save(NewId("uow"), payload), cancellationToken),
+                    DocumentStoreWriteStatus.Saved,
+                    "unit-of-work workload");
+            }
+            await unitOfWork.CommitAsync(cancellationToken);
+        }, operationLatencies);
+        return Execution(1, payloadBytes, operations);
     }
 
-    private async Task<WorkloadExecution> ConflictsAsync(int operations, CancellationToken cancellationToken)
+    private async Task<WorkloadExecution> ConflictsAsync(
+        int operations,
+        ICollection<long> operationLatencies,
+        CancellationToken cancellationToken)
     {
         var queue = RequiredQueue(BenchmarkWorkload.OptimisticConcurrency);
         for (var index = 0; index < operations; index++)
         {
             var id = Dequeue(queue, BenchmarkWorkload.OptimisticConcurrency);
-            RequireStatus(await TenantA.SaveAsync(
-                    Save(id, Payload("closed", index, "stale"), expectedVersion: 0),
-                    cancellationToken),
+            RequireStatus(await ObserveAsync(
+                    () => TenantA.SaveAsync(
+                        Save(id, Payload("closed", index, "stale", payloadPaddingBytes), expectedVersion: 0),
+                        cancellationToken),
+                    operationLatencies),
                 DocumentStoreWriteStatus.ConcurrencyConflict,
                 "optimistic-concurrency workload");
         }
@@ -362,6 +440,7 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     private async Task<WorkloadExecution> ConcurrentCreatesAsync(
         int batches,
         int concurrency,
+        ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
         long payloadBytes = 0;
@@ -372,8 +451,10 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             var attempts = Enumerable.Range(0, concurrency).Select(async index =>
             {
                 await start.Task.WaitAsync(cancellationToken);
-                var payload = Payload("open", index, "concurrent");
-                return (Result: await TenantA.SaveAsync(Save(id, payload), cancellationToken), Payload: payload);
+                var payload = Payload("open", index, "concurrent", payloadPaddingBytes);
+                var timestamp = Stopwatch.GetTimestamp();
+                var result = await TenantA.SaveAsync(Save(id, payload), cancellationToken);
+                return (Result: result, Payload: payload, Latency: ElapsedNanoseconds(timestamp));
             }).ToArray();
             start.SetResult();
             var results = await Task.WhenAll(attempts);
@@ -383,6 +464,8 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
                 throw new InvalidOperationException("Concurrent-create workload did not converge to one successful create.");
             }
             payloadBytes += results.Sum(result => Encoding.UTF8.GetByteCount(result.Payload));
+            foreach (var result in results)
+                operationLatencies.Add(result.Latency);
         }
         return Execution(batches * concurrency, payloadBytes, batches);
     }
@@ -390,14 +473,19 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
     private async Task<WorkloadExecution> PaginationAndCountAsync(
         int operations,
         int iteration,
+        ICollection<long> operationLatencies,
         CancellationToken cancellationToken)
     {
         for (var index = 0; index < operations; index++)
         {
             var skip = (iteration + index) % Math.Max(1, seededCount / 4);
             var query = Query(skip, take: 20);
-            var page = await QueriesA.QueryAsync(query, cancellationToken);
-            var count = await QueriesA.CountAsync(query.Select(BoundedQueryResultOperation.Count), cancellationToken);
+            var page = await ObserveAsync(
+                () => QueriesA.QueryAsync(query, cancellationToken),
+                operationLatencies);
+            var count = await ObserveAsync(
+                () => QueriesA.CountAsync(query.Select(BoundedQueryResultOperation.Count), cancellationToken),
+                operationLatencies);
             if (page.TotalCount != count)
                 throw new InvalidOperationException("Pagination/count workload observed inconsistent totals.");
         }
@@ -429,7 +517,30 @@ public abstract class PhysicalStorageBenchmarkTarget : IPhysicalStorageBenchmark
             logicalPayloadBytes,
             logicalMutations,
             roundTrips,
-            providerWork ?? new Dictionary<string, long>());
+            providerWork ?? new Dictionary<string, long>(),
+            []);
+
+    private static async Task<T> ObserveAsync<T>(
+        Func<Task<T>> operation,
+        ICollection<long> operationLatencies)
+    {
+        var timestamp = Stopwatch.GetTimestamp();
+        var result = await operation();
+        operationLatencies.Add(ElapsedNanoseconds(timestamp));
+        return result;
+    }
+
+    private static async Task ObserveAsync(
+        Func<Task> operation,
+        ICollection<long> operationLatencies)
+    {
+        var timestamp = Stopwatch.GetTimestamp();
+        await operation();
+        operationLatencies.Add(ElapsedNanoseconds(timestamp));
+    }
+
+    private static long ElapsedNanoseconds(long timestamp) =>
+        Math.Max(1, (long)Math.Round(Stopwatch.GetElapsedTime(timestamp).TotalNanoseconds));
 
     private sealed record BenchmarkPayload(string Status, int Rank, string Category, string? Padding);
 }
