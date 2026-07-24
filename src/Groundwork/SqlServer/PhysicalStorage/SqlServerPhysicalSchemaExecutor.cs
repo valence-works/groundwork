@@ -146,7 +146,7 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
     }
 
     public override string AddColumnSql(string table, string column, ProjectedColumnDefinition definition) =>
-        $"ALTER TABLE {Q(table)} ADD {ProjectedColumn(column, definition)};";
+        $"ALTER TABLE {Q(table)} ADD {ProjectedColumnSql(column, definition)};";
 
     public override string FinalizeColumnSql(string table, string column, ProjectedColumnDefinition definition) =>
         $"ALTER TABLE {Q(table)} ALTER COLUMN {Q(column)} {ProjectedType(definition)}{CollationSql(definition)} NOT NULL;";
@@ -231,6 +231,55 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
         _ = ProjectedCollation(definition);
         if (definition.DefaultValue is not null)
             _ = RelationalPhysicalProjectionValues.ConvertScalar(definition.DefaultValue, definition);
+    }
+
+    public override void ValidateCollectionElementStorage(ExecutableCollectionElementStorageRoute storage)
+    {
+        base.ValidateCollectionElementStorage(storage);
+        var key = new[]
+        {
+            (storage.DocumentKind.Column.Identifier, EnvelopeType(RelationalEnvelopeColumnKind.DocumentKind)),
+            (storage.StorageScope.Column.Identifier, EnvelopeType(RelationalEnvelopeColumnKind.StorageScope)),
+            (storage.IdLookupKey.Column.Identifier, EnvelopeType(RelationalEnvelopeColumnKind.IdentityLookup)),
+            (storage.Ordinal.Column.Identifier, ProjectedType(CollectionOrdinalDefinition))
+        };
+        var bytes = key.Sum(column => BoundedKeyBytes(column.Item2));
+        if (bytes > 1700)
+        {
+            throw new InvalidOperationException(
+                $"SQL Server collection owner key ({string.Join(", ", key.Select(column => column.Item1))}) " +
+                $"requires {bytes} bytes, exceeding the 1700-byte nonclustered-key limit.");
+        }
+    }
+
+    private static int BoundedKeyBytes(string type)
+    {
+        var normalized = type.Trim().ToLowerInvariant();
+        if (normalized == "int")
+            return 4;
+        if (normalized == "bigint")
+            return 8;
+        if (normalized is "uniqueidentifier")
+            return 16;
+        if (normalized.StartsWith("nvarchar(", StringComparison.Ordinal) && normalized.EndsWith(')'))
+            return 2 * ParseLength(normalized, "nvarchar");
+        if (normalized.StartsWith("varchar(", StringComparison.Ordinal) && normalized.EndsWith(')'))
+            return ParseLength(normalized, "varchar");
+        if (normalized.StartsWith("varbinary(", StringComparison.Ordinal) && normalized.EndsWith(')'))
+            return ParseLength(normalized, "varbinary");
+        if (normalized.StartsWith("binary(", StringComparison.Ordinal) && normalized.EndsWith(')'))
+            return ParseLength(normalized, "binary");
+        throw new InvalidOperationException(
+            $"SQL Server collection owner key type '{type}' is not a bounded index-key type.");
+    }
+
+    private static int ParseLength(string type, string prefix)
+    {
+        var length = type[(prefix.Length + 1)..^1];
+        if (!int.TryParse(length, CultureInfo.InvariantCulture, out var parsed) || parsed < 1)
+            throw new InvalidOperationException(
+                $"SQL Server collection owner key type '{type}' is not a bounded index-key type.");
+        return parsed;
     }
 
     public override async Task AcquireApplicationLockAsync(DbConnection connection, string resource, CancellationToken cancellationToken)
@@ -569,7 +618,7 @@ internal class SqlServerPhysicalSchemaDialect : RelationalServerPhysicalSchemaDi
         return unique is null ? null : new RelationalPhysicalIndexMetadata(unique.Value, columns, filter);
     }
 
-    private string ProjectedColumn(string column, ProjectedColumnDefinition definition) =>
+    public override string ProjectedColumnSql(string column, ProjectedColumnDefinition definition) =>
         $"{Q(column)} {ProjectedType(definition)}{CollationSql(definition)} {(definition.IsNullable ? "NULL" : "NOT NULL")}" +
         (DefaultSql(definition) is { } value ? $" DEFAULT {value}" : string.Empty);
 

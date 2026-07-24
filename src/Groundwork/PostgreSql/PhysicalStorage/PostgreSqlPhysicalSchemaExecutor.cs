@@ -118,7 +118,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         $"CREATE TABLE {Q(table)} ({string.Join(", ", columns)}, PRIMARY KEY ({string.Join(", ", primaryKey.Select(Q))}));";
 
     public override string AddColumnSql(string table, string column, ProjectedColumnDefinition definition) =>
-        $"ALTER TABLE {Q(table)} ADD COLUMN {ProjectedColumn(column, definition)};";
+        $"ALTER TABLE {Q(table)} ADD COLUMN {ProjectedColumnSql(column, definition)};";
 
     public override string FinalizeColumnSql(string table, string column, ProjectedColumnDefinition definition) =>
         $"ALTER TABLE {Q(table)} ALTER COLUMN {Q(column)} SET NOT NULL;";
@@ -544,7 +544,7 @@ internal sealed class PostgreSqlPhysicalSchemaDialect : RelationalServerPhysical
         return unique is null ? null : new RelationalPhysicalIndexMetadata(unique.Value, columns, filter);
     }
 
-    private string ProjectedColumn(string column, ProjectedColumnDefinition definition) =>
+    public override string ProjectedColumnSql(string column, ProjectedColumnDefinition definition) =>
         $"{Q(column)} {ProjectedType(definition)}{CollationSql(definition)} {(definition.IsNullable ? "NULL" : "NOT NULL")}" +
         (DefaultSql(definition) is { } value ? $" DEFAULT {value}" : string.Empty);
 

@@ -39,7 +39,9 @@ internal static class RelationalPhysicalStorageTestModels
         RelationalMutationScenarioOptions? mutationOptions = null,
         StringIdentityCasePolicy stringCasePolicy = StringIdentityCasePolicy.Ordinal,
         QueryPagingSupport categoryPaging = QueryPagingSupport.Offset,
-        bool includeLatestPerCategory = false)
+        bool includeLatestPerCategory = false,
+        bool includeCollection = false,
+        string? collectionCollation = "ordinal")
     {
         mutationOptions ??= new RelationalMutationScenarioOptions();
         var typedTransitions = mutationOptions.TypedTransitions ?? new RelationalTypedTransitionTestOptions();
@@ -49,6 +51,18 @@ internal static class RelationalPhysicalStorageTestModels
         {
             new("category", "category", PortablePhysicalType.String, Length: 200, IsNullable: categoryNullable)
         };
+        if (includeCollection)
+        {
+            columns.Add(new ProjectedColumnDefinition(
+                "permissions",
+                "permissions",
+                PortablePhysicalType.String,
+                Length: 128,
+                IsNullable: true,
+                Collation: collectionCollation,
+                Cardinality: ProjectionCardinality.CollectionElements,
+                MaxCollectionElements: 8));
+        }
         var categoryIndexColumns = new List<PhysicalIndexColumnDefinition>();
         if (scoped)
             categoryIndexColumns.Add(new PhysicalIndexColumnDefinition("storage_scope", 0));
