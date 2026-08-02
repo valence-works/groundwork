@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build and core tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore Groundwork.slnx
+
+      - name: Build
+        run: >-
+          dotnet build Groundwork.slnx
+          --configuration Release
+          --no-restore
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          projects=(
+            tests/Groundwork/Groundwork.Tests/Groundwork.Tests.csproj
+            tests/Groundwork/Groundwork.Sqlite.Tests/Groundwork.Sqlite.Tests.csproj
+            tests/Groundwork/Groundwork.DiagnosticRecords.Tests/Groundwork.DiagnosticRecords.Tests.csproj
+            tests/Groundwork/Groundwork.SchemaTool.Tests/Groundwork.SchemaTool.Tests.csproj
+            tests/Groundwork/Groundwork.Materialization.Tests/Groundwork.Materialization.Tests.csproj
+            samples/Groundwork.Modules.Inbox.Tests/Groundwork.Modules.Inbox.Tests.csproj
+          )
+          for project in "${projects[@]}"; do
+            dotnet test "$project" --configuration Release --no-build
+          done
+
+  providers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MongoDB provider
+            project: tests/Groundwork/Groundwork.MongoDb.Tests/Groundwork.MongoDb.Tests.csproj
+          - name: Relational providers
+            project: tests/Groundwork/Groundwork.RelationalProviders.Tests/Groundwork.RelationalProviders.Tests.csproj
+          - name: Schema tool provider parity
+            project: tests/Groundwork/Groundwork.SchemaTool.ProviderTests/Groundwork.SchemaTool.ProviderTests.csproj
+          - name: Support tickets sample
+            project: samples/Groundwork.SupportTickets.Tests/Groundwork.SupportTickets.Tests.csproj
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore Groundwork.slnx
+
+      - name: Build
+        run: >-
+          dotnet build Groundwork.slnx
+          --configuration Release
+          --no-restore
+
+      # These suites provision their own containers through Testcontainers.
+      # ubuntu-latest runners ship a running Docker daemon, so no service block
+      # is needed; a suite that cannot reach one fails with
+      # DockerUnavailableException rather than skipping.
+      - name: Test
+        run: >-
+          dotnet test ${{ matrix.project }}
+          --configuration Release
+          --no-build
